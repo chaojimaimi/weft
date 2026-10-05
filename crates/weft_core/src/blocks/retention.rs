@@ -104,6 +104,10 @@ impl BlockTracker {
     /// v1.11.2 X4: ids evicted from memory by retention are folded back in —
     /// they were produced this session too, and per-tab restore must keep
     /// referencing them (they live in SQLite even though the Vec forgot them).
+    ///
+    /// v1.12.24 review P1-2: ids paged in via the panel's GLOBAL "load
+    /// older" query ([`load_older_to_front`]) are excluded as well — they
+    /// are other tabs' blocks, not this tab's history (per-tab isolation).
     pub fn session_produced_block_ids(&self) -> Vec<u64> {
         // Invariant: evicted_ids ∩ blocks = ∅ (a pop only ever LEAVES the
         // Vec, `load_older_to_front` removes re-loaded ids from evicted_ids,
@@ -116,19 +120,39 @@ impl BlockTracker {
         ids.extend(
             self.blocks
                 .iter()
-                .filter(|b| !self.loaded_ids.contains(&b.id.0))
+                .filter(|b| {
+                    !self.loaded_ids.contains(&b.id.0) && !self.load_older_ids.contains(&b.id.0)
+                })
                 .map(|b| b.id.0),
         );
         ids.extend(self.evicted_ids.iter().copied());
         ids
     }
 
+    /// v1.12.24 (N-3): full lineage for snapshots — blocks produced this
+    /// session UNION those loaded from a previous restore. The v1.7.6
+    /// session-only design dropped the previous generation's recall on every
+    /// restart-restore cycle (audit N-3).
+    pub fn lineage_block_ids(&self) -> Vec<u64> {
+        let mut ids = self.session_produced_block_ids();
+        ids.extend(self.loaded_ids.iter().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// v1.11.2 X4 (PLAN_v1112 §1.3): re-insert previously persisted (older)
     /// blocks at the FRONT of the history, preserving time order. Each id:
-    /// recorded as loaded (so it never counts as session-produced), marked
-    /// dirty (vertex rebuild), cleared from `evicted_ids` if retention had
-    /// evicted it, and PINNED against future eviction (review Minor-4 —
-    /// the user asked for this page; the next finalize must not drop it).
+    /// recorded in `load_older_ids`, marked dirty (vertex rebuild), cleared
+    /// from `evicted_ids` if retention had evicted it, and PINNED against
+    /// future eviction (review Minor-4 — the user asked for this page; the
+    /// next finalize must not drop it).
+    ///
+    /// v1.12.24 review P1-2: the "load older" query is GLOBAL (no tab
+    /// filter) — these blocks belong to other tabs, so the id lands in
+    /// `load_older_ids` (NOT `loaded_ids`): they stay visible in the panel
+    /// / block view but never enter `session_produced_block_ids` /
+    /// `lineage_block_ids`, keeping the v1.7.6 per-tab snapshot isolation.
     pub fn load_older_to_front(&mut self, mut older: Vec<Block>) {
         if older.is_empty() {
             return;
@@ -140,7 +164,7 @@ impl BlockTracker {
         older.sort_by_key(|b| (b.started_at, b.id.0));
         for b in &older {
             self.ids.observe(b.id.0);
-            self.loaded_ids.insert(b.id.0);
+            self.load_older_ids.insert(b.id.0);
             self.dirty_blocks.insert(b.id.0);
             self.evicted_ids.remove(&b.id.0);
             self.user_pinned_ids.insert(b.id.0);

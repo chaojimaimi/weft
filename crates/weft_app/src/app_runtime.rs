@@ -2,6 +2,8 @@
 
 use super::*;
 
+#[cfg(test)]
+mod log_rotate_tests;
 mod resize_transaction;
 #[cfg(test)]
 mod retention_tests;
@@ -18,6 +20,8 @@ pub(crate) fn install_runtime_diagnostics() {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // v1.12.24: precedes the open — renaming an open handle would write into the rotated file.
+    rotate_log_if_huge(&log_path);
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -118,6 +122,21 @@ fn runtime_log_path(home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
     match home {
         Some(h) => std::path::PathBuf::from(h).join("Library/Logs/Weft/weft.log"),
         None => std::path::PathBuf::from("/tmp/weft.log"),
+    }
+}
+
+/// v1.12.24: rotate the append-only runtime log at startup — it grew to
+/// 175 MB in the field with no cap. Keeps one generation (.log.1).
+fn rotate_log_if_huge(log_path: &std::path::Path) {
+    const WEFT_LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(log_path) {
+        if meta.len() > WEFT_LOG_ROTATE_BYTES {
+            let mut rotated = log_path.to_path_buf();
+            rotated.set_extension("log.1");
+            let _ = std::fs::remove_file(&rotated);
+            let _ = std::fs::rename(log_path, &rotated)
+                .map_err(|e| tracing::debug!(error = %e, "log rotate: rename failed"));
+        }
     }
 }
 

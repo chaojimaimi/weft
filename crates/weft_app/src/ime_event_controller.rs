@@ -30,6 +30,15 @@ impl App {
             winit::event::Ime::Commit(text) => event_replay::ImeInput::Commit(text),
             winit::event::Ime::Disabled => event_replay::ImeInput::Disabled,
         };
+        // v1.12.24 (N-1): intercept BEFORE the router context is built — the
+        // note editor is a focus-modal card, so composition routes to its own
+        // inline preedit (never to the terminal preedit, which would drop
+        // CJK into the PTY grid while ASCII direct keys land in the buffer —
+        // the two-pipe split this fix removes).
+        if self.overlay_input_owner() == Some(crate::input_router::OverlayInputOwner::NoteEditor) {
+            self.handle_note_editor_ime(input);
+            return;
+        }
         let (active_tab, input_mode) = if self.sessions.is_empty() {
             (0, weft_core::input::InputMode::Passthrough)
         } else {
@@ -127,6 +136,13 @@ impl App {
                         "routing fresh IME commit"
                     );
                     match target {
+                        // v1.12.24 (N-1): conservative sink — the note editor
+                        // intercepts its IME before the router, so this arm
+                        // only fires if routing ever changes under us.
+                        event_replay::ImeCommitTarget::NoteEditorConsumed => {
+                            tracing::debug!(len = text.len(), "IME commit consumed by note editor");
+                            self.request_redraw();
+                        }
                         event_replay::ImeCommitTarget::Palette => {
                             // v1.8.4: route commit to the correct buffer
                             // based on the active submode. AiCommand and
@@ -235,5 +251,31 @@ impl App {
                 }
             }
         }
+    }
+
+    /// v1.12.24 (N-1): the open note editor's own IME pipeline. Preedit
+    /// renders inline in the card (mirrors palette.ime_preedit); Commit
+    /// inserts committed text at the caret via the SHARED insertion
+    /// semantics of `handle_note_editor_key`'s printable arm (no fork);
+    /// Enabled/Disabled drop stale composition state. Every branch redraws.
+    fn handle_note_editor_ime(&mut self, input: event_replay::ImeInput) {
+        match input {
+            event_replay::ImeInput::Preedit { text, cursor } => {
+                self.note_editor.ime_preedit = text;
+                self.note_editor.ime_preedit_cursor = cursor;
+            }
+            event_replay::ImeInput::Commit(text) => {
+                if !text.is_empty() {
+                    self.insert_text_into_note_editor(&text);
+                }
+                self.note_editor.ime_preedit.clear();
+                self.note_editor.ime_preedit_cursor = None;
+            }
+            event_replay::ImeInput::Enabled | event_replay::ImeInput::Disabled => {
+                self.note_editor.ime_preedit.clear();
+                self.note_editor.ime_preedit_cursor = None;
+            }
+        }
+        self.request_redraw();
     }
 }

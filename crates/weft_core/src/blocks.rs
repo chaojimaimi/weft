@@ -297,6 +297,16 @@ pub struct BlockTracker {
     /// history. Without this, saving a tab would re-persist all loaded
     /// global history into the tab's `block_ids`, breaking per-tab isolation.
     loaded_ids: HashSet<u64>,
+    /// v1.12.24 review P1-2: ids paged in via the panel's GLOBAL "load
+    /// older" query ([`load_older_to_front`]). Unlike `loaded_ids`
+    /// (restore-owned history that N-3 keeps in the snapshot lineage),
+    /// load-older blocks are browsed content — another tab's blocks — so
+    /// they are excluded from `session_produced_block_ids` /
+    /// `lineage_block_ids` and a restart can never absorb them into this
+    /// tab's snapshot. Append-only: load-older pages are PINNED against
+    /// eviction (rust-reviewer v1.11.2 Minor-4), so the eviction pop loop
+    /// can never visit them.
+    load_older_ids: HashSet<u64>,
     /// v1.0 P0-b Layer 2: Block ids whose rendering-relevant state changed
     /// (new block, collapse toggle). v1.12.23 audit batch 2: the polling
     /// accessors (`take_dirty_blocks`/`has_dirty_blocks`/`mark_block_dirty`)
@@ -369,6 +379,7 @@ impl BlockTracker {
             continuation_base: None,
             session_start: 0,
             loaded_ids: HashSet::new(),
+            load_older_ids: HashSet::new(),
             dirty_blocks: HashSet::new(),
             retained_limit: retention::DEFAULT_BLOCKS_RETAINED_LIMIT,
             output_cap: DEFAULT_OUTPUT_CAP,

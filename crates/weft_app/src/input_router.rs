@@ -20,6 +20,10 @@ pub(crate) fn cycle_list_selection(selection: usize, len: usize, forward: bool) 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayInputOwner {
+    // v1.12.24 (N-1): the note editor is a focus-modal card — highest
+    // priority, mirroring keyboard.rs's "note_editor.open captures all keys"
+    // intercept (which sits before overlay routing and keybindings).
+    NoteEditor,
     Palette,
     Settings,
     Find,
@@ -29,6 +33,7 @@ pub(crate) enum OverlayInputOwner {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OverlayInputContext {
+    pub(crate) note_editor_open: bool,
     pub(crate) palette_open: bool,
     pub(crate) settings_open: bool,
     pub(crate) find_open: bool,
@@ -303,7 +308,11 @@ pub(crate) fn route_modal_mouse(
 
 impl OverlayInputOwner {
     pub(crate) fn resolve(context: OverlayInputContext) -> Option<Self> {
-        if context.palette_open {
+        // v1.12.24 (N-1): NoteEditor first — the focus-modal card presses
+        // every other surface (palette/find/settings/menu/panel).
+        if context.note_editor_open {
+            Some(Self::NoteEditor)
+        } else if context.palette_open {
             Some(Self::Palette)
         } else if context.settings_open {
             Some(Self::Settings)
@@ -342,6 +351,7 @@ mod tests {
     #[test]
     fn modal_priority_is_deterministic_when_state_is_temporarily_inconsistent() {
         let all_open = OverlayInputContext {
+            note_editor_open: true,
             palette_open: true,
             settings_open: true,
             find_open: true,
@@ -350,16 +360,16 @@ mod tests {
         };
         assert_eq!(
             OverlayInputOwner::resolve(all_open),
-            Some(OverlayInputOwner::Palette)
+            Some(OverlayInputOwner::NoteEditor)
         );
 
-        let without_palette = OverlayInputContext {
-            palette_open: false,
+        let without_note_editor = OverlayInputContext {
+            note_editor_open: false,
             ..all_open
         };
         assert_eq!(
-            OverlayInputOwner::resolve(without_palette),
-            Some(OverlayInputOwner::Settings)
+            OverlayInputOwner::resolve(without_note_editor),
+            Some(OverlayInputOwner::Palette)
         );
     }
 
@@ -379,17 +389,44 @@ mod tests {
         );
     }
 
+    /// v1.12.24 (N-1): the note editor is a focus-modal card — it owns input
+    /// even with every other overlay open (mirrors keyboard.rs's intercept
+    /// sitting before overlay routing).
+    #[test]
+    fn note_editor_owns_input_over_every_other_surface() {
+        let note = OverlayInputContext {
+            note_editor_open: true,
+            ..OverlayInputContext::default()
+        };
+        assert_eq!(
+            OverlayInputOwner::resolve(note),
+            Some(OverlayInputOwner::NoteEditor)
+        );
+        let note_with_palette = OverlayInputContext {
+            palette_open: true,
+            ..note
+        };
+        assert_eq!(
+            OverlayInputOwner::resolve(note_with_palette),
+            Some(OverlayInputOwner::NoteEditor),
+            "note editor must outrank an open palette"
+        );
+    }
+
     #[test]
     fn all_open_closed_combinations_follow_one_priority_order() {
-        for bits in 0_u8..32 {
+        for bits in 0_u16..64 {
             let context = OverlayInputContext {
-                palette_open: bits & 0b0001 != 0,
-                settings_open: bits & 0b0010 != 0,
-                find_open: bits & 0b0100 != 0,
-                context_menu_open: bits & 0b1000 != 0,
-                panel_search_focused: bits & 0b1_0000 != 0,
+                note_editor_open: bits & 0b00_0001 != 0,
+                palette_open: bits & 0b00_0010 != 0,
+                settings_open: bits & 0b00_0100 != 0,
+                find_open: bits & 0b00_1000 != 0,
+                context_menu_open: bits & 0b01_0000 != 0,
+                panel_search_focused: bits & 0b10_0000 != 0,
             };
-            let expected = if context.palette_open {
+            let expected = if context.note_editor_open {
+                Some(OverlayInputOwner::NoteEditor)
+            } else if context.palette_open {
                 Some(OverlayInputOwner::Palette)
             } else if context.settings_open {
                 Some(OverlayInputOwner::Settings)
@@ -405,7 +442,7 @@ mod tests {
             assert_eq!(
                 OverlayInputOwner::resolve(context),
                 expected,
-                "bits={bits:05b}"
+                "bits={bits:06b}"
             );
         }
     }

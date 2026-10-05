@@ -86,3 +86,72 @@ fn retention_evicted_blocks_still_hydrate_to_their_tab() {
     let commands: Vec<&str> = hydrated.iter().map(|b| b.command.as_str()).collect();
     assert_eq!(commands, vec!["cmd0", "cmd1", "cmd2", "cmd3"]);
 }
+
+// ── v1.12.24 (N-2 + N-3): lineage snapshot × hydrate recall ────────────
+
+use weft_core::blocks::{Block, BlockId};
+
+/// Minimal persisted-style block, mirroring the shape `BlockStore` queries
+/// return (local twin of the inline tests' `block()` helper — child modules
+/// cannot see each other's private items).
+fn persisted_block(id: u64, command: &str) -> Block {
+    Block {
+        id: BlockId(id),
+        command: command.to_string(),
+        cwd: None,
+        output: String::new().into(),
+        styled_output: None,
+        exit_code: Some(0),
+        started_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
+        finished_at: Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id)),
+        collapsed: false,
+        screen_origin: false,
+    }
+}
+
+/// The user's 30-second scenario, miniaturized. Restore hydrates generation 1
+/// (blocks 1-3), a fresh command finalizes generation 2 (block 4), and the
+/// pre-removal snapshot's lineage ids (what `persist_tabs_snapshot_now` →
+/// `save_tabs` now lands in the tabs DB; pre-fix: session-only ids [4])
+/// rehydrate a fresh terminal into recalling BOTH generations on ↑ —
+/// previously every restart-restore cycle dropped one recall generation.
+#[test]
+fn lineage_snapshot_rehydrates_recall_for_both_generations() {
+    use std::sync::Arc;
+
+    // Generation 1 in the DB (newest-first): blocks 1-3.
+    let newest_first = vec![
+        persisted_block(3, "❯ three"),
+        persisted_block(2, "❯ two"),
+        persisted_block(1, "❯ one"),
+    ];
+    let allocator = Arc::new(weft_core::block_id_sequence::BlockIdPool::new(4, 4 + 4096));
+    let mut terminal_a = Terminal::new(24, 80);
+    hydrate_persisted_history(&mut terminal_a, &newest_first, &[1, 2, 3], allocator);
+    assert_eq!(terminal_a.editor().history(), ["three", "two", "one"]);
+
+    // Generation 2: the user runs "four" this session (headless).
+    let tracker = terminal_a.block_tracker_mut();
+    tracker.on_prompt_start();
+    tracker.on_command_start("four".to_string());
+    tracker.on_command_end(0);
+    // The snapshot written by the pre-removal save carries both generations.
+    assert_eq!(terminal_a.block_tracker().lineage_block_ids(), [1, 2, 3, 4]);
+
+    // Restart: a fresh hydrate from the saved lineage ids recalls both.
+    let mut db_newest_first = vec![persisted_block(4, "four")];
+    db_newest_first.extend(newest_first);
+    let allocator_b = Arc::new(weft_core::block_id_sequence::BlockIdPool::new(5, 5 + 4096));
+    let mut terminal_b = Terminal::new(24, 80);
+    hydrate_persisted_history(
+        &mut terminal_b,
+        &db_newest_first,
+        &[1, 2, 3, 4],
+        allocator_b,
+    );
+    assert_eq!(
+        terminal_b.editor().history(),
+        ["four", "three", "two", "one"],
+        "↑ recall after restart must include BOTH generations"
+    );
+}

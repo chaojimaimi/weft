@@ -156,6 +156,74 @@ fn session_produced_block_ids_include_evicted_ids() {
     assert_eq!(produced.len(), 4, "no duplicates between vec and evicted");
 }
 
+/// v1.12.24 (N-3): lineage_block_ids = session-produced UNION loaded, so a
+/// per-tab snapshot keeps referencing the previous restore's history instead
+/// of dropping one generation on every restart-restore cycle. The narrower
+/// session-only accessor keeps its v1.7.6 semantics side by side.
+#[test]
+fn lineage_block_ids_union_loaded_and_session_produced() {
+    let mut t = BlockTracker::new();
+    t.load_blocks(vec![
+        make_block(1, "one", 30),
+        make_block(2, "two", 20),
+        make_block(3, "three", 10),
+    ]);
+    finish_cmd(&mut t, "four");
+    // observe() advanced the sequence past the loaded ids → block 4.
+    assert_eq!(t.session_produced_block_ids(), vec![4]);
+    assert_eq!(t.lineage_block_ids(), vec![1, 2, 3, 4]);
+}
+
+/// v1.12.24 (N-3): the lineage union is deterministic — HashSet iteration
+/// order must never leak into the snapshot's block_ids.
+#[test]
+fn lineage_block_ids_are_sorted_and_deduplicated() {
+    let mut t = BlockTracker::new();
+    // A loaded id that is ALSO referenced via the evicted union (loaded block
+    // evicted from memory) must appear exactly once in the lineage.
+    t.load_blocks(vec![make_block(10, "historic", 60)]);
+    t.set_retained_limit(1);
+    finish_cmd(&mut t, "fresh");
+    assert!(t.evicted_ids().contains(&10));
+    assert_eq!(t.lineage_block_ids(), vec![10, 11]);
+}
+
+/// v1.12.24 review P1-2: the panel's "load older" query is GLOBAL — pages
+/// brought in this way are OTHER tabs' blocks. They must stay visible in
+/// the tracker's block list (panel / block view) but never leak into the
+/// per-tab snapshot lineage, or a restart would absorb them into this tab.
+#[test]
+fn load_older_ids_do_not_enter_lineage() {
+    let mut t = BlockTracker::new();
+    finish_cmd(&mut t, "mine");
+    t.load_older_to_front(vec![
+        make_block(90, "other-tab-a", 30),
+        make_block(91, "other-tab-b", 90),
+    ]);
+    // Visible in the block list (pinned, oldest-first prepend)...
+    let commands: Vec<&str> = t.blocks().iter().map(|b| b.command.as_str()).collect();
+    assert_eq!(commands, vec!["other-tab-b", "other-tab-a", "mine"]);
+    // ...but excluded from the snapshot lineage.
+    assert_eq!(
+        t.lineage_block_ids(),
+        vec![1],
+        "load-older pages are browsed content, not tab-owned history"
+    );
+    assert_eq!(t.session_produced_block_ids(), vec![1]);
+}
+
+/// Contrast guard for N-3 (P1-2 pair): the RESTORE path (`load_blocks`)
+/// must keep feeding `loaded_ids` — the previous generation's ids stay in
+/// the tab snapshot lineage. If this regresses, every restart-restore
+/// cycle loses one ↑ recall generation again.
+#[test]
+fn restore_loaded_ids_still_enter_lineage() {
+    let mut t = BlockTracker::new();
+    t.load_blocks(vec![make_block(1, "prev-gen", 60)]);
+    finish_cmd(&mut t, "fresh");
+    assert_eq!(t.lineage_block_ids(), vec![1, 2]);
+}
+
 #[test]
 fn retention_leaves_continuation_flow_intact() {
     // With retention tight (limit 1), the screen-continuation restore

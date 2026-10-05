@@ -30,11 +30,14 @@ pub struct TabSnapshot {
     /// Shell phase as a string: "NotIntegrated" / "AtPrompt" /
     /// "CommandExecuting".
     pub shell_phase: String,
-    /// v1.7.6: IDs of blocks produced in this tab's last session. On
-    /// Restore, each tab hydrates only its own blocks (filtered from the
-    /// global SQLite history by these IDs), preventing all tabs from
-    /// showing the same mixed global history. Empty for legacy snapshots
-    /// predating v1.7.6 (tab starts with no restored block-view content).
+    /// v1.7.6: IDs of the blocks this tab owns. v1.12.24 (N-3): the full
+    /// lineage — session-produced ∪ previously-restored ids — so ↑ recall
+    /// survives restart-restore cycles; panel "load older" pages are
+    /// deliberately excluded (they are other tabs' blocks). On Restore,
+    /// each tab hydrates only its own blocks (filtered from the global
+    /// SQLite history by these IDs), preventing all tabs from showing the
+    /// same mixed global history. Empty for legacy snapshots predating
+    /// v1.7.6 (tab starts with no restored block-view content).
     #[serde(default)]
     pub block_ids: Vec<u64>,
 }
@@ -69,7 +72,16 @@ impl BlockStore {
     /// table is cleared and re-inserted in a single transaction so the
     /// save is atomic — a crash mid-save leaves the previous state
     /// intact. Position ordering is preserved.
+    ///
+    /// v1.12.24 (N-2 wipe guard): an empty snapshot list only occurs in
+    /// the exit transient (tabs already drained) — executing the DELETE
+    /// below would wipe the table and the next launch would restore zero
+    /// tabs. Explicit full clears go through [`BlockStore::clear_tabs`].
     pub fn save_tabs(&self, snapshots: &[TabSnapshot]) -> Result<(), PersistenceError> {
+        if snapshots.is_empty() {
+            tracing::warn!("refusing to save an empty tabs snapshot (wipe guard)");
+            return Ok(());
+        }
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM tabs", [])?;
         for snap in snapshots {
@@ -188,6 +200,21 @@ mod tests {
         }
     }
 
+    /// v1.12.24 (N-2/N-3 lineage chain): a snapshot carrying the union of
+    /// session-produced and loaded ids (what `Tab::to_snapshot` writes via
+    /// `lineage_block_ids`) survives save→load byte-identical, so the next
+    /// launch's hydrate can recall both generations.
+    #[test]
+    fn lineage_block_ids_roundtrip_through_sqlite() {
+        let store = temp_store();
+        let mut snap = snapshot(0, "/work", 0, "AtPrompt");
+        snap.block_ids = vec![1, 2, 3, 4]; // sorted+deduped lineage
+        store.save_tabs(&[snap]).unwrap();
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].block_ids, vec![1, 2, 3, 4]);
+    }
+
     #[test]
     fn save_and_load_tabs_roundtrip() {
         let store = temp_store();
@@ -266,12 +293,25 @@ mod tests {
         assert!(store.load_tabs().unwrap().is_empty());
     }
 
+    /// v1.12.24 (N-2 wipe guard): an empty save must NOT wipe existing rows —
+    /// the exit transient (tabs already drained) used to DELETE the whole
+    /// table on `save_tabs([])`, so the next launch restored zero tabs.
+    /// (Log line "wipe guard" is emitted via tracing::warn!; this workspace
+    /// has no log-capture test infra, so the DB state carries the assertion.)
     #[test]
-    fn save_empty_tabs_is_valid() {
+    fn save_empty_tabs_refuses_to_wipe_existing_rows() {
         let store = temp_store();
+        store
+            .save_tabs(&[snapshot(0, "/a", 0, "AtPrompt")])
+            .unwrap();
         store.save_tabs(&[]).unwrap();
         let loaded = store.load_tabs().unwrap();
-        assert!(loaded.is_empty());
+        assert_eq!(loaded.len(), 1, "wipe guard must keep the existing row");
+        assert_eq!(loaded[0].cwd.as_deref(), Some("/a"));
+        // A fresh (never-populated) DB stays empty — the guard is a no-op.
+        let fresh = temp_store();
+        fresh.save_tabs(&[]).unwrap();
+        assert!(fresh.load_tabs().unwrap().is_empty());
     }
 
     #[test]

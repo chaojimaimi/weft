@@ -914,11 +914,13 @@ impl Tab {
             weft_core::blocks::ShellPhase::AtPrompt => "AtPrompt",
             weft_core::blocks::ShellPhase::CommandExecuting => "CommandExecuting",
         };
-        // v1.7.6: persist the IDs of blocks produced THIS session so each
-        // tab can restore only its own history on next launch (per-tab
-        // isolation). Loaded history (from a previous Restore) is excluded
-        // via `loaded_ids` inside the tracker.
-        let block_ids = terminal.block_tracker().session_produced_block_ids();
+        // v1.7.6: persist per-tab block ownership so each tab can restore
+        // only its own history on next launch (per-tab isolation).
+        // v1.12.24 (N-3): use the full lineage (session-produced UNION
+        // loaded-from-previous-restore) — the v1.7.6 session-only design
+        // dropped the previous generation's recall on every restart-restore
+        // cycle, so each ↑ history shrunk by one generation per restart.
+        let block_ids = terminal.block_tracker().lineage_block_ids();
         Some(TabSnapshot {
             position,
             active,

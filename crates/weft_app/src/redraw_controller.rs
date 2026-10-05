@@ -636,6 +636,7 @@ impl App {
                 Some(crate::paint::overlays::NoteEditorDrawState {
                     buffer: self.note_editor.buffer.clone(),
                     cursor: self.note_editor.cursor,
+                    ime_preedit: self.note_editor.ime_preedit.clone(),
                 })
             } else {
                 None

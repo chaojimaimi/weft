@@ -63,8 +63,6 @@ impl GlyphAtlas {
             uv_origin,
             uv_size,
             size: (glyph_w, cell_h),
-            advance: glyph_w as f32,
-            is_wide,
             is_color,
         })
     }
@@ -314,8 +312,6 @@ impl GlyphAtlas {
             uv_origin,
             uv_size,
             size: (glyph_w, cell_h),
-            advance: glyph_w as f32,
-            is_wide,
             // Init-time pre-rasterization only covers ASCII + UI symbols,
             // which all live in the R8 mask atlas.
             is_color: false,

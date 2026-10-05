@@ -593,6 +593,11 @@ pub struct NoteEditorState {
     pub buffer: String,
     /// Byte offset of the caret in `buffer`.
     pub cursor: usize,
+    /// v1.12.24 (N-1): IME composition state, mirrors palette.ime_preedit.
+    pub ime_preedit: String,
+    /// v1.12.24 (N-1): raw winit (cursor, selection) tuple — the palette
+    /// stores it unconverted, so this field mirrors that exactly.
+    pub ime_preedit_cursor: Option<(usize, usize)>,
 }
 
 impl NoteEditorState {
@@ -608,6 +613,9 @@ impl NoteEditorState {
         self.target_block_id = None;
         self.buffer.clear();
         self.cursor = 0;
+        // v1.12.24 (N-1): stale composition must never outlive the card.
+        self.ime_preedit.clear();
+        self.ime_preedit_cursor = None;
     }
 }
 

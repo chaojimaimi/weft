@@ -60,6 +60,8 @@ pub struct NoteEditorDrawState {
     pub buffer: String,
     /// Byte offset of the caret in `buffer`.
     pub cursor: usize,
+    /// v1.12.24 (N-1): active IME composition, rendered inline at the caret.
+    pub ime_preedit: String,
 }
 
 impl FindDrawState {
@@ -598,6 +600,18 @@ impl MetalRenderer {
                 [0.0; 4],
                 fg,
             );
+        }
+
+        // v1.12.24 (N-1): IME preedit inline at the caret (palette precedent),
+        // accent-colored + underlined. Width = text_col_width (CJK = 2 cols);
+        // visible truncation rides push_text's column budget.
+        if !state.ime_preedit.is_empty() {
+            let preedit_max = buf_max_cells.saturating_sub(caret_char);
+            let cols = Self::text_col_width(&state.ime_preedit).min(preedit_max) as f32;
+            let underline = [caret_x, line_y + ch - 1.0, caret_x + cols * cw, line_y + ch];
+            let preedit = &state.ime_preedit;
+            self.push_text(&mut verts, caret_x, line_y, preedit, accent, preedit_max);
+            push_quad(&mut verts, underline, bg_uv, [0.0; 4], accent);
         }
 
         // Separator between input and hint.

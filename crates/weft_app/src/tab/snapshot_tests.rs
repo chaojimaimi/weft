@@ -63,6 +63,43 @@ fn snapshot(cwd: &str, editor: &EditorBuffer) -> TabSnapshot {
     }
 }
 
+/// v1.12.24 (N-3): a tab that loaded a previous generation's history and then
+/// produced new blocks must serialize BOTH generations into its snapshot —
+/// the v1.7.6 session-only snapshot dropped the loaded ids, so every
+/// restart-restore cycle lost one ↑ recall generation (user-reproduced).
+#[test]
+fn to_snapshot_block_ids_carry_full_lineage_across_generations() {
+    use std::time::{Duration, SystemTime};
+    use weft_core::blocks::{Block, BlockId};
+
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    let mk = |id: u64, cmd: &str| Block {
+        id: BlockId(id),
+        command: cmd.to_string(),
+        cwd: None,
+        output: String::new().into(),
+        styled_output: None,
+        exit_code: Some(0),
+        started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        finished_at: None,
+        collapsed: false,
+        screen_origin: false,
+    };
+    // Previous generation loaded at startup/Restore (ids 1-3)...
+    terminal
+        .block_tracker_mut()
+        .load_blocks(vec![mk(1, "one"), mk(2, "two"), mk(3, "three")]);
+    // ...then this session produces "four" (id 4 via the observed sequence).
+    let tracker = terminal.block_tracker_mut();
+    tracker.on_prompt_start();
+    tracker.on_command_start("four".to_string());
+    tracker.on_command_end(0);
+
+    let snap = tab.to_snapshot(0, true).unwrap();
+    assert_eq!(snap.block_ids, vec![1, 2, 3, 4]);
+}
+
 #[test]
 fn restored_cwd_survives_until_terminal_reports_authoritative_cwd() {
     let mut tab = tab_with_terminal();

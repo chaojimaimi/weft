@@ -15,6 +15,7 @@ use winit::keyboard::KeyCode as WinitKeyCode;
 impl crate::App {
     pub(crate) fn overlay_input_owner(&self) -> Option<OverlayInputOwner> {
         OverlayInputOwner::resolve(OverlayInputContext {
+            note_editor_open: self.note_editor.open,
             palette_open: self.palette.open,
             settings_open: self.settings.open,
             find_open: self.find.open,
@@ -177,6 +178,13 @@ impl crate::App {
         let overlay_owner = self.overlay_input_owner();
         if let Some(owner) = overlay_owner {
             let overlay_consumed = match owner {
+                // v1.12.24 (N-1): defensive arm — the note-editor intercept
+                // above already returns early, but if routing ever reaches
+                // the overlay match with the card open, it consumes all keys.
+                OverlayInputOwner::NoteEditor => {
+                    self.handle_note_editor_key(key, m, text);
+                    true
+                }
                 OverlayInputOwner::Palette => self.handle_palette_key(key, m, text),
                 OverlayInputOwner::Settings => self.handle_settings_key(key, m, text),
                 OverlayInputOwner::Find => self.handle_find_key(key, m, text),
@@ -378,10 +386,9 @@ impl crate::App {
         // Cmd+V: paste from clipboard.
         if mods.contains(Modifiers::SUPER) && key == KeyCode::Char('v') {
             if let Some(pasted) = clipboard_paste() {
-                let ne = &mut self.note_editor;
-                let insert_pos = ne.cursor.min(ne.buffer.len());
-                ne.buffer.insert_str(insert_pos, &pasted);
-                ne.cursor = insert_pos + pasted.len();
+                // v1.12.24 (N-1): shared caret-insertion semantics (also used
+                // by the IME commit path) — one insertion code path, no forks.
+                self.insert_text_into_note_editor(&pasted);
             }
             self.request_redraw();
             return;
@@ -395,6 +402,11 @@ impl crate::App {
         match crate::paint::command_surface::resolve_command_surface_key(key, mods) {
             CommandSurfaceKeyAction::Cancel => {
                 self.note_editor.close();
+                // v1.12.24 (N-1): discard residual marked text so Esc isn't
+                // intercepted by the IME (focus.rs palette/find precedent;
+                // v1.8.7's native discard sits in the else branch the note
+                // intercept never reaches).
+                self.reset_ime_context("note editor closed");
                 self.request_redraw();
                 return;
             }
@@ -480,10 +492,10 @@ impl crate::App {
                         mods.contains(Modifiers::SHIFT),
                     );
                     if !resolved.is_control() {
-                        let ne = &mut self.note_editor;
-                        let pos = ne.cursor.min(ne.buffer.len());
-                        ne.buffer.insert(pos, resolved);
-                        ne.cursor = pos + resolved.len_utf8();
+                        // v1.12.24 review P3: the shared insertion fn (also
+                        // serves the IME commit + paste arms) — one code path.
+                        let mut utf8 = [0u8; 4];
+                        self.insert_text_into_note_editor(resolved.encode_utf8(&mut utf8));
                         self.request_redraw();
                     }
                 }
@@ -497,6 +509,9 @@ impl crate::App {
         let target = self.note_editor.target_block_id;
         let buffer = std::mem::take(&mut self.note_editor.buffer);
         self.note_editor.close();
+        // v1.12.24 (N-1): same IME cleanup as the Cancel arm — the Enter
+        // commit must not leave marked text intercepting the next Esc.
+        self.reset_ime_context("note editor closed");
 
         if let Some(bid) = target {
             if let Some(store) = self.sessions.annotation_store() {
@@ -517,5 +532,16 @@ impl crate::App {
             }
         }
         self.request_redraw();
+    }
+
+    /// v1.12.24 (N-1): insert `text` at the note editor caret (cursor
+    /// clamped, caret advances past the insertion). The ONE insertion
+    /// semantic shared by the Cmd+V paste arm and the IME commit path —
+    /// byte-offset arithmetic identical to the old inline paste arm.
+    pub(crate) fn insert_text_into_note_editor(&mut self, text: &str) {
+        let ne = &mut self.note_editor;
+        let insert_pos = ne.cursor.min(ne.buffer.len());
+        ne.buffer.insert_str(insert_pos, text);
+        ne.cursor = insert_pos + text.len();
     }
 }

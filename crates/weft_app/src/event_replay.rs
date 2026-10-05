@@ -29,6 +29,8 @@ pub(crate) struct ImeRouteContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImeCommitTarget {
+    // v1.12.24 (N-1): conservative sink (router-reachable only by invariant breach).
+    NoteEditorConsumed,
     Palette,
     SettingsConsumed,
     Find,
@@ -87,6 +89,8 @@ pub(crate) fn route_ime_input(input: ImeInput, context: ImeRouteContext) -> Vec<
                 return actions;
             }
             let target = match context.owner {
+                // v1.12.24 (N-1): conservative arm (intercepted pre-router).
+                Some(OverlayInputOwner::NoteEditor) => ImeCommitTarget::NoteEditorConsumed,
                 Some(OverlayInputOwner::Palette) => ImeCommitTarget::Palette,
                 Some(OverlayInputOwner::Settings) => ImeCommitTarget::SettingsConsumed,
                 Some(OverlayInputOwner::Find) => ImeCommitTarget::Find,
@@ -274,7 +278,9 @@ mod tests {
                     ImeRoutingAction::ClearAllPreedit => clear_all_preedit(&mut self.tabs),
                     ImeRoutingAction::Commit { target, text } => match target {
                         ImeCommitTarget::Palette => self.palette.push_str(&text),
-                        ImeCommitTarget::SettingsConsumed
+                        // v1.12.24 (N-1): conservative no-op like Settings.
+                        ImeCommitTarget::NoteEditorConsumed
+                        | ImeCommitTarget::SettingsConsumed
                         | ImeCommitTarget::ContextMenuConsumed => {}
                         ImeCommitTarget::Find => self.find.push_str(&text),
                         ImeCommitTarget::PanelSearch => self.panel.push_str(&text),
@@ -389,6 +395,8 @@ mod tests {
             (OverlayInputOwner::Find, "查找"),
             (OverlayInputOwner::ContextMenu, "菜单忽略"),
             (OverlayInputOwner::PanelSearch, "历史"),
+            // P2-1: router-reachable NoteEditor commits are no-op sinks.
+            (OverlayInputOwner::NoteEditor, "备注"),
         ] {
             replay.dispatch(
                 ImeInput::Preedit {
@@ -514,6 +522,7 @@ mod tests {
         assert_eq!(saved, Some(FocusId::SidebarSearch));
 
         let owner = OverlayInputOwner::resolve(OverlayInputContext {
+            note_editor_open: false,
             palette_open: true,
             settings_open: true,
             find_open: true,

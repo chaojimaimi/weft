@@ -171,6 +171,21 @@ impl App {
         }
     }
 
+    /// v1.12.24 (N-2): pre-removal final save for a dying tab, called from
+    /// `process_messages` BEFORE `remove_dead` — after removal the
+    /// should_exit tail never saves (an empty-list save would wipe the tabs
+    /// table), so the 1 Hz autosave's ≤1s lag was the last command's only
+    /// loss window. Carries the same recovery-modal guard as the 1 Hz caller
+    /// (`run_tabs_autosave_tick`, v1.10.23): a save while the crash-recovery
+    /// prompt is pending would overwrite the on-disk crash snapshot.
+    pub(super) fn persist_tabs_snapshot_now(&mut self) {
+        if crate::recovery_controller::autosave_suppressed(&self.pending_recovery) {
+            tracing::debug!("skipping pre-removal tabs save while recovery prompt is pending");
+            return;
+        }
+        self.save_changed_tabs();
+    }
+
     /// v0.9 H1 Stage 4: re-bind the global find state to the active tab.
     ///
     /// Find query / regex / case-sensitive flags stay global (convenient for

@@ -1,12 +1,10 @@
 //! Atlas coordinate helpers shared by prewarmed and dynamic glyph slots.
 
 /// UV rect for a glyph in the atlas texture.
-// v1.12.23 audit batch 2: allow retained — stripping it surfaced genuine
-// `dead_code` on the `advance`/`is_wide` fields in the bin target (they
-// are never read anywhere, construction-only); delete the fields in a later
-// batch rather than wiring readers.
+// v1.12.24 (P0-04): the construction-only `advance`/`is_wide` fields (never
+// read anywhere — batch 2's retained allow) are deleted; clippy runs clean
+// without the allow, proving the fields were dead.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 pub struct GlyphInfo {
     /// Top-left UV coordinate in atlas (normalized 0..1).
     pub uv_origin: (f32, f32),
@@ -14,10 +12,6 @@ pub struct GlyphInfo {
     pub uv_size: (f32, f32),
     /// Glyph bitmap size in pixels.
     pub size: (u32, u32),
-    /// Horizontal advance width in pixels.
-    pub advance: f32,
-    /// Whether this glyph occupies double width (CJK).
-    pub is_wide: bool,
     /// v1.10.4: whether this glyph's pixels live in the RGBA color atlas
     /// (color emoji — Apple Color Emoji sbix bitmaps) instead of the R8
     /// alpha-mask atlas. Color glyphs carry their own RGB; the instance's

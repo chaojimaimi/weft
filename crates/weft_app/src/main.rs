@@ -565,6 +565,11 @@ impl App {
                 if menu_belongs_to_dead_session {
                     self.take_context_menu("context menu owner shell exited");
                 }
+                // v1.12.24 (N-2): the dying tab's final snapshot must land in the tabs
+                // DB BEFORE removal — after remove_dead no save ever runs on the
+                // should_exit tail (saving empty tabs would wipe the table), so the
+                // 1 Hz autosave's ≤1s lag was the last command's only loss window.
+                self.persist_tabs_snapshot_now();
                 let is_last = self.sessions.remove_dead(i);
                 if is_last {
                     exit_requested = true;
