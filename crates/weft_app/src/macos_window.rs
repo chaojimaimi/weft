@@ -173,7 +173,8 @@ pub(crate) fn configure_titlebar(window: &Window) {
             Some(imp_raw),
             types.as_ptr() as *const std::os::raw::c_char,
         );
-    }));
+    }))
+    .map_err(|_| tracing::warn!("objc bridge panicked (window configure_titlebar)"));
 }
 
 /// Helper: get the NSWindow owning an NSView (`[view window]`), retained.

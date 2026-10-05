@@ -223,7 +223,20 @@ impl From<serde_yaml_ng::Error> for WorkspaceError {
 // ── WorkspacePaneNode methods ───────────────────────────────────────────
 
 impl WorkspacePaneNode {
-    /// Count leaf panes in this sub-tree.
+    /// v1.12.25 (audit core P2-3): DFS-collect every pane cwd in this tree —
+    /// `validate` checks each for embedded NUL bytes (a legal YAML `"\0"`
+    /// escape in hand-edited files would panic the PTY env builder's
+    /// `CString::new` downstream).
+    fn collect_cwds<'a>(&'a self, out: &mut Vec<&'a std::path::Path>) {
+        match self {
+            WorkspacePaneNode::Pane { cwd, .. } => out.push(cwd.as_path()),
+            WorkspacePaneNode::Split { first, second, .. } => {
+                first.collect_cwds(out);
+                second.collect_cwds(out);
+            }
+        }
+    }
+
     pub fn pane_count(&self) -> usize {
         match self {
             Self::Pane { .. } => 1,
@@ -393,6 +406,18 @@ impl WorkspaceDocument {
                     tab.active_pane_index
                 )));
             }
+            // v1.12.25 (audit core P2-3): reject NUL bytes in pane cwds before
+            // the value reaches the PTY env builder (defense line one; pty.rs
+            // build_child_env skips + warns as line two).
+            let mut cwds = Vec::new();
+            tab.panes.collect_cwds(&mut cwds);
+            for cwd in cwds {
+                if cwd.as_os_str().as_encoded_bytes().contains(&0) {
+                    return Err(WorkspaceError::Validation(format!(
+                        "tab {i} pane cwd contains NUL byte"
+                    )));
+                }
+            }
             total_draft += tab.panes.draft_byte_size();
         }
         if total_draft > MAX_WORKSPACE_DRAFT_BYTES {
@@ -429,6 +454,20 @@ impl WorkspaceDocument {
     }
 
     fn load_file(path: &Path) -> Result<Self, WorkspaceError> {
+        // v1.12.25 (audit L-3): cap hand-edited/corrupt snapshots before the
+        // serde_yaml alias expansion can amplify them (theme.rs precedent).
+        const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size > SNAPSHOT_MAX_BYTES {
+            tracing::warn!(
+                size,
+                limit = SNAPSHOT_MAX_BYTES,
+                "workspace snapshot exceeds size limit"
+            );
+            return Err(WorkspaceError::Validation(format!(
+                "workspace snapshot is {size} bytes, limit is {SNAPSHOT_MAX_BYTES}"
+            )));
+        }
         let yaml = std::fs::read_to_string(path)?;
         let mut doc = Self::from_yaml(&yaml)?;
         // Clamp ratios on load so out-of-range values from hand-edited YAML
@@ -597,6 +636,46 @@ mod tests {
         let doc = WorkspaceDocument::from_yaml(yaml).unwrap();
         assert_eq!(doc.profile, None);
         assert_eq!(doc.active_tab, 0);
+    }
+
+    #[test]
+    fn workspace_yaml_with_nul_cwd_is_rejected() {
+        // v1.12.25 (audit core P2-3): YAML `"\0"` is a legal escape; a NUL
+        // cwd used to reach the PTY env builder and panic the main thread in
+        // `CString::new`. `validate()` (via `from_yaml`) must reject it.
+        let yaml = "version: 1\nname: nul-cwd\nwindow:\n  width: 200\n  height: 200\ntabs:\n  - panes:\n      kind: Pane\n      cwd: \"\\0\"\n      draft: \"\"\n    active_pane_index: 0\n";
+        let err = WorkspaceDocument::from_yaml(yaml).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Validation(ref msg) if msg.contains("NUL")));
+    }
+
+    #[test]
+    fn load_file_caps_snapshot_size() {
+        // v1.12.25 (audit L-3): oversized hand-edited/corrupt snapshots are
+        // rejected before serde_yaml can expand them; normal small files are
+        // unaffected.
+        let dir = std::env::temp_dir().join(format!(
+            "weft-workspace-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workspace.yaml");
+
+        // A normal small file still loads.
+        let doc = sample_doc();
+        doc.save(&path).unwrap();
+        assert!(WorkspaceDocument::load(&path).is_ok());
+
+        // An oversized file is rejected before parsing (no .bak exists yet,
+        // so `load` propagates the error).
+        std::fs::write(&path, vec![b'x'; 16 * 1024 * 1024 + 1]).unwrap();
+        let err = WorkspaceDocument::load(&path).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Validation(ref msg) if msg.contains("limit")));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -182,7 +182,8 @@ pub fn discard_marked_text(window: &Window) {
         // native context, matching WarpHostView's two-layer reset. Keep the
         // raw message inside catch_unwind per the project's objc2 discipline.
         let _: () = msg_send![&*view, unmarkText];
-    }));
+    }))
+    .map_err(|_| tracing::warn!("objc bridge panicked (IME discard_marked_text)"));
 }
 
 #[cfg(test)]

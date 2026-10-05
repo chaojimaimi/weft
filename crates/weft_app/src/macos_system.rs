@@ -588,7 +588,7 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
         return;
     };
 
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    guarded_unwind("set_dock_icon", (), || unsafe {
         let app = NSApplication::sharedApplication(mtm);
         if std::env::current_exe()
             .ok()
@@ -614,7 +614,7 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
         } else {
             tracing::warn!(?variant, "NSImage::initWithData returned nil");
         }
-    }));
+    });
 }
 
 #[cfg(test)]

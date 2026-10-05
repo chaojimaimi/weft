@@ -439,7 +439,8 @@ pub(super) unsafe fn set_dock_badge(badge: Option<&str>) {
         // badge updates to 200 ms and the string is tiny.
         let label = badge.map(NSString::from_str);
         app.dockTile().setBadgeLabel(label.as_deref());
-    }));
+    }))
+    .map_err(|_| tracing::warn!("objc bridge panicked (dock badge set_dock_badge)"));
 }
 
 /// Route a notification response to the app. Extracted so the delegate

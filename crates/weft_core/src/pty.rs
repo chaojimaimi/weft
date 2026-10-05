@@ -204,7 +204,39 @@ impl Pty {
                 let read_child_pid = child;
 
                 tokio::spawn(async move {
-                    read_loop::read_loop(duped, read_child_pid, tx, mouse_suppress, wake).await;
+                    // v1.12.25 (audit S-2): a panicking reader task used to vanish silently
+                    // (tokio swallows it; the channel stays open because Pty holds another
+                    // tx clone) — the tab froze forever with no Exit and no log. Await the
+                    // inner task's JoinHandle and convert its panic payload into a
+                    // synthetic Exit so the existing teardown path runs.
+                    let reader = tx.clone();
+                    let handle = tokio::spawn(read_loop::read_loop(
+                        duped,
+                        read_child_pid,
+                        reader,
+                        mouse_suppress,
+                        wake,
+                    ));
+                    if let Err(join_err) = handle.await {
+                        let msg = if join_err.is_panic() {
+                            let panic = join_err.into_panic();
+                            panic
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "reader task panicked".to_string())
+                        } else {
+                            // Defensive: nothing aborts the inner task, so this arm is
+                            // unreachable in practice (review P3) — kept distinct from the
+                            // panic wording above.
+                            "reader task cancelled".to_string()
+                        };
+                        tracing::error!(
+                            error = %msg,
+                            "pty reader task failed; emitting synthetic Exit"
+                        );
+                        let _ = tx.send(PtyEvent::Exit(Err(msg))).await;
+                    }
                 });
 
                 Ok(Self {
@@ -557,14 +589,23 @@ fn build_child_env(overrides: &[(&str, &str)]) -> Vec<std::ffi::CString> {
         env.insert(std::ffi::OsString::from(k), std::ffi::OsString::from(v));
     }
     env.into_iter()
-        .map(|(k, v)| {
+        .filter_map(|(k, v)| {
             let mut bytes = Vec::with_capacity(k.len() + 1 + v.len());
             bytes.extend_from_slice(k.as_encoded_bytes());
             bytes.push(b'=');
             bytes.extend_from_slice(v.as_encoded_bytes());
-            // Environment entries cannot contain NUL; a NUL here would be a
-            // programmer error, so panicking is correct.
-            std::ffi::CString::new(bytes).expect("env entry must not contain NUL")
+            // v1.12.25 (audit core P2-3): a NUL here used to panic the main
+            // thread ("a NUL here would be a programmer error"). It can now
+            // arrive via user data (hand-edited workspace YAML cwd) — skip
+            // the entry and warn instead; workspace validate() rejects it
+            // earlier (defense line one, this is line two).
+            match std::ffi::CString::new(bytes) {
+                Ok(entry) => Some(entry),
+                Err(_) => {
+                    tracing::warn!("env entry contains NUL; skipping it for child exec");
+                    None
+                }
+            }
         })
         .collect()
 }

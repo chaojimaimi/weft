@@ -189,6 +189,19 @@ impl RecoverySnapshot {
     }
 
     pub fn load_file(path: &Path) -> Result<Self, RecoveryError> {
+        // v1.12.25 (audit L-3): cap hand-edited/corrupt snapshots before the
+        // serde_yaml alias expansion can amplify them (theme.rs precedent).
+        // RecoveryError::Corrupt carries no payload — log the actual size.
+        const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size > SNAPSHOT_MAX_BYTES {
+            tracing::warn!(
+                size,
+                limit = SNAPSHOT_MAX_BYTES,
+                "recovery snapshot exceeds size limit"
+            );
+            return Err(RecoveryError::Corrupt);
+        }
         let yaml = std::fs::read_to_string(path)?;
         if yaml.trim().is_empty() {
             return Err(RecoveryError::Corrupt);
@@ -374,6 +387,26 @@ mod tests {
         snap.save(&path).unwrap();
         let loaded = RecoverySnapshot::load(&path).unwrap();
         assert_eq!(snap, loaded);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn load_file_caps_snapshot_size() {
+        // v1.12.25 (audit L-3): oversized snapshots are rejected as Corrupt
+        // (actual size logged) before the read; normal small files load.
+        let tmp = test_tempdir("cap");
+        let path = tmp.join("snapshot.yaml");
+
+        let snap = sample_snapshot(false);
+        snap.save(&path).unwrap();
+        assert!(RecoverySnapshot::load(&path).is_ok());
+
+        std::fs::write(&path, vec![b'x'; 16 * 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            RecoverySnapshot::load(&path).unwrap_err(),
+            RecoveryError::Corrupt
+        ));
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 

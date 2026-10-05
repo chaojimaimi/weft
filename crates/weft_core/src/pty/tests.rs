@@ -25,6 +25,20 @@ fn child_env_drops_inherited_no_color_policy() {
     assert_eq!(env.get(std::ffi::OsStr::new("TERM")), Some(&"dumb".into()));
 }
 
+#[test]
+fn build_child_env_skips_nul_entries() {
+    // v1.12.25 (audit core P2-3): a NUL entry used to panic the main thread
+    // via `CString::new().expect` (reachable from a hand-edited workspace
+    // YAML cwd). It is now skipped + warned; clean entries pass through.
+    let entries = build_child_env(&[("WEFT_TEST_NUL_KEY", "va\0lue"), ("WEFT_TEST_OK", "fine")]);
+    let encoded: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.to_string_lossy().into_owned())
+        .collect();
+    assert!(encoded.iter().all(|entry| !entry.contains('\0')));
+    assert!(encoded.iter().any(|entry| entry == "WEFT_TEST_OK=fine"));
+}
+
 /// Test that spawning a PTY with /bin/cat works and we can read/write.
 #[tokio::test]
 async fn spawn_and_echo() {

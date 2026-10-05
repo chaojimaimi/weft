@@ -221,7 +221,9 @@ impl Grid {
 
     /// v1.11.16 (Fix B2): Grid-local counterpart of
     /// `Terminal::deferred_wrap_newline` (no screen-transform side effects —
-    /// plain `scroll_up` only).
+    /// plain `scroll_up` only). Test-only since v1.12.25 (audit core P2-4):
+    /// the VT print path owns the real wrap implementation.
+    #[cfg(test)]
     fn advance_row_for_wrap(&mut self) {
         self.cursor.wrap_pending = false;
         self.cursor.col = 0;
@@ -241,7 +243,9 @@ impl Grid {
     /// Write a character at the cursor position with given attributes.
     ///
     /// NOTE: the VT print path has its own inline write logic — this
-    /// function is currently only exercised by tests.
+    /// function is test-only (v1.12.25 audit core P2-4: cfg(test) makes the
+    /// old doc note a compiler guarantee instead of a drift hazard).
+    #[cfg(test)]
     pub fn write_char_with_attrs(
         &mut self,
         ch: char,
@@ -327,7 +331,8 @@ impl Grid {
     }
 
     /// Write a character at the cursor position and advance.
-    /// Preserves existing fg/bg (for direct/test use).
+    /// Preserves existing fg/bg; test-only since v1.12.25 (audit P2-4).
+    #[cfg(test)]
     pub fn write_char(&mut self, ch: char) {
         let width = if terminal_char_width(ch) > 1 {
             CellWidth::Full
