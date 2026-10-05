@@ -280,8 +280,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let active_synchronized = self
                         .sessions
                         .active()
-                        .terminal
-                        .as_ref()
+                        .and_then(|tab| tab.terminal.as_ref())
                         .is_some_and(Terminal::synchronized_output);
                     let any_synchronized = self
                         .sessions

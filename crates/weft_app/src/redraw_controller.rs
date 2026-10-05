@@ -78,15 +78,18 @@ impl App {
         // recompute geometry so PTY cols switch between full-width (TUI)
         // and gutter-subtracted (BlockView). Must happen before the render
         // so the grid dimensions match the new screen mode this frame.
-        if self.sessions.active_mut().take_pending_alt_rescale() {
+        if self
+            .sessions
+            .active_mut()
+            .is_some_and(|tab| tab.take_pending_alt_rescale())
+        {
             self.recompute_layout();
         }
         if crate::redraw_gates::redraw_suppressed(
             forced,
             self.sessions
                 .active()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .is_some_and(Terminal::synchronized_output),
             crate::input_router::route_session_input(!self.sessions.is_empty()),
         ) {
@@ -137,8 +140,7 @@ impl App {
             let snap_to_bottom = self
                 .sessions
                 .active()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .map(|t| {
                     crate::block_component::should_follow_running_output(
                         t.block_tracker().phase(),
@@ -147,11 +149,13 @@ impl App {
                 })
                 .unwrap_or(false)
                 && matches!(
-                    self.sessions.active().block_scroll_anchor(),
-                    crate::tab::BlockScrollAnchor::FollowBottom
+                    self.sessions.active().map(|tab| tab.block_scroll_anchor()),
+                    Some(crate::tab::BlockScrollAnchor::FollowBottom)
                 );
             if snap_to_bottom {
-                self.sessions.active_mut().snap_to_bottom();
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.snap_to_bottom();
+                }
             }
         }
 
@@ -161,23 +165,24 @@ impl App {
         let desired = self
             .terminal_layout()
             .and_then(|layout| {
-                self.sessions.active().active_pane_dimensions_for_rect(
-                    [
-                        layout.content.left as f32,
-                        layout.content.top as f32,
-                        layout.content.right as f32,
-                        layout.content.bottom as f32,
-                    ],
-                    layout.cell_width as f32,
-                    layout.cell_height as f32,
-                )
+                self.sessions.active().and_then(|tab| {
+                    tab.active_pane_dimensions_for_rect(
+                        [
+                            layout.content.left as f32,
+                            layout.content.top as f32,
+                            layout.content.right as f32,
+                            layout.content.bottom as f32,
+                        ],
+                        layout.cell_width as f32,
+                        layout.cell_height as f32,
+                    )
+                })
             })
             .unwrap_or((0, 0));
         let current = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| (t.grid().num_rows, t.grid().num_cols))
             .unwrap_or((0, 0));
         if desired.0 != 0 && desired.1 != 0 && desired != current {
@@ -213,12 +218,21 @@ impl App {
             .iter()
             .map(|tab| (tab.session_id, tab.pending_pane_resizes()))
             .collect();
-        let resize_effects = effect::pending_resize_effects(
-            &pending,
-            self.sessions.active().session_id,
-            cascade_settled,
-            std::time::Instant::now(),
-        );
+        // v1.12.25 (audit 3-B, P1-01): the empty-tabs guard at the top of
+        // run_redraw makes `None` unreachable here — an empty effects list
+        // keeps the no-drain no-op without a panic.
+        let resize_effects = self
+            .sessions
+            .active()
+            .map(|tab| {
+                effect::pending_resize_effects(
+                    &pending,
+                    tab.session_id,
+                    cascade_settled,
+                    std::time::Instant::now(),
+                )
+            })
+            .unwrap_or_default();
         self.drain_effects(resize_effects);
 
         // v0.9 H1: borrow the active Tab once and access its fields
@@ -257,7 +271,12 @@ impl App {
         // immutably, which would conflict with `active_mut()`.
         // v1.11 audit (PLAN_audit_fix_batch3 C3): refcount bump, not a clone.
         let bookmarked_blocks = std::sync::Arc::clone(&self.bookmarked_blocks);
-        let tab = self.sessions.active_mut();
+        // v1.12.25 (audit 3-B, P1-01): unreachable — the empty-tabs guard at
+        // the top of run_redraw already returned; this arm is type-forced,
+        // not a panic path.
+        let Some(tab) = self.sessions.active_mut() else {
+            return;
+        };
         // v1.0 P0-b: when the active tab changed since the last frame,
         // the renderer's per-row grid cache is stale — force a full
         // redraw before drawing.

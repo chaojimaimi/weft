@@ -170,7 +170,11 @@ impl App {
                 .unwrap_or(false);
             if need_expand {
                 if let Some(bm) = self.find.block_matches.get(self.find.block_index) {
-                    if let Some(term) = self.sessions.active_mut().terminal.as_mut() {
+                    if let Some(term) = self
+                        .sessions
+                        .active_mut()
+                        .and_then(|tab| tab.terminal.as_mut())
+                    {
                         let block = term
                             .block_tracker()
                             .session_blocks()
@@ -224,7 +228,11 @@ impl App {
         // Borrow the active tab's terminal via `active_mut()` — this borrows
         // `self.sessions` mutably, but `self.find` is a disjoint field of
         // `self`, so the find_* fields below can be mutated without conflict.
-        let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
+        let Some(term) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_ref())
+        else {
             return;
         };
 
@@ -387,7 +395,11 @@ impl App {
         if self.block_view_active() && !self.find.block_matches.is_empty() {
             let bm = self.find.block_matches.get(self.find.block_index).cloned();
             let Some(bm) = bm else { return };
-            let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
+            let Some(term) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.terminal.as_ref())
+            else {
                 return;
             };
             let blocks = term.block_tracker().session_blocks();
@@ -426,7 +438,9 @@ impl App {
             ) else {
                 return;
             };
-            self.sessions.active_mut().set_block_scroll(target);
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.set_block_scroll(target);
+            }
             return;
         }
         // Grid view: scroll grid to bring the match to the upper-middle of the
@@ -434,7 +448,11 @@ impl App {
         let Some(m) = self.find.matches.get(self.find.index).copied() else {
             return;
         };
-        let Some(term) = self.sessions.active_mut().terminal.as_mut() else {
+        let Some(term) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        else {
             return;
         };
         let grid = term.grid_mut();

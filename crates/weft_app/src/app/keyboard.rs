@@ -57,31 +57,29 @@ impl crate::App {
         // then via a dedicated fast path that bypasses every app-side
         // consumer (note editor / keybindings / overlays / editor box) —
         // a Cmd+V Release must never paste into the find bar.
-        // v1.12.23 audit batch 1: `self.tab()` is a bare `sessions.active()`
-        // index — with every tab closed (last shell `exit`) any keystroke
-        // reaching here panicked. Empty tabs reads as "no negotiated terminal"
-        // (flags 0, identical to a tab without a terminal), so a Release still
-        // early-returns below while session-less actions (Cmd+T NewTab) keep
-        // routing through execute_action. Only the state READS are guarded —
-        // no whole-handler early return.
+        // v1.12.25 (audit 3-B, P1-01): `SessionManager::active()` is now
+        // `Option` — the batch-1 `has_sessions` conditional reads collapsed
+        // into the accessor itself (empty tabs read as "no negotiated
+        // terminal", flags 0). `has_sessions` stays only as the route-layer
+        // input (`route_keyboard_entry`), whose session-less action routing
+        // (Cmd+T NewTab etc.) is unchanged.
         let has_sessions = !self.sessions.is_empty();
-        let kitty_flags = if has_sessions {
-            self.tab()
-                .terminal
-                .as_ref()
-                .map(|t| t.keyboard_protocol_flags())
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let kitty_flags = self
+            .tab()
+            .and_then(|tab| tab.terminal.as_ref())
+            .map(|t| t.keyboard_protocol_flags())
+            .unwrap_or(0);
         if kind == weft_core::input::KittyEventKind::Release {
             if (kitty_flags & weft_core::input::kitty::FLAG_REPORT_EVENT_TYPES) == 0 {
                 return;
             }
             // Defense in depth: with flags 0 above, a Release already returned
             // at the gate — this only matters if that invariant ever changes.
-            if !has_sessions
-                || !self.tab().terminal.as_ref().is_some_and(|t| {
+            // Empty tabs (`None`) read as "not passthrough" and return here.
+            if !self
+                .tab()
+                .and_then(|tab| tab.terminal.as_ref())
+                .is_some_and(|t| {
                     t.effective_input_mode() == weft_core::input::InputMode::Passthrough
                 })
             {
@@ -210,22 +208,19 @@ impl crate::App {
         // passthrough automatically in alt-screen / command-running / SSH.
         let input_mode = self
             .tab()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| t.effective_input_mode())
             .unwrap_or(weft_core::input::InputMode::Passthrough);
         if input_mode == weft_core::input::InputMode::Editor {
             let prev_lines = self
                 .tab()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .map(|t| t.editor().line_count())
                 .unwrap_or(1);
             let consumed = self.handle_editor_key(key, m, text);
             let new_lines = self
                 .tab()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .map(|t| t.editor().line_count())
                 .unwrap_or(1);
             if new_lines != prev_lines {
@@ -241,13 +236,14 @@ impl crate::App {
         // selections (Warp parity — "点空/Esc = clear"). The ESC byte still
         // forwards to the PTY below (vim/less keep their own key handling).
         if key == KeyCode::Escape {
-            let pane = self.sessions.active_mut();
-            if pane.selection_handler.selecting
-                || pane.selection_handler.block_view_selection.is_some()
-                || pane.selection_handler.selection.is_some()
-            {
-                pane.selection_handler.clear();
-                self.request_redraw();
+            if let Some(pane) = self.sessions.active_mut() {
+                if pane.selection_handler.selecting
+                    || pane.selection_handler.block_view_selection.is_some()
+                    || pane.selection_handler.selection.is_some()
+                {
+                    pane.selection_handler.clear();
+                    self.request_redraw();
+                }
             }
         }
 
@@ -269,14 +265,20 @@ impl crate::App {
         kitty_flags: u8,
         input_mode: weft_core::input::InputMode,
     ) {
-        let app_cursor_keys = self
-            .tab()
+        // v1.12.25 (audit 3-B, P1-01): the empty-tabs transient has no PTY to
+        // receive the key — ignore the event (debug log kept from batch 1's
+        // "ignored: no sessions" semantics).
+        let Some(tab) = self.sessions.active_mut() else {
+            tracing::debug!("key forward ignored: no sessions");
+            return;
+        };
+        let app_cursor_keys = tab
             .terminal
             .as_ref()
             .map(|t| t.app_cursor_keys())
             .unwrap_or(false);
         {
-            let ih = &mut self.tab_mut().input_handler;
+            let ih = &mut tab.input_handler;
             ih.app_cursor_keys = app_cursor_keys;
             ih.kitty_flags = if input_mode == weft_core::input::InputMode::Passthrough {
                 kitty_flags
@@ -286,16 +288,16 @@ impl crate::App {
             ih.kitty_event_kind = kind;
         }
 
-        let bytes = crate::ime::encode_passthrough_key(&self.tab().input_handler, key, m, text);
+        let bytes = crate::ime::encode_passthrough_key(&tab.input_handler, key, m, text);
         // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we
         // send for each key, including whether DECCKM/app-cursor mode is on.
-        let input_seq = self.tab_mut().next_input_seq();
+        let input_seq = tab.next_input_seq();
         tracing::debug!(
-            session_id = self.tab().session_id,
+            session_id = tab.session_id,
             input_seq,
             ?key,
             ?m,
-            app_cursor_keys = self.tab().input_handler.app_cursor_keys,
+            app_cursor_keys = tab.input_handler.app_cursor_keys,
             ?bytes,
             "key → pty"
         );
@@ -308,15 +310,14 @@ impl crate::App {
         // flag. Empty encodings (e.g. modifier-only presses) forward nothing
         // and must not count.
         if !bytes.is_empty() {
-            if let Some(t) = self.tab_mut().terminal.as_mut() {
+            if let Some(t) = tab.terminal.as_mut() {
                 t.note_interactive_stdin();
             }
         }
         // v1.11.11 (M-B): the Effect family targets the stable session id. The
         // active tab exists for the whole handler, so forwarding semantics
         // are unchanged; the drain reverse-looks-up the id at delivery.
-        let effects =
-            crate::effect::passthrough_key_effects(self.sessions.active().session_id, bytes);
+        let effects = crate::effect::passthrough_key_effects(tab.session_id, bytes);
         self.drain_effects(effects);
     }
 

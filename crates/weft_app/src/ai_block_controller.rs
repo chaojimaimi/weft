@@ -51,8 +51,7 @@ impl crate::App {
         let Some(block) = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .and_then(|t| {
                 t.block_tracker()
                     .session_blocks()

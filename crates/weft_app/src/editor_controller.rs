@@ -38,7 +38,11 @@ impl App {
         // v0.9: any non-Cmd editor key clears the mouse-drag selection so
         // typing replaces the selection. Cmd+C is handled above (returns
         // false) so it won't clear the selection — copy still works.
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+        if let Some(t) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             if t.editor().buffer.has_selection() {
                 t.editor_mut().buffer.clear_selection();
                 self.request_redraw();
@@ -48,7 +52,11 @@ impl App {
 
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
         if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) && key != Enter {
-            let consumed = if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+            let consumed = if let Some(t) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.terminal.as_mut())
+            {
                 let e = t.editor_mut();
                 match key {
                     Char('a') => {
@@ -91,12 +99,15 @@ impl App {
         let searching = self
             .sessions
             .active_mut()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| t.editor().is_searching())
             .unwrap_or(false);
         if searching {
-            if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+            if let Some(t) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.terminal.as_mut())
+            {
                 let e = t.editor_mut();
                 match key {
                     Char(c) => {
@@ -135,8 +146,7 @@ impl App {
         let completing = self
             .sessions
             .active_mut()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| t.editor().is_completing())
             .unwrap_or(false);
         if completing {
@@ -199,13 +209,21 @@ impl App {
                 );
                 if do_submit {
                     self.editor_submit();
-                } else if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                } else if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.split_newline();
                 }
                 true
             }
             Char(c) => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut()
                         .buffer
                         .insert_char(resolve_text_char(text, c, shift));
@@ -213,43 +231,71 @@ impl App {
                 true
             }
             Backspace => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.delete_backspace();
                 }
                 true
             }
             Delete => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.delete_forward();
                 }
                 true
             }
             Left => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.move_left();
                 }
                 true
             }
             Right => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.move_right();
                 }
                 true
             }
             Home => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.move_line_home();
                 }
                 true
             }
             End => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.move_line_end();
                 }
                 true
             }
             Up => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     let e = t.editor_mut();
                     if e.buffer.cursor.0 == 0 {
                         e.history_prev();
@@ -262,7 +308,11 @@ impl App {
                 true
             }
             Down => {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     let e = t.editor_mut();
                     let last = e.buffer.line_count() - 1;
                     if e.buffer.cursor.0 == last {
@@ -284,8 +334,13 @@ impl App {
 
     pub(super) fn editor_start_completion(&mut self) {
         // Gather context under an immutable borrow, then mutate the editor.
-        let pane_session_id = self.sessions.active().pane_session_id;
-        let (line_owned, col, cwd, history) = match self.sessions.active_mut().terminal.as_ref() {
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — nothing to
+        // complete.
+        let Some(tab) = self.sessions.active_mut() else {
+            return;
+        };
+        let pane_session_id = tab.pane_session_id;
+        let (line_owned, col, cwd, history) = match tab.terminal.as_ref() {
             Some(t) => {
                 let line_idx = t.editor().buffer.cursor.0;
                 let col = t.editor().buffer.cursor.1;
@@ -394,11 +449,18 @@ impl App {
         }
         while let Some(result) = self.completion_worker.try_recv() {
             if result.generation != self.completion_worker.current_generation()
-                || self.sessions.active().pane_session_id != result.pane_session_id
+                || self
+                    .sessions
+                    .active()
+                    .map_or(true, |tab| tab.pane_session_id != result.pane_session_id)
             {
                 continue;
             }
-            let Some(terminal) = self.sessions.active_mut().terminal.as_mut() else {
+            let Some(terminal) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.terminal.as_mut())
+            else {
                 continue;
             };
             let editor = terminal.editor_mut();
@@ -583,13 +645,21 @@ impl App {
     }
 
     pub(super) fn editor_completion_next(&mut self) {
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+        if let Some(t) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             t.editor_mut().completion_next();
         }
     }
 
     pub(super) fn editor_completion_prev(&mut self) {
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+        if let Some(t) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             t.editor_mut().completion_prev();
         }
     }
@@ -598,8 +668,7 @@ impl App {
         let Some((selected, target)) = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .and_then(|terminal| terminal.editor().completion_view())
             .map(|(matches, selected)| {
                 let target = crate::paint::command_surface::apply_page_selection(
@@ -625,13 +694,21 @@ impl App {
     }
 
     pub(super) fn editor_completion_accept(&mut self) {
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+        if let Some(t) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             t.editor_mut().completion_accept();
         }
     }
 
     pub(super) fn editor_completion_cancel(&mut self) {
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+        if let Some(t) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             t.editor_mut().completion_cancel();
         }
     }
@@ -644,28 +721,34 @@ impl App {
         // becomes the input owner, otherwise its first key can commit stale
         // text into less/vim.
         self.reset_ime_context("editor command submitted");
-        self.sessions.active_mut().arm_tui_scroll_window();
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — the submit was
+        // routed to a session that no longer exists; ignore it.
+        if let Some(tab) = self.sessions.active_mut() {
+            tab.arm_tui_scroll_window();
+        }
         let bytes = self
             .sessions
             .active_mut()
-            .terminal
-            .as_mut()
+            .and_then(|tab| tab.terminal.as_mut())
             .map(|t| t.submit_command())
             .unwrap_or_default();
         if !bytes.is_empty() {
-            if let Err(error) = self.sessions.active_mut().write_user_input(&bytes) {
+            if let Some(Err(error)) = self
+                .sessions
+                .active_mut()
+                .map(|tab| tab.write_user_input(&bytes))
+            {
                 warn!(%error, "failed to submit editor command to PTY");
             }
         }
         let resp = self
             .sessions
             .active_mut()
-            .terminal
-            .as_mut()
+            .and_then(|tab| tab.terminal.as_mut())
             .map(|t| t.take_response())
             .unwrap_or_default();
         if !resp.is_empty() {
-            if let Some(pty) = &self.sessions.active_mut().pty {
+            if let Some(pty) = self.sessions.active_mut().and_then(|tab| tab.pty.as_ref()) {
                 let _ = pty.write_sync(&resp);
             }
         }
@@ -677,7 +760,9 @@ impl App {
         // the view stays scrolled up on history. Snapping here, at submit
         // time, guarantees the user sees the result regardless of how fast
         // the command completes.
-        self.sessions.active_mut().snap_to_bottom();
+        if let Some(tab) = self.sessions.active_mut() {
+            tab.snap_to_bottom();
+        }
         self.request_redraw();
     }
 }

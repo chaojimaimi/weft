@@ -300,13 +300,20 @@ impl WorkflowStore {
     }
 
     /// Find by unique name.
+    ///
+    /// v1.12.25 (audit 3-B, P1-05): a real DB error is now `Err` — the old
+    /// `.ok()` collapsed it into `Ok(None)`, indistinguishable from "no such
+    /// workflow". Callers can tell "absent" from "read failed".
     pub fn find_by_name(&self, name: &str) -> Result<Option<Workflow>, WorkflowStoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, description, steps_json, variables_json, source, use_count, last_used_ms \
              FROM workflows WHERE name=?1",
         )?;
-        let row = stmt.query_row(params![name], row_to_workflow).ok();
-        Ok(row)
+        match stmt.query_row(params![name], row_to_workflow) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// List all workflows, sorted by use frequency (most-used first).

@@ -46,8 +46,7 @@ impl App {
                 self.sessions.active_idx(),
                 self.sessions
                     .active()
-                    .terminal
-                    .as_ref()
+                    .and_then(|tab| tab.terminal.as_ref())
                     .map(|terminal| terminal.effective_input_mode())
                     .unwrap_or(weft_core::input::InputMode::Passthrough),
             )

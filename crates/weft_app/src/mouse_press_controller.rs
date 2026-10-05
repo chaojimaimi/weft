@@ -113,7 +113,11 @@ impl App {
         // PTY mouse events route to the clicked pane. For single-pane tabs
         // `pane_at_pixel` always returns the one pane id — no-op switch.
         if let Some(pane_id) = self.pane_at_pixel(x, y) {
-            let tab = self.sessions.active_mut();
+            // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — no pane to
+            // focus, ignore the press.
+            let Some(tab) = self.sessions.active_mut() else {
+                return;
+            };
             if tab.active_pane_id() != pane_id {
                 if let Err(e) = tab.set_active_pane(pane_id) {
                     tracing::warn!(error = ?e, "failed to focus pane under cursor");
@@ -142,12 +146,13 @@ impl App {
         let modes = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| (t.mouse_protocol(), t.sgr_mouse()));
         if let Some((mp, sgr)) = modes {
-            self.sessions.active_mut().input_handler.mouse_protocol = mp;
-            self.sessions.active_mut().input_handler.sgr_mouse = sgr;
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.input_handler.mouse_protocol = mp;
+                tab.input_handler.sgr_mouse = sgr;
+            }
         }
         // v0.9 H1: Tab bar click handling — check before everything else so
         // tab clicks work even inside TUI apps that captured the mouse.
@@ -394,8 +399,10 @@ impl App {
                     // Clear before set_block_scroll's internal sync so the
                     // history view can exit in the same press (a surviving
                     // block selection would hold the snapshot view open).
-                    self.sessions.active_mut().selection_handler.clear();
-                    self.sessions.active_mut().set_block_scroll(offset);
+                    if let Some(tab) = self.sessions.active_mut() {
+                        tab.selection_handler.clear();
+                        tab.set_block_scroll(offset);
+                    }
                     self.interaction.scrollbar_drag =
                         Some(crate::scrollbar_component::ScrollbarDragState {
                             layout,
@@ -475,7 +482,11 @@ impl App {
                             && yf < row.y_bottom
                         {
                             if let Some(bid) = row.block_id {
-                                if let Some(term) = self.sessions.active_mut().terminal.as_mut() {
+                                if let Some(term) = self
+                                    .sessions
+                                    .active_mut()
+                                    .and_then(|tab| tab.terminal.as_mut())
+                                {
                                     term.block_tracker_mut().toggle_collapse(bid);
                                     // M5-b P2-2: no invalidate — collapsed mismatch
                                     // takes the WidthOnly rebuild path (L1 kept).
@@ -592,21 +603,30 @@ impl App {
                 .unwrap_or(false);
             if in_prompt {
                 if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                    if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                    if let Some(t) = self
+                        .sessions
+                        .active_mut()
+                        .and_then(|tab| tab.terminal.as_mut())
+                    {
                         t.editor_mut().buffer.start_selection(pos);
                     }
                     self.interaction.prompt_dragging = true;
                     // Clear any block/grid selection so Cmd+C targets the editor.
-                    let tab = self.sessions.active_mut();
-                    tab.selection_handler.clear();
-                    // v1.10.20 (S1): clearing the block selection releases
-                    // the delayed history-view exit — sync drops the
-                    // snapshot view back to the live grid.
-                    tab.sync_primary_history_view();
+                    if let Some(tab) = self.sessions.active_mut() {
+                        tab.selection_handler.clear();
+                        // v1.10.20 (S1): clearing the block selection releases
+                        // the delayed history-view exit — sync drops the
+                        // snapshot view back to the live grid.
+                        tab.sync_primary_history_view();
+                    }
                     self.request_redraw();
                 }
                 return;
-            } else if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+            } else if let Some(t) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.terminal.as_mut())
+            {
                 if t.editor().buffer.has_selection() {
                     t.editor_mut().buffer.clear_selection();
                     self.request_redraw();
@@ -649,35 +669,37 @@ impl App {
                         // and the document fingerprint is recorded so a
                         // structural change next frame clears a stale one.
                         if let Some(anchor) = self.pixel_to_block_view_pos(x, y) {
-                            let pane = self.sessions.active_mut();
-                            let fingerprint = pane
-                                .terminal
-                                .as_ref()
-                                .map(|t| {
-                                    crate::selection::block_selection_fingerprint(
-                                        t.block_tracker().session_blocks(),
-                                        t.screen_head_lines(),
-                                    )
-                                })
-                                .unwrap_or_default();
-                            crate::selection::start_block_selection(
-                                &mut pane.selection_handler,
-                                anchor,
-                                fingerprint,
-                            );
+                            if let Some(pane) = self.sessions.active_mut() {
+                                let fingerprint = pane
+                                    .terminal
+                                    .as_ref()
+                                    .map(|t| {
+                                        crate::selection::block_selection_fingerprint(
+                                            t.block_tracker().session_blocks(),
+                                            t.screen_head_lines(),
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                crate::selection::start_block_selection(
+                                    &mut pane.selection_handler,
+                                    anchor,
+                                    fingerprint,
+                                );
+                            }
                         } else {
                             // Click missed every selectable row (e.g. on the
                             // prompt box, CWD bar, or empty padding). Clear the
                             // existing selection so the user gets visual
                             // feedback that the previous selection is gone.
-                            let tab = self.sessions.active_mut();
-                            tab.selection_handler.clear();
-                            // v1.10.20 (S1): clearing the block selection
-                            // releases the delayed history-view exit (a
-                            // migrated drag's selection is block-space only —
-                            // its grid half is already gone) — sync drops the
-                            // snapshot view back to the live grid.
-                            tab.sync_primary_history_view();
+                            if let Some(tab) = self.sessions.active_mut() {
+                                tab.selection_handler.clear();
+                                // v1.10.20 (S1): clearing the block selection
+                                // releases the delayed history-view exit (a
+                                // migrated drag's selection is block-space only —
+                                // its grid half is already gone) — sync drops the
+                                // snapshot view back to the live grid.
+                                tab.sync_primary_history_view();
+                            }
                         }
                     } else {
                         // Grid view (alt-screen): classic grid selection.
@@ -687,10 +709,9 @@ impl App {
                         } else {
                             SelectionMode::Simple
                         };
-                        self.sessions
-                            .active_mut()
-                            .selection_handler
-                            .start(pos, mode);
+                        if let Some(tab) = self.sessions.active_mut() {
+                            tab.selection_handler.start(pos, mode);
+                        }
                     }
                 }
 
@@ -701,10 +722,13 @@ impl App {
                 self.send_mouse_event(MouseButton::Left, MouseAction::Press, grid_pos);
             }
             winit::event::MouseButton::Middle => {
-                // Middle click: paste
-                self.drain_effects(vec![crate::effect::Effect::Paste {
-                    session_id: self.sessions.active().session_id,
-                }]);
+                // Middle click: paste (v1.12.25 audit 3-B P1-01: no session —
+                // nothing to paste into).
+                if let Some(tab) = self.sessions.active() {
+                    self.drain_effects(vec![crate::effect::Effect::Paste {
+                        session_id: tab.session_id,
+                    }]);
+                }
                 let pos = self.pixel_to_grid(x, y);
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
             }
@@ -713,10 +737,15 @@ impl App {
                 // supports both completed blocks (including those with no
                 // output) and the in-flight (running) command.
                 if let Some(id) = self.block_at(y as f32) {
+                    // v1.12.25 (audit 3-B, P1-01): unreachable without an
+                    // active tab (block view needs a terminal) — type-forced.
+                    let Some(session_id) = self.sessions.active().map(|tab| tab.session_id) else {
+                        return;
+                    };
                     self.reset_ime_context("context menu opened");
                     self.save_focus_for_modal(crate::scene::FocusId::ContextMenu);
                     self.interaction.context_menu = Some(ContextMenu {
-                        session_id: self.sessions.active().session_id,
+                        session_id,
                         block_id: id,
                         x: x as f32,
                         y: y as f32,
@@ -730,48 +759,38 @@ impl App {
                     // Right click: extend selection.
                     if block_view {
                         if let Some(anchor) = self.pixel_to_block_view_pos(x, y) {
-                            let has_selection = self
-                                .sessions
-                                .active()
-                                .selection_handler
-                                .block_view_selection
-                                .is_some();
-                            let pane = self.sessions.active_mut();
-                            let fingerprint = pane
-                                .terminal
-                                .as_ref()
-                                .map(|t| {
-                                    crate::selection::block_selection_fingerprint(
-                                        t.block_tracker().session_blocks(),
-                                        t.screen_head_lines(),
-                                    )
-                                })
-                                .unwrap_or_default();
-                            if has_selection {
-                                pane.selection_handler.extend_block_view(anchor);
-                            } else {
-                                crate::selection::start_block_selection(
-                                    &mut pane.selection_handler,
-                                    anchor,
-                                    fingerprint,
-                                );
+                            if let Some(pane) = self.sessions.active_mut() {
+                                let has_selection =
+                                    pane.selection_handler.block_view_selection.is_some();
+                                let fingerprint = pane
+                                    .terminal
+                                    .as_ref()
+                                    .map(|t| {
+                                        crate::selection::block_selection_fingerprint(
+                                            t.block_tracker().session_blocks(),
+                                            t.screen_head_lines(),
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                if has_selection {
+                                    pane.selection_handler.extend_block_view(anchor);
+                                } else {
+                                    crate::selection::start_block_selection(
+                                        &mut pane.selection_handler,
+                                        anchor,
+                                        fingerprint,
+                                    );
+                                }
                             }
                         }
                     } else {
                         let pos = self.pixel_to_grid(x, y);
-                        if self
-                            .sessions
-                            .active_mut()
-                            .selection_handler
-                            .selection
-                            .is_none()
-                        {
-                            self.sessions
-                                .active_mut()
-                                .selection_handler
-                                .start(pos, SelectionMode::Simple);
-                        } else {
-                            self.sessions.active_mut().selection_handler.extend(pos);
+                        if let Some(tab) = self.sessions.active_mut() {
+                            if tab.selection_handler.selection.is_none() {
+                                tab.selection_handler.start(pos, SelectionMode::Simple);
+                            } else {
+                                tab.selection_handler.extend(pos);
+                            }
                         }
                     }
                 }

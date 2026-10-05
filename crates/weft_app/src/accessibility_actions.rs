@@ -44,7 +44,10 @@ impl App {
                     return;
                 };
                 if menu.session_id != session_id
-                    || self.sessions.active().session_id != session_id
+                    || !self
+                        .sessions
+                        .active()
+                        .is_some_and(|tab| tab.session_id == session_id)
                     || index >= CONTEXT_MENU_ITEMS.len()
                 {
                     return;

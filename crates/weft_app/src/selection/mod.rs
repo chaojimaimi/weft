@@ -291,7 +291,11 @@ impl App {
         // computed against the CURRENT grid. Entering the history view
         // snapshots but never mutates the grid, so the mapping stays exact.
         let (anchor, snapshot_line) = {
-            let tab = self.sessions.active_mut();
+            // v1.12.25 (audit 3-B, P1-01): the empty-tabs transient has no
+            // selection to migrate.
+            let Some(tab) = self.sessions.active_mut() else {
+                return false;
+            };
             let Some(sel) = tab.selection_handler.selection.as_ref().cloned() else {
                 return false;
             };
@@ -326,7 +330,8 @@ impl App {
         // Step 2 (read-only): the anchor grid row's cells → source char
         // offset within its snapshot line.
         let source_char = {
-            let Some(terminal) = self.sessions.active().terminal.as_ref() else {
+            let Some(terminal) = self.sessions.active().and_then(|tab| tab.terminal.as_ref())
+            else {
                 return false;
             };
             let Some(row) = terminal.grid().viewport.get(anchor.start.row) else {
@@ -335,7 +340,11 @@ impl App {
             grid_col_to_source_char_index(row, anchor.start.col)
         };
         // Step 3: switch into the history view (snapshots synchronously).
-        if !self.sessions.active_mut().enter_primary_history_if_active() {
+        if !self
+            .sessions
+            .active_mut()
+            .is_some_and(|tab| tab.enter_primary_history_if_active())
+        {
             return false;
         }
         // Step 4: rebuild the selection in block space; the drag continues
@@ -346,7 +355,9 @@ impl App {
             line: snapshot_line,
             char_offset: source_char,
         };
-        let pane = self.sessions.active_mut();
+        let Some(pane) = self.sessions.active_mut() else {
+            return false;
+        };
         let fingerprint = pane
             .terminal
             .as_ref()

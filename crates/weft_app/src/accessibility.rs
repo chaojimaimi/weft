@@ -286,93 +286,88 @@ impl App {
             // Batch 5 Step 3: also carry the block_id so we can emit Button
             // semantics for the copy/fold actions on the sticky header.
             let mut sticky_header: Option<(String, [f32; 4], BlockId)> = None;
-            let text =
-                self.sessions
-                    .active()
-                    .terminal
-                    .as_ref()
-                    .map_or_else(String::new, |terminal| {
-                        if terminal.show_block_view() {
-                            let blocks = terminal.block_tracker().session_blocks();
-                            let mut fold_hasher = std::collections::hash_map::DefaultHasher::new();
-                            for block in blocks {
-                                block.id.hash(&mut fold_hasher);
-                                block.collapsed.hash(&mut fold_hasher);
-                            }
-                            let key = BlockTextKey {
-                                session_id: self.sessions.active().session_id,
-                                block_count: blocks.len(),
-                                last_output_len: blocks
-                                    .last()
-                                    .map_or(0, |block| block.output.len()),
-                                live_output_len: terminal
-                                    .block_tracker()
-                                    .in_flight()
-                                    .map_or(0, |live| live.output.len()),
-                                scroll: self.sessions.active().block_scroll(),
-                                editor_hash: stable_id(&terminal.editor().buffer.text()),
-                                cwd_hash: terminal.cwd().map_or(0, stable_id),
-                                git_branch_hash: terminal.git_branch().map_or(0, stable_id),
-                                fold_hash: fold_hasher.finish(),
-                                width_bits: ((layout.content.right - layout.content.left) as f32)
-                                    .to_bits(),
-                                height_bits: ((layout.content.bottom - layout.content.top) as f32)
-                                    .to_bits(),
-                            };
-                            if self.accessibility.block_text_key == Some(key) {
-                                return self.accessibility.block_text.clone();
-                            }
-                            let Some((mut rows, _, _)) = self.compute_block_view_rows() else {
-                                return String::new();
-                            };
-                            rows.retain(|row| {
-                                row.y_bottom > layout.content.top as f32
-                                    && row.y_top < layout.content.bottom as f32
-                            });
-                            rows.sort_by(|a, b| a.y_top.total_cmp(&b.y_top));
-
-                            // R2-3: while rows are still available, check for a
-                            // sticky header block and capture its label + bounds
-                            // for the accessibility node pushed below.
-                            let clip_top = layout.content.top as f32;
-                            let clip_bottom = layout.content.bottom as f32;
-                            if let Some(sid) = crate::paint::block_view::sticky_block_id(
-                                &rows,
-                                clip_top,
-                                clip_bottom,
-                            ) {
-                                if let Some(block) = blocks.iter().find(|b| b.id == sid) {
-                                    let cell_h = layout.cell_height as f32;
-                                    // At most 2 rows (CWD + command); use the
-                                    // full band so screen readers cover both.
-                                    let sticky_bottom = clip_top + cell_h * 2.0;
-                                    sticky_header = Some((
-                                        format!("Header: {}", block.command),
-                                        [
-                                            layout.content.left as f32,
-                                            clip_top,
-                                            layout.content.right as f32,
-                                            sticky_bottom,
-                                        ],
-                                        sid,
-                                    ));
-                                }
-                            }
-
-                            let text = rows
-                                .into_iter()
-                                .filter(|row| row.is_selectable() && !row.text.is_empty())
-                                .map(|row| row.text)
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            block_cache_update = Some((key, text.clone()));
-                            return text;
+            let text = self
+                .sessions
+                .active()
+                .and_then(|tab| tab.terminal.as_ref().map(|terminal| (tab, terminal)))
+                .map_or_else(String::new, |(tab, terminal)| {
+                    if terminal.show_block_view() {
+                        let blocks = terminal.block_tracker().session_blocks();
+                        let mut fold_hasher = std::collections::hash_map::DefaultHasher::new();
+                        for block in blocks {
+                            block.id.hash(&mut fold_hasher);
+                            block.collapsed.hash(&mut fold_hasher);
                         }
-                        (0..terminal.grid().num_rows)
-                            .map(|row| terminal.grid().displayed_row_text(row))
+                        let key = BlockTextKey {
+                            session_id: tab.session_id,
+                            block_count: blocks.len(),
+                            last_output_len: blocks.last().map_or(0, |block| block.output.len()),
+                            live_output_len: terminal
+                                .block_tracker()
+                                .in_flight()
+                                .map_or(0, |live| live.output.len()),
+                            scroll: tab.block_scroll(),
+                            editor_hash: stable_id(&terminal.editor().buffer.text()),
+                            cwd_hash: terminal.cwd().map_or(0, stable_id),
+                            git_branch_hash: terminal.git_branch().map_or(0, stable_id),
+                            fold_hash: fold_hasher.finish(),
+                            width_bits: ((layout.content.right - layout.content.left) as f32)
+                                .to_bits(),
+                            height_bits: ((layout.content.bottom - layout.content.top) as f32)
+                                .to_bits(),
+                        };
+                        if self.accessibility.block_text_key == Some(key) {
+                            return self.accessibility.block_text.clone();
+                        }
+                        let Some((mut rows, _, _)) = self.compute_block_view_rows() else {
+                            return String::new();
+                        };
+                        rows.retain(|row| {
+                            row.y_bottom > layout.content.top as f32
+                                && row.y_top < layout.content.bottom as f32
+                        });
+                        rows.sort_by(|a, b| a.y_top.total_cmp(&b.y_top));
+
+                        // R2-3: while rows are still available, check for a
+                        // sticky header block and capture its label + bounds
+                        // for the accessibility node pushed below.
+                        let clip_top = layout.content.top as f32;
+                        let clip_bottom = layout.content.bottom as f32;
+                        if let Some(sid) =
+                            crate::paint::block_view::sticky_block_id(&rows, clip_top, clip_bottom)
+                        {
+                            if let Some(block) = blocks.iter().find(|b| b.id == sid) {
+                                let cell_h = layout.cell_height as f32;
+                                // At most 2 rows (CWD + command); use the
+                                // full band so screen readers cover both.
+                                let sticky_bottom = clip_top + cell_h * 2.0;
+                                sticky_header = Some((
+                                    format!("Header: {}", block.command),
+                                    [
+                                        layout.content.left as f32,
+                                        clip_top,
+                                        layout.content.right as f32,
+                                        sticky_bottom,
+                                    ],
+                                    sid,
+                                ));
+                            }
+                        }
+
+                        let text = rows
+                            .into_iter()
+                            .filter(|row| row.is_selectable() && !row.text.is_empty())
+                            .map(|row| row.text)
                             .collect::<Vec<_>>()
-                            .join("\n")
-                    });
+                            .join("\n");
+                        block_cache_update = Some((key, text.clone()));
+                        return text;
+                    }
+                    (0..terminal.grid().num_rows)
+                        .map(|row| terminal.grid().displayed_row_text(row))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
             let terminal_semantic = SemanticNode {
                 role: SemanticRole::TextArea,
                 label: "Terminal".into(),
@@ -439,8 +434,7 @@ impl App {
                 let fold_label = self
                     .sessions
                     .active()
-                    .terminal
-                    .as_ref()
+                    .and_then(|tab| tab.terminal.as_ref())
                     .and_then(|terminal| {
                         terminal
                             .block_tracker()
@@ -489,8 +483,7 @@ impl App {
             let display = self
                 .sessions
                 .active()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .map(|terminal| {
                     crate::paint::ui_helpers::panel_display(
                         terminal.block_tracker().blocks(),
@@ -504,8 +497,7 @@ impl App {
             let has_blocks = self
                 .sessions
                 .active()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .is_some_and(|t| !t.block_tracker().blocks().is_empty());
             let mut scene = crate::panel_component::build_panel_scene(
                 layout.panel_rect,
@@ -590,8 +582,7 @@ impl App {
             let selected_index = self
                 .sessions
                 .active()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .and_then(|terminal| terminal.editor().completion_view())
                 .map(|(_, selected)| selected);
             if let Some(selected) = selected_index {

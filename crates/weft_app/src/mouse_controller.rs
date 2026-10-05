@@ -161,9 +161,10 @@ impl App {
             // live grid returns.
             tab.sync_primary_history_view();
         } else if terminal_session.is_none() && !self.sessions.is_empty() {
-            let tab = self.sessions.active_mut();
-            tab.selection_handler.end();
-            tab.sync_primary_history_view();
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.selection_handler.end();
+                tab.sync_primary_history_view();
+            }
         }
 
         let btn = match button {
@@ -207,7 +208,9 @@ impl App {
                 y as f32,
                 drag.grab_offset,
             );
-            self.sessions.active_mut().set_block_scroll(offset);
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.set_block_scroll(offset);
+            }
             self.request_redraw();
             return;
         }
@@ -217,12 +220,13 @@ impl App {
         let modes = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| (t.mouse_protocol(), t.sgr_mouse()));
         if let Some((mp, sgr)) = modes {
-            self.sessions.active_mut().input_handler.mouse_protocol = mp;
-            self.sessions.active_mut().input_handler.sgr_mouse = sgr;
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.input_handler.mouse_protocol = mp;
+                tab.input_handler.sgr_mouse = sgr;
+            }
         }
         // F2 P0-3: when mouse reporting is active (vim/less/htop), use Arrow
         // so the TUI app controls the pointer. Otherwise use Text for normal
@@ -355,14 +359,22 @@ impl App {
         // v0.9: extend editor drag-selection inside the prompt box.
         if self.interaction.prompt_dragging {
             if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.extend_selection(pos);
                     self.request_redraw();
                 }
             }
         }
 
-        if self.sessions.active_mut().selection_handler.selecting {
+        if self
+            .sessions
+            .active_mut()
+            .is_some_and(|tab| tab.selection_handler.selecting)
+        {
             if self.block_view_active() {
                 // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): mouse-move NO
                 // LONGER pumps the autoscroll — a stream of move events each
@@ -372,10 +384,9 @@ impl App {
                 // the content band; the 40ms timer is the SOLE scroll driver.
                 self.interaction.selection_drag_pos = Some((x, y));
                 if let Some(anchor) = self.pixel_to_block_view_pos(x, y) {
-                    self.sessions
-                        .active_mut()
-                        .selection_handler
-                        .extend_block_view(anchor);
+                    if let Some(tab) = self.sessions.active_mut() {
+                        tab.selection_handler.extend_block_view(anchor);
+                    }
                 }
                 self.arm_selection_autoscroll(y);
                 self.request_redraw();
@@ -389,7 +400,9 @@ impl App {
                 self.interaction.selection_drag_pos = Some((x, y));
                 if self.selection_autoscroll_overshoot(y).is_none() {
                     let pos = self.pixel_to_grid(x, y);
-                    self.sessions.active_mut().selection_handler.extend(pos);
+                    if let Some(tab) = self.sessions.active_mut() {
+                        tab.selection_handler.extend(pos);
+                    }
                 }
                 self.arm_selection_autoscroll(y);
                 self.request_redraw();
@@ -546,7 +559,11 @@ impl App {
         // store can be accessed without a borrow conflict.
         let mut export_block_data: Option<weft_core::blocks::Block> = None;
         {
-            let Some(terminal) = &mut self.sessions.active_mut().terminal else {
+            let Some(terminal) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.terminal.as_mut())
+            else {
                 // Annotation-only actions (toggle_bookmark / add_note) don't
                 // need the terminal — fall through to the post-borrow block.
                 if matches!(action, "toggle_bookmark" | "add_note") {
@@ -765,8 +782,7 @@ impl App {
         let block_view = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .is_some_and(Terminal::show_block_view);
         if block_view {
             if let winit::event::MouseScrollDelta::PixelDelta(pos) = delta {
@@ -781,13 +797,14 @@ impl App {
                 let peeking = self
                     .sessions
                     .active()
-                    .terminal
-                    .as_ref()
+                    .and_then(|tab| tab.terminal.as_ref())
                     .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
                 if peeking && !self.interaction.mods.state().shift_key() {
                     // snap_to_bottom clears the flag and arms the gate's
                     // re-entry lockout (exit edge detected inside).
-                    self.sessions.active_mut().snap_to_bottom();
+                    if let Some(tab) = self.sessions.active_mut() {
+                        tab.snap_to_bottom();
+                    }
                     self.request_redraw();
                     return;
                 }
@@ -802,16 +819,16 @@ impl App {
                     .renderer
                     .as_ref()
                     .and_then(|renderer| {
-                        let terminal = self.sessions.active().terminal.as_ref()?;
-                        let pane_session_id = self.sessions.active().pane_session_id;
+                        let tab = self.sessions.active()?;
+                        let terminal = tab.terminal.as_ref()?;
                         let (_total, _visible, max) =
-                            renderer.block_scroll_metrics(terminal, pane_session_id);
+                            renderer.block_scroll_metrics(terminal, tab.pane_session_id);
                         Some(max)
                     })
                     .unwrap_or(0);
-                self.sessions
-                    .active_mut()
-                    .scroll_block_fractional((pos.y / cell_height.max(1.0)) as f32, max_scroll);
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.scroll_block_fractional((pos.y / cell_height.max(1.0)) as f32, max_scroll);
+                }
                 self.request_redraw();
                 return;
             }
@@ -838,9 +855,12 @@ impl App {
         // Short-lived immutable borrow to read the mode flags up-front —
         // avoids holding a long-lived mutable borrow of `terminal` across
         // later accesses to `block_scroll_offset`, `renderer`, etc.
-        let tui_starting = self.sessions.active_mut().tui_scroll_window_active();
+        let tui_starting = self
+            .sessions
+            .active_mut()
+            .is_some_and(|tab| tab.tui_scroll_window_active());
         let (mouse_protocol_active, alt_screen_active, app_cursor_keys, mouse_protocol, sgr_mouse) = {
-            let Some(t) = self.sessions.active().terminal.as_ref() else {
+            let Some(t) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
                 return;
             };
             // v1.0 fix: capture mouse_protocol here and sync it into the
@@ -864,9 +884,11 @@ impl App {
         // Apply all terminal-controlled input modes before encoding this
         // gesture. Vim/less commonly enable DECCKM before the first wheel;
         // using a stale default would emit CSI arrows instead of SS3 arrows.
-        self.sessions.active_mut().input_handler.app_cursor_keys = app_cursor_keys;
-        self.sessions.active_mut().input_handler.mouse_protocol = mouse_protocol;
-        self.sessions.active_mut().input_handler.sgr_mouse = sgr_mouse;
+        if let Some(tab) = self.sessions.active_mut() {
+            tab.input_handler.app_cursor_keys = app_cursor_keys;
+            tab.input_handler.mouse_protocol = mouse_protocol;
+            tab.input_handler.sgr_mouse = sgr_mouse;
+        }
 
         // Shift disables mouse routing for this gesture on the PRIMARY screen so
         // the user can browse terminal history even while a primary-screen TUI
@@ -882,7 +904,11 @@ impl App {
             // v1.11.15 (FIX A): the reader already saw this session's
             // mouse-disable — the wheel must not land in a shell that is
             // back in cooked mode (the teardown leak window).
-            if self.sessions.active().mouse_suppressed() {
+            if self
+                .sessions
+                .active()
+                .is_some_and(|tab| tab.mouse_suppressed())
+            {
                 return;
             }
             if !self.terminal_content_contains(x, y) {
@@ -902,14 +928,17 @@ impl App {
             if let Some(bytes) = self
                 .sessions
                 .active_mut()
-                .input_handler
-                .encode_scroll(up, pos.col, pos.row, m)
+                .and_then(|tab| tab.input_handler.encode_scroll(up, pos.col, pos.row, m))
             {
                 let mut batch = Vec::with_capacity(bytes.len() * lines);
                 for _ in 0..lines {
                     batch.extend_from_slice(&bytes);
                 }
-                if let Err(e) = self.sessions.active_mut().write_user_input(&batch) {
+                if let Some(Err(e)) = self
+                    .sessions
+                    .active_mut()
+                    .map(|tab| tab.write_user_input(&batch))
+                {
                     tracing::debug!(?e, "tui wheel write failed"); // v1.12.23 batch 1: was silent `let _ =`
                 }
             }
@@ -927,7 +956,11 @@ impl App {
             // — do not even queue a gesture that would be replayed into a
             // suppressed session (the parked resolution checks the flag too,
             // but not queueing keeps the wake timer off entirely).
-            if self.sessions.active().mouse_suppressed() {
+            if self
+                .sessions
+                .active()
+                .is_some_and(|tab| tab.mouse_suppressed())
+            {
                 return;
             }
             if !self.terminal_content_contains(x, y) {
@@ -944,12 +977,17 @@ impl App {
             if self.interaction.mods.state().control_key() {
                 m |= Modifiers::CONTROL;
             }
-            if self
+            let queued = self
                 .sessions
                 .active_mut()
-                .queue_tui_scroll(rows, pos.col, pos.row, m)
-            {
-                if let Some(delay) = self.sessions.active_mut().take_tui_scroll_wake_delay() {
+                .map(|tab| tab.queue_tui_scroll(rows, pos.col, pos.row, m))
+                .unwrap_or(false);
+            if queued {
+                if let Some(delay) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.take_tui_scroll_wake_delay())
+                {
                     let proxy = self.proxy.clone();
                     std::thread::Builder::new()
                         .name(String::from("weft-mouse"))
@@ -993,15 +1031,19 @@ impl App {
             // entering the history view with a live grid selection would
             // orphan it (L3). Migration failure degrades: keep the grid
             // selection, do not scroll (would drift its anchor, L2).
+            // v1.12.25 (audit 3-B, P1-01): empty-tabs transient reads as
+            // "nothing selected" — the gesture degrades to a no-op below.
             let (selecting, has_grid_selection, tui_active) = {
-                let tab = self.sessions.active();
-                (
-                    tab.selection_handler.selecting,
-                    tab.selection_handler.selection.is_some(),
-                    tab.terminal
-                        .as_ref()
-                        .is_some_and(weft_core::vt::Terminal::primary_screen_app_active),
-                )
+                match self.sessions.active() {
+                    Some(tab) => (
+                        tab.selection_handler.selecting,
+                        tab.selection_handler.selection.is_some(),
+                        tab.terminal
+                            .as_ref()
+                            .is_some_and(weft_core::vt::Terminal::primary_screen_app_active),
+                    ),
+                    None => (false, false, false),
+                }
             };
             if selecting && has_grid_selection && tui_active {
                 if !self.migrate_grid_selection_to_primary_history() {
@@ -1009,7 +1051,11 @@ impl App {
                     return;
                 }
             } else {
-                let entered = self.sessions.active_mut().enter_primary_history_if_active();
+                let entered = self
+                    .sessions
+                    .active_mut()
+                    .map(|tab| tab.enter_primary_history_if_active())
+                    .unwrap_or(false);
                 tracing::debug!(
                     entered,
                     rows,
@@ -1021,8 +1067,7 @@ impl App {
         let block_view = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .is_some_and(Terminal::show_block_view);
         if block_view {
             // A1: compute max_scroll LIVE from the layout cache. The per-frame
@@ -1035,10 +1080,10 @@ impl App {
                 .renderer
                 .as_ref()
                 .and_then(|renderer| {
-                    let terminal = self.sessions.active().terminal.as_ref()?;
-                    let pane_session_id = self.sessions.active().pane_session_id;
+                    let tab = self.sessions.active()?;
+                    let terminal = tab.terminal.as_ref()?;
                     let (_total, _visible, max) =
-                        renderer.block_scroll_metrics(terminal, pane_session_id);
+                        renderer.block_scroll_metrics(terminal, tab.pane_session_id);
                     Some(max)
                 })
                 .unwrap_or(0);
@@ -1046,15 +1091,16 @@ impl App {
                 up,
                 lines,
                 max_scroll,
-                current = self.sessions.active().block_scroll(),
+                current = self.sessions.active().map_or(0, |tab| tab.block_scroll()),
                 "SCROLL_DIAG: block-view scroll"
             );
             if up {
-                let tab = self.sessions.active_mut();
-                tab.scroll_up_by(lines);
-                tab.clamp_block_scroll(max_scroll);
-            } else {
-                self.sessions.active_mut().scroll_down_by(lines);
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.scroll_up_by(lines);
+                    tab.clamp_block_scroll(max_scroll);
+                }
+            } else if let Some(tab) = self.sessions.active_mut() {
+                tab.scroll_down_by(lines);
             }
         } else {
             // Grid view scroll — needs mutable terminal.
@@ -1064,7 +1110,7 @@ impl App {
             // the selection instead of corrupting the copy range. Only when
             // the offset actually moves — offset 0 + scroll-down is a no-op.
             let (had_selection, offset_will_change) = {
-                let terminal = self.sessions.active().terminal.as_ref();
+                let terminal = self.sessions.active().and_then(|tab| tab.terminal.as_ref());
                 match terminal {
                     Some(t) => {
                         let grid = t.grid();
@@ -1076,7 +1122,9 @@ impl App {
                             offset.saturating_sub(lines)
                         };
                         (
-                            self.sessions.active().selection_handler.selection.is_some(),
+                            self.sessions
+                                .active()
+                                .is_some_and(|tab| tab.selection_handler.selection.is_some()),
                             new != offset,
                         )
                     }
@@ -1085,9 +1133,15 @@ impl App {
             };
             if had_selection && offset_will_change {
                 tracing::debug!("cleared grid selection before viewport scroll (drift guard)");
-                self.sessions.active_mut().selection_handler.clear();
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.selection_handler.clear();
+                }
             }
-            if let Some(terminal) = &mut self.sessions.active_mut().terminal {
+            if let Some(terminal) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.terminal.as_mut())
+            {
                 let grid = &mut terminal.grid_mut();
                 if up {
                     grid.scroll_up_history(lines);
@@ -1106,7 +1160,11 @@ impl App {
     /// Shared by the move handler (which only ARMS the 40ms timer) and the
     /// timer pump (which scrolls + extends). `None` inside the band.
     pub(super) fn selection_autoscroll_overshoot(&self, y: f64) -> Option<(AutoscrollDir, f32)> {
-        if !self.sessions.active().selection_handler.selecting {
+        if !self
+            .sessions
+            .active()
+            .is_some_and(|tab| tab.selection_handler.selecting)
+        {
             return None;
         }
         if self.block_view_active() {
@@ -1124,14 +1182,13 @@ impl App {
             // geometry reads as full-bleed (a wide border/table fills the
             // pane), which otherwise mis-triggered a Down scroll from the
             // last visible line (v1.10.25 ML2).
-            let snapshot_context =
-                self.sessions
-                    .active()
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|terminal| {
-                        terminal.primary_history_view() || terminal.is_alt_screen_history_peek()
-                    });
+            let snapshot_context = self
+                .sessions
+                .active()
+                .and_then(|tab| tab.terminal.as_ref())
+                .is_some_and(|terminal| {
+                    terminal.primary_history_view() || terminal.is_alt_screen_history_peek()
+                });
             let down_threshold = down_autoscroll_threshold(bottom, ch, snapshot_context);
             if (y as f32) < top - ch {
                 Some((AutoscrollDir::Up, (top - ch) - y as f32))
@@ -1146,8 +1203,7 @@ impl App {
             let tui_active = self
                 .sessions
                 .active()
-                .terminal
-                .as_ref()
+                .and_then(|tab| tab.terminal.as_ref())
                 .is_some_and(Terminal::primary_screen_app_active);
             if !tui_active {
                 return None;
@@ -1237,9 +1293,13 @@ impl App {
             .renderer
             .as_ref()
             .and_then(|renderer| {
-                let terminal = self.sessions.active().terminal.as_ref()?;
-                let pane_session_id = self.sessions.active().pane_session_id;
-                Some(renderer.block_scroll_metrics(terminal, pane_session_id).2)
+                let tab = self.sessions.active()?;
+                let terminal = tab.terminal.as_ref()?;
+                Some(
+                    renderer
+                        .block_scroll_metrics(terminal, tab.pane_session_id)
+                        .2,
+                )
             })
             .unwrap_or(0);
         // Warp ramp speed, whole rows with fractional carry.
@@ -1250,28 +1310,28 @@ impl App {
         // At the history top/bottom the saturating scroll has no net effect;
         // detect that so the 40ms timer can stop instead of idle-spinning
         // (before = immutable read, then the mutable scroll, then re-read).
-        let before = self.sessions.active().block_scroll();
-        let tab = self.sessions.active_mut();
-        match dir {
-            AutoscrollDir::Up => {
-                tab.scroll_up_by(steps);
-                tab.clamp_block_scroll(max_scroll);
-            }
-            AutoscrollDir::Down => {
-                tab.scroll_down_by(steps);
-                tab.clamp_block_scroll(max_scroll);
+        let before = self.sessions.active().map_or(0, |tab| tab.block_scroll());
+        if let Some(tab) = self.sessions.active_mut() {
+            match dir {
+                AutoscrollDir::Up => {
+                    tab.scroll_up_by(steps);
+                    tab.clamp_block_scroll(max_scroll);
+                }
+                AutoscrollDir::Down => {
+                    tab.scroll_down_by(steps);
+                    tab.clamp_block_scroll(max_scroll);
+                }
             }
         }
-        let moved = before != self.sessions.active().block_scroll();
+        let moved = before != self.sessions.active().map_or(0, |tab| tab.block_scroll());
         // Extend the endpoint: clamp y into the content band so the shared
         // row hit-test naturally lands on the new edge row.
         let (top, bottom) = self.block_content_vbounds().unwrap_or((0.0, 0.0));
         let cy = (y as f32).clamp(top, (bottom - 1.0).max(top));
         if let Some(anchor) = self.pixel_to_block_view_pos(x, cy as f64) {
-            self.sessions
-                .active_mut()
-                .selection_handler
-                .extend_block_view(anchor);
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.selection_handler.extend_block_view(anchor);
+            }
         }
         self.window_runtime
             .selection_autoscroll_active

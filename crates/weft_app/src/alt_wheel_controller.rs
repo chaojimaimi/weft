@@ -17,28 +17,28 @@ impl App {
     /// batch-encoding arrow keys; `up` is the direction.
     pub(super) fn handle_alt_screen_wheel(&mut self, rows: i32, lines: usize, up: bool) {
         let shift = self.interaction.mods.state().shift_key();
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient has no alt screen
+        // to scroll — every read below treats `None` as "gesture ignored".
         let peeking = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
         // Feed the gate only Shift gestures' signed rows (up = positive):
         // entry requires Shift anyway, so plain-wheel travel must not
         // accumulate toward the threshold across separate gestures (a
         // later 1-line Shift flick would otherwise enter peek). The gate
         // also enforces the 400ms post-exit lockout (see `PeekEntryGate`).
-        let entry_allowed = if shift {
-            self.sessions
-                .active_mut()
-                .alt_peek_gate
-                .allow_entry(std::time::Instant::now(), rows as f32)
-        } else {
-            self.sessions
-                .active_mut()
-                .alt_peek_gate
-                .allow_entry(std::time::Instant::now(), 0.0)
-        };
+        let entry_allowed = self
+            .sessions
+            .active_mut()
+            .map(|tab| {
+                tab.alt_peek_gate.allow_entry(
+                    std::time::Instant::now(),
+                    if shift { rows as f32 } else { 0.0 },
+                )
+            })
+            .unwrap_or(false);
         match crate::alt_peek::route(peeking, shift, up, entry_allowed) {
             crate::alt_peek::AltWheelAction::ForwardArrows { up } => {
                 // Plain wheel, no peek: Up/Down arrow keys let the TUI
@@ -51,23 +51,30 @@ impl App {
                 let kitty_flags = self
                     .sessions
                     .active()
-                    .terminal
-                    .as_ref()
+                    .and_then(|tab| tab.terminal.as_ref())
                     .map(|t| t.keyboard_protocol_flags())
                     .unwrap_or(0);
                 let key = if up { KeyCode::Up } else { KeyCode::Down };
-                let single = {
-                    let ih = &mut self.sessions.active_mut().input_handler;
-                    ih.kitty_flags = kitty_flags;
-                    ih.encode_key(key, Modifiers::empty())
-                };
+                let single = self
+                    .sessions
+                    .active_mut()
+                    .map(|tab| {
+                        let ih = &mut tab.input_handler;
+                        ih.kitty_flags = kitty_flags;
+                        ih.encode_key(key, Modifiers::empty())
+                    })
+                    .unwrap_or_default();
                 if !single.is_empty() {
                     let mut batch = Vec::with_capacity(single.len() * lines);
                     for _ in 0..lines {
                         batch.extend_from_slice(&single);
                     }
                     // v1.12.23 audit batch 1: a dropped write was invisible — log it.
-                    if let Err(e) = self.sessions.active_mut().write_user_input(&batch) {
+                    if let Some(Err(e)) = self
+                        .sessions
+                        .active_mut()
+                        .map(|tab| tab.write_user_input(&batch))
+                    {
                         tracing::debug!(?e, "tui wheel write failed");
                     }
                 }
@@ -79,11 +86,14 @@ impl App {
                 let bootstrap = self
                     .sessions
                     .active()
-                    .terminal
-                    .as_ref()
+                    .and_then(|tab| tab.terminal.as_ref())
                     .is_some_and(|t| t.block_tracker().bootstrap_ready());
                 if bootstrap {
-                    if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                    if let Some(t) = self
+                        .sessions
+                        .active_mut()
+                        .and_then(|tab| tab.terminal.as_mut())
+                    {
                         t.set_alt_screen_history_peek(true);
                     }
                     self.scroll_local_view(rows);
@@ -100,7 +110,9 @@ impl App {
                 // Peek active, plain wheel: "普通手势=与应用交互" — snap
                 // back to the live TUI and consume the gesture.
                 // snap_to_bottom clears the flag and arms the gate lockout.
-                self.sessions.active_mut().snap_to_bottom();
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.snap_to_bottom();
+                }
                 self.request_redraw();
             }
             crate::alt_peek::AltWheelAction::Noop => {

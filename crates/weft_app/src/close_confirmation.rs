@@ -249,8 +249,12 @@ impl App {
     }
 
     pub(super) fn confirm_active_pane_close(&self) -> bool {
-        let commands = pane_running_command(self.sessions.active().active())
+        let commands = self
+            .sessions
+            .active()
+            .map(|tab| pane_running_command(tab.active()))
             .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         self.confirm_running_commands(CloseScope::Pane, &commands)
     }

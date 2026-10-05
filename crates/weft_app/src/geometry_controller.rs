@@ -25,7 +25,9 @@ impl App {
     ) -> Option<crate::scrollbar_component::ScrollbarLayout> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient reads as None.
+        let tab = self.sessions.active()?;
+        let terminal = tab.terminal.as_ref()?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -40,7 +42,7 @@ impl App {
             total,
             visible,
             max_scroll,
-            self.sessions.active().block_scroll(),
+            tab.block_scroll(),
         )
     }
     pub(super) fn palette_scene(
@@ -96,7 +98,10 @@ impl App {
     ) -> Option<crate::scene::Scene<crate::completion_component::CompletionTarget>> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        let terminal = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.terminal.as_ref())?;
         if terminal.effective_input_mode() != weft_core::input::InputMode::Editor
             || terminal.editor().search_view().is_some()
         {
@@ -166,7 +171,7 @@ impl App {
         ];
         self.sessions
             .active()
-            .pane_hit_test(x as f32, y as f32, content_rect)
+            .and_then(|tab| tab.pane_hit_test(x as f32, y as f32, content_rect))
     }
 
     /// v1.3.2: Hit-test for a draggable pane divider at the given pointer
@@ -184,7 +189,7 @@ impl App {
             layout.content.right as f32,
             layout.content.bottom as f32,
         ];
-        let pane_layouts = self.sessions.active().split_tree().layout(content_rect);
+        let pane_layouts = self.sessions.active()?.split_tree().layout(content_rect);
         crate::paint::pane_dividers::pane_divider_at(&pane_layouts, x, y, 4.0)
     }
 
@@ -321,8 +326,7 @@ impl App {
         let (num_rows, num_cols) = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| (t.grid().num_rows, t.grid().num_cols))
             .unwrap_or((1, 1));
 
@@ -340,8 +344,7 @@ impl App {
         let inset_block_gutter = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .is_some_and(|t| !t.is_alt_screen_active() && t.primary_screen_owns_live_view());
         let (adj_x, adj_y, gutter_delta) = if layout.contains_content(x, y) {
             let content_rect: weft_core::pane_layout::Rect = [
@@ -350,21 +353,26 @@ impl App {
                 layout.content.right as f32,
                 layout.content.bottom as f32,
             ];
-            let active_id = self.sessions.active().active_pane_id();
+            // v1.12.25 (audit 3-B, P1-01): no active tab — same degenerate
+            // origin as "active pane not found" below.
             self.sessions
                 .active()
-                .split_tree()
-                .layout(content_rect)
-                .into_iter()
-                .find(|(id, _)| *id == active_id)
-                .map(|(_, rect)| {
-                    let [px0, py0, _, _] = rect;
-                    let dx = px0 as f64 - layout.content.left;
-                    let dy = py0 as f64 - layout.content.top;
-                    let pane_ctx = layout.layout_ctx().for_pane(rect);
-                    let origin_x =
-                        crate::terminal_geometry::grid_hit_origin_x(&pane_ctx, inset_block_gutter);
-                    (x - dx, y - dy, origin_x - px0 as f64)
+                .and_then(|tab| {
+                    tab.split_tree()
+                        .layout(content_rect)
+                        .into_iter()
+                        .find(|(id, _)| *id == tab.active_pane_id())
+                        .map(|(_, rect)| {
+                            let [px0, py0, _, _] = rect;
+                            let dx = px0 as f64 - layout.content.left;
+                            let dy = py0 as f64 - layout.content.top;
+                            let pane_ctx = layout.layout_ctx().for_pane(rect);
+                            let origin_x = crate::terminal_geometry::grid_hit_origin_x(
+                                &pane_ctx,
+                                inset_block_gutter,
+                            );
+                            (x - dx, y - dy, origin_x - px0 as f64)
+                        })
                 })
                 .unwrap_or((x, y, 0.0))
         } else {
@@ -390,7 +398,10 @@ impl App {
         if self.block_view_active() {
             return self.block_view_hyperlink_at_pixel(x, y);
         }
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        let terminal = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.terminal.as_ref())?;
         if !self.terminal_content_contains(x, y) {
             return None;
         }
@@ -427,7 +438,10 @@ impl App {
                 self.renderer.as_ref()?.cell_width() as f64,
                 row.indent_cols,
             );
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        let terminal = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.terminal.as_ref())?;
         let tracker = terminal.block_tracker();
         // Resolve the StyledLine from either a finalized block or the live
         // in-flight block (block_id is None for live rows).
@@ -520,9 +534,10 @@ impl App {
         if cw <= 0.0 || ch <= 0.0 {
             return None;
         }
-        let Some(terminal) = &self.sessions.active().terminal else {
-            return None;
-        };
+        let terminal = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.terminal.as_ref())?;
         if terminal.effective_input_mode() != weft_core::input::InputMode::Editor {
             return None;
         }
@@ -577,7 +592,10 @@ impl App {
     pub(super) fn prompt_box_rect(&self) -> Option<[f32; 4]> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        let terminal = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.terminal.as_ref())?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -598,7 +616,11 @@ impl App {
         &self,
     ) -> Option<(Vec<weft_core::selection::BlockViewRow>, f32, f32)> {
         let renderer = self.renderer.as_ref()?;
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient reads as None;
+        // the tab binding below also serves the two active() reads in the
+        // BlockViewParams literal.
+        let tab = self.sessions.active()?;
+        let terminal = tab.terminal.as_ref()?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -625,7 +647,7 @@ impl App {
                 live: (!editor_mode)
                     .then(|| terminal.block_tracker().in_flight())
                     .flatten(),
-                block_scroll: self.sessions.active().block_scroll_position(),
+                block_scroll: tab.block_scroll_position(),
                 viewport_rows: terminal.grid().num_rows,
                 block_hovered: self.interaction.block_hovered,
                 block_selected: self.interaction.block_selected,
@@ -636,7 +658,7 @@ impl App {
                     .as_ref()
                     .and_then(|find| find.block_highlight),
                 palette: terminal.palette(),
-                cache_namespace: self.sessions.active().pane_session_id,
+                cache_namespace: tab.pane_session_id,
                 block_diagnose_state: &self.block_diagnose_state,
                 ai_configured: self.ai_state.is_configured(),
                 tui_cursor: None,
@@ -657,8 +679,7 @@ impl App {
     pub(super) fn block_view_active(&self) -> bool {
         self.sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| t.show_block_view())
             .unwrap_or(false)
     }
@@ -700,8 +721,7 @@ impl App {
         }
         self.sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| t.mouse_protocol() != MouseProtocol::Off)
             .unwrap_or(false)
     }
@@ -834,8 +854,7 @@ impl App {
         let footer = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .filter(|t| !t.block_tracker().blocks().is_empty())
             .map(|_| layout.footer_rect);
         let scene = crate::panel_component::build_panel_scene(

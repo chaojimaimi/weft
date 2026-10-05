@@ -85,7 +85,10 @@ impl App {
             return None;
         }
         let pos = self.pixel_to_grid(x, y);
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        let terminal = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.terminal.as_ref())?;
         let (text, click_col, segments) = grid_logical_line(terminal.grid(), pos);
         let target = match_display_at(&text, click_col)?;
         let start = grid_pos_at_display_col(&segments, target.start_display_col)?;
@@ -98,15 +101,25 @@ impl App {
     }
 
     fn apply_smart_selection(&mut self, selection: SmartSelection) {
+        // v1.12.25 (audit 3-B, P1-01): the empty-tabs transient has nothing
+        // to select — both arms ignore the event.
         match selection {
             SmartSelection::Grid { start, end } => {
-                let handler = &mut self.sessions.active_mut().selection_handler;
+                let Some(handler) = self
+                    .sessions
+                    .active_mut()
+                    .map(|tab| &mut tab.selection_handler)
+                else {
+                    return;
+                };
                 handler.start(start, SelectionMode::Simple);
                 handler.extend(end);
                 handler.end();
             }
             SmartSelection::Block { start, end } => {
-                let pane = self.sessions.active_mut();
+                let Some(pane) = self.sessions.active_mut() else {
+                    return;
+                };
                 let fingerprint = pane
                     .terminal
                     .as_ref()
@@ -135,8 +148,7 @@ impl App {
                 let cwd = self
                     .sessions
                     .active()
-                    .terminal
-                    .as_ref()
+                    .and_then(|tab| tab.terminal.as_ref())
                     .and_then(Terminal::cwd)
                     .map(Path::new);
                 let home = std::env::var_os("HOME").map(PathBuf::from);

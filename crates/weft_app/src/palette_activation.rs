@@ -198,7 +198,11 @@ impl App {
                                 workflow.steps.first().map(|step| step.command.clone())
                             });
                         if let Some(command) = command {
-                            if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
+                            if let Some(terminal) = self
+                                .sessions
+                                .active_mut()
+                                .and_then(|tab| tab.terminal.as_mut())
+                            {
                                 terminal.editor_mut().buffer.set_text(&command);
                                 terminal.editor_mut().buffer.select_all();
                             }
@@ -226,7 +230,11 @@ impl App {
                 self.request_redraw();
             }
             PaletteEntry::Runbook(entry) => {
-                if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(terminal) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     terminal.editor_mut().buffer.set_text(&entry.command);
                     terminal.editor_mut().buffer.select_all();
                 }
@@ -236,7 +244,11 @@ impl App {
             // v1.8.1: Insert the AI-generated command into the editor.
             // No auto-execution — the user reviews and presses Enter.
             PaletteEntry::AiSuggestion { command, risk: _ } => {
-                if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(terminal) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     terminal.editor_mut().buffer.set_text(&command);
                     terminal.editor_mut().buffer.select_all();
                 }
@@ -258,12 +270,34 @@ impl App {
             tracing::debug!("workflow submit ignored: no sessions");
             return;
         }
-        self.sessions.active_mut().arm_tui_scroll_window();
-        let Some(store) = &self.palette.store else {
-            return;
-        };
-        let wf = store.find_by_name(&form.workflow_name).ok().flatten();
-        let Some(wf) = wf else {
+        // v1.12.25 (audit 3-B, P1-01): type-forced no-op arm — the guard
+        // above makes `None` unreachable here.
+        if let Some(tab) = self.sessions.active_mut() {
+            tab.arm_tui_scroll_window();
+        }
+        // v1.12.25 (audit 3-B, P1-05): the old `.ok().flatten()` disguised a
+        // DB failure as "not found" — the error was silently swallowed (no
+        // toast, no log). Read the result WITHOUT the store borrow, then
+        // match so errors and absence are distinguishable and visible.
+        let lookup = self
+            .palette
+            .store
+            .as_ref()
+            .map(|store| store.find_by_name(&form.workflow_name));
+        let Some(wf) = (match lookup {
+            Some(Ok(Some(wf))) => Some(wf),
+            Some(Ok(None)) => {
+                warn!(name = %form.workflow_name, "workflow not found");
+                self.show_block_history_toast("workflow 不存在");
+                None
+            }
+            Some(Err(e)) => {
+                warn!(error = %e, name = %form.workflow_name, "failed to read workflow");
+                self.show_block_history_toast("读取 workflow 失败");
+                None
+            }
+            None => None, // no block store — unchanged silent no-op
+        }) else {
             return;
         };
 
@@ -276,18 +310,21 @@ impl App {
         match wf.render(&values) {
             Ok(commands) => {
                 for cmd in &commands {
-                    let tab = self.sessions.active_mut();
-                    if let Some(terminal) = &mut tab.terminal {
-                        // Set the command text and submit via the editor path.
-                        terminal.editor_mut().buffer.set_text(cmd);
-                        let bytes = terminal.submit_command();
-                        if !bytes.is_empty() && tab.write_user_input(&bytes).is_err() {
-                            warn!("failed to write workflow command to PTY");
+                    if let Some(tab) = self.sessions.active_mut() {
+                        if let Some(terminal) = &mut tab.terminal {
+                            // Set the command text and submit via the editor path.
+                            terminal.editor_mut().buffer.set_text(cmd);
+                            let bytes = terminal.submit_command();
+                            if !bytes.is_empty() && tab.write_user_input(&bytes).is_err() {
+                                warn!("failed to write workflow command to PTY");
+                            }
                         }
                     }
                 }
                 // Update use count.
-                let _ = store.bump_use_count(wf.id);
+                if let Some(store) = &self.palette.store {
+                    let _ = store.bump_use_count(wf.id);
+                }
             }
             Err(e) => {
                 warn!(error = %e, "workflow render failed");

@@ -301,8 +301,7 @@ impl crate::App {
         let oldest_started_ms = self
             .sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .and_then(|t| t.block_tracker().blocks().first())
             .map(|b| b.started_at)
             .map(|started| {
@@ -326,7 +325,11 @@ impl crate::App {
             }
             Ok(blocks) => {
                 let loaded = blocks.len();
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.block_tracker_mut().load_older_to_front(blocks);
                 }
                 info!(loaded, "loaded older block history from store");
@@ -341,7 +344,9 @@ impl crate::App {
 
     /// v1.11.2 X4: reuse the paste-toast surface for generic feedback text.
     /// Same 3s TTL and 1 Hz expiry tick apply.
-    fn show_block_history_toast(&mut self, message: &str) {
+    /// v1.12.25 (audit 3-B, P1-05): `pub(crate)` so the palette workflow
+    /// arms can surface DB read failures on the same toast channel.
+    pub(crate) fn show_block_history_toast(&mut self, message: &str) {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_paste_toast(Some((message.to_string(), std::time::Instant::now())));
         }
@@ -775,7 +780,11 @@ impl crate::App {
     /// block view's pitch/scroll/layout don't map 1:1 to grid rows.
     pub(crate) fn copy_selection(&mut self) {
         let text = {
-            let tab = self.sessions.active();
+            // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — nothing
+            // selected, nothing to copy.
+            let Some(tab) = self.sessions.active() else {
+                return;
+            };
             let Some(terminal) = tab.terminal.as_ref() else {
                 return;
             };

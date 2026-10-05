@@ -41,18 +41,20 @@ impl App {
                 ((y - by0) / (by1 - by0).max(1.0)).clamp(0.0, 1.0)
             }
         };
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — nothing to
+        // re-ratio; keep consuming the drag (same as the no-divider arm).
         match self
             .sessions
             .active_mut()
-            .set_pane_ratio(drag.first, drag.second, new_ratio)
+            .map(|tab| tab.set_pane_ratio(drag.first, drag.second, new_ratio))
         {
-            Ok(true) => {
+            Some(Ok(true)) => {
                 self.recompute_layout();
                 self.request_redraw();
                 true
             }
-            Ok(false) => true, // root leaf — no divider; keep consuming the drag
-            Err(e) => {
+            Some(Ok(false)) | None => true, // no divider / no tab; keep consuming
+            Some(Err(e)) => {
                 tracing::warn!(error = ?e, "pane divider drag: set_ratio failed; aborting drag");
                 self.interaction.pane_divider_drag = None;
                 false // release the drag so subsequent moves don't re-log
@@ -92,8 +94,7 @@ impl App {
         }
         self.sessions
             .active()
-            .terminal
-            .as_ref()
+            .and_then(|tab| tab.terminal.as_ref())
             .map(|t| t.grid().num_rows)
             .unwrap_or(0)
     }
@@ -101,7 +102,7 @@ impl App {
     /// F3-4: Total count of blocks matching the panel query (no truncation).
     /// Used to clamp `scroll_offset` so the list can't scroll past the end.
     pub(super) fn panel_total_filtered(&self) -> usize {
-        let Some(terminal) = self.sessions.active().terminal.as_ref() else {
+        let Some(terminal) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
             return 0;
         };
         panel_filtered_count(terminal.block_tracker().blocks(), &self.panel.query)
@@ -118,7 +119,7 @@ impl App {
     /// Count of blocks visible in the current panel window (after
     /// `scroll_offset` skip, newest-first, query-filtered).
     pub(super) fn panel_visible_count(&self) -> usize {
-        let Some(terminal) = self.sessions.active().terminal.as_ref() else {
+        let Some(terminal) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
             return 0;
         };
         let blocks = terminal.block_tracker().blocks();
@@ -144,7 +145,10 @@ impl App {
 
     /// The [`BlockId`] of the currently selected panel row, if any.
     pub(super) fn panel_selected_block_id(&self) -> Option<BlockId> {
-        let terminal = self.sessions.active().terminal.as_ref()?;
+        let terminal = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.terminal.as_ref())?;
         let visible = self.panel_max_visible();
         terminal
             .block_tracker()
@@ -171,7 +175,7 @@ impl App {
         // Borrow the terminal immutably to find the command, then release
         // before mutating the editor.
         let cmd: Option<String> = {
-            let Some(t) = self.sessions.active().terminal.as_ref() else {
+            let Some(t) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
                 return;
             };
             if t.effective_input_mode() != weft_core::input::InputMode::Editor {
@@ -185,7 +189,11 @@ impl App {
         };
         if let Some(cmd) = cmd {
             if !cmd.is_empty() {
-                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                if let Some(t) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.terminal.as_mut())
+                {
                     t.editor_mut().buffer.set_text(&cmd);
                     // v0.9: select all so Cmd+C copies the command without
                     // needing a drag-select first. The user can still adjust
@@ -216,7 +224,11 @@ impl App {
         if !self.block_view_active() {
             return;
         }
-        let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
+        let Some(term) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_ref())
+        else {
             return;
         };
         let cwd_header_active = crate::layout::block_cwd_header_active(
@@ -254,7 +266,9 @@ impl App {
         // `.max(0)` was dead (clippy::unnecessary_min_or_max under CI's
         // `-D warnings`).
         let target = rows_from_bottom.saturating_sub(visible / 3);
-        self.sessions.active_mut().set_block_scroll(target);
+        if let Some(tab) = self.sessions.active_mut() {
+            tab.set_block_scroll(target);
+        }
 
         // Arm the highlight: accent border around the block for 1.5s.
         self.panel.highlight = Some(block_id);
@@ -287,7 +301,13 @@ impl App {
             return false;
         };
         self.sessions.set_active(tab_index);
-        if self.sessions.active_mut().set_active_pane(pane_id).is_err() {
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — target lookup
+        // already returned false above, so `None` here is defensive only.
+        if self
+            .sessions
+            .active_mut()
+            .is_some_and(|tab| tab.set_active_pane(pane_id).is_err())
+        {
             return false;
         }
         self.scroll_to_block_id(block_id);
@@ -297,7 +317,11 @@ impl App {
     /// Local scrollback navigation (page up/down, top, bottom).
     pub(super) fn scroll_action(&mut self, action: Action) {
         let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
-        let tab = self.sessions.active_mut();
+        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — no view to
+        // scroll; ignore the action.
+        let Some(tab) = self.sessions.active_mut() else {
+            return;
+        };
         if matches!(
             action,
             Action::ScrollPageUp | Action::ScrollLineUp | Action::ScrollToTop

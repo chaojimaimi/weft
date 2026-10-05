@@ -45,7 +45,11 @@ impl App {
             self.sessions.active_idx()
         };
         if action == MouseAction::Press {
-            let session_id = self.sessions.active().session_id;
+            // v1.12.25 (audit 3-B, P1-01): no active session on the empty-tabs
+            // transient — nothing to capture, ignore the press.
+            let Some(session_id) = self.sessions.active().map(|tab| tab.session_id) else {
+                return;
+            };
             let pty_press_sent = self.send_mouse_event_to_session(tab, button, action, pos);
             self.interaction.modal_mouse_capture.capture_terminal_press(
                 physical_button,

@@ -347,14 +347,11 @@ struct App {
 }
 
 impl App {
-    /// Immutable borrow of the active tab.
-    fn tab(&self) -> &Tab {
+    /// Immutable borrow of the active tab. v1.12.25 (audit 3-B, P1-01):
+    /// `None` on the empty-tabs transient (exit moment) — callers ignore
+    /// the event instead of panicking.
+    fn tab(&self) -> Option<&Tab> {
         self.sessions.active()
-    }
-
-    /// Mutable borrow of the active tab.
-    fn tab_mut(&mut self) -> &mut Tab {
-        self.sessions.active_mut()
     }
 
     fn new(proxy: EventLoopProxy<AppEvent>) -> Self {

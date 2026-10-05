@@ -29,9 +29,13 @@ impl crate::App {
                 true
             }
             Action::Paste => {
-                self.drain_effects(vec![Effect::Paste {
-                    session_id: self.sessions.active().session_id,
-                }]);
+                // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — no
+                // session to paste into, the action is consumed as a no-op.
+                if let Some(tab) = self.sessions.active() {
+                    self.drain_effects(vec![Effect::Paste {
+                        session_id: tab.session_id,
+                    }]);
+                }
                 true
             }
             Action::ReloadConfig => {
@@ -182,13 +186,19 @@ impl crate::App {
                     // recompute_layout() corrects it.
                     crate::tab::PaneSplitGeometry::default()
                 };
-                let tab = self.sessions.active_mut();
+                // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — no pane
+                // to split; consume the action as a no-op.
+                let Some(tab) = self.sessions.active_mut() else {
+                    return true;
+                };
                 let old_active = tab.active_pane_id();
                 match tab.split_active_pane(direction, 0.5, scrollback, &self.proxy, geo) {
                     Ok(id) => {
                         tracing::info!(?id, ?direction, ?old_active, "pane split");
                         // v1.11.2 X4: retention cap on the newly spawned pane.
-                        if let Some(pane) = self.sessions.active_mut().pane_mut(id) {
+                        if let Some(pane) =
+                            self.sessions.active_mut().and_then(|tab| tab.pane_mut(id))
+                        {
                             pane.set_blocks_retained_limit(
                                 self.config_state.config.blocks.retained_limit,
                             );
@@ -201,19 +211,24 @@ impl crate::App {
                                 self.config_state.config.experimental.tui_render_mode,
                             );
                         }
-                        let tab2 = self.sessions.active();
-                        tracing::info!(
-                            panes = ?tab2.split_tree().panes(),
-                            active = ?tab2.active_pane_id(),
-                            "split tree state after split"
-                        );
+                        if let Some(tab2) = self.sessions.active() {
+                            tracing::info!(
+                                panes = ?tab2.split_tree().panes(),
+                                active = ?tab2.active_pane_id(),
+                                "split tree state after split"
+                            );
+                        }
                         // Apply theme palette to the new pane's terminal so
                         // it matches the window's renderer theme (same as
                         // new_tab does). The atlas is shared per-window.
                         // Nested `if let` keeps the disjoint-field borrows
                         // (`self.sessions` mut, `self.renderer` imm) visible
                         // to the borrow checker.
-                        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                        if let Some(t) = self
+                            .sessions
+                            .active_mut()
+                            .and_then(|tab| tab.terminal.as_mut())
+                        {
                             if let Some(r) = self.renderer.as_ref() {
                                 t.set_palette(r.theme().palette);
                                 t.set_background_color(r.theme().background);
@@ -232,7 +247,11 @@ impl crate::App {
                 true
             }
             Action::FocusNextPane => {
-                if let Some(id) = self.sessions.active_mut().focus_next_pane() {
+                if let Some(id) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.focus_next_pane())
+                {
                     tracing::info!(?id, "focus next pane");
                     self.refresh_find_for_active_tab();
                     self.request_redraw();
@@ -240,7 +259,11 @@ impl crate::App {
                 true
             }
             Action::FocusPrevPane => {
-                if let Some(id) = self.sessions.active_mut().focus_prev_pane() {
+                if let Some(id) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.focus_prev_pane())
+                {
                     tracing::info!(?id, "focus prev pane");
                     self.refresh_find_for_active_tab();
                     self.request_redraw();
@@ -248,8 +271,12 @@ impl crate::App {
                 true
             }
             Action::ClosePane => {
-                if close_pane_disposition(self.sessions.active().pane_count())
-                    == ClosePaneDisposition::CloseTab
+                // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — no pane
+                // to close; consume the action as a no-op.
+                let Some(active_tab) = self.sessions.active() else {
+                    return true;
+                };
+                if close_pane_disposition(active_tab.pane_count()) == ClosePaneDisposition::CloseTab
                 {
                     // Preserve the final pane's Terminal until close_tab()
                     // settles and persists any pending block output.
@@ -260,23 +287,34 @@ impl crate::App {
                 if !self.confirm_active_pane_close() {
                     return true;
                 }
-                match self.sessions.active_mut().close_active_pane() {
-                    Ok(false) => {
+                match self
+                    .sessions
+                    .active_mut()
+                    .map(|tab| tab.close_active_pane())
+                {
+                    None => {}
+                    Some(Ok(false)) => {
                         tracing::info!("pane closed, tab still has panes");
                         self.recompute_layout();
                         self.refresh_find_for_active_tab();
                         self.request_redraw();
                     }
-                    Ok(true) => tracing::error!("multi-pane close unexpectedly emptied tab"),
-                    Err(e) => {
+                    Some(Ok(true)) => tracing::error!("multi-pane close unexpectedly emptied tab"),
+                    Some(Err(e)) => {
                         tracing::warn!(?e, "close pane failed");
                     }
                 }
                 true
             }
             Action::TogglePaneZoom => {
-                let was_zoomed = self.sessions.active().is_zoomed();
-                let zoomed = self.sessions.active_mut().toggle_pane_zoom();
+                let Some(active_tab) = self.sessions.active() else {
+                    return true;
+                };
+                let was_zoomed = active_tab.is_zoomed();
+                let zoomed = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.toggle_pane_zoom());
                 if was_zoomed == zoomed.is_some() {
                     // No state change (single-pane tree or empty) — skip
                     // the layout work, just consume the key.
@@ -381,7 +419,7 @@ impl crate::App {
         if let Some(id) = self
             .sessions
             .active_mut()
-            .focus_direction_pane(dir, content_rect)
+            .and_then(|tab| tab.focus_direction_pane(dir, content_rect))
         {
             tracing::info!(?id, ?dir, "focus direction pane");
             self.refresh_find_for_active_tab();

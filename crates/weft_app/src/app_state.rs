@@ -46,12 +46,17 @@ impl SessionManager {
 
     // ── Read accessors ────────────────────────────────────────────────
 
-    pub fn active(&self) -> &Tab {
-        &self.tabs[self.active_tab]
+    /// v1.12.25 (audit 3-B, P1-01): `Option`-ized — `None` on the empty-tabs
+    /// transient (after the last tab exits) instead of a bare index panic.
+    /// Empty-tabs semantics = "ignore the event"; callers handle `None` by
+    /// returning early, never by panicking.
+    pub fn active(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab)
     }
 
-    pub fn active_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab]
+    /// v1.12.25 (audit 3-B, P1-01): `Option`-ized twin of [`Self::active`].
+    pub fn active_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active_tab)
     }
 
     pub fn active_idx(&self) -> usize {
@@ -1174,5 +1179,19 @@ mod tests {
         sm.push_tab(Tab::empty());
         assert!(sm.remove_dead(0));
         assert!(sm.is_empty());
+    }
+
+    // v1.12.25 (audit 3-B, P1-01): the Option-ization contract — the
+    // empty-tabs transient must read as `None`, never panic.
+    #[test]
+    fn active_on_empty_returns_none() {
+        let sm = SessionManager::new();
+        assert!(sm.active().is_none());
+    }
+
+    #[test]
+    fn active_mut_on_empty_returns_none() {
+        let mut sm = SessionManager::new();
+        assert!(sm.active_mut().is_none());
     }
 }

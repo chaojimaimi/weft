@@ -43,7 +43,11 @@ impl App {
         // Finder-launched apps commonly have `/` as their process cwd. A new
         // terminal tab should instead inherit the active shell's live OSC 7
         // cwd (or its restored fallback) so Cmd+T preserves user context.
-        let inherited_cwd = self.sessions.active().launch_cwd().map(str::to_owned);
+        let inherited_cwd = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.launch_cwd())
+            .map(str::to_owned);
         let idx = self.sessions.open_tab(
             rows,
             cols,
@@ -69,11 +73,17 @@ impl App {
         // must inject the tier too, or every user-created tab stays Classic
         // and the screen-owned block-view fix never applies where tabs are
         // actually opened. Same chokepoint as set_blocks_retained_limit.
-        crate::config_controller::apply_tui_render_mode(
-            self.sessions.active_mut(),
-            self.config_state.config.experimental.tui_render_mode,
-        );
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+        if let Some(tab) = self.sessions.active_mut() {
+            crate::config_controller::apply_tui_render_mode(
+                tab,
+                self.config_state.config.experimental.tui_render_mode,
+            );
+        }
+        if let Some(t) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             t.set_blocks_retained_limit(self.config_state.config.blocks.retained_limit);
             t.set_block_output_cap(crate::config_controller::output_cap_bytes(
                 self.config_state.config.blocks.output_cap_mib,
@@ -402,7 +412,11 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+        if let Some(t) = self
+            .sessions
+            .active_mut()
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             t.set_palette(theme.palette);
             t.set_background_color(theme.background);
         }
