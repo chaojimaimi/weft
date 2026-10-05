@@ -767,11 +767,19 @@ impl App {
                 // terminal cursor (which is hidden behind the popup).
                 // Without this, CJK IME candidates render off-screen and
                 // users can't complete character composition.
+                // v1.12.24.1 (P1-3): note-first — the note editor owns IME
+                // input while open (keyboard.rs captures all keys; the ime
+                // controller intercepts pre-router), so the candidate window
+                // anchors at the note card. `.or` keeps palette fallback.
+                let note_area = self
+                    .note_editor
+                    .open
+                    .then(|| crate::paint::text::note_editor_ime_area(&ctx));
                 crate::ime::update_cursor_area(
                     window,
                     ctx,
                     terminal,
-                    palette_snap.ime_area,
+                    note_area.or(palette_snap.ime_area),
                     renderer.block_view_tui_caret_area.get(),
                 );
             }

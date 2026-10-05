@@ -1,6 +1,10 @@
 //! Context menu, Find and Completion vertex builders.
 
 use crate::paint::primitives::{color_to_normalized, push_quad};
+use crate::paint::text::{
+    note_card_width, note_display_window, NOTE_CARD_ACCENT_STRIPE_W, NOTE_CARD_INNER_PAD,
+    NOTE_CARD_LABEL, NOTE_CARD_LINE_H_CELLS, NOTE_CARD_LINE_H_MIN_PX, NOTE_CARD_TOP_OFFSET,
+};
 use crate::renderer::MetalRenderer;
 
 /// Per-frame FindInGrid draw state (v0.8 B3). Set by the app before `draw()`.
@@ -495,12 +499,14 @@ impl MetalRenderer {
 
         // Layout: top-center card, 60% of viewport width (clamped to
         // [40cw, 80cw]). Height = 1 input line + 1 hint line + padding.
+        // v1.12.24.1 (P1-3): geometry constants are the shared `paint::text`
+        // note-card consts (single source of truth with the IME anchor).
         let vp_w = ctx.viewport.0;
-        let target_w = (vp_w * 0.6).max(cw * 40.0).min(cw * 80.0);
+        let target_w = note_card_width(vp_w, cw);
         let popup_x0 = (vp_w - target_w) * 0.5;
         let popup_x1 = popup_x0 + target_w;
-        let popup_y0 = ctx.top() + 10.0;
-        let line_h = (ch * 1.75).max(ch + 16.0);
+        let popup_y0 = ctx.top() + NOTE_CARD_TOP_OFFSET;
+        let line_h = (ch * NOTE_CARD_LINE_H_CELLS).max(ch + NOTE_CARD_LINE_H_MIN_PX);
         let hint_h = ch * 1.2;
         let popup_y1 = popup_y0 + line_h + hint_h + ch * 0.3;
 
@@ -554,44 +560,41 @@ impl MetalRenderer {
             );
         }
 
-        // Accent left stripe (3px) — branded accent.
+        // Accent left stripe — branded accent.
+        let stripe_w = NOTE_CARD_ACCENT_STRIPE_W;
         push_quad(
             &mut verts,
-            [popup_x0, popup_y0, popup_x0 + 3.0, popup_y1],
+            [popup_x0, popup_y0, popup_x0 + stripe_w, popup_y1],
             bg_uv,
             [0.0; 4],
             accent,
         );
 
         // Input line: "Note: " + buffer + caret.
-        let inner_pad = 8.0;
-        let text_x = popup_x0 + 3.0 + inner_pad;
-        let text_w = popup_x1 - popup_x0 - 3.0 - inner_pad * 2.0;
+        let inner_pad = NOTE_CARD_INNER_PAD;
+        let text_x = popup_x0 + stripe_w + inner_pad;
+        let text_w = popup_x1 - popup_x0 - stripe_w - inner_pad * 2.0;
         let line_y = popup_y0 + (line_h - ch) * 0.5;
 
-        let label = "Note: ";
+        let label = NOTE_CARD_LABEL;
         let label_cells = label.len(); // ASCII
         self.push_text(&mut verts, text_x, line_y, label, prompt_c, label_cells);
 
         let buf_x = text_x + label_cells as f32 * cw;
         let buf_max_cells = ((text_x + text_w - buf_x) / cw).floor() as usize;
-        // Convert byte-offset cursor to char offset so multi-byte CJK text
-        // positions the caret correctly.
-        let cursor_char_offset = state
-            .buffer
-            .char_indices()
-            .take_while(|(byte_idx, _)| *byte_idx < state.cursor)
-            .count();
-        let display_chars = buf_max_cells.saturating_sub(1);
-        let buf_display: String = state.buffer.chars().take(display_chars).collect();
-        if !buf_display.is_empty() {
-            self.push_text(&mut verts, buf_x, line_y, &buf_display, fg, buf_max_cells);
+        // v1.12.24.1 (N-4): cell-based trailing display window — the v1.7.3
+        // char-count math drew the caret at half the CJK text extent and
+        // never scrolled once the card's cell budget filled.
+        let preedit_cells = Self::text_col_width(&state.ime_preedit);
+        let win = note_display_window(&state.buffer, state.cursor, preedit_cells, buf_max_cells);
+        if !win.display.is_empty() {
+            let buf_cols = Self::text_col_width(&win.display);
+            self.push_text(&mut verts, buf_x, line_y, &win.display, fg, buf_cols);
         }
 
         // Caret: blink-driven block cursor at the caret position (clamped
         // to the visible display region so it doesn't overflow the popup).
-        let caret_char = cursor_char_offset.min(display_chars);
-        let caret_x = buf_x + caret_char as f32 * cw;
+        let caret_x = buf_x + win.caret_cell as f32 * cw;
         if self.cursor_blink_on {
             push_quad(
                 &mut verts,
@@ -606,7 +609,7 @@ impl MetalRenderer {
         // accent-colored + underlined. Width = text_col_width (CJK = 2 cols);
         // visible truncation rides push_text's column budget.
         if !state.ime_preedit.is_empty() {
-            let preedit_max = buf_max_cells.saturating_sub(caret_char);
+            let preedit_max = buf_max_cells.saturating_sub(win.caret_cell);
             let cols = Self::text_col_width(&state.ime_preedit).min(preedit_max) as f32;
             let underline = [caret_x, line_y + ch - 1.0, caret_x + cols * cw, line_y + ch];
             let preedit = &state.ime_preedit;
