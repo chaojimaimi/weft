@@ -250,6 +250,104 @@ impl Grid {
     }
 }
 
+/// v1.12.25 (audit core P1-2): one searchable cell. `Char` holds the lead
+/// scalar of an ordinary cell (zero-alloc); `Str` borrows the multi-scalar
+/// grapheme cluster text from the row's `RowExtras`. Replaces the old
+/// per-cell `String` tokens (`c.to_string()` / `grapheme_at().to_string()`
+/// plus a second `to_lowercase()` alloc when folding).
+enum Token<'a> {
+    Char(char),
+    Str(&'a str),
+}
+
+/// Build the per-cell token stream for a row from borrowed `(cells, extras)`.
+/// Each token carries either the multi-scalar cluster (when EXTRA is set) or
+/// the lead `char` alone; `(col, width)` back-pointers ride along. Split out
+/// of `find_in_grid`'s old closure so scrollback rows (flat storage — no
+/// `&Row` exists; `FlatStorage::get` materializes an owned row) and viewport
+/// rows (borrowed in place) share one token builder.
+fn tokens_from_row<'a>(
+    cells: &'a [crate::grid::Cell],
+    extras: &'a crate::grid::RowExtras,
+    out: &mut Vec<(Token<'a>, usize, usize)>,
+) {
+    for (col, cell) in cells.iter().enumerate() {
+        if cell.flags.contains(crate::grid::CellFlags::WIDE_SPACER) {
+            continue;
+        }
+        let w = if cell.width == crate::grid::CellWidth::Full {
+            2
+        } else {
+            1
+        };
+        let c = if cell.character == '\0' {
+            ' '
+        } else {
+            cell.character
+        };
+        // v1.6.0: prefer the multi-scalar cluster when present.
+        let token = if cell.flags.contains(crate::grid::CellFlags::EXTRA) {
+            extras.grapheme_at(col).map_or(Token::Char(c), Token::Str)
+        } else {
+            Token::Char(c)
+        };
+        out.push((token, col, w));
+    }
+}
+
+/// Expand tokens into a flat char stream plus per-char `(col, width)`
+/// back-pointers, applying the query's case mode. Folding per token: ASCII
+/// takes the allocation-free `to_ascii_lowercase` path; non-ASCII keeps the
+/// Unicode `to_lowercase` semantics the old per-token `String::to_lowercase`
+/// had (for a single scalar, `char::to_lowercase` == `str::to_lowercase`).
+/// A multi-char expansion (e.g. `İ` → "i̇") pushes one back-pointer per
+/// produced char, exactly like the old lowercased-String expansion.
+fn expand_tokens(
+    tokens: &[(Token<'_>, usize, usize)],
+    case_sensitive: bool,
+) -> (Vec<char>, Vec<(usize, usize)>) {
+    let mut line_chars: Vec<char> = Vec::with_capacity(tokens.len());
+    let mut char_to_cell: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
+    for (token, col, w) in tokens {
+        match *token {
+            Token::Char(c) => {
+                if case_sensitive || c.is_ascii() {
+                    line_chars.push(if case_sensitive {
+                        c
+                    } else {
+                        c.to_ascii_lowercase()
+                    });
+                    char_to_cell.push((*col, *w));
+                } else {
+                    for lc in c.to_lowercase() {
+                        line_chars.push(lc);
+                        char_to_cell.push((*col, *w));
+                    }
+                }
+            }
+            Token::Str(s) => {
+                if case_sensitive {
+                    for ch in s.chars() {
+                        line_chars.push(ch);
+                        char_to_cell.push((*col, *w));
+                    }
+                } else if s.is_ascii() {
+                    for ch in s.chars().map(|c| c.to_ascii_lowercase()) {
+                        line_chars.push(ch);
+                        char_to_cell.push((*col, *w));
+                    }
+                } else {
+                    for ch in s.to_lowercase().chars() {
+                        line_chars.push(ch);
+                        char_to_cell.push((*col, *w));
+                    }
+                }
+            }
+        }
+    }
+    (line_chars, char_to_cell)
+}
+
 /// Search `grid` for `query`. Returns matches in document order (top-to-bottom,
 /// left-to-right), capped at [`MAX_MATCHES`]. Scans the FULL scrollback +
 /// viewport (v0.9 U-P1 removed the `MAX_SCAN_ROWS` cap — async search makes
@@ -300,65 +398,40 @@ pub fn find_in_grid(
     let sb_len = grid.scrollback_len();
     let total_rows = sb_len + grid.num_rows;
 
-    // Helper: build the per-cell token stream for a unified row. Each token
-    // carries either the multi-scalar cluster string (when EXTRA is set) or
-    // the lead `char` alone. The substring path compares token-by-token; the
-    // regex path concatenates tokens into a line string.
-    //
-    // v1.6.0: previously this returned `(char, col, width)`; now it returns
-    // `(String, col, width)` so multi-scalar clusters participate in matches.
-    // The String is small (1 char in the common case) so the per-row alloc
-    // cost is bounded; for ASCII-heavy rows the compiler optimizes the
-    // allocation away in practice.
-    let build_tokens = |unified_row: usize| -> Vec<(String, usize, usize)> {
-        let mut tokens: Vec<(String, usize, usize)> = Vec::with_capacity(grid.num_cols);
-        let (cells, extras): (Vec<crate::grid::Cell>, crate::grid::RowExtras) =
-            if unified_row < sb_len {
-                grid.scrollback
-                    .get(unified_row)
-                    .map(|r| (r.cells.to_vec(), r.extras.clone()))
-                    .unwrap_or_default()
-            } else {
-                let vp_row = unified_row - sb_len;
-                if vp_row >= grid.viewport.len() {
-                    return tokens;
-                }
-                (
-                    grid.viewport[vp_row].cells.to_vec(),
-                    grid.viewport[vp_row].extras.clone(),
-                )
+    // v1.12.25 (audit core P1-2): the old inline closure cloned every row
+    // (`cells.to_vec()` + `extras.clone()`, plus 1-2 heap allocs per cell)
+    // and folded with a per-token `to_lowercase()` alloc. Rows are now
+    // tokenized in place — viewport rows borrow straight off the grid;
+    // scrollback rows use the row materialized by the flat storage (the old
+    // second clone on top of it is gone) — and case folding happens once,
+    // during the char-stream expansion below. Matching semantics are
+    // byte-identical (guarded by the existing find tests).
+    'outer: for unified_row in 0..total_rows {
+        // Flat storage materializes an owned row per access (no `&Row`
+        // exists in the byte store); tokens borrow from that local binding —
+        // the old second clone (`cells.to_vec()` + `extras.clone()`) is gone.
+        // The binding lives at iteration scope so `tokens` can borrow either
+        // this row or the viewport row below.
+        let materialized_row;
+        let mut tokens: Vec<(Token<'_>, usize, usize)> = Vec::with_capacity(grid.num_cols);
+        if unified_row < sb_len {
+            materialized_row = match grid.scrollback.get(unified_row) {
+                Some(row) => row,
+                None => continue,
             };
-        for (col, cell) in cells.into_iter().enumerate() {
-            if cell.flags.contains(crate::grid::CellFlags::WIDE_SPACER) {
+            tokens_from_row(
+                &materialized_row.cells,
+                &materialized_row.extras,
+                &mut tokens,
+            );
+        } else {
+            let vp_row = unified_row - sb_len;
+            if vp_row >= grid.viewport.len() {
                 continue;
             }
-            let w = if cell.width == crate::grid::CellWidth::Full {
-                2
-            } else {
-                1
-            };
-            let c = if cell.character == '\0' {
-                ' '
-            } else {
-                cell.character
-            };
-            // v1.6.0: prefer the multi-scalar cluster string when present.
-            let s: String = if cell.flags.contains(crate::grid::CellFlags::EXTRA) {
-                extras
-                    .grapheme_at(col)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| c.to_string())
-            } else {
-                c.to_string()
-            };
-            let s = if case_sensitive { s } else { s.to_lowercase() };
-            tokens.push((s, col, w));
+            let row = &grid.viewport[vp_row];
+            tokens_from_row(&row.cells, &row.extras, &mut tokens);
         }
-        tokens
-    };
-
-    'outer: for unified_row in 0..total_rows {
-        let tokens = build_tokens(unified_row);
         if tokens.is_empty() {
             continue;
         }
@@ -369,14 +442,7 @@ pub fn find_in_grid(
             // fall inside a multi-scalar cluster token can be correctly mapped.
             // Previously byte_pos jumped by token length and could skip past
             // start_byte, producing col=0/len=0 bogus matches.
-            let mut line_chars: Vec<char> = Vec::with_capacity(tokens.len());
-            let mut char_to_cell: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
-            for (s, col, w) in &tokens {
-                for ch in s.chars() {
-                    line_chars.push(ch);
-                    char_to_cell.push((*col, *w));
-                }
-            }
+            let (line_chars, char_to_cell) = expand_tokens(&tokens, case_sensitive);
             let line_str: String = line_chars.iter().collect();
             for m in re.find_iter(&line_str) {
                 let start_byte = m.start();
@@ -411,14 +477,7 @@ pub fn find_in_grid(
             // cells. A multi-scalar token expands to multiple chars that all
             // share the same (col, w) — the match length in cells is the sum
             // of the widths of the *distinct* cells the match spans.
-            let mut line_chars: Vec<char> = Vec::with_capacity(tokens.len());
-            let mut char_to_cell: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
-            for (s, col, w) in &tokens {
-                for ch in s.chars() {
-                    line_chars.push(ch);
-                    char_to_cell.push((*col, *w));
-                }
-            }
+            let (line_chars, char_to_cell) = expand_tokens(&tokens, case_sensitive);
 
             let mut i = 0;
             while i + needle_chars.len() <= line_chars.len() {

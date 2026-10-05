@@ -108,6 +108,30 @@ fn wide_char_match_len_is_in_cells() {
 }
 
 #[test]
+fn cjk_row_with_mixed_case_query() {
+    // v1.12.25 (audit core P1-2): regression for the Token::Char/Str
+    // rework — a CJK row interleaves wide (caseless) and ASCII (caseful)
+    // cells; the ASCII fold must stay allocation-free AND byte-identical
+    // to the old per-token `String::to_lowercase` behavior, with match
+    // columns still counted in cells (CJK = 2 cells each).
+    let mut g = Grid::new(3, 30);
+    write(&mut g, 0, 0, "摘要 Hello World 摘要");
+    // "hello world" (lowercase query) still matches "Hello World".
+    let m = find_in_grid(&g, "hello world", false, false);
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0].row, 0);
+    // 2 CJK chars (4 cells) + space → match starts at cell col 5.
+    assert_eq!(m[0].col, 5);
+    assert_eq!(m[0].len, 11);
+    // Uppercase query matches too (folding is symmetric for ASCII).
+    let m = find_in_grid(&g, "HELLO WORLD", false, false);
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0].col, 5);
+    // Case-sensitive query with different case does not match.
+    assert!(find_in_grid(&g, "hello world", true, false).is_empty());
+}
+
+#[test]
 fn case_sensitive_skips_different_case() {
     let mut g = Grid::new(2, 20);
     write(&mut g, 0, 0, "Hello World");
