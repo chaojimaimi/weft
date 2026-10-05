@@ -38,7 +38,7 @@ bug 修复**禁止凭猜直接改代码**。必须遵循 `superpowers:systematic
 
 ### 4. 文件规模：模块化 + 行数治理
 
-- `main.rs` 已完成拆分（2026-08 重构，6600+ → 490 行），只保留模块声明与启动编排，**禁止重新膨胀**
+- `main.rs` 已完成拆分（2026-08 重构 6600+ → 490 行；v1.12.25 3-B-2 四个 session I/O 方法外移到 `app/session_pump.rs` 后实际 530 行），只保留模块声明、App struct/new/tab 与启动编排，**禁止重新膨胀**（gate 专项阈值 MAIN_RS_MAX=530）
 - 新功能必须拆到独立模块（参考 `app/`、`paint/`、`glyph/`、`layout/`、`tab/`、`block_view/` 子模块）
 - `commit-gate.sh` 会检查暂存区 `.rs` 文件行数：超 800 行且不在 `scripts/architecture_allowlist.txt` 中直接 block；allowlist 变更需审计理由
 
@@ -67,7 +67,7 @@ bug 修复**禁止凭猜直接改代码**。必须遵循 `superpowers:systematic
 ```
 crates/
   weft_app/     — 主应用（窗口、事件循环、渲染器、菜单）
-    src/main.rs     — 模块声明 + 启动编排（490 行，禁止膨胀）
+    src/main.rs     — 模块声明 + 启动编排（530 行，禁止膨胀）
     src/app/        — App 结构体 + Action
     src/paint/      — Metal 绘制（block_view/ grid_cache/ grid_instances/ prompt/ 等）
     src/glyph/      — 字形图集（atlas/ font/ rasterize/ style/ query/）

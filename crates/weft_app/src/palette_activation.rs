@@ -189,14 +189,31 @@ impl App {
                         }
                     }
                     SearchDocumentKind::Workflow => {
-                        let command = self
+                        // v1.12.25 (3-B-2 P2-03): the old `.ok().flatten()`
+                        // disguised a DB failure as "not found" — the command
+                        // was silently not inserted (no log, no toast). Read
+                        // the result WITHOUT the store borrow, then match so
+                        // errors and absence are distinguishable and visible
+                        // (same shape as execute_workflow's 3-B P1-05 fix).
+                        let lookup = self
                             .palette
                             .store
                             .as_ref()
-                            .and_then(|store| store.find_by_name(&hit.doc.title).ok().flatten())
-                            .and_then(|workflow| {
-                                workflow.steps.first().map(|step| step.command.clone())
-                            });
+                            .map(|store| store.find_by_name(&hit.doc.title));
+                        let command = match lookup {
+                            Some(Ok(Some(wf))) => wf.steps.first().map(|step| step.command.clone()),
+                            Some(Ok(None)) => {
+                                warn!(name = %hit.doc.title, "workflow not found");
+                                self.show_block_history_toast("workflow 不存在");
+                                None
+                            }
+                            Some(Err(e)) => {
+                                warn!(error = %e, name = %hit.doc.title, "failed to read workflow");
+                                self.show_block_history_toast("读取 workflow 失败");
+                                None
+                            }
+                            None => None, // no block store — unchanged silent no-op
+                        };
                         if let Some(command) = command {
                             if let Some(terminal) = self
                                 .sessions

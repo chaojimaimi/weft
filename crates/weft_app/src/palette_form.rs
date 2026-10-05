@@ -219,6 +219,7 @@ impl App {
             PaletteSubMode::EditWorkflow { id, name, .. } => (*id, name.clone()),
             _ => return false,
         };
+        let _ = id; // the lookup is by name; id kept for future direct addressing
 
         match key {
             KeyCode::Escape => {
@@ -232,9 +233,23 @@ impl App {
                     _ => return false,
                 };
 
-                // Update the workflow in the store.
-                if let Some(store) = &self.palette.store {
-                    if let Some(mut wf) = store.find_by_name(&name).unwrap_or(None) {
+                // v1.12.25 (3-B-2 P2-03): the old `.unwrap_or(None)` disguised
+                // a DB failure as "not found" while the tail reset the submode
+                // anyway — a silent fake success (the user believed the edit
+                // was saved while the buffer was thrown away). Read the result
+                // WITHOUT the store borrow, then match: on Err/Ok(None) the
+                // failure surfaces on the block-history toast channel
+                // (execute_workflow 3-B P1-05 precedent) and the EditWorkflow
+                // submode + buffer are KEPT so the user can retry or abandon
+                // explicitly via Esc.
+                let lookup = self
+                    .palette
+                    .store
+                    .as_ref()
+                    .map(|store| store.find_by_name(&name));
+                match lookup {
+                    Some(Ok(Some(mut wf))) => {
+                        // Update the workflow in the store.
                         if let Some(step) = wf.steps.first_mut() {
                             step.command = new_command.clone();
                         } else {
@@ -243,26 +258,49 @@ impl App {
                                 command: new_command.clone(),
                             });
                         }
-                        if let Err(e) = store.update(&wf) {
-                            warn!(error = %e, "failed to update workflow");
-                        } else {
-                            if let Some(index) = &self.search_index {
-                                if let Err(e) = index
-                                    .upsert(&weft_core::search::SearchDocument::from_workflow(&wf))
-                                {
-                                    warn!(error = %e, "failed to reindex workflow");
+                        if let Some(store) = &self.palette.store {
+                            if let Err(e) = store.update(&wf) {
+                                warn!(error = %e, "failed to update workflow");
+                            } else {
+                                if let Some(index) = &self.search_index {
+                                    if let Err(e) = index.upsert(
+                                        &weft_core::search::SearchDocument::from_workflow(&wf),
+                                    ) {
+                                        warn!(error = %e, "failed to reindex workflow");
+                                    }
                                 }
+                                info!(name = %name, "workflow updated");
                             }
-                            info!(name = %name, "workflow updated");
                         }
+                        self.palette.submode = PaletteSubMode::Search;
+                        self.palette.query.clear();
+                        self.refresh_palette_results();
+                        self.request_redraw();
+                        true
+                    }
+                    Some(Ok(None)) => {
+                        warn!(name = %name, "workflow to edit not found");
+                        self.show_block_history_toast("workflow 不存在");
+                        // Keep the EditWorkflow submode + buffer (retry / manual Esc).
+                        self.request_redraw();
+                        true
+                    }
+                    Some(Err(e)) => {
+                        warn!(error = %e, name = %name, "failed to read workflow");
+                        self.show_block_history_toast("读取 workflow 失败");
+                        // Keep the EditWorkflow submode + buffer (retry / manual Esc).
+                        self.request_redraw();
+                        true
+                    }
+                    None => {
+                        // No block store — unchanged behavior (return to search).
+                        self.palette.submode = PaletteSubMode::Search;
+                        self.palette.query.clear();
+                        self.refresh_palette_results();
+                        self.request_redraw();
+                        true
                     }
                 }
-                let _ = id; // id already used via find_by_name
-                self.palette.submode = PaletteSubMode::Search;
-                self.palette.query.clear();
-                self.refresh_palette_results();
-                self.request_redraw();
-                true
             }
             KeyCode::Backspace => {
                 if let PaletteSubMode::EditWorkflow { buffer, .. } = &mut self.palette.submode {

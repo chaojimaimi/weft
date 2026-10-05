@@ -30,6 +30,12 @@ cd "$ROOT"
 
 MARKER=".zcode/review-passed"
 MAX_LINES=800
+# v1.12.25 (3-B-2 P2-01): main.rs 专项阈值 — spawn_pty/pump_pty/process_messages/
+# request_redraw 四方法已外移到 app/session_pump.rs；App struct/new()/tab() 与
+# AppEvent/AppMsg 定义留守使 main.rs 无法回到 AGENTS.md §4 的 490，阈值钉在实际
+# 审计值（进位取整），只防回弹、不允许借道 allowlist 越限。
+MAIN_RS_MAX=530
+MAIN_RS_FILE="crates/weft_app/src/main.rs"
 BUDGET_FILE="scripts/architecture_allowlist.txt"
 failures=0
 
@@ -71,6 +77,13 @@ while IFS= read -r -d '' file; do
     [ -f "$file" ] || continue
 
     lines=$(wc -l < "$file" | tr -d ' ')
+    # v1.12.25 (3-B-2 P2-01): main.rs has its own stricter ceiling (see MAIN_RS_MAX).
+    if [ "$file" = "$MAIN_RS_FILE" ] && [ "$lines" -gt "$MAIN_RS_MAX" ]; then
+        echo "FAIL: $file is $lines lines (main.rs limit $MAIN_RS_MAX)"
+        echo "       Split new methods into a module (e.g. app/), do not re-inflate."
+        echo "       (AGENTS.md §4: main.rs 只保留模块声明与启动编排，禁止重新膨胀)"
+        failures=$((failures + 1))
+    fi
     if [ "$lines" -gt "$MAX_LINES" ]; then
         entry=$(awk -F '|' -v path="$file" '$1 == path { print; exit }' "$BUDGET_FILE" 2>/dev/null || true)
         if [ -z "$entry" ]; then

@@ -5,8 +5,10 @@
 //! and pure helpers. Each concern now lives in its own submodule so `main.rs`
 //! stays under the 800-line architecture gate.
 //!
-//! All methods here are `impl App` extensions using `pub(super)` visibility,
-//! so `main.rs` retains ownership of the `App` struct definition and `new()`.
+//! All methods here are `impl App` extensions using `pub(crate)` visibility —
+//! their callers span the whole top-level controller family, not just the
+//! `app` tree — so `main.rs` retains ownership of the `App` struct definition
+//! and `new()`.
 
 pub(crate) mod action;
 pub(crate) mod cursor_anim;
@@ -14,5 +16,9 @@ pub(crate) mod effect_dispatch;
 pub(crate) mod focus;
 pub(crate) mod helpers;
 pub(crate) mod keyboard;
+// v1.12.25 (3-B-2 P2-01): per-frame session I/O core (`spawn_pty` /
+// `pump_pty` / `process_messages` / `request_redraw`) moved verbatim out of
+// `main.rs`; bodies zero-rewritten, visibility `pub(crate)`.
+pub(crate) mod session_pump;
 // v1.11.5 (PLAN_v1115 §M2): UI-event dispatch table + Dock badge debounce.
 pub(crate) mod ui_events;
