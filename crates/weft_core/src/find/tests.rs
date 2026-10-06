@@ -580,3 +580,41 @@ fn find_in_grid_and_flat_snapshot_agree_on_scrollback() {
         assert_eq!(direct, via_snapshot, "regex divergence for {pattern:?}");
     }
 }
+
+/// F-1 (v1.12.25 re-cut) end-to-end: a history ROW's byte range can
+/// straddle a 1024-byte flat-content chunk boundary (only chunk rolls are
+/// fixed; rows end wherever content ends), and the field crash was exactly
+/// `seq 1 500` → Cmd+F panicking while building the search snapshot. The
+/// whole pipeline — snapshot build + cross-boundary match — must survive.
+#[test]
+fn find_snapshot_history_row_straddling_chunk_boundary() {
+    let mut grid = Grid::with_scrollback(2, 2200, 10);
+    // Prep short rows so the straddling row does not start at offset 0 —
+    // the field shape was a row START landing mid-chunk. They own content
+    // bytes 0..6.
+    grid.scrollback.push(make_row(2200, "aa"));
+    grid.scrollback.push(make_row(2200, "bb"));
+    // The needle starts at row-relative byte 1017 → absolute 1023, so the
+    // bytes of "needle" themselves straddle the chunk boundary at 1024;
+    // the row (2100 bytes + terminator) crosses a second boundary at 2048.
+    let long_text = format!("{}needle{}", "a".repeat(1017), "a".repeat(2100 - 1017 - 6));
+    grid.scrollback.push(make_row(2200, &long_text));
+
+    // Must not panic.
+    let snap = grid.find_snapshot();
+    assert_eq!(snap.scrollback.rows.len(), 3);
+    assert_eq!(
+        snap.scrollback.content.len(),
+        2 + 2 + 2100,
+        "terminators excluded, all cell bytes present"
+    );
+    // The match sits in the third scrollback row at the straddling offset.
+    assert_eq!(
+        find_in_snapshot(&snap, "needle", false, false).unwrap(),
+        vec![FindMatch {
+            row: 2,
+            col: 1017,
+            len: 6
+        }]
+    );
+}

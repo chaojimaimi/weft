@@ -194,12 +194,19 @@ fn assert_gate_equivalence(rows: &[Row], columns: usize, msg: &str) {
 }
 
 /// The row's content bytes, terminator included.
+///
+/// F-1 (v1.12.25 re-cut): a whole-row range can straddle a chunk boundary,
+/// so this must go through `append_range_to` — the single-chunk
+/// `Index<Range>` impl's straddle guard is a debug_assert. (These tests
+/// never crossed a boundary, which is why the old Index use never fired.)
 fn row_text(storage: &FlatStorage, row: usize) -> String {
     let range = storage
         .index
         .content_range_for_row(row)
         .expect("row in bounds");
-    storage.content[range].to_string()
+    let mut bytes = Vec::new();
+    storage.content.append_range_to(&mut bytes, range);
+    String::from_utf8(bytes).expect("row content is valid UTF-8")
 }
 
 /// Per-byte hyperlink map values for content bytes `[start, start + count)`.

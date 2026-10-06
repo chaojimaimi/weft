@@ -627,3 +627,64 @@ fn rebuild_line_breaking_matches_reference_at_arbitrary_widths() {
         assert_rows_equal(&materialized, &expected, &format!("rebuild at width {w}"));
     }
 }
+
+// ── F-1 (v1.12.25 re-cut): snapshot vs chunk-straddling rows ────────────
+
+#[test]
+fn search_rows_snapshot_row_straddling_chunk_boundary() {
+    // F-1 regression: a ROW's byte range can straddle a 1024-byte content-
+    // chunk boundary (chunks roll at fixed byte offsets; rows end wherever
+    // content ends). The old whole-row copy went through the Index<Range>
+    // impl, which resolves only the chunk holding the range START and
+    // guards straddling with a debug_assert — a release panic in the field
+    // (find snapshot, `seq 1 500` + Cmd+F).
+    let mut storage = FlatStorage::new(2100, usize::MAX);
+    // Prep short rows first: the crash shape is a straddling row whose
+    // START sits mid-chunk, not at offset 0.
+    storage.push_rows_from_string("aa\n");
+    storage.push_rows_from_string("bb\n");
+    storage.push_rows_from_string("cc\n");
+    // One hard-terminated row with >1024 content bytes: its content range
+    // (starting at offset 9) necessarily crosses the boundary at 1024.
+    let long_text = "x".repeat(1500);
+    storage.push_rows_from_string(&format!("{long_text}\n"));
+
+    // Must not panic.
+    let (bytes, rows) = storage.search_rows_snapshot();
+
+    // Snapshot holds every row's cell bytes, terminators stripped.
+    let expected = format!("aabbcc{long_text}");
+    assert_eq!(bytes, expected.as_bytes());
+    assert_eq!(rows.len(), 4);
+    // Row starts advance by the preceding rows' cell byte counts.
+    assert_eq!(rows[3].start, 2 + 2 + 2);
+    assert_eq!(rows[3].cell_bytes, long_text.len());
+    // The RLE run table must account for exactly the row's cell bytes.
+    let run_bytes: usize = rows[3]
+        .runs
+        .iter()
+        .map(|(count, _, utf8_len)| *count as usize * *utf8_len as usize)
+        .sum();
+    assert_eq!(run_bytes, long_text.len());
+}
+
+#[test]
+fn search_rows_snapshot_row_spanning_multiple_chunks() {
+    // F-1 companion: a row long enough to cross TWO chunk boundaries must
+    // be stitched from three chunks (filled / filled / active).
+    let mut storage = FlatStorage::new(2600, usize::MAX);
+    storage.push_rows_from_string("aa\n");
+    storage.push_rows_from_string("bb\n");
+    // >2048 content bytes: the row range (offsets 6..2507) crosses both
+    // the 1024 and the 2048 boundary.
+    let long_text = "y".repeat(2500);
+    storage.push_rows_from_string(&format!("{long_text}\n"));
+
+    let (bytes, rows) = storage.search_rows_snapshot();
+
+    let expected = format!("aabb{long_text}");
+    assert_eq!(bytes, expected.as_bytes());
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].start, 2 + 2);
+    assert_eq!(rows[2].cell_bytes, long_text.len());
+}

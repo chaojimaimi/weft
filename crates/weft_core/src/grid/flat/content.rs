@@ -112,7 +112,9 @@ impl std::fmt::Display for ByteOffset {
 pub(crate) struct Content {
     /// Fully-built chunks, keyed by the offset of their final byte
     /// (inclusive). Keying by the *end* makes `BTreeMap::range(start..)`
-    /// directly find the chunk containing any given offset.
+    /// directly find the chunk containing any given offset — a property
+    /// both the Index impl and [`Content::append_range_to`] (F-1) depend
+    /// on; never re-key by chunk start.
     filled_chunks: BTreeMap<ByteOffset, Chunk>,
 
     /// The chunk currently being appended to.
@@ -192,8 +194,65 @@ impl Content {
     pub(crate) fn end_offset(&self) -> usize {
         self.active_chunk.start_offset.as_usize() + self.active_chunk.len()
     }
+
+    /// F-1 (v1.12.25 re-cut): copies a byte range that may straddle chunk
+    /// boundaries — whole-ROW ranges do — appending the bytes to `out`.
+    ///
+    /// WHY this exists: the [`Index<Range>`] impl resolves only the chunk
+    /// holding the range START and its straddle guard is a debug_assert (a
+    /// no-op in release), so a row-sized range crossing a chunk edge
+    /// panicked in the field (end 1025..1027 > 1024). This walk starts at
+    /// the chunk containing `range.start`, then the active chunk, copying
+    /// each chunk's overlap into `out`.
+    ///
+    /// The start lookup relies on `filled_chunks` being keyed by each
+    /// chunk's FINAL byte (inclusive — see the field comment): map keys are
+    /// closed endpoints, so `range(covered_to..)` returns the chunk
+    /// containing `covered_to` directly. Do NOT re-key by chunk start —
+    /// that silently breaks every lookup here and in the Index impl.
+    pub(crate) fn append_range_to(&self, out: &mut Vec<u8>, range: Range<ByteOffset>) {
+        let mut covered_to = range.start;
+        for chunk in self
+            .filled_chunks
+            .range(covered_to..)
+            .map(|(_, chunk)| chunk)
+            .chain(std::iter::once(&self.active_chunk))
+        {
+            if covered_to >= range.end {
+                break;
+            }
+            // Mirror of the Index impl's start guard (defensive: a start in
+            // the evicted prefix would silently clamp forward in release).
+            // Later iterations need no guard — chunks are contiguous
+            // (push/truncate/truncate_front leave no gaps), so `covered_to`
+            // equals each next chunk's start_offset exactly.
+            debug_assert!(
+                covered_to >= chunk.start_offset,
+                "range start ({}) must be >= chunk.start_offset ({})",
+                covered_to,
+                chunk.start_offset
+            );
+            let seg_start = covered_to.max(chunk.start_offset);
+            let seg_end = range.end.min(chunk.content_range().end);
+            if seg_start < seg_end {
+                let local = (seg_start - chunk.start_offset).as_usize()
+                    ..(seg_end - chunk.start_offset).as_usize();
+                out.extend_from_slice(&chunk.content[local]);
+                covered_to = seg_end;
+            }
+        }
+        debug_assert!(
+            covered_to >= range.end || range.end.as_usize() > self.end_offset(),
+            "append_range_to must cover the requested range"
+        );
+    }
 }
 
+/// Single-chunk byte-slice access: the impl resolves only the chunk holding
+/// the range START, so it is valid only for ranges that stay inside one
+/// chunk (grapheme-level ranges — graphemes never straddle chunks).
+/// Whole-ROW ranges CAN straddle a chunk boundary and MUST go through
+/// [`Content::append_range_to`] instead (F-1, v1.12.25 re-cut).
 impl Index<Range<ByteOffset>> for Content {
     type Output = str;
 
@@ -376,5 +435,70 @@ mod tests {
 
         content.push_grapheme(&Grapheme::new_from_str("!"));
         assert_eq!(content.end_offset(), before + 1);
+    }
+
+    // ── F-1 (v1.12.25 re-cut): append_range_to ──────────────────────────
+
+    /// Harness: 1024 `a`s filling chunk 0 (offsets 0..1024, keyed at 1023)
+    /// followed by 10 `b`s in the active chunk (1024..1034).
+    fn chunk_boundary_content() -> Content {
+        let mut content = Content::new();
+        for _ in 0..Chunk::CHUNK_SIZE {
+            content.push_grapheme(&Grapheme::new_from_str("a"));
+        }
+        for _ in 0..10 {
+            content.push_grapheme(&Grapheme::new_from_str("b"));
+        }
+        assert_eq!(content.filled_chunks.len(), 1);
+        content
+    }
+
+    #[test]
+    fn append_range_to_copies_across_one_chunk_boundary() {
+        let content = chunk_boundary_content();
+        let mut out = Vec::new();
+        content.append_range_to(
+            &mut out,
+            ByteOffset::from_usize(1000)..ByteOffset::from_usize(1030),
+        );
+        // 24 bytes from the filled chunk's tail + 6 from the active chunk —
+        // the exact straddle shape the Index impl cannot serve.
+        let mut expected = vec![b'a'; 24];
+        expected.resize(30, b'b');
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn append_range_to_end_exactly_at_chunk_boundary() {
+        let content = chunk_boundary_content();
+        // range.end lands exactly on the filled chunk's exclusive end: the
+        // walk must stop there without over-copying from the active chunk.
+        let mut out = Vec::new();
+        content.append_range_to(
+            &mut out,
+            ByteOffset::from_usize(1000)..ByteOffset::from_usize(1024),
+        );
+        assert_eq!(out, vec![b'a'; 24]);
+    }
+
+    #[test]
+    fn append_range_to_short_range_inside_active_chunk() {
+        let content = chunk_boundary_content();
+        // Wholly inside the active chunk and past every filled chunk's key:
+        // the start lookup must fall through to the active chunk.
+        let mut out = Vec::new();
+        content.append_range_to(
+            &mut out,
+            ByteOffset::from_usize(1026)..ByteOffset::from_usize(1030),
+        );
+        assert_eq!(out, vec![b'b'; 4]);
+
+        // range.end == end_offset: the exact tail of the content.
+        let mut out = Vec::new();
+        content.append_range_to(
+            &mut out,
+            ByteOffset::from_usize(1030)..ByteOffset::from_usize(1034),
+        );
+        assert_eq!(out, vec![b'b'; 4]);
     }
 }

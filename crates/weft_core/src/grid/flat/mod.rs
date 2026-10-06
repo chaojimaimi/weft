@@ -277,7 +277,8 @@ impl FlatStorage {
             };
             let start = bytes.len();
             let cell_end = range.start + cell_bytes;
-            bytes.extend_from_slice(self.content[range.start..cell_end].as_bytes());
+            self.content
+                .append_range_to(&mut bytes, range.start..cell_end);
             let runs: Vec<(u16, u8, u16)> = self
                 .index
                 .grapheme_runs_for_row(index)
