@@ -1,5 +1,5 @@
 #[path = "snapshot_row.rs"]
-mod snapshot_row; // v1.11.3: gate budget
+pub(crate) mod snapshot_row; // v1.11.3: gate budget; pub(crate) so the grid walker-consistency test can pin `styled_row` to the other Row-level text paths (v1.12.27a P1-01)
 
 use self::snapshot_row::{mark_snapshot_truncated, push_snapshot_text, styled_row};
 use super::{Grid, Row};

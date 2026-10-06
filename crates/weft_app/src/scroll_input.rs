@@ -22,6 +22,33 @@ impl PreciseScrollAccumulator {
     }
 }
 
+/// Physical pixels per wheel "line" for list-style scrollers. v1.12.27a
+/// (P1-03) only NAMES the panel branch's long-standing `pos.y / 40.0`
+/// magic number — the value is unchanged (zero-behavior red line).
+pub(crate) const PIXELS_PER_LINE: f64 = 40.0;
+
+/// Convert a raw wheel delta to a signed line count for list-style
+/// scrollers (the panel sidebar): notch wheels report `LineDelta` rows
+/// directly; precise trackpads report `PixelDelta` physical pixels, which
+/// divide by [`PIXELS_PER_LINE`]. Positive = wheel up. The caller applies
+/// its own ceil/floor quantization (v1.12.27a P1-03: extracted verbatim
+/// from the panel branch's inline `match MouseScrollDelta`).
+pub(crate) fn delta_to_lines(delta: MouseScrollDelta) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, v) => v,
+        MouseScrollDelta::PixelDelta(pos) => (pos.y / PIXELS_PER_LINE) as f32,
+    }
+}
+
+/// Wheel-up predicate over a raw delta (positive delta = up), the
+/// direction half of [`delta_to_lines`]'s consumers (v1.12.27a P1-03).
+pub(crate) fn delta_up(delta: MouseScrollDelta) -> bool {
+    match delta {
+        MouseScrollDelta::LineDelta(_, v) => v > 0.0,
+        MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
+    }
+}
+
 /// Convert a terminal scroll event to signed cell rows.
 ///
 /// Positive rows reveal older content (wheel-up); negative rows reveal newer
@@ -73,6 +100,45 @@ mod tests {
 
     fn pixels(y: f64) -> MouseScrollDelta {
         MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y))
+    }
+
+    fn lines(y: f32) -> MouseScrollDelta {
+        MouseScrollDelta::LineDelta(0.0, y)
+    }
+
+    // ── v1.12.27a (P1-03): delta_to_lines / delta_up ────────────────────
+
+    #[test]
+    fn pixels_per_line_is_the_panel_scroll_legacy_constant() {
+        // The value is the panel branch's long-standing `pos.y / 40.0`
+        // magic number, named (not changed) by P1-03.
+        assert_eq!(PIXELS_PER_LINE, 40.0);
+    }
+
+    #[test]
+    fn delta_to_lines_passes_line_deltas_through_signed() {
+        assert_eq!(delta_to_lines(lines(3.0)), 3.0);
+        assert_eq!(delta_to_lines(lines(-2.5)), -2.5);
+        assert_eq!(delta_to_lines(lines(0.0)), 0.0);
+    }
+
+    #[test]
+    fn delta_to_lines_converts_pixel_deltas_by_pixels_per_line() {
+        assert_eq!(delta_to_lines(pixels(80.0)), 2.0);
+        assert_eq!(delta_to_lines(pixels(-40.0)), -1.0);
+        assert_eq!(delta_to_lines(pixels(0.0)), 0.0);
+    }
+
+    #[test]
+    fn delta_up_follows_the_delta_sign() {
+        // LineDelta: positive y = wheel up.
+        assert!(delta_up(lines(1.0)));
+        assert!(!delta_up(lines(0.0)));
+        assert!(!delta_up(lines(-1.0)));
+        // PixelDelta: positive y = wheel up.
+        assert!(delta_up(pixels(1.0)));
+        assert!(!delta_up(pixels(0.0)));
+        assert!(!delta_up(pixels(-1.0)));
     }
 
     #[test]

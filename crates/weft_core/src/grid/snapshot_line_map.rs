@@ -22,7 +22,7 @@
 //!   `_with_ownership_masks`), so any drift between the two walks fails.
 
 use super::snapshot::snapshot_text_budget;
-use super::{CellFlags, Grid, Row};
+use super::{walk_cells, Grid, Row};
 
 /// Shared cell-extent rule: last non-blank cell of a row's snapshot text
 /// (cells beyond it are not part of the text). `pub(crate)` so the snapshot
@@ -161,27 +161,20 @@ fn walk_snapshot_row(state: &mut SnapshotWalkState, row: &Row, num_cols: usize) 
 
 /// Byte length of the row's snapshot text, mirroring `styled_row`'s push
 /// logic exactly (skip `WIDE_SPACER`; `EXTRA` cells contribute their full
-/// cluster; `\0` renders as a space).
-fn snapshot_row_text_len(row: &Row, num_cols: usize) -> usize {
+/// cluster; `\0` renders as a space). v1.12.27a (P1-01): the walk is the
+/// shared [`super::display::walk_cells`] rule; this consumer maps `\0` →
+/// space (the snapshot 口径). `pub(crate)` so the walker-consistency test
+/// in `super::tests` can pin it to the other Row-level paths
+/// (v1.12.27a P1-01).
+pub(crate) fn snapshot_row_text_len(row: &Row, num_cols: usize) -> usize {
     let last = snapshot_row_extent(row, num_cols);
-    let mut len = 0usize;
-    for (col, cell) in row.cells[..last].iter().enumerate() {
-        if cell.flags.contains(CellFlags::WIDE_SPACER) {
-            continue;
-        }
-        let cluster = cell
-            .flags
-            .contains(CellFlags::EXTRA)
-            .then(|| row.extras.grapheme_at(col))
-            .flatten();
-        let ch = if cell.character == '\0' {
-            ' '
-        } else {
-            cell.character
-        };
-        len += cluster.map(str::len).unwrap_or_else(|| ch.len_utf8());
-    }
-    len
+    walk_cells(&row.cells, &row.extras, last)
+        .map(|item| {
+            item.cluster
+                .map(str::len)
+                .unwrap_or_else(|| if item.ch == '\0' { ' ' } else { item.ch }.len_utf8())
+        })
+        .sum()
 }
 
 #[cfg(test)]

@@ -1,5 +1,49 @@
 use super::row::Row;
-use super::{CellFlags, Grid};
+use super::{Cell, CellFlags, CellWidth, Grid, RowExtras};
+
+/// v1.12.27a (P1-01): one yielded cell of the shared row walk. `ch` is the
+/// RAW cell char — consumers map it themselves (display/snapshot render
+/// `\0` as a space; selection passes it through unchanged; zero-behavior
+/// red line). `cluster` is `Some` only when the cell carries
+/// `CellFlags::EXTRA` and a `RowExtras` grapheme entry exists.
+pub(crate) struct WalkedCell<'a> {
+    pub col: usize,
+    pub ch: char,
+    pub cluster: Option<&'a str>,
+    pub width: u8,
+}
+
+/// v1.12.27a (P1-01): the ONE cell-walking rule (skip `WIDE_SPACER`;
+/// `EXTRA` cells contribute their full cluster) shared by text extraction
+/// and tokenization — previously five inline copies (display, selection,
+/// find ×2, snapshot ×2) drifted once already (audit core P1-1). Yields
+/// columns `[0, min(limit, cells.len()))` in order; `limit` is the
+/// caller's own extent (trailing-blank trim, row width, or `cells.len()`).
+pub(crate) fn walk_cells<'a>(
+    cells: &'a [Cell],
+    extras: &'a RowExtras,
+    limit: usize,
+) -> impl Iterator<Item = WalkedCell<'a>> {
+    let width = cells.len().min(limit);
+    (0..width).filter_map(move |col| {
+        let cell = &cells[col];
+        if cell.flags.contains(CellFlags::WIDE_SPACER) {
+            return None;
+        }
+        let cluster = if cell.flags.contains(CellFlags::EXTRA) {
+            extras.grapheme_at(col)
+        } else {
+            None
+        };
+        let width = if cell.width == CellWidth::Full { 2 } else { 1 };
+        Some(WalkedCell {
+            col,
+            ch: cell.character,
+            cluster,
+            width,
+        })
+    })
+}
 
 /// Text of one physical row, shared by [`Grid::row_text`] (live viewport,
 /// shell-marker snapshots) and [`Grid::displayed_row_text`] (scroll-aware
@@ -12,21 +56,14 @@ pub(crate) fn row_display_text(row: &Row, cols: usize) -> String {
         .rposition(|cell| cell.character != ' ' && cell.character != '\0')
         .map_or(0, |index| index + 1);
     let mut out = String::with_capacity(last);
-    for (col, cell) in row.cells[..last].iter().enumerate() {
-        if cell.flags.contains(CellFlags::WIDE_SPACER) {
-            continue;
-        }
-        if cell.flags.contains(CellFlags::EXTRA) {
-            if let Some(cluster) = row.extras.grapheme_at(col) {
-                out.push_str(cluster);
-                continue;
-            }
-        }
-        out.push(if cell.character == '\0' {
-            ' '
+    // v1.12.27a (P1-01): the walk is the shared [`walk_cells`] rule; this
+    // consumer maps `\0` → space (the display/snapshot 口径).
+    for item in walk_cells(&row.cells, &row.extras, last) {
+        if let Some(cluster) = item.cluster {
+            out.push_str(cluster);
         } else {
-            cell.character
-        });
+            out.push(if item.ch == '\0' { ' ' } else { item.ch });
+        }
     }
     out
 }

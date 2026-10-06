@@ -718,6 +718,13 @@ impl MetalRenderer {
             // pane so its grid renders correctly on the first multi-pane frame.
             self.force_full_grid_redraw();
         }
+        // v1.12.27a (P1-04): the ONE `expect` anchor for the rest of draw().
+        // `LayoutCtx` is `Copy`, and this sits AFTER the background-pane
+        // block above (which intentionally swaps pane-local contexts into
+        // `self.layout_ctx` and keeps its own base_ctx binding), so the five
+        // former per-site expects below all read the same active-pane
+        // context without five separate unwrap chains.
+        let draw_ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
         // B3-2 (PLAN_S2_render): prune row caches of panes that no longer
         // exist this frame (session ids are monotonic, so a plain retain
         // against the live background list keeps the map bounded). Deliberately
@@ -737,10 +744,7 @@ impl MetalRenderer {
                 // v1.3 multi-pane: use the active pane's LayoutCtx (which
                 // carries pane_origin + clip set by the background-pane block
                 // above) instead of the stale full-viewport `ctx` local.
-                let active_ctx = self
-                    .layout_ctx
-                    .as_ref()
-                    .expect("LayoutCtx built at draw() entry");
+                let active_ctx = &draw_ctx;
                 let (_, prompt_layout, _) =
                     crate::paint::prompt::prompt_layout_for_buffer(active_ctx, p.lines, p.cursor);
                 let box_top_y = prompt_layout.box_rect[1];
@@ -786,11 +790,7 @@ impl MetalRenderer {
                         live_head_lines: terminal.screen_head_lines(),
                         // v1.3 multi-pane: region_bottom_y must be pane-local
                         // (clip's bottom edge), not the full vp_h - pad_y.
-                        region_bottom_y: self
-                            .layout_ctx
-                            .as_ref()
-                            .expect("LayoutCtx built at draw() entry")
-                            .bottom(),
+                        region_bottom_y: draw_ctx.bottom(),
                         cwd: terminal.cwd(),
                         git_branch: terminal.git_branch(),
                         live: terminal.block_tracker().in_flight(),
@@ -946,10 +946,7 @@ impl MetalRenderer {
             if let Some((total, visible, max_scroll)) = scroll_metrics {
                 // v1.3 multi-pane: scrollbar uses the active pane's ctx (it
                 // carries pane_origin + clip), not the stale full-viewport `ctx`.
-                let scrollbar_ctx = self
-                    .layout_ctx
-                    .as_ref()
-                    .expect("LayoutCtx built at draw() entry");
+                let scrollbar_ctx = &draw_ctx;
                 if let Some(scrollbar) = crate::scrollbar_component::scrollbar_layout(
                     scrollbar_ctx,
                     total,
@@ -1016,7 +1013,7 @@ impl MetalRenderer {
         if let Some((matches, selected)) = completions {
             if !matches.is_empty() {
                 let visual_prompt = prompt.map(|p| {
-                    let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+                    let ctx = draw_ctx;
                     crate::paint::prompt::prompt_layout_for_buffer(&ctx, p.lines, p.cursor).0
                 });
                 let n_lines = visual_prompt
@@ -1027,7 +1024,7 @@ impl MetalRenderer {
                     .as_ref()
                     .map(|visual| (visual.cursor_row, visual.cursor_display_col))
                     .unwrap_or((0, 0));
-                let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+                let ctx = draw_ctx;
                 if let Some(layout) = crate::completion_component::derive_completion_layout(
                     &ctx,
                     matches,

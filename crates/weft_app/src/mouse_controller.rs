@@ -738,28 +738,19 @@ impl App {
                 .as_ref()
                 .is_some_and(|r| x < r.sidebar_width() as f64);
         if over_panel {
-            let panel_lines = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, v) => {
-                    if v > 0.0 {
-                        v.ceil() as usize
-                    } else {
-                        v.floor().abs() as usize
-                    }
-                }
-                winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                    let v = pos.y / 40.0;
-                    if v > 0.0 {
-                        v.ceil() as usize
-                    } else {
-                        v.floor().abs() as usize
-                    }
-                }
+            // v1.12.27a (P1-03): the two inline `match MouseScrollDelta`
+            // arms (line count + direction) moved to scroll_input's
+            // delta_to_lines / delta_up. The tab-bar branch above keeps its
+            // horizontal-semantics match, and the PixelDelta type guard
+            // further below stays — both are out of scope by plan.
+            let lines = crate::scroll_input::delta_to_lines(delta);
+            let panel_lines = if lines > 0.0 {
+                lines.ceil() as usize
+            } else {
+                lines.floor().abs() as usize
             };
             if panel_lines > 0 {
-                let up = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-                };
+                let up = crate::scroll_input::delta_up(delta);
                 if up {
                     self.panel.scroll_offset = self.panel.scroll_offset.saturating_add(panel_lines);
                 } else {

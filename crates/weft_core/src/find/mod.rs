@@ -215,29 +215,13 @@ impl Grid {
             .iter()
             .take(self.num_rows)
             .map(|row| {
-                row.cells
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(col, cell)| {
-                        if cell.flags.contains(crate::grid::CellFlags::WIDE_SPACER) {
-                            return None;
-                        }
-                        let width = if cell.width == crate::grid::CellWidth::Full {
-                            2
-                        } else {
-                            1
-                        };
-                        let ch = if cell.character == '\0' {
-                            ' '
-                        } else {
-                            cell.character
-                        };
-                        let cluster = if cell.flags.contains(crate::grid::CellFlags::EXTRA) {
-                            row.extras.grapheme_at(col).map(std::sync::Arc::<str>::from)
-                        } else {
-                            None
-                        };
-                        Some(FindSnapshotCell { ch, width, cluster })
+                // v1.12.27a (P1-01): the walk is the shared `grid::walk_cells`
+                // rule; this consumer maps `\0` → space (the find 口径).
+                crate::grid::walk_cells(&row.cells, &row.extras, row.cells.len())
+                    .map(|item| FindSnapshotCell {
+                        ch: if item.ch == '\0' { ' ' } else { item.ch },
+                        width: item.width,
+                        cluster: item.cluster.map(std::sync::Arc::<str>::from),
                     })
                     .collect()
             })
@@ -255,7 +239,10 @@ impl Grid {
 /// grapheme cluster text from the row's `RowExtras`. Replaces the old
 /// per-cell `String` tokens (`c.to_string()` / `grapheme_at().to_string()`
 /// plus a second `to_lowercase()` alloc when folding).
-enum Token<'a> {
+/// v1.12.27a (P1-01): `pub(crate)` alongside `tokens_from_row` so the
+/// grid's walker-consistency test can pin the token stream to the same
+/// character sequence as the other Row-level text paths.
+pub(crate) enum Token<'a> {
     Char(char),
     Str(&'a str),
 }
@@ -266,32 +253,24 @@ enum Token<'a> {
 /// of `find_in_grid`'s old closure so scrollback rows (flat storage — no
 /// `&Row` exists; `FlatStorage::get` materializes an owned row) and viewport
 /// rows (borrowed in place) share one token builder.
-fn tokens_from_row<'a>(
+///
+/// v1.12.27a (P1-01): the walk is the shared `grid::walk_cells` rule; this
+/// consumer maps `\0` → space (the find 口径, unchanged). `pub(crate)` so
+/// the grid's walker-consistency test can pin all four Row-level text
+/// paths to one character sequence.
+pub(crate) fn tokens_from_row<'a>(
     cells: &'a [crate::grid::Cell],
     extras: &'a crate::grid::RowExtras,
     out: &mut Vec<(Token<'a>, usize, usize)>,
 ) {
-    for (col, cell) in cells.iter().enumerate() {
-        if cell.flags.contains(crate::grid::CellFlags::WIDE_SPACER) {
-            continue;
-        }
-        let w = if cell.width == crate::grid::CellWidth::Full {
-            2
-        } else {
-            1
-        };
-        let c = if cell.character == '\0' {
-            ' '
-        } else {
-            cell.character
-        };
+    for item in crate::grid::walk_cells(cells, extras, cells.len()) {
+        let c = if item.ch == '\0' { ' ' } else { item.ch };
         // v1.6.0: prefer the multi-scalar cluster when present.
-        let token = if cell.flags.contains(crate::grid::CellFlags::EXTRA) {
-            extras.grapheme_at(col).map_or(Token::Char(c), Token::Str)
-        } else {
-            Token::Char(c)
+        let token = match item.cluster {
+            Some(cluster) => Token::Str(cluster),
+            None => Token::Char(c),
         };
-        out.push((token, col, w));
+        out.push((token, item.col, item.width as usize));
     }
 }
 

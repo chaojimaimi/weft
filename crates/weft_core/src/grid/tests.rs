@@ -2197,3 +2197,157 @@ fn resize_blank_between_content_rows_anchors_at_mapped_line() {
     // bytes); the buggy indexing dropped the cursor onto it ('w').
     assert_eq!(grid.cell(1, 0).character, 'w', "'w' must not be stomped");
 }
+
+// ── v1.12.27a (P1-01): the shared Row-level cell walker ─────────────
+
+use crate::find::tokens_from_row;
+
+/// Fixture row mixing every interesting cell kind: never-written `\0`
+/// cells (mapped per consumer), a full-width CJK pair with its
+/// `WIDE_SPACER` (skipped by the rule), and an EXTRA cell carrying a
+/// multi-scalar cluster.
+fn walker_fixture_row() -> Row {
+    let mut row = Row::new(8);
+    row.cells[0].character = 'a';
+    row.cells[1].character = '中';
+    row.cells[1].width = CellWidth::Full;
+    row.cells[2].flags = CellFlags::WIDE_SPACER;
+    row.cells[3].character = 'e';
+    row.cells[3].flags = CellFlags::EXTRA;
+    row.extras
+        .set_grapheme(3, std::sync::Arc::from("e\u{0301}"));
+    row
+}
+
+/// Walker unit test: spacers skipped, raw `ch` (incl. `\0`) passed
+/// through untouched, EXTRA yields the cluster, widths are 1/2 cells.
+#[test]
+fn walk_cells_skips_spacers_and_yields_raw_chars_clusters_widths() {
+    let row = walker_fixture_row();
+    let items: Vec<_> = walk_cells(&row.cells, &row.extras, row.cells.len()).collect();
+
+    let (cols, chs, widths): (Vec<_>, Vec<_>, Vec<_>) = (
+        items.iter().map(|i| i.col).collect(),
+        items.iter().map(|i| i.ch).collect(),
+        items.iter().map(|i| i.width).collect(),
+    );
+    assert_eq!(cols, vec![0, 1, 3, 4, 5, 6, 7], "WIDE_SPACER col 2 is skipped; the walker itself never trims — callers pass their own extent (see the limit test)");
+    assert_eq!(
+        chs,
+        vec!['a', '中', 'e', ' ', ' ', ' ', ' '],
+        "ch is the RAW cell char (default cells stay ' ', NUL cells would pass through raw)"
+    );
+    assert_eq!(
+        widths,
+        vec![1, 2, 1, 1, 1, 1, 1],
+        "Full cells yield width 2"
+    );
+    assert_eq!(
+        items[2].cluster,
+        Some("e\u{0301}"),
+        "EXTRA cells yield their full cluster"
+    );
+    assert_eq!(items[0].cluster, None);
+}
+
+/// Walker unit test: `limit` clips the walk (callers pass their own
+/// trailing-blank extent).
+#[test]
+fn walk_cells_limit_clips_the_walk() {
+    let row = walker_fixture_row();
+    let cols: Vec<usize> = walk_cells(&row.cells, &row.extras, 2)
+        .map(|i| i.col)
+        .collect();
+    assert_eq!(cols, vec![0, 1]);
+    let cols: Vec<usize> = walk_cells(&row.cells, &row.extras, 0)
+        .map(|i| i.col)
+        .collect();
+    assert!(cols.is_empty());
+}
+
+/// The four Row-level text paths (display / styled_row / line-map byte
+/// length / find tokenization) produce the SAME character sequence for
+/// one fixture row containing `\0`, a CJK pair and a multi-scalar
+/// cluster — the walker pins them together (display/snapshot map `\0` →
+/// space; the find token path does the same; selection is the deliberate
+/// pass-through exception tested separately on its own semantics).
+#[test]
+fn walker_pins_the_four_row_level_text_paths_to_one_sequence() {
+    let row = walker_fixture_row();
+    // Also add a literal `\0` cell with content before the trim extent so
+    // the `\0` mapping is exercised (col 5 between content cells).
+    let mut row = row;
+    row.cells[4].character = 'x';
+    row.cells[5].character = '\0';
+    row.cells[5].flags = CellFlags::DIRTY; // a written NUL cell
+    row.cells[6].character = 'y';
+
+    // Path 1 — display (row_display_text via the Grid facade).
+    let mut grid = Grid::new(1, 8);
+    grid.viewport[0] = row.clone();
+    let display_text = grid.row_text(0);
+
+    // Path 2 — snapshot styled_row text.
+    let styled = super::snapshot::snapshot_row::styled_row(&row, 8, usize::MAX, None, &|_| None);
+
+    // Path 3 — snapshot_line_map byte length (must match path 2's bytes).
+    let len = super::snapshot_line_map::snapshot_row_text_len(&row, 8);
+
+    // Path 4 — find tokenization over the SAME extent (find's own walk
+    // covers all cells untrimmed — trailing blanks stay spaces so
+    // whitespace queries keep matching — so the comparison slices to the
+    // shared trim extent; that sliceable signature is exactly why the
+    // walker is `(&[Cell], &RowExtras, limit)`).
+    let extent = super::snapshot_line_map::snapshot_row_extent(&row, 8);
+    let mut tokens = Vec::new();
+    tokens_from_row(&row.cells[..extent], &row.extras, &mut tokens);
+    let find_text: String = tokens
+        .iter()
+        .map(|(token, _, _)| match token {
+            crate::find::Token::Char(c) => c.to_string(),
+            crate::find::Token::Str(s) => s.to_string(),
+        })
+        .collect();
+
+    assert_eq!(
+        display_text, styled.text,
+        "display and snapshot must extract the same characters"
+    );
+    assert_eq!(
+        styled.text.len(),
+        len,
+        "line-map byte length must match styled_row's byte count"
+    );
+    assert_eq!(
+        display_text, find_text,
+        "find tokenization must see the same character sequence"
+    );
+    // And the sequence is what a reader expects: NUL → space, CJK lead,
+    // cluster text (spacer never contributes a char).
+    assert_eq!(display_text, "a中e\u{0301}x y");
+}
+
+/// Selection passes `\0` through RAW (its own Grid-level helper, unlike
+/// the display/snapshot `\0`→space mapping) — the deliberate divergence
+/// pinned here so a future unification is a conscious decision.
+#[test]
+fn selection_keeps_nul_cells_verbatim_in_simple_and_block_modes() {
+    let mut grid = Grid::new(1, 8);
+    grid.viewport[0].cells[0].character = '\0';
+    grid.viewport[0].cells[0].flags = CellFlags::DIRTY;
+    grid.viewport[0].cells[1].character = 'b';
+
+    let simple = crate::selection::Selection::new(
+        crate::selection::GridPos::new(0, 0),
+        crate::selection::GridPos::new(0, 1),
+        crate::selection::SelectionMode::Simple,
+    );
+    assert_eq!(simple.text_from_grid(&grid), "\u{0}b");
+
+    let block = crate::selection::Selection::new(
+        crate::selection::GridPos::new(0, 0),
+        crate::selection::GridPos::new(0, 1),
+        crate::selection::SelectionMode::Block,
+    );
+    assert_eq!(block.text_from_grid(&grid), "\u{0}b");
+}

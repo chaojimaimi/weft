@@ -206,13 +206,24 @@ impl MetalRenderer {
         let text_y = panel_layout.search_text_y;
         let text_x = panel_layout.search_text_x;
         let text_cols = ((field_x1 - text_x - cw * 0.4) / cw) as usize;
+        // v1.12.27a (P1-06②): the caret/preedit x used to ride the FULL
+        // query width while the drawn text is column-budgeted by push_text,
+        // so an over-long query pushed the caret past the field's right
+        // edge. Find-overlay `query_display` precedent (paint/overlays.rs):
+        // show the query tail under a "…" prefix within a budget that
+        // reserves 1 col for the caret + the active preedit, then drive the
+        // caret x and the preedit budget from the SHOWN width.
+        let preedit_cells = MetalRenderer::text_col_width(p.panel_ime_preedit);
+        let query_budget = text_cols.saturating_sub(1).saturating_sub(preedit_cells);
+        let (query_display, query_cols) = panel_query_display(p.query, query_budget);
+        let mut cursor_x = text_x + query_cols as f32 * cw;
         if p.query.is_empty() && p.panel_ime_preedit.is_empty() {
             // v1.12.26 (P1-03): the placeholder only yields to query OR live
             // composition — an active preedit draws in its place, never
             // underneath the dim "Search…" ghost.
             self.push_text(&mut vertices, text_x, text_y, "Search…", dim, text_cols);
         } else {
-            self.push_text(&mut vertices, text_x, text_y, p.query, fg, text_cols);
+            self.push_text(&mut vertices, text_x, text_y, &query_display, fg, text_cols);
         }
 
         // v1.12.26 (P1-03): IME preedit inline after the query (palette/
@@ -221,11 +232,8 @@ impl MetalRenderer {
         // at half extent); over-wide compositions truncate via push_text's
         // column budget, and the caret below rides the SHOWN width.
         let accent = color_to_normalized(self.theme.accent);
-        let query_cells = MetalRenderer::text_col_width(p.query);
-        let preedit_cells = MetalRenderer::text_col_width(p.panel_ime_preedit);
-        let mut cursor_x = text_x + query_cells as f32 * cw;
         if !p.panel_ime_preedit.is_empty() {
-            let preedit_max = text_cols.saturating_sub(query_cells);
+            let preedit_max = text_cols.saturating_sub(query_cols);
             if preedit_max > 0 {
                 let shown = preedit_cells.min(preedit_max) as f32;
                 self.push_text(
@@ -445,5 +453,80 @@ impl MetalRenderer {
         }
 
         vertices
+    }
+}
+
+/// v1.12.27a (P1-06②): the panel search field's shown query text and its
+/// displayed column width. The caret sits at the END of the query, so an
+/// over-long query keeps the tail under a "…" prefix (the find overlay's
+/// `query_display` precedent, paint/overlays.rs). The returned width drives
+/// the caret x and the IME preedit budget so both stay inside the field's
+/// right edge — the old full-width caret math escaped the field for long
+/// queries.
+fn panel_query_display(query: &str, budget_cols: usize) -> (String, usize) {
+    let full_w = MetalRenderer::text_col_width(query);
+    if full_w <= budget_cols {
+        return (query.to_string(), full_w);
+    }
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut w = MetalRenderer::text_col_width("…");
+    for grapheme in query.graphemes(true).rev() {
+        let width = MetalRenderer::text_col_width(grapheme);
+        if w + width > budget_cols {
+            break;
+        }
+        kept.push(grapheme);
+        w += width;
+    }
+    kept.reverse();
+    let mut s = String::from("…");
+    for grapheme in kept {
+        s.push_str(grapheme);
+    }
+    (s, w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // v1.12.27a (P1-06②): the caret x is `text_x + shown_cols * cw`, so the
+    // shown width saturating (never exceeding) the call-site budget — which
+    // already reserves the caret col out of `text_cols` — is exactly the
+    // "caret stays inside the field's right edge" contract.
+    #[test]
+    fn overlong_query_shown_width_stays_within_budget() {
+        let budget = 19; // text_cols 20 minus the reserved caret col
+        let ascii = "a".repeat(60);
+        let (shown, cols) = panel_query_display(&ascii, budget);
+        assert_eq!(cols, budget, "tail truncation saturates the budget");
+        assert!(shown.starts_with('…'));
+        assert_eq!(MetalRenderer::text_col_width(&shown), cols);
+
+        let cjk = "中".repeat(40);
+        let (shown, cols) = panel_query_display(&cjk, budget);
+        assert!(cols <= budget, "CJK query never exceeds the budget");
+        assert!(shown.starts_with('…'));
+        assert_eq!(MetalRenderer::text_col_width(&shown), cols);
+    }
+
+    // Short queries pass through verbatim — the common path is unchanged.
+    #[test]
+    fn short_query_passes_through_verbatim() {
+        let (shown, cols) = panel_query_display("vim", 19);
+        assert_eq!(shown, "vim");
+        assert_eq!(cols, 3);
+    }
+
+    // A tail grapheme that cannot fit is dropped whole, never overpainted.
+    #[test]
+    fn wide_tail_grapheme_that_does_not_fit_is_dropped() {
+        let (shown, cols) = panel_query_display("ab中", 3);
+        assert_eq!(shown, "…中");
+        assert_eq!(cols, 3);
+        let (shown, cols) = panel_query_display("中", 1);
+        assert_eq!(shown, "…");
+        assert_eq!(cols, 1);
     }
 }

@@ -519,7 +519,6 @@ impl MetalRenderer {
             );
         }
 
-        let _ = ch;
         verts
     }
 

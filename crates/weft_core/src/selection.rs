@@ -84,6 +84,8 @@ impl Selection {
     ///
     /// v1.6.0: `CellFlags::EXTRA` cells contribute their full grapheme cluster
     /// via [`Grid::grapheme_at`].
+    /// v1.12.27a (P1-01): the three copy branches' inline cell walks are
+    /// consolidated into the private [`row_cells_text`] Grid-level helper.
     pub fn text_from_grid(&self, grid: &Grid) -> String {
         let (tl, br) = self.ordered();
         // Clamp endpoints to valid bounds — a margin endpoint would otherwise
@@ -107,30 +109,7 @@ impl Selection {
                         grid.num_cols - 1
                     };
 
-                    let mut last_char_col = 0;
-                    for col in col_start..=col_end {
-                        let cell = grid.cell(row, col);
-                        if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                            continue;
-                        }
-                        if cell.character != ' ' {
-                            last_char_col = col;
-                        }
-                    }
-
-                    for col in col_start..=last_char_col {
-                        let cell = grid.cell(row, col);
-                        if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                            continue;
-                        }
-                        if cell.flags.contains(CellFlags::EXTRA) {
-                            if let Some(cluster) = grid.grapheme_at(row, col) {
-                                result.push_str(cluster);
-                                continue;
-                            }
-                        }
-                        result.push(cell.character);
-                    }
+                    result.push_str(&row_cells_text(grid, row, col_start, col_end, true));
 
                     if row < br.row && row < grid.num_rows && !grid.viewport[row].wrapped {
                         result.push('\n');
@@ -139,19 +118,7 @@ impl Selection {
             }
             SelectionMode::Block => {
                 for row in tl.row..=br.row {
-                    for col in tl.col..=br.col {
-                        let cell = grid.cell(row, col);
-                        if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                            continue;
-                        }
-                        if cell.flags.contains(CellFlags::EXTRA) {
-                            if let Some(cluster) = grid.grapheme_at(row, col) {
-                                result.push_str(cluster);
-                                continue;
-                            }
-                        }
-                        result.push(cell.character);
-                    }
+                    result.push_str(&row_cells_text(grid, row, tl.col, br.col, false));
                     if row < br.row {
                         result.push('\n');
                     }
@@ -161,6 +128,52 @@ impl Selection {
 
         result
     }
+}
+
+/// v1.12.27a (P1-01): the ONE Grid-level cell-walk rule shared by the
+/// selection copy branches (previously three inline copies). The walk is
+/// the same skip-`WIDE_SPACER` / EXTRA-cluster rule as the Row-level
+/// `grid::walk_cells`, but selection reads through the scroll-aware
+/// `Grid::cell` / `Grid::grapheme_at` pair — a different layer than the
+/// Row walker — so it consolidates HERE instead of forcing materialized
+/// rows through the Row walker.
+///
+/// Semantics kept verbatim per branch: `trim = true` (`Simple`/`Line`)
+/// first finds the last cell whose char is NOT a literal space — which
+/// deliberately COUNTS `\0` cells as content — then walks
+/// `[col_start..=last]`; `trim = false` (`Block`) walks the range whole.
+/// `ch` is pushed RAW: selection passes `\0` through unchanged (unlike
+/// display/snapshot, which map it to a space — known quirk, recorded in
+/// PROGRESS; not "fixed" here under the zero-behavior red line).
+fn row_cells_text(grid: &Grid, row: usize, col_start: usize, col_end: usize, trim: bool) -> String {
+    let mut out = String::new();
+    let mut last = col_end;
+    if trim {
+        last = 0;
+        for col in col_start..=col_end {
+            let cell = grid.cell(row, col);
+            if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                continue;
+            }
+            if cell.character != ' ' {
+                last = col;
+            }
+        }
+    }
+    for col in col_start..=last {
+        let cell = grid.cell(row, col);
+        if cell.flags.contains(CellFlags::WIDE_SPACER) {
+            continue;
+        }
+        if cell.flags.contains(CellFlags::EXTRA) {
+            if let Some(cluster) = grid.grapheme_at(row, col) {
+                out.push_str(cluster);
+                continue;
+            }
+        }
+        out.push(cell.character);
+    }
+    out
 }
 
 /// Mouse button for selection events.
