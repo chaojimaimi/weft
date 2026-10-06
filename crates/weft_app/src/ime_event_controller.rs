@@ -72,8 +72,12 @@ impl App {
             match action {
                 event_replay::ImeRoutingAction::ClearActivePreedit => {
                     // v1.8.4: when the Palette owns IME, clear the palette's
-                    // preedit (not the tab's). Find/PanelSearch don't have
-                    // preedit fields, so they clear the tab's (no-op visual).
+                    // preedit (not the tab's). v1.12.26 (P1-02/P1-03):
+                    // Find/PanelSearch own preedit fields now, so a blanket
+                    // clear sweeps them too — the Commit route sends
+                    // ClearActivePreedit first (route side), and a stale
+                    // composition would otherwise outlive the commit and
+                    // keep painting over the committed text.
                     // v1.8.7: always discard native marked text for ANY overlay
                     // owner (Palette/Settings/Find/ContextMenu/PanelSearch), not
                     // just Palette. Without this, macOS IME intercepts Esc to
@@ -88,15 +92,28 @@ impl App {
                                 crate::ime::discard_marked_text(window);
                             }
                         }
-                    } else if let Some(tab) = self.sessions.tab_mut(active_tab) {
-                        let had_preedit = !tab.ime_preedit.is_empty();
-                        tab.ime_preedit.clear();
-                        tab.ime_preedit_cursor = None;
-                        // v1.8.7: discard native marked text for non-Palette
-                        // overlays too, so Esc isn't intercepted.
-                        if had_preedit && context.owner.is_some() {
-                            if let Some(window) = &self.window {
-                                crate::ime::discard_marked_text(window);
+                    } else {
+                        let mut had_overlay_preedit = false;
+                        if !self.find.ime_preedit.is_empty() {
+                            self.find.ime_preedit.clear();
+                            self.find.ime_preedit_cursor = None;
+                            had_overlay_preedit = true;
+                        }
+                        if !self.panel.ime_preedit.is_empty() {
+                            self.panel.ime_preedit.clear();
+                            self.panel.ime_preedit_cursor = None;
+                            had_overlay_preedit = true;
+                        }
+                        if let Some(tab) = self.sessions.tab_mut(active_tab) {
+                            let had_preedit = !tab.ime_preedit.is_empty();
+                            tab.ime_preedit.clear();
+                            tab.ime_preedit_cursor = None;
+                            // v1.8.7: discard native marked text for non-Palette
+                            // overlays too, so Esc isn't intercepted.
+                            if (had_preedit || had_overlay_preedit) && context.owner.is_some() {
+                                if let Some(window) = &self.window {
+                                    crate::ime::discard_marked_text(window);
+                                }
                             }
                         }
                     }
@@ -118,11 +135,30 @@ impl App {
                     // (only while composing), so an explicit request is cheap.
                     self.request_redraw();
                 }
+                // v1.12.26 (P1-02/P1-03): the target-carrying Set arms write
+                // exactly the state the variant names — no owner re-guess.
+                // Same explicit-redraw contract as SetActivePreedit above
+                // (composition updates need a frame to paint).
+                event_replay::ImeRoutingAction::SetActiveFindPreedit { text, cursor } => {
+                    self.find.ime_preedit = text;
+                    self.find.ime_preedit_cursor = cursor;
+                    self.request_redraw();
+                }
+                event_replay::ImeRoutingAction::SetActivePanelPreedit { text, cursor } => {
+                    self.panel.ime_preedit = text;
+                    self.panel.ime_preedit_cursor = cursor;
+                    self.request_redraw();
+                }
                 event_replay::ImeRoutingAction::ClearAllPreedit => {
                     event_replay::clear_all_preedit(self.sessions.tabs_mut());
                     // v1.8.4: also clear palette preedit on full reset.
                     self.palette.ime_preedit.clear();
                     self.palette.ime_preedit_cursor = None;
+                    // v1.12.26 (P1-02/P1-03): find/panel join the full reset.
+                    self.find.ime_preedit.clear();
+                    self.find.ime_preedit_cursor = None;
+                    self.panel.ime_preedit.clear();
+                    self.panel.ime_preedit_cursor = None;
                     // Same contract as SetActivePreedit: a cleared preedit
                     // must leave the screen, which needs a frame.
                     self.request_redraw();
@@ -189,10 +225,18 @@ impl App {
                         }
                         event_replay::ImeCommitTarget::Find => {
                             self.find.query.push_str(&text);
+                            // v1.12.26 (P1-02): mirror the palette arm — the
+                            // commit consumes the live composition.
+                            self.find.ime_preedit.clear();
+                            self.find.ime_preedit_cursor = None;
                             self.arm_find_refresh();
                         }
                         event_replay::ImeCommitTarget::PanelSearch => {
                             self.panel.query.push_str(&text);
+                            // v1.12.26 (P1-03): same commit-consumes-preedit
+                            // contract as the find bar.
+                            self.panel.ime_preedit.clear();
+                            self.panel.ime_preedit_cursor = None;
                             self.clamp_panel_scroll();
                             self.clamp_panel_selection();
                             self.request_redraw();

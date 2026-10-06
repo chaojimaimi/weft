@@ -555,6 +555,13 @@ impl TabBarState {
 pub struct PanelState {
     pub open: bool,
     pub query: String,
+    /// v1.12.26 (P1-03): active IME composition for the panel search box —
+    /// mirrors `find.ime_preedit` (palette/note precedent). Rendered inline
+    /// after the query; cleared on commit/query clear/close.
+    pub ime_preedit: String,
+    /// v1.12.26 (P1-03): raw winit (cursor, selection) tuple, stored
+    /// unconverted exactly like `palette.ime_preedit_cursor`.
+    pub ime_preedit_cursor: Option<(usize, usize)>,
     pub selection: usize,
     pub expanded: Option<BlockId>,
     pub search_focused: bool,
@@ -571,6 +578,9 @@ impl PanelState {
     pub fn close(&mut self) {
         self.open = false;
         self.search_focused = false;
+        // v1.12.26 (P1-03): a stale composition must never outlive the bar.
+        self.ime_preedit.clear();
+        self.ime_preedit_cursor = None;
         self.highlight = None;
         self.highlight_until = None;
         self.last_click = None;
@@ -580,6 +590,10 @@ impl PanelState {
     pub fn clear_transient_selection(&mut self) {
         self.selection = 0;
         self.expanded = None;
+        // v1.12.26 (P1-03): the panel-open path clears the query right
+        // before this call — the composition goes with it.
+        self.ime_preedit.clear();
+        self.ime_preedit_cursor = None;
         self.highlight = None;
         self.highlight_until = None;
         self.last_click = None;
@@ -686,6 +700,13 @@ impl AiConnectionStatus {
 pub struct FindState {
     pub open: bool,
     pub query: String,
+    /// v1.12.26 (P1-02): active IME composition for the find bar — mirrors
+    /// `palette.ime_preedit` (palette/note precedent). Rendered inline after
+    /// the query tail; cleared on commit/query reset/close.
+    pub ime_preedit: String,
+    /// v1.12.26 (P1-02): raw winit (cursor, selection) tuple, stored
+    /// unconverted exactly like `palette.ime_preedit_cursor`.
+    pub ime_preedit_cursor: Option<(usize, usize)>,
     pub last_key: Option<Instant>,
     pub matches: Vec<FindMatch>,
     pub index: usize,
@@ -712,6 +733,8 @@ impl FindState {
         Self {
             open: false,
             query: String::new(),
+            ime_preedit: String::new(),
+            ime_preedit_cursor: None,
             last_key: None,
             matches: Vec::new(),
             index: 0,
@@ -735,6 +758,10 @@ impl FindState {
 
     pub fn reset_query(&mut self) {
         self.query.clear();
+        // v1.12.26 (P1-02): a stale composition must never outlive the bar
+        // (reset_query runs on both the Cmd+F open and the close paths).
+        self.ime_preedit.clear();
+        self.ime_preedit_cursor = None;
         self.last_key = None;
         self.matches.clear();
         self.index = 0;

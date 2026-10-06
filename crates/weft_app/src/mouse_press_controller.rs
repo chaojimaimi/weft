@@ -373,6 +373,11 @@ impl App {
                     // unfocus search (but keep panel open).
                     if self.panel.search_focused {
                         self.panel.search_focused = false;
+                        // v1.12.26 (review P1): unfocus must also drop any
+                        // active IME composition — a lingering preedit kept a
+                        // phantom string in the box and left native marked
+                        // text routing to the terminal owner.
+                        self.reset_ime_context("panel search unfocused");
                         self.request_redraw();
                     }
                 }

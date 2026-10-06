@@ -24,6 +24,9 @@ pub struct PanelDrawParams<'a> {
     /// v0.9 fix: whether the search box has keyboard focus (draws accent
     /// underline so the user knows typing will go to the filter).
     pub search_focused: bool,
+    /// v1.12.26 (P1-03): active IME composition for the search box, rendered
+    /// inline after the query (palette/find precedent).
+    pub panel_ime_preedit: &'a str,
     /// F3-4: Block-level scroll offset (number of filtered blocks skipped
     /// from the newest end). 0 = newest visible.
     pub scroll_offset: usize,
@@ -197,33 +200,67 @@ impl MetalRenderer {
         }
 
         // Text inside the field: show query, or placeholder "Search…" when empty.
-        let text_y = field_y0 + (field_y1 - field_y0 - ch) * 0.5;
-        let text_x = field_x0 + cw * 0.4;
+        // v1.12.26 (P1-03): the text origin comes from PanelLayout so the
+        // draw path and the panel IME anchor (`panel_ime_area`) read ONE
+        // formula and cannot drift.
+        let text_y = panel_layout.search_text_y;
+        let text_x = panel_layout.search_text_x;
         let text_cols = ((field_x1 - text_x - cw * 0.4) / cw) as usize;
-        if p.query.is_empty() {
+        if p.query.is_empty() && p.panel_ime_preedit.is_empty() {
+            // v1.12.26 (P1-03): the placeholder only yields to query OR live
+            // composition — an active preedit draws in its place, never
+            // underneath the dim "Search…" ghost.
             self.push_text(&mut vertices, text_x, text_y, "Search…", dim, text_cols);
         } else {
             self.push_text(&mut vertices, text_x, text_y, p.query, fg, text_cols);
         }
 
-        // Blinking cursor at the end of the query text when focused.
-        if p.search_focused {
-            let blink_phase = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() % 1200)
-                .unwrap_or(0);
-            if blink_phase < 600 {
-                let query_w = p.query.chars().count() as f32 * cw;
-                let cursor_x = text_x + query_w;
-                let cursor_w = 2.0_f32.max(cw * 0.12);
-                push_quad(
+        // v1.12.26 (P1-03): IME preedit inline after the query (palette/
+        // find precedent), accent-colored + underlined. Width math is
+        // text_col_width-based (N-4 lesson: char-count math drew CJK carets
+        // at half extent); over-wide compositions truncate via push_text's
+        // column budget, and the caret below rides the SHOWN width.
+        let accent = color_to_normalized(self.theme.accent);
+        let query_cells = MetalRenderer::text_col_width(p.query);
+        let preedit_cells = MetalRenderer::text_col_width(p.panel_ime_preedit);
+        let mut cursor_x = text_x + query_cells as f32 * cw;
+        if !p.panel_ime_preedit.is_empty() {
+            let preedit_max = text_cols.saturating_sub(query_cells);
+            if preedit_max > 0 {
+                let shown = preedit_cells.min(preedit_max) as f32;
+                self.push_text(
                     &mut vertices,
-                    [cursor_x, text_y, cursor_x + cursor_w, text_y + ch],
-                    bg_uv,
-                    [0.0; 4],
-                    fg,
+                    cursor_x,
+                    text_y,
+                    p.panel_ime_preedit,
+                    accent,
+                    preedit_max,
                 );
+                let underline = [
+                    cursor_x,
+                    text_y + ch - 1.0,
+                    cursor_x + shown * cw,
+                    text_y + ch,
+                ];
+                push_quad(&mut vertices, underline, bg_uv, [0.0; 4], accent);
+                cursor_x += shown * cw;
             }
+        }
+
+        // Blinking cursor at the end of the query text when focused.
+        // v1.12.26 (P1-01): the caret follows the renderer-global blink
+        // phase (`cursor_blink_on`), matching palette/note — the old
+        // private wall-clock phase never repainted when no redraw was
+        // scheduled, freezing the caret on its last frame.
+        if p.search_focused && self.cursor_blink_on {
+            let cursor_w = 2.0_f32.max(cw * 0.12);
+            push_quad(
+                &mut vertices,
+                [cursor_x, text_y, cursor_x + cursor_w, text_y + ch],
+                bg_uv,
+                [0.0; 4],
+                fg,
+            );
         }
 
         // Display list: newest-first, filtered by query, virtualized via

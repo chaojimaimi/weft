@@ -61,6 +61,13 @@ impl App {
         // that crosses the `active_mut()` boundary.
         let settings_is_narrow = self.settings_is_narrow();
         let terminal_owns_ime = self.overlay_input_owner().is_none();
+        // v1.12.26 (P1-01): computed here beside `terminal_owns_ime` — the
+        // owner probe borrows all of `&self`, which conflicts with the
+        // `terminal` borrow held from :80 down to the anim_active consumer
+        // below, so the result is hoisted into this owned local.
+        let overlay_text_input_active = self.overlay_input_owner().is_some_and(|owner| {
+            crate::input_router::OverlayInputOwner::TEXT_INPUT_HOLDERS.contains(&owner)
+        });
         // C1 gating: with the settings panel closed the whole settings
         // construction chain is skipped (String collection included) — the
         // panel was the only consumer of this data (评审已核实).
@@ -330,6 +337,7 @@ impl App {
                     panel_width: renderer.sidebar_width(),
                     panel_open: self.panel.open,
                     panel_query: &self.panel.query,
+                    panel_ime_preedit: &self.panel.ime_preedit,
                     panel_selection: self.panel.selection,
                     panel_expanded: self.panel.expanded,
                     panel_search_focused: self.panel.search_focused,
@@ -434,6 +442,7 @@ impl App {
                 );
                 Some(FindDrawState {
                     query: self.find.query.clone(),
+                    ime_preedit: self.find.ime_preedit.clone(),
                     current,
                     total,
                     truncated,
@@ -597,11 +606,26 @@ impl App {
                     .note_editor
                     .open
                     .then(|| crate::paint::text::note_editor_ime_area(&ctx));
+                // v1.12.26 (P1-02): the find bar owns IME composition now —
+                // anchor the macOS candidate window at the bar's query input
+                // instead of the terminal cursor (palette/note precedent).
+                let find_area = self
+                    .find
+                    .open
+                    .then(|| crate::paint::text::find_ime_area(&ctx));
+                // v1.12.26 (P1-03): same anchor treatment for the panel
+                // search box, gated on the box actually holding keyboard
+                // focus (mirrors the OverlayInputOwner::PanelSearch gate).
+                let panel_area = (self.panel.open && self.panel.search_focused)
+                    .then(|| crate::paint::text::panel_ime_area(&ctx, renderer.sidebar_width()));
                 crate::ime::update_cursor_area(
                     window,
                     ctx,
                     terminal,
-                    note_area.or(palette_snap.ime_area),
+                    note_area
+                        .or(palette_snap.ime_area)
+                        .or(find_area)
+                        .or(panel_area),
                     renderer.block_view_tui_caret_area.get(),
                 );
             }
@@ -619,6 +643,14 @@ impl App {
             // `update_cursor_blink`), so the wake is also unnecessary.
             let anim_active = if self.window_runtime.reduce_motion {
                 false
+            } else if overlay_text_input_active {
+                // v1.12.26 (P1-01): an open text-input overlay (palette/
+                // find/panel-search/note) must keep its own caret blinking
+                // regardless of the terminal cursor's state — the old
+                // terminal-only terms froze the shared phase (invisible
+                // when e.g. a command was executing, since the blink thread
+                // stopped waking the loop and no frame was produced).
+                true
             } else if terminal.show_block_view() {
                 terminal.block_tracker().phase() == ShellPhase::AtPrompt
             } else {

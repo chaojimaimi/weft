@@ -189,7 +189,11 @@ impl MetalRenderer {
             }
 
             // v0.9 fix: blinking caret at end of query so the user sees the
-            // input focus (matches the find bar + panel search box behavior).
+            // input focus. v1.12.26 (P1-01): all four text-input overlay
+            // carets (palette/find bar/panel search/note) now share THIS
+            // renderer-global blink phase — the old comment claimed parity
+            // with the find bar + panel search box, but those still ran a
+            // private wall-clock phase until this train unified them.
             if self.cursor_blink_on {
                 let cx = if !p.ime_preedit.is_empty() && preedit_avail > 0 {
                     let preedit_cols = Self::text_col_width(p.ime_preedit).min(preedit_avail);

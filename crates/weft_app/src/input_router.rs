@@ -307,6 +307,22 @@ pub(crate) fn route_modal_mouse(
 }
 
 impl OverlayInputOwner {
+    /// v1.12.26 (P1-01): the overlay owners that host a text input with a
+    /// blinking caret (palette query / find bar / panel search / note
+    /// editor). While one of these is open, the cursor-blink timer thread
+    /// must keep waking the loop so the overlay's own caret keeps blinking
+    /// regardless of the terminal cursor's state — the old terminal-only
+    /// wake terms froze the shared blink phase whenever a command was
+    /// executing or the cursor style wasn't blinking. Settings and
+    /// ContextMenu are consume-only surfaces (no text input) and must NOT
+    /// wake the timer.
+    pub(crate) const TEXT_INPUT_HOLDERS: &'static [OverlayInputOwner] = &[
+        OverlayInputOwner::NoteEditor,
+        OverlayInputOwner::Palette,
+        OverlayInputOwner::Find,
+        OverlayInputOwner::PanelSearch,
+    ];
+
     pub(crate) fn resolve(context: OverlayInputContext) -> Option<Self> {
         // v1.12.24 (N-1): NoteEditor first — the focus-modal card presses
         // every other surface (palette/find/settings/menu/panel).
@@ -411,6 +427,24 @@ mod tests {
             Some(OverlayInputOwner::NoteEditor),
             "note editor must outrank an open palette"
         );
+    }
+
+    /// v1.12.26 (P1-01): exactly the four text-input overlays may wake the
+    /// blink timer — Settings/ContextMenu are consume-only and must stay
+    /// out, or a closed-over modal would keep the cursor timer alive.
+    #[test]
+    fn text_input_holders_lists_exactly_the_four_text_surfaces() {
+        assert_eq!(
+            OverlayInputOwner::TEXT_INPUT_HOLDERS,
+            &[
+                OverlayInputOwner::NoteEditor,
+                OverlayInputOwner::Palette,
+                OverlayInputOwner::Find,
+                OverlayInputOwner::PanelSearch,
+            ]
+        );
+        assert!(!OverlayInputOwner::TEXT_INPUT_HOLDERS.contains(&OverlayInputOwner::Settings));
+        assert!(!OverlayInputOwner::TEXT_INPUT_HOLDERS.contains(&OverlayInputOwner::ContextMenu));
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub struct PanelViewParams<'a> {
     pub panel_width: f32,
     pub panel_open: bool,
     pub panel_query: &'a str,
+    /// v1.12.26 (P1-03): active IME composition for the panel search box.
+    pub panel_ime_preedit: &'a str,
     pub panel_selection: usize,
     pub panel_expanded: Option<BlockId>,
     pub panel_search_focused: bool,

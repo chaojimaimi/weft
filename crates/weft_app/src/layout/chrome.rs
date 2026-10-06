@@ -192,6 +192,15 @@ pub struct PanelLayout {
     pub panel_rect: Rect,
     /// Search input field rect (clickable → focus search).
     pub search_field_rect: Rect,
+    /// v1.12.26 (P1-03): X of the query text inside the search field — the
+    /// origin the query + its inline IME preedit draw from, and the panel
+    /// IME candidate-window anchor column. Exposed (instead of recomputed
+    /// inline) so `build_panel_vertices`, `panel_ime_area` and the pinning
+    /// test read ONE formula.
+    pub search_text_x: f32,
+    /// v1.12.26 (P1-03): Y of the query text inside the search field
+    /// (vertically centered within the field rect).
+    pub search_text_y: f32,
     /// Y of the first history row's top edge.
     pub list_top: f32,
     /// Per-row height (pitch).
@@ -231,6 +240,10 @@ pub fn layout_panel(
     ];
     let list_top = field_y1 + cell_h * 0.4;
     let row_height = cell_h * 1.1;
+    // v1.12.26 (P1-03): query text origin — mirrors build_panel_vertices'
+    // inline formula (0.4cw inset, vertically centered in the field).
+    let search_text_x = search_field_rect[0] + cell_w * 0.4;
+    let search_text_y = search_field_rect[1] + (field_h - cell_h) * 0.5;
     // v1.11.2 X4: footer strip anchored just above the viewport bottom.
     let footer_h = cell_h * 1.6;
     let footer_y1 = viewport_h - cell_h * 0.5;
@@ -243,6 +256,8 @@ pub fn layout_panel(
     PanelLayout {
         panel_rect,
         search_field_rect,
+        search_text_x,
+        search_text_y,
         list_top,
         row_height,
         footer_rect,

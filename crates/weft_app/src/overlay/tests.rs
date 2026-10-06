@@ -387,6 +387,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         panel_width: 123.0,
         panel_open: true,
         panel_query: "query",
+        panel_ime_preedit: "preedit",
         panel_selection: 3,
         panel_expanded: None,
         panel_search_focused: true,
@@ -468,6 +469,9 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         OverlayContent::HistoryPanel(p) => {
             assert_eq!(p.width_px, 123.0);
             assert_eq!(p.query, "query");
+            // v1.12.26 (P1-03): the new preedit field rides the same group
+            // passthrough contract as every other panel input.
+            assert_eq!(p.panel_ime_preedit, "preedit");
             assert_eq!(p.selection, 3);
             assert!(p.search_focused);
             assert_eq!(p.scroll_offset, 7);

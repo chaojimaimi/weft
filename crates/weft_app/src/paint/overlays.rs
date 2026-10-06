@@ -12,6 +12,11 @@ use crate::renderer::MetalRenderer;
 pub struct FindDrawState {
     /// Live query string (rendered in the bar input).
     pub query: String,
+    /// v1.12.26 (P1-02): active IME composition, rendered inline after the
+    /// query tail (accent + underline, palette precedent). The find bar's
+    /// caret always sits at the end, so no separate cursor field is needed —
+    /// the caret slides right by the preedit extent instead.
+    pub ime_preedit: String,
     /// 1-based index of the current match, or 0 when there are no matches.
     pub current: usize,
     /// Total NAVIGABLE matches. In grid view this is grid matches; in block
@@ -425,10 +430,16 @@ impl MetalRenderer {
         // extends to status_x.
         let query_right_x = if show_status { status_x } else { up_x };
         let query_max_w = ((query_right_x - query_start_x) / cw).floor().max(0.0) as usize;
-        // Reserve 1 col for the cursor.
-        let query_budget = query_max_w.saturating_sub(1);
+        // v1.12.26 (P1-02): reserve 1 col for the cursor PLUS the active
+        // preedit's extent, so the tail truncation shrinks the query to
+        // make room instead of the preedit overpainting the caret
+        // (palette.rs's preedit-aware cx precedent). Width math is
+        // text_col_width-based (N-4 lesson: char-count math drew CJK
+        // carets at half the text extent).
+        let preedit_cells = Self::text_col_width(&find.ime_preedit);
+        let query_budget = query_max_w.saturating_sub(1).saturating_sub(preedit_cells);
         let query_full_w = Self::text_col_width(&find.query);
-        let (query_display, cursor_x): (String, f32) = if query_full_w <= query_budget {
+        let (query_display, mut cursor_x): (String, f32) = if query_full_w <= query_budget {
             // Full query fits — cursor goes right after the last char.
             let cx = query_start_x + query_full_w as f32 * cw;
             (find.query.clone(), cx)
@@ -463,13 +474,41 @@ impl MetalRenderer {
             query_cols,
         );
 
+        // ── IME preedit inline after the query tail (v1.12.26 P1-02) ─────
+        // Accent-colored + underlined (palette/note precedent). Over-wide
+        // compositions truncate via push_text's column budget; the caret
+        // below rides the SHOWN width so it stays glued to the composition.
+        if !find.ime_preedit.is_empty() {
+            let preedit_max = query_max_w.saturating_sub(1).saturating_sub(query_cols);
+            if preedit_max > 0 {
+                let shown = preedit_cells.min(preedit_max) as f32;
+                self.push_text(
+                    &mut verts,
+                    cursor_x,
+                    line_y,
+                    &find.ime_preedit,
+                    accent,
+                    preedit_max,
+                );
+                let underline = [
+                    cursor_x,
+                    line_y + ch - 1.0,
+                    cursor_x + shown * cw,
+                    line_y + ch,
+                ];
+                push_quad(&mut verts, underline, bg_uv, [0.0; 4], accent);
+                cursor_x += shown * cw;
+            }
+        }
+
         // ── Blinking cursor (vertical bar at end of query) ───────────────
-        // 600ms on, 600ms off — standard terminal cursor blink rate.
-        let blink_phase = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() % 1200)
-            .unwrap_or(0);
-        if blink_phase < 600 {
+        // v1.12.26 (P1-01): the caret follows the renderer-global blink
+        // phase (`cursor_blink_on`), exactly like palette/note. The old
+        // private wall-clock phase self-corrected but never painted when
+        // no redraw was scheduled (e.g. a command executing froze the bar
+        // on its last frame) — the shared phase plus the text-input
+        // overlay wake keeps it blinking in every state.
+        if self.cursor_blink_on {
             let cursor_w = 2.0_f32.max(cw * 0.12);
             push_quad(
                 &mut verts,

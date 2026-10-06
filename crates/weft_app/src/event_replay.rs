@@ -47,6 +47,21 @@ pub(crate) enum ImeRoutingAction {
         text: String,
         cursor: Option<(usize, usize)>,
     },
+    /// v1.12.26 (P1-02): target-carrying variants for the find bar and the
+    /// panel search box — both grew their own preedit state (palette/note
+    /// precedent). Deliberately NOT one generalized SetActivePreedit: the
+    /// controller arm reading the action must know which state owner to
+    /// write, and a target-less variant would force a second guess off
+    /// `context.owner` (the exact drift these pure routing actions exist
+    /// to prevent).
+    SetActiveFindPreedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    SetActivePanelPreedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
     ClearAllPreedit,
     Commit {
         target: ImeCommitTarget,
@@ -72,12 +87,22 @@ pub(crate) fn route_ime_input(input: ImeInput, context: ImeRouteContext) -> Vec<
         ImeInput::Enabled => Vec::new(),
         ImeInput::Preedit { text, cursor } => {
             // v1.8.4: Palette (Search + AiCommand) supports inline preedit
-            // so CJK IME works. Find/PanelSearch still commit via IME but
-            // don't render inline preedit (no preedit field). Settings/
-            // ContextMenu consume (clear) — they're not text-entry surfaces.
+            // so CJK IME works. v1.12.26 (P1-02/P1-03): Find/PanelSearch
+            // grew their own preedit state, so they route to target-carrying
+            // Set actions — the old blanket ClearActivePreedit here dropped
+            // the composition display entirely and left the macOS candidate
+            // window anchored at the terminal caret (v1.8.4 self-confessed
+            // gap). Settings/ContextMenu consume (clear) — they're not
+            // text-entry surfaces.
             match context.owner {
                 Some(OverlayInputOwner::Palette) => {
                     vec![ImeRoutingAction::SetActivePreedit { text, cursor }]
+                }
+                Some(OverlayInputOwner::Find) => {
+                    vec![ImeRoutingAction::SetActiveFindPreedit { text, cursor }]
+                }
+                Some(OverlayInputOwner::PanelSearch) => {
+                    vec![ImeRoutingAction::SetActivePanelPreedit { text, cursor }]
                 }
                 Some(_) => vec![ImeRoutingAction::ClearActivePreedit],
                 None => vec![ImeRoutingAction::SetActivePreedit { text, cursor }],
@@ -216,6 +241,11 @@ mod tests {
         palette: String,
         find: String,
         panel: String,
+        // v1.12.26 (P1-02/P1-03): harness mirrors of the two new preedit
+        // owners, so tests can assert composition state lands on (and
+        // leaves) the right surface.
+        find_preedit: String,
+        panel_preedit: String,
         editor_commits: Vec<(usize, String)>,
         effects: Vec<Effect>,
         native_marked_text: bool,
@@ -264,6 +294,11 @@ mod tests {
             for action in actions {
                 match action {
                     ImeRoutingAction::ClearActivePreedit => {
+                        // v1.12.26 (P1-02/P1-03): the blanket clear sweeps
+                        // the find/panel preedit mirrors too (the Commit
+                        // route sends ClearActivePreedit first).
+                        self.find_preedit.clear();
+                        self.panel_preedit.clear();
                         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                             tab.ime_preedit.clear();
                             tab.ime_preedit_cursor = None;
@@ -275,7 +310,17 @@ mod tests {
                             tab.ime_preedit_cursor = cursor;
                         }
                     }
-                    ImeRoutingAction::ClearAllPreedit => clear_all_preedit(&mut self.tabs),
+                    ImeRoutingAction::SetActiveFindPreedit { text, .. } => {
+                        self.find_preedit = text;
+                    }
+                    ImeRoutingAction::SetActivePanelPreedit { text, .. } => {
+                        self.panel_preedit = text;
+                    }
+                    ImeRoutingAction::ClearAllPreedit => {
+                        clear_all_preedit(&mut self.tabs);
+                        self.find_preedit.clear();
+                        self.panel_preedit.clear();
+                    }
                     ImeRoutingAction::Commit { target, text } => match target {
                         ImeCommitTarget::Palette => self.palette.push_str(&text),
                         // v1.12.24 (N-1): conservative no-op like Settings.
@@ -774,9 +819,12 @@ mod tests {
     }
 
     #[test]
-    fn palette_preedit_routes_set_active_while_find_and_panel_clear() {
-        // v1.8.4: Palette owns inline preedit; Find/PanelSearch don't have
-        // preedit fields so they get ClearActivePreedit (commit still works).
+    fn palette_preedit_routes_set_active_while_find_and_panel_route_to_their_own_preedit() {
+        // v1.8.4: Palette owns inline preedit.
+        // v1.12.26 (P1-02/P1-03) contract rewrite: Find/PanelSearch grew
+        // their own preedit state, so Preedit routes to their target-
+        // carrying Set actions — the previously asserted blanket
+        // ClearActivePreedit was exactly the gap this train closes.
         let ctx_palette = ImeRouteContext {
             owner: Some(OverlayInputOwner::Palette),
             input_mode: InputMode::Editor,
@@ -794,7 +842,22 @@ mod tests {
             [ImeRoutingAction::SetActivePreedit { .. }]
         ));
 
-        for owner in [OverlayInputOwner::Find, OverlayInputOwner::PanelSearch] {
+        for (owner, expected) in [
+            (
+                OverlayInputOwner::Find,
+                ImeRoutingAction::SetActiveFindPreedit {
+                    text: "x".into(),
+                    cursor: None,
+                },
+            ),
+            (
+                OverlayInputOwner::PanelSearch,
+                ImeRoutingAction::SetActivePanelPreedit {
+                    text: "x".into(),
+                    cursor: None,
+                },
+            ),
+        ] {
             let ctx = ImeRouteContext {
                 owner: Some(owner),
                 input_mode: InputMode::Editor,
@@ -807,10 +870,45 @@ mod tests {
                 },
                 ctx,
             );
-            assert!(
-                matches!(actions.as_slice(), [ImeRoutingAction::ClearActivePreedit]),
-                "owner={owner:?}"
+            assert_eq!(actions, [expected], "owner={owner:?}");
+        }
+    }
+
+    /// v1.12.26 (P1-02/P1-03): end-to-end replay for the find bar and the
+    /// panel search box — Preedit lands on each bar's own preedit state (the
+    /// tab's terminal preedit stays untouched), and the Commit prefix clears
+    /// the composition while the committed text reaches the query.
+    #[test]
+    fn find_and_panel_preedit_land_on_their_own_state_and_commit_clears() {
+        for owner in [OverlayInputOwner::Find, OverlayInputOwner::PanelSearch] {
+            let mut replay = ReplayState::with_tabs(1);
+            replay.dispatch(
+                ImeInput::Preedit {
+                    text: "查找".into(),
+                    cursor: Some((0, 3)),
+                },
+                Some(owner),
+                InputMode::Editor,
             );
+            match owner {
+                OverlayInputOwner::Find => assert_eq!(replay.find_preedit, "查找"),
+                _ => assert_eq!(replay.panel_preedit, "查找"),
+            }
+            assert!(
+                replay.tabs[0].ime_preedit.is_empty(),
+                "owner={owner:?} must not leak composition into the tab preedit"
+            );
+            replay.dispatch(
+                ImeInput::Commit("查找".into()),
+                Some(owner),
+                InputMode::Editor,
+            );
+            assert!(replay.find_preedit.is_empty() && replay.panel_preedit.is_empty());
+            match owner {
+                OverlayInputOwner::Find => assert_eq!(replay.find, "查找"),
+                _ => assert_eq!(replay.panel, "查找"),
+            }
+            assert!(replay.effects.is_empty());
         }
     }
 }

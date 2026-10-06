@@ -391,6 +391,47 @@ pub(crate) fn note_editor_ime_area(ctx: &LayoutCtx) -> ImeCursorArea {
     }
 }
 
+/// v1.12.26 (P1-02): IME candidate-window anchor for the find bar. Pure
+/// geometry — `layout_find` is the SAME pure function the bar's vertex
+/// builder (`build_find_vertices`) consumes, so paint and anchor cannot
+/// drift; the x sits after the "Find: " label where the query (plus its
+/// inline preedit) starts. Physical pixels, same coordinate basis as
+/// `note_editor_ime_area` (`ime.rs` feeds the value straight into
+/// `PhysicalPosition`). `total_matches` only toggles the button rects in
+/// `layout_find`, so 0 keeps the text-row geometry identical.
+pub(crate) fn find_ime_area(ctx: &LayoutCtx) -> ImeCursorArea {
+    let layout = crate::layout::layout_find(ctx, 0);
+    // "Find: " is pure ASCII, so terminal_text_width == char count == 6.
+    let label_cells = weft_core::grid::terminal_text_width("Find: ") as f32;
+    ImeCursorArea {
+        x: layout.text_x0 + label_cells * ctx.cell_w,
+        y: layout.line_y,
+        width: ctx.cell_w,
+        height: ctx.cell_h,
+    }
+}
+
+/// v1.12.26 (P1-03): IME candidate-window anchor for the panel search box —
+/// sits at the query text origin the box actually draws from
+/// (`PanelLayout::search_text_x/y`, so paint and anchor cannot drift).
+/// `sidebar_width` is the renderer's sidebar width in physical pixels (the
+/// same value `build_overlay_stack` feeds `PanelDrawParams::width_px`).
+pub(crate) fn panel_ime_area(ctx: &LayoutCtx, sidebar_width: f32) -> ImeCursorArea {
+    let panel = crate::layout::layout_panel(
+        ctx.chrome_top,
+        ctx.cell_w,
+        ctx.cell_h,
+        sidebar_width,
+        ctx.viewport.1,
+    );
+    ImeCursorArea {
+        x: panel.search_text_x,
+        y: panel.search_text_y,
+        width: ctx.cell_w,
+        height: ctx.cell_h,
+    }
+}
+
 // ── v1.12.2 (PLAN_S2_render A3): text Y physical-pixel snapping ───────
 
 #[cfg(test)]
@@ -617,5 +658,64 @@ mod note_window_tests {
         assert_eq!(area.x, popup_x0 + 3.0 + 8.0 + "Note: ".len() as f32 * CW);
         assert_eq!(area.y, popup_y0 + (line_h - CH) * 0.5);
         assert_eq!((area.width, area.height), (CW, CH));
+    }
+}
+
+// ── v1.12.26 (P1-02/P1-03): find bar + panel search box IME anchors ──
+
+#[cfg(test)]
+mod overlay_ime_anchor_tests {
+    use super::*;
+    use crate::layout::LayoutCtx;
+
+    const CW: f32 = 17.5;
+    const CH: f32 = 35.0;
+
+    fn ime_ctx() -> LayoutCtx {
+        LayoutCtx::new((1600.0, 1000.0), CW, CH, 12.0, 8.0)
+    }
+
+    /// P1-02: the find bar's candidate window anchors at the query input —
+    /// after the "Find: " label on the same row `layout_find` (the vertex
+    /// builder's own geometry source) produces, one cell wide/tall.
+    #[test]
+    fn find_ime_area_anchors_at_find_query_start() {
+        let ctx = ime_ctx();
+        let area = find_ime_area(&ctx);
+        let layout = crate::layout::layout_find(&ctx, 0);
+        assert_eq!(
+            area.x,
+            layout.text_x0 + weft_core::grid::terminal_text_width("Find: ") as f32 * CW,
+            "anchor must sit right after the 'Find: ' label"
+        );
+        assert_eq!(area.y, layout.line_y);
+        assert_eq!((area.width, area.height), (CW, CH));
+        // Same coordinate basis as the bar's text row (layout_find derives
+        // both from ctx), so the anchor cannot drift from the paint.
+        assert!(area.x > layout.text_x0);
+    }
+
+    /// P1-03: the panel's candidate window anchors at the search box's text
+    /// origin, recomputed here from the RAW renderer formula (0.4cw inset,
+    /// vertically centered in the field rect) — the same line-for-line pin
+    /// the note-card consts use, so a PanelLayout formula drift fails here
+    /// instead of silently moving the candidate window.
+    #[test]
+    fn panel_ime_area_matches_search_field_text_origin() {
+        let ctx = ime_ctx();
+        let sidebar_w = 260.0;
+        let area = panel_ime_area(&ctx, sidebar_w);
+        let panel = crate::layout::layout_panel(ctx.chrome_top, CW, CH, sidebar_w, 1000.0);
+        // Raw formulas as build_panel_vertices drew them before v1.12.26.
+        let [fx0, fy0, fx1, fy1] = panel.search_field_rect;
+        assert_eq!(area.x, fx0 + CW * 0.4);
+        assert_eq!(area.y, fy0 + (fy1 - fy0 - CH) * 0.5);
+        // And the layout-exposed origin IS that formula (single source).
+        assert_eq!(panel.search_text_x, area.x);
+        assert_eq!(panel.search_text_y, area.y);
+        assert_eq!((area.width, area.height), (CW, CH));
+        // The anchor lives inside the clickable field rect.
+        assert!(area.x > fx0 && area.x < fx1);
+        assert!(area.y > fy0 && area.y < fy1);
     }
 }

@@ -591,6 +591,7 @@ pub fn build_overlay_stack<'a>(
                 blocks: terminal.block_tracker().blocks(),
                 width_px: panel.panel_width,
                 query: panel.panel_query,
+                panel_ime_preedit: panel.panel_ime_preedit,
                 selection: panel.panel_selection,
                 expanded_id: panel.panel_expanded,
                 search_focused: panel.panel_search_focused,

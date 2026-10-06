@@ -53,6 +53,10 @@ impl crate::App {
             }
             Action::ToggleBlockPanel => {
                 if self.panel.open {
+                    // v1.12.26 (review P2): panel close drops its IME state
+                    // via close(), but the native marked text also needs the
+                    // discard — same family as palette/find toggles.
+                    self.reset_ime_context("block panel closed");
                     self.panel.close();
                 } else {
                     self.panel.open = true;
