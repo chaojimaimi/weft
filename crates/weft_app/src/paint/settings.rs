@@ -1,4 +1,3 @@
-// arch-gate: allow-over-800
 // Settings 2.0 split layout: 6 category forms + sidebar + row renderer.
 // Rewritten for F5; remaining size is the 6 per-category render functions
 // + shared push_settings_row helper. Splitting categories into separate
@@ -11,7 +10,16 @@
 //! (<640pt) switch to single-column drill-down. Field-level validation
 //! errors render inline next to the offending field. Keybinding conflicts
 //! get a summary badge. Advanced rows carry restart-required badges.
+//!
+//! v1.12.27b (P1-03): the Keybindings / Advanced / LocalAi content arms
+//! moved verbatim into the child modules (`keybindings.rs` / `advanced.rs` /
+//! `local_ai.rs`) — `pages.rs` v1.12.19 precedent (child-module privacy
+//! reaches `push_settings_row` / `find_field_error`); this file is the
+//! orchestration entry.
 
+mod advanced;
+mod keybindings;
+mod local_ai;
 mod pages;
 
 use crate::paint::primitives::{color_to_normalized, push_filled_triangle, push_line, push_quad};
@@ -363,96 +371,24 @@ impl MetalRenderer {
                     }
                 }
                 SettingsTab::Keybindings => {
-                    let mut list_top = content_top;
-                    let validation_error = find_field_error(s.field_errors, "Keybindings");
-                    if s.keybinding_conflict_count > 0 || validation_error.is_some() {
-                        let badge = validation_error.map_or_else(
-                            || format!("\u{26a0} {} conflict(s)", s.keybinding_conflict_count),
-                            |error| format!("\u{26a0} {error}"),
-                        );
-                        self.push_text(
-                            &mut verts,
-                            content_x0,
-                            list_top,
-                            &badge,
-                            warning_c,
-                            content_cols,
-                        );
-                        list_top += ch;
-                    }
-                    let total = s.keybindings.len();
-                    let available_rows =
-                        ((layout.footer_y - ch * 0.5 - list_top) / ch).max(1.0) as usize;
-                    let scrollable = total > available_rows;
-                    let usable_rows = if scrollable {
-                        available_rows.saturating_sub(1)
-                    } else {
-                        available_rows
-                    };
-                    let visible = usable_rows.min(total);
-                    let mut offset = s.scroll_offset.min(total);
-                    if s.selection < offset {
-                        offset = s.selection;
-                    } else if s.selection >= offset + visible {
-                        offset = s.selection + 1 - visible;
-                    }
-                    let end = (offset + visible).min(total);
-                    for (i, kb) in s.keybindings[offset..end].iter().enumerate() {
-                        let row_y = list_top + i as f32 * ch;
-                        let is_selected = offset + i == s.selection;
-                        if is_selected {
-                            push_quad(
-                                &mut verts,
-                                [content_x0, row_y, content_x1, row_y + ch],
-                                bg_uv,
-                                [0.0; 4],
-                                selection_bg,
-                            );
-                        }
-                        let action_color = if kb.conflict { warning_c } else { label_c };
-                        self.push_text(
-                            &mut verts,
-                            content_x0,
-                            row_y,
-                            &kb.action,
-                            action_color,
-                            content_cols,
-                        );
-                        let binding_x = content_x1 - cw * 15.0;
-                        let binding_color = if kb.conflict { warning_c } else { accent };
-                        self.push_text(
-                            &mut verts,
-                            binding_x,
-                            row_y,
-                            &kb.binding,
-                            binding_color,
-                            content_cols,
-                        );
-                    }
-                    if scrollable {
-                        let indicator_y = list_top + visible as f32 * ch;
-                        let mut indicator = String::new();
-                        if offset > 0 {
-                            indicator.push('\u{2191}');
-                        }
-                        if end < total {
-                            if !indicator.is_empty() {
-                                indicator.push(' ');
-                            }
-                            indicator.push('\u{2193}');
-                        }
-                        if !indicator.is_empty() {
-                            indicator.push_str(" more");
-                            self.push_text(
-                                &mut verts,
-                                content_x0,
-                                indicator_y,
-                                &indicator,
-                                label_c,
-                                content_cols,
-                            );
-                        }
-                    }
+                    // v1.12.27b (P1-03): body in settings/keybindings.rs
+                    // (line-budget split, child-module privacy).
+                    self.render_keybindings_content(
+                        &mut verts,
+                        s,
+                        content_top,
+                        content_x0,
+                        content_x1,
+                        cw,
+                        ch,
+                        content_cols,
+                        bg_uv,
+                        selection_bg,
+                        label_c,
+                        accent,
+                        warning_c,
+                        layout.footer_y,
+                    );
                 }
                 SettingsTab::Window => {
                     let sidebar_w_str = match s.sidebar_width {
@@ -493,85 +429,25 @@ impl MetalRenderer {
                     }
                 }
                 SettingsTab::Advanced => {
-                    // v1.5.2: Added Import Config / Export Config action rows.
-                    // The first two rows (Debug Logging, Experimental) carry
-                    // restart-required badges; the action rows carry a "▶"
-                    // glyph to signal that Enter triggers a panel.
-                    // v1.11.5 (PLAN_v1115 §M8): rows 4-7 read the LIVE
-                    // draft values (Notified Enabled / Threshold / Sound /
-                    // OSC52 Clipboard). `unrestricted` renders with a
-                    // warning suffix (silent clipboard reads by remote
-                    // programs). The Import / Export action rows carry the
-                    // "▶" glyph; those stay at rows 2/3.
-                    let notify_enabled = s.notify_enabled;
-                    let notify_sound = s.notify_sound;
-                    let osc52_label = match s.osc52_mode {
-                        weft_core::config::Osc52Mode::Default => "Default",
-                        weft_core::config::Osc52Mode::Off => "Off",
-                        weft_core::config::Osc52Mode::Unrestricted => "Unrestricted \u{26a0}",
-                    };
-                    let rows: [(&str, String); crate::settings_validation::ADVANCED_ROW_COUNT] = [
-                        ("Debug Logging:", "Off".to_string()),
-                        ("Experimental:", "Disabled".to_string()),
-                        ("Import Config:", "\u{25b6} Open\u{2026}".to_string()),
-                        ("Export Config:", "\u{25b6} Save\u{2026}".to_string()),
-                        (
-                            "Notify Enabled:",
-                            if notify_enabled { "On" } else { "Off" }.to_string(),
-                        ),
-                        (
-                            "Notify Threshold:",
-                            format!("{} s", s.notify_threshold_secs),
-                        ),
-                        (
-                            "Notify Sound:",
-                            if notify_sound { "On" } else { "Off" }.to_string(),
-                        ),
-                        ("OSC52 Clipboard:", osc52_label.to_string()),
-                    ];
-                    for (i, (label, value)) in rows.iter().enumerate() {
-                        let value = value.as_str();
-                        let row_y = content_top + i as f32 * ch;
-                        let is_sel = i == s.selection;
-                        self.push_settings_row(
-                            &mut verts,
-                            row_y,
-                            label,
-                            value,
-                            is_sel,
-                            content_x0,
-                            content_x1,
-                            value_x,
-                            cw,
-                            ch,
-                            content_cols,
-                            bg_uv,
-                            selection_bg,
-                            fg,
-                            label_c,
-                            accent,
-                            None,
-                        );
-                        // Restart-required badge (↻) — only the first two
-                        // rows (Debug Logging, Experimental). The Import /
-                        // Export action rows don't need a restart.
-                        if i < 2 {
-                            let val_w = cw * Self::text_col_width(value) as f32;
-                            let badge_x = value_x + val_w + cw * 2.5;
-                            let badge_cols = content_cols
-                                .saturating_sub(((badge_x - content_x0) / cw).max(0.0) as usize);
-                            if badge_cols > 5 {
-                                self.push_text(
-                                    &mut verts,
-                                    badge_x,
-                                    row_y,
-                                    "\u{21bb} restart",
-                                    warning_c,
-                                    badge_cols,
-                                );
-                            }
-                        }
-                    }
+                    // v1.12.27b (P1-03): body in settings/advanced.rs
+                    // (line-budget split, child-module privacy).
+                    self.render_advanced_content(
+                        &mut verts,
+                        s,
+                        content_top,
+                        content_x0,
+                        content_x1,
+                        value_x,
+                        cw,
+                        ch,
+                        content_cols,
+                        bg_uv,
+                        selection_bg,
+                        fg,
+                        label_c,
+                        accent,
+                        warning_c,
+                    );
                 }
                 // v1.8.3: LocalAi tab — 8 rows: Enabled / Model / URL /
                 // Max Tokens / Timeout / Cmd Generation / Error Diagnosis /
@@ -579,115 +455,25 @@ impl MetalRenderer {
                 // the standard `push_settings_row` helper; row 7 gets a "▶"
                 // glyph like Advanced's action rows and a status line below.
                 SettingsTab::LocalAi => {
-                    let enabled_str = if s.ai.enabled { "On" } else { "Off" };
-                    let model_str = if s.ai.model.is_empty() {
-                        "(none — Test Connection to discover)"
-                    } else {
-                        s.ai.model
-                    };
-                    let max_tokens_str = format!("{}", s.ai.max_tokens);
-                    let timeout_str = format!("{} s", s.ai.timeout_secs);
-                    let cmd_gen_str = if s.ai.enable_command_generation {
-                        "On"
-                    } else {
-                        "Off"
-                    };
-                    let err_diag_str = if s.ai.enable_error_diagnosis {
-                        "On"
-                    } else {
-                        "Off"
-                    };
-                    // Row 7 (Test Connection) — "▶ Test" when idle, "…" when
-                    // testing. The status line is drawn separately below.
-                    let test_str = if s.ai.testing {
-                        "\u{2026}"
-                    } else {
-                        "\u{25b6} Test"
-                    };
-
-                    // Rows 0-6 use the standard row helper. Row 7 is an
-                    // action button — rendered with the same helper but with
-                    // a "▶" glyph value (matching Advanced's Import/Export).
-                    let row_specs: [(&str, &str); 8] = [
-                        ("Enabled:", enabled_str),
-                        ("Model:", model_str),
-                        ("URL:", s.ai.base_url),
-                        ("Max Tokens:", &max_tokens_str),
-                        ("Timeout:", &timeout_str),
-                        ("Cmd Generation:", cmd_gen_str),
-                        ("Error Diagnosis:", err_diag_str),
-                        ("Test Connection:", test_str),
-                    ];
-                    for (i, (label, value)) in row_specs.iter().enumerate() {
-                        let row_y = content_top + i as f32 * ch;
-                        let is_sel = i == s.selection;
-                        self.push_settings_row(
-                            &mut verts,
-                            row_y,
-                            label,
-                            value,
-                            is_sel,
-                            content_x0,
-                            content_x1,
-                            value_x,
-                            cw,
-                            ch,
-                            content_cols,
-                            bg_uv,
-                            selection_bg,
-                            fg,
-                            label_c,
-                            accent,
-                            None,
-                        );
-                    }
-
-                    // Status line below row 7 — shows the connection status
-                    // label (e.g. "Connected (3 models)", "Failed: …"). Uses
-                    // `warning_c` for failures and `accent` for success so the
-                    // user can tell at a glance whether the test succeeded.
-                    // Only drawn when there's something to show (non-idle).
-                    if s.ai.connection_status != "Not tested" {
-                        let status_y = content_top + 8.0 * ch;
-                        let status_color = if s.ai.connection_status.starts_with("Connected") {
-                            accent
-                        } else if s.ai.connection_status.starts_with("Testing") {
-                            label_c
-                        } else {
-                            warning_c
-                        };
-                        let status_cols = content_cols.saturating_sub(2);
-                        if status_cols > 0 {
-                            self.push_text(
-                                &mut verts,
-                                content_x0 + cw * 2.0,
-                                status_y,
-                                s.ai.connection_status,
-                                status_color,
-                                status_cols,
-                            );
-                        }
-                    }
-
-                    // v1.8.3: Observability row — aggregate request counts +
-                    // p95 latency. Drawn below the connection status line.
-                    // Only shown when at least one request has been made
-                    // (empty string on a fresh launch). Uses `label_c` so it
-                    // reads as secondary diagnostics, not a primary action.
-                    if !s.ai.observability.is_empty() {
-                        let obs_y = content_top + 9.0 * ch;
-                        let obs_cols = content_cols.saturating_sub(2);
-                        if obs_cols > 0 {
-                            self.push_text(
-                                &mut verts,
-                                content_x0 + cw * 2.0,
-                                obs_y,
-                                s.ai.observability,
-                                label_c,
-                                obs_cols,
-                            );
-                        }
-                    }
+                    // v1.12.27b (P1-03): body in settings/local_ai.rs
+                    // (line-budget split, child-module privacy).
+                    self.render_local_ai_content(
+                        &mut verts,
+                        s,
+                        content_top,
+                        content_x0,
+                        content_x1,
+                        value_x,
+                        cw,
+                        ch,
+                        content_cols,
+                        bg_uv,
+                        selection_bg,
+                        fg,
+                        label_c,
+                        accent,
+                        warning_c,
+                    );
                 }
             }
         }
