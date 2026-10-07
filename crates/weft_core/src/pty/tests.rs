@@ -26,6 +26,50 @@ fn child_env_drops_inherited_no_color_policy() {
 }
 
 #[test]
+fn panic_exit_reason_str_payload() {
+    // v1.13.2 (WP-A): `panic!("literal")` produces a `&str` payload.
+    let payload: Box<dyn std::any::Any + Send> = Box::new("boom literal");
+    assert_eq!(panic_exit_reason(payload), "boom literal");
+}
+
+#[test]
+fn panic_exit_reason_string_payload() {
+    // v1.13.2 (WP-A): `panic!("{}", owned)` produces a `String` payload.
+    let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("boom owned"));
+    assert_eq!(panic_exit_reason(payload), "boom owned");
+}
+
+#[test]
+fn panic_exit_reason_non_string_payload_falls_back() {
+    // v1.13.2 (WP-A): a non-string payload (e.g. `Box::<usize>`) falls back
+    // to the generic wording carried into the synthetic Exit.
+    let payload: Box<dyn std::any::Any + Send> = Box::new(1234_usize);
+    assert_eq!(panic_exit_reason(payload), "reader task panicked");
+}
+
+#[test]
+fn child_env_drops_inherited_pty_capture_key() {
+    // v1.13.2 (WP-C, audit L-1): Weft's own PTY-capture debug knob must not
+    // stay visible to spawned children (build_child_env path).
+    let mut env = std::collections::HashMap::from([
+        ("WEFT_PTY_CAPTURE".into(), "/tmp/capture.bin".into()),
+        ("TERM".into(), "dumb".into()),
+    ]);
+    strip_inherited_debug_env(&mut env);
+    assert!(!env.contains_key(std::ffi::OsStr::new("WEFT_PTY_CAPTURE")));
+    assert_eq!(env.get(std::ffi::OsStr::new("TERM")), Some(&"dumb".into()));
+}
+
+#[test]
+fn child_env_strip_pty_capture_is_noop_without_key() {
+    // v1.13.2 (WP-C): no capture key set → strip removes nothing.
+    let mut env = std::collections::HashMap::from([("TERM".into(), "dumb".into())]);
+    strip_inherited_debug_env(&mut env);
+    assert_eq!(env.len(), 1);
+    assert_eq!(env.get(std::ffi::OsStr::new("TERM")), Some(&"dumb".into()));
+}
+
+#[test]
 fn build_child_env_skips_nul_entries() {
     // v1.12.25 (audit core P2-3): a NUL entry used to panic the main thread
     // via `CString::new().expect` (reachable from a hand-edited workspace

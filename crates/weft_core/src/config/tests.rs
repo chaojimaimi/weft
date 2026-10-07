@@ -615,6 +615,22 @@ fn parse_binding_rejects_unknown() {
 }
 
 #[test]
+fn parse_binding_empty_spec_is_none() {
+    // v1.13.2 (WP-E): `"".split('+')` yields `[""]`, so the empty spec is
+    // rejected by `parse_key_token`'s catch-all arm — the dead
+    // `tokens.is_empty()` check removed with this change is locked in as
+    // behaviorally equivalent.
+    assert!(parse_binding("").is_none());
+}
+
+#[test]
+fn parse_binding_double_plus_is_none() {
+    // v1.13.2 (WP-E): `"++"` yields three empty tokens; the empty prefix
+    // tokens are rejected by the modifier match's catch-all arm.
+    assert!(parse_binding("++").is_none());
+}
+
+#[test]
 fn keybindings_default_has_copy_paste() {
     let kb = KeyBindings::default();
     let copy = kb.lookup(KeyCode::Char('c'), Modifiers::SUPER);

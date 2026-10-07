@@ -37,7 +37,13 @@ pub(crate) fn window_in_live_resize(window: &Window) -> bool {
         let retained: Option<Retained<objc2_app_kit::NSWindow>> = view.window();
         retained.is_some_and(|window| window.inLiveResize())
     }))
-    .unwrap_or(false)
+    .unwrap_or_else(|_| {
+        // v1.13.2 (WP-B): this probe runs every frame during a live resize, so
+        // a persistent ObjC panic would spam a warn each frame — log at debug
+        // level instead. The `false` degradation is unchanged.
+        tracing::debug!("objc bridge panicked (in_live_resize probe)");
+        false
+    })
 }
 
 /// v1.11: NSView `mouseDownCanMoveWindow` override — returns `NO` so macOS

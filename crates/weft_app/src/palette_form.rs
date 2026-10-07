@@ -139,8 +139,6 @@ impl App {
                         if buffer.is_empty() {
                             return true;
                         }
-                        *command = std::mem::take(buffer);
-                        *step = CreateStep::Done;
 
                         // Create the workflow in the store.
                         let wf = weft_core::workflow::Workflow {
@@ -148,7 +146,7 @@ impl App {
                             name: name.clone(),
                             description: "User-created workflow".into(),
                             steps: vec![weft_core::workflow::WorkflowStep {
-                                command: command.clone(),
+                                command: buffer.clone(),
                             }],
                             variables: vec![],
                             source: weft_core::workflow::WorkflowSource::Manual,
@@ -157,8 +155,23 @@ impl App {
                         };
                         if let Some(store) = &self.palette.store {
                             match store.insert(&wf) {
-                                Err(e) => warn!(error = %e, "failed to save new workflow"),
+                                Err(e) => {
+                                    warn!(error = %e, "failed to save new workflow");
+                                    // v1.13.2 (WP-F): a failed save used to fall through and
+                                    // bounce back to Search as if it had succeeded. Keep the
+                                    // CreateWorkflow form open instead — buffer/step were
+                                    // never mutated, so the user's input survives and Enter
+                                    // can retry. No new UI surface/error copy in this vehicle
+                                    // (the warn log is the only signal); the store=None
+                                    // fallthrough below remains a known out-of-scope residue.
+                                    return true;
+                                }
                                 Ok(id) => {
+                                    // v1.13.2 (WP-F): the field mutations were deferred here
+                                    // from before the insert attempt — a failed save must not
+                                    // consume the buffer or flip the step to Done.
+                                    *command = std::mem::take(buffer);
+                                    *step = CreateStep::Done;
                                     let mut indexed = wf.clone();
                                     indexed.id = id;
                                     if let Some(index) = &self.search_index {

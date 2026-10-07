@@ -219,12 +219,7 @@ impl Pty {
                     ));
                     if let Err(join_err) = handle.await {
                         let msg = if join_err.is_panic() {
-                            let panic = join_err.into_panic();
-                            panic
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| panic.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "reader task panicked".to_string())
+                            panic_exit_reason(join_err.into_panic())
                         } else {
                             // Defensive: nothing aborts the inner task, so this arm is
                             // unreachable in practice (review P3) — kept distinct from the
@@ -566,6 +561,19 @@ fn resize_ioctl_result(result: nix::libc::c_int) -> Result<()> {
     }
 }
 
+/// v1.13.2 (WP-A): the reader-task panic wrapper's payload downcast, extracted
+/// verbatim from the inline code so all three arms are unit testable.
+/// Behavior is unchanged: `&str` and `String` payloads surface their message;
+/// anything else falls back to the generic wording that the synthetic
+/// `Exit(Err(..))` carries into the tab teardown path.
+fn panic_exit_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "reader task panicked".to_string())
+}
+
 impl Drop for Pty {
     fn drop(&mut self) {
         // Best-effort: send SIGHUP to child when PTY is dropped.
@@ -585,6 +593,7 @@ fn build_child_env(overrides: &[(&str, &str)]) -> Vec<std::ffi::CString> {
     use std::collections::HashMap;
     let mut env: HashMap<std::ffi::OsString, std::ffi::OsString> = std::env::vars_os().collect();
     strip_launcher_presentation_env(&mut env);
+    strip_inherited_debug_env(&mut env);
     for (k, v) in overrides {
         env.insert(std::ffi::OsString::from(k), std::ffi::OsString::from(v));
     }
@@ -617,6 +626,25 @@ fn strip_launcher_presentation_env(
     env: &mut std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
 ) {
     env.remove(std::ffi::OsStr::new("NO_COLOR"));
+}
+
+/// v1.13.2 (WP-C, audit L-1): do not leak Weft's own PTY-output capture knob
+/// into child sessions — a `WEFT_PTY_CAPTURE=path` used to start Weft used to
+/// stay visible to every command it spawns (an inherited debug surface).
+///
+/// Premise (pinned per plan): this strip only guards the `build_child_env`
+/// path — when `overrides` is empty, `build_child_env` returns early and the
+/// child inherits the full parent environment via `execvp`, a path this line
+/// does not cover (production always passes `shell_integration_env`, so the
+/// overrides list is non-empty there).
+///
+/// Deliberately NOT merged with `strip_launcher_presentation_env`: launcher
+/// presentation policy vs. Weft's own debug surface are semantically
+/// independent and must stay independently traceable to their audits.
+fn strip_inherited_debug_env(
+    env: &mut std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
+) {
+    env.remove(std::ffi::OsStr::new("WEFT_PTY_CAPTURE"));
 }
 
 /// v1.11.2 X2 (PLAN_v1112 §2): capacity of the bounded PTY event channel.

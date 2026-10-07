@@ -45,10 +45,15 @@ fn hex_val(b: u8) -> Option<u8> {
 /// `(KeyCode, Modifiers)` pair. Tokens are split on `+`; the final token is
 /// the key, the rest are modifiers. Unknown tokens → `None`.
 pub fn parse_binding(spec: &str) -> Option<(KeyCode, Modifiers)> {
+    // Invariant: `str::split` always yields at least one token (even `""`
+    // yields `[""]`), so `tokens` is never empty here — the former
+    // `if tokens.is_empty()` arm was dead code (removed v1.13.2). Both edge
+    // shapes are still rejected downstream:
+    // - the empty key token of `""` is rejected by `parse_key_token`'s
+    //   catch-all `_ => None` arm;
+    // - the empty prefix tokens of `"++"` are rejected by the modifier
+    //   match's `_ => return None` arm.
     let tokens: Vec<&str> = spec.split('+').map(str::trim).collect();
-    if tokens.is_empty() {
-        return None;
-    }
     let mut mods = Modifiers::empty();
     for tok in &tokens[..tokens.len() - 1] {
         match tok.to_ascii_lowercase().as_str() {
@@ -59,7 +64,7 @@ pub fn parse_binding(spec: &str) -> Option<(KeyCode, Modifiers)> {
             _ => return None,
         }
     }
-    let key = parse_key_token(tokens.last().unwrap())?;
+    let key = parse_key_token(tokens.last().expect("split('+') yields at least one token"))?;
     Some((key, mods))
 }
 

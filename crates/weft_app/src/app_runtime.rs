@@ -569,7 +569,15 @@ impl ApplicationHandler<AppEvent> for App {
         self.bookmarked_blocks = self
             .sessions
             .annotation_store()
-            .and_then(|store| store.bookmarked_ids().ok())
+            // v1.13.2 (WP-D): `.ok()` used to swallow a failed startup load;
+            // the empty-set fallback is unchanged, the failure is now logged.
+            .and_then(|store| match store.bookmarked_ids() {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    warn!(error = %e, "bookmark ids load failed");
+                    None
+                }
+            })
             .map(std::sync::Arc::new)
             .unwrap_or_default();
 
