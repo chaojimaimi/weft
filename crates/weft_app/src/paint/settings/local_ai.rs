@@ -26,6 +26,9 @@ impl MetalRenderer {
         label_c: [f32; 4],
         accent: [f32; 4],
         warning_c: [f32; 4],
+        // v1.13.1 (PLAN_v1.13.1 §二.2): footer bound for the wrapped
+        // status/observability lines' vertical clamp.
+        footer_y: f32,
     ) {
         // v1.8.3: LocalAi tab — 8 rows: Enabled / Model / URL /
         // Max Tokens / Timeout / Cmd Generation / Error Diagnosis /
@@ -100,8 +103,12 @@ impl MetalRenderer {
         // `warning_c` for failures and `accent` for success so the
         // user can tell at a glance whether the test succeeded.
         // Only drawn when there's something to show (non-idle).
+        // v1.13.1 (G-5): word-wrapped (error strings can be long);
+        // status_rows drives the observability line's y so a wrapped
+        // status never overlaps it.
+        let status_y = content_top + 8.0 * ch;
+        let mut status_rows = 0usize;
         if s.ai.connection_status != "Not tested" {
-            let status_y = content_top + 8.0 * ch;
             let status_color = if s.ai.connection_status.starts_with("Connected") {
                 accent
             } else if s.ai.connection_status.starts_with("Testing") {
@@ -111,14 +118,17 @@ impl MetalRenderer {
             };
             let status_cols = content_cols.saturating_sub(2);
             if status_cols > 0 {
-                self.push_text(
-                    verts,
-                    content_x0 + cw * 2.0,
-                    status_y,
-                    s.ai.connection_status,
-                    status_color,
-                    status_cols,
-                );
+                if let Some(budget) = crate::paint::text_wrap::line_budget(status_y, footer_y, ch) {
+                    status_rows = self.push_text_wrapped(
+                        verts,
+                        content_x0 + cw * 2.0,
+                        status_y,
+                        s.ai.connection_status,
+                        status_color,
+                        status_cols,
+                        Some(budget),
+                    );
+                }
             }
         }
 
@@ -128,17 +138,23 @@ impl MetalRenderer {
         // (empty string on a fresh launch). Uses `label_c` so it
         // reads as secondary diagnostics, not a primary action.
         if !s.ai.observability.is_empty() {
-            let obs_y = content_top + 9.0 * ch;
+            // v1.13.1 (G-5): follows the wrapped status line's actual row
+            // count (falls back to the historical 1-row slot when the
+            // status line is absent) and word-wraps within the footer bound.
+            let obs_y = status_y + status_rows.max(1) as f32 * ch;
             let obs_cols = content_cols.saturating_sub(2);
             if obs_cols > 0 {
-                self.push_text(
-                    verts,
-                    content_x0 + cw * 2.0,
-                    obs_y,
-                    s.ai.observability,
-                    label_c,
-                    obs_cols,
-                );
+                if let Some(budget) = crate::paint::text_wrap::line_budget(obs_y, footer_y, ch) {
+                    self.push_text_wrapped(
+                        verts,
+                        content_x0 + cw * 2.0,
+                        obs_y,
+                        s.ai.observability,
+                        label_c,
+                        obs_cols,
+                        Some(budget),
+                    );
+                }
             }
         }
     }

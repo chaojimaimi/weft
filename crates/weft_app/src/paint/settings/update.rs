@@ -27,6 +27,9 @@ impl MetalRenderer {
         fg: [f32; 4],
         label_c: [f32; 4],
         accent: [f32; 4],
+        // v1.13.1 (PLAN_v1.13.1 §二.2): footer bound for the wrapped help
+        // line's vertical clamp.
+        footer_y: f32,
     ) {
         // Row 1 status: framework in place (spike R1 degrade face). Read
         // from the process-global bridge state — no App borrow needed.
@@ -63,21 +66,25 @@ impl MetalRenderer {
                 None,
             );
         }
-        // Help line below the rows (LocalAi draws its status lines without a
-        // footer guard — same precedent).
+        // Help line below the rows. v1.13.1 (G-5): word-wrapped within the
+        // footer bound — the hard-clipped single row was the first visible
+        // instance of the settings free-standing-text defect family.
         let help_y = content_top + row_specs.len() as f32 * ch;
         let help = if crate::updater::framework_available() {
             "Daily checks in the background; Off still allows manual checks."
         } else {
             "Update features require a bundled Sparkle.framework."
         };
-        self.push_text(
-            verts,
-            content_x0 + cw * 2.0,
-            help_y,
-            help,
-            label_c,
-            content_cols.saturating_sub(2),
-        );
+        if let Some(budget) = crate::paint::text_wrap::line_budget(help_y, footer_y, ch) {
+            self.push_text_wrapped(
+                verts,
+                content_x0 + cw * 2.0,
+                help_y,
+                help,
+                label_c,
+                content_cols.saturating_sub(2),
+                Some(budget),
+            );
+        }
     }
 }

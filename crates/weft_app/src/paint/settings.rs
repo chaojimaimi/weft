@@ -358,16 +358,21 @@ impl MetalRenderer {
                             None,
                         );
                     }
-                    // Help text.
+                    // Help text. v1.13.1 (G-5): word-wrapped; the old
+                    // one-row footer guard became a wrapped-row-count
+                    // budget (PLAN_v1.13.1 §二.2).
                     let help_y = content_top + rows.len() as f32 * ch;
-                    if help_y + ch < layout.footer_y {
-                        self.push_text(
+                    if let Some(budget) =
+                        crate::paint::text_wrap::line_budget(help_y, layout.footer_y, ch)
+                    {
+                        self.push_text_wrapped(
                             &mut verts,
                             content_x0,
                             help_y,
                             "Cmd+Shift+Click selects; Cmd+Option+Click safely opens.",
                             label_c,
                             content_cols,
+                            Some(budget),
                         );
                     }
                 }
@@ -474,6 +479,7 @@ impl MetalRenderer {
                         label_c,
                         accent,
                         warning_c,
+                        layout.footer_y,
                     );
                 }
                 SettingsTab::Update => {
@@ -495,6 +501,7 @@ impl MetalRenderer {
                         fg,
                         label_c,
                         accent,
+                        layout.footer_y,
                     );
                 }
             }
