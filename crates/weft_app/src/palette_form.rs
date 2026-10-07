@@ -1,6 +1,7 @@
 //! Palette form sub-mode handlers extracted from palette_controller.
 
 use super::*;
+use weft_core::workflow::WorkflowStoreError;
 
 pub(crate) fn palette_form_field_direction(key: KeyCode, mods: Modifiers) -> Option<bool> {
     use crate::paint::command_surface::CommandSurfaceKeyAction;
@@ -9,6 +10,32 @@ pub(crate) fn palette_form_field_direction(key: KeyCode, mods: Modifiers) -> Opt
         CommandSurfaceKeyAction::MoveDown | CommandSurfaceKeyAction::PageDown => Some(true),
         CommandSurfaceKeyAction::CycleFocus => Some(!mods.contains(Modifiers::SHIFT)),
         _ => None,
+    }
+}
+
+/// v1.13.3: classify a workflow-store save failure for the toast copy.
+/// `name` is the table's only UNIQUE column (weft_core workflow.rs SCHEMA),
+/// so a constraint violation means "duplicate name" — the one deterministic
+/// failure an Enter-retry can never fix. Everything else is transient from
+/// the user's point of view and gets the generic retry copy.
+pub(crate) fn workflow_save_failure_message(err: &WorkflowStoreError) -> &'static str {
+    use rusqlite::ffi::ErrorCode;
+    // 判定精度论证（v1.13.3 r2）：workflows 表中 `name` 是唯一 UNIQUE 列；其余
+    // 约束仅 NOT NULL —— insert 恒供全列（Create 表单拒空名 + serde 恒非 NULL），
+    // NOT NULL 不可达；update SET name 在 Edit 不改名前提下不触发 UNIQUE。故
+    // 主码 ConstraintViolation 在实践上等价于"重名"。
+    // 耦合注明：若未来升级为 extended_code == SQLITE_CONSTRAINT_UNIQUE 精确判定，
+    // 下方单测的构造器须同步换结构体字面量 `Error { code, extended_code }`——
+    // libsqlite3-sys 0.28 只有 `new(c_int)` 一个构造器且它把 extended_code 设为
+    // result_code 本身（无 new_extended；字段 pub 可字面量构造）——见测试内钉死注释。
+    if matches!(
+        err,
+        WorkflowStoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == ErrorCode::ConstraintViolation
+    ) {
+        "名称已存在，请换一个"
+    } else {
+        "保存失败，请重试"
     }
 }
 
@@ -153,47 +180,56 @@ impl App {
                             use_count: 0,
                             last_used_ms: 0,
                         };
-                        if let Some(store) = &self.palette.store {
-                            match store.insert(&wf) {
-                                Err(e) => {
-                                    warn!(error = %e, "failed to save new workflow");
-                                    // v1.13.2 (WP-F): a failed save used to fall through and
-                                    // bounce back to Search as if it had succeeded. Keep the
-                                    // CreateWorkflow form open instead — buffer/step were
-                                    // never mutated, so the user's input survives and Enter
-                                    // can retry. No new UI surface/error copy in this vehicle
-                                    // (the warn log is the only signal); the store=None
-                                    // fallthrough below remains a known out-of-scope residue.
-                                    return true;
-                                }
-                                Ok(id) => {
-                                    // v1.13.2 (WP-F): the field mutations were deferred here
-                                    // from before the insert attempt — a failed save must not
-                                    // consume the buffer or flip the step to Done.
-                                    *command = std::mem::take(buffer);
-                                    *step = CreateStep::Done;
-                                    let mut indexed = wf.clone();
-                                    indexed.id = id;
-                                    if let Some(index) = &self.search_index {
-                                        if let Err(e) = index.upsert(
-                                            &weft_core::search::SearchDocument::from_workflow(
-                                                &indexed,
-                                            ),
-                                        ) {
-                                            warn!(error = %e, "failed to index new workflow");
-                                        }
+                        // v1.13.3 (C1+C2): read the insert result WITHOUT the
+                        // store borrow, then match (v1.12.25 3-B-2 P2-03
+                        // pattern) — every toast call below happens after the
+                        // store borrow has ended.
+                        let outcome = self.palette.store.as_ref().map(|store| store.insert(&wf));
+                        match outcome {
+                            Some(Ok(id)) => {
+                                // v1.13.2 (WP-F): the field mutations were deferred here
+                                // from before the insert attempt — a failed save must not
+                                // consume the buffer or flip the step to Done.
+                                *command = std::mem::take(buffer);
+                                *step = CreateStep::Done;
+                                let mut indexed = wf.clone();
+                                indexed.id = id;
+                                if let Some(index) = &self.search_index {
+                                    if let Err(e) = index.upsert(
+                                        &weft_core::search::SearchDocument::from_workflow(&indexed),
+                                    ) {
+                                        warn!(error = %e, "failed to index new workflow");
                                     }
-                                    info!(name = %wf.name, "workflow created");
                                 }
+                                info!(name = %wf.name, "workflow created");
+
+                                // Return to search mode and refresh.
+                                self.palette.submode = PaletteSubMode::Search;
+                                self.palette.query.clear();
+                                self.refresh_palette_results();
+                                self.request_redraw();
+                                true
+                            }
+                            Some(Err(e)) => {
+                                warn!(error = %e, "failed to save new workflow");
+                                // v1.13.3 (C1): a failed save used to bounce nowhere
+                                // with only a warn log. Now: classified toast copy
+                                // (duplicate name vs transient), and the CreateWorkflow
+                                // form stays open — buffer/step were never mutated
+                                // (v1.13.2 WP-F semantics unchanged), so Enter can
+                                // retry after an edit and Esc abandons explicitly.
+                                self.show_block_history_toast(workflow_save_failure_message(&e));
+                                true
+                            }
+                            None => {
+                                // v1.13.3 (C2): a missing store used to fall through
+                                // to Search — a silent fake success. Keep the form
+                                // open and say so (replaces the v1.13.2 known residue).
+                                warn!("no workflow store; keeping the create form open");
+                                self.show_block_history_toast("数据库不可用，未保存");
+                                true
                             }
                         }
-
-                        // Return to search mode and refresh.
-                        self.palette.submode = PaletteSubMode::Search;
-                        self.palette.query.clear();
-                        self.refresh_palette_results();
-                        self.request_redraw();
-                        true
                     }
                     CreateStep::Done => true,
                 }
@@ -271,10 +307,13 @@ impl App {
                                 command: new_command.clone(),
                             });
                         }
-                        if let Some(store) = &self.palette.store {
-                            if let Err(e) = store.update(&wf) {
-                                warn!(error = %e, "failed to update workflow");
-                            } else {
+                        // v1.13.3 (E1): same result-first pattern for the update —
+                        // a failed save used to warn and still bounce back to
+                        // Search (fake success). Store borrow ends before any
+                        // `self.` feedback call below.
+                        let outcome = self.palette.store.as_ref().map(|store| store.update(&wf));
+                        match outcome {
+                            Some(Ok(())) => {
                                 if let Some(index) = &self.search_index {
                                     if let Err(e) = index.upsert(
                                         &weft_core::search::SearchDocument::from_workflow(&wf),
@@ -283,13 +322,38 @@ impl App {
                                     }
                                 }
                                 info!(name = %name, "workflow updated");
+
+                                self.palette.submode = PaletteSubMode::Search;
+                                self.palette.query.clear();
+                                self.refresh_palette_results();
+                                self.request_redraw();
+                                true
+                            }
+                            Some(Err(e)) => {
+                                warn!(error = %e, "failed to update workflow");
+                                // Edit never renames, so a UNIQUE hit is unreachable
+                                // on this path (see workflow_save_failure_message's
+                                // precision argument) — the generic copy is correct.
+                                self.show_block_history_toast("保存失败，请重试");
+                                // Keep the EditWorkflow submode + buffer (retry / manual Esc).
+                                self.request_redraw();
+                                true
+                            }
+                            None => {
+                                // v1.13.3 (E2, rust-reviewer P1): DEFENSIVE-ONLY —
+                                // unreachable today: the lookup above gates this
+                                // update block and returns its own None arm first
+                                // whenever store is absent (palette.store is set
+                                // once at startup). Kept as a guard, not a path.
+                                warn!(
+                                    "no workflow store at update time; keeping the edit form open"
+                                );
+                                self.show_block_history_toast("数据库不可用，未保存");
+                                // Keep the EditWorkflow submode + buffer (retry / manual Esc).
+                                self.request_redraw();
+                                true
                             }
                         }
-                        self.palette.submode = PaletteSubMode::Search;
-                        self.palette.query.clear();
-                        self.refresh_palette_results();
-                        self.request_redraw();
-                        true
                     }
                     Some(Ok(None)) => {
                         warn!(name = %name, "workflow to edit not found");
@@ -306,10 +370,14 @@ impl App {
                         true
                     }
                     None => {
-                        // No block store — unchanged behavior (return to search).
-                        self.palette.submode = PaletteSubMode::Search;
-                        self.palette.query.clear();
-                        self.refresh_palette_results();
+                        // v1.13.3 (E2, rust-reviewer P1): the REACHABLE store=None
+                        // path for Edit — the lookup above already returned None,
+                        // so store.update was never reached. Used to silently
+                        // bounce back to Search ("unchanged behavior") — a fake
+                        // success. Keep the form open and say so instead.
+                        warn!("no workflow store; keeping the edit form open");
+                        self.show_block_history_toast("数据库不可用，未保存");
+                        // Keep the EditWorkflow submode + buffer (retry / manual Esc).
                         self.request_redraw();
                         true
                     }
@@ -355,10 +423,16 @@ impl App {
                     PaletteSubMode::ConfirmDelete { id, name } => (*id, name.clone()),
                     _ => return false,
                 };
-                if let Some(store) = &self.palette.store {
-                    if let Err(e) = store.delete(id) {
-                        warn!(error = %e, "failed to delete workflow");
-                    } else {
+                // v1.13.3 (D1+D2): result-first pattern — a failed delete used
+                // to be indistinguishable from success on the UI (both bounced
+                // back to Search silently). Store borrow ends before any
+                // `self.` feedback call below. Every arm returns to Search:
+                // refresh_palette_results self-heals result visibility, and a
+                // delete has no input to preserve, so the confirm state is NOT
+                // kept (unlike Create/Edit which keep their forms).
+                let outcome = self.palette.store.as_ref().map(|store| store.delete(id));
+                match outcome {
+                    Some(Ok(())) => {
                         if let Some(index) = &self.search_index {
                             if let Err(e) = index.delete(
                                 weft_core::search::SearchDocumentKind::Workflow,
@@ -368,6 +442,14 @@ impl App {
                             }
                         }
                         info!(name = %name, "workflow deleted");
+                    }
+                    Some(Err(e)) => {
+                        warn!(error = %e, "failed to delete workflow");
+                        self.show_block_history_toast("删除失败，请重试");
+                    }
+                    None => {
+                        warn!("no workflow store; returning to search");
+                        self.show_block_history_toast("数据库不可用，未保存");
                     }
                 }
                 self.palette.submode = PaletteSubMode::Search;
@@ -621,7 +703,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::palette_form_field_direction;
+    use super::workflow_save_failure_message;
     use weft_core::input::{KeyCode, Modifiers};
+    use weft_core::workflow::WorkflowStoreError;
 
     #[test]
     fn palette_form_owns_tab_arrows_and_page_navigation() {
@@ -653,5 +737,37 @@ mod tests {
             palette_form_field_direction(KeyCode::Char('x'), Modifiers::empty()),
             None
         );
+    }
+
+    #[test]
+    fn save_failure_message_maps_constraint_violation_to_duplicate_name() {
+        // 构造器耦合钉死（v1.13.3）：`ffi::Error::new(c_int)` 是 libsqlite3-sys 0.28
+        // 唯一构造器，它把 extended_code 设为 result_code 本身（无 new_extended；
+        // 字段 pub）。若 `workflow_save_failure_message` 升级为 extended_code ==
+        // SQLITE_CONSTRAINT_UNIQUE 精确判定，本测试必须同步换结构体字面量
+        // `Error { code, extended_code }` 构造——此处失败即提醒两处一起改。
+        let err = WorkflowStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        ));
+        assert_eq!(workflow_save_failure_message(&err), "名称已存在，请换一个");
+    }
+
+    #[test]
+    fn save_failure_message_maps_io_to_generic_copy() {
+        let err = WorkflowStoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "db not writable",
+        ));
+        assert_eq!(workflow_save_failure_message(&err), "保存失败，请重试");
+    }
+
+    #[test]
+    fn save_failure_message_maps_non_constraint_sqlite_to_generic_copy() {
+        let err = WorkflowStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            None,
+        ));
+        assert_eq!(workflow_save_failure_message(&err), "保存失败，请重试");
     }
 }
