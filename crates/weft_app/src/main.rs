@@ -60,6 +60,9 @@ mod macos_window;
 mod macos_zoom;
 mod menu;
 mod mouse_controller;
+// v1.12.27b (P1-02): handle_mouse_press's cascade stages, moved verbatim out
+// of mouse_press_controller.rs (PhaseOutcome-style signal-return contract).
+mod mouse_press;
 mod mouse_press_controller;
 mod mouse_protocol_controller;
 // v1.11.5 (PLAN_v1115 §M5): pure notify / OSC52-deny decision logic.
@@ -101,6 +104,9 @@ mod tab_drag_controller;
 mod terminal_geometry;
 mod transfer_controller;
 mod ui_tokens;
+// v1.12.27b (P1-04): dispatch_window_event's Resized arm, moved verbatim out
+// of window_event_controller.rs (same-file split exceeded the 800 ceiling).
+mod window_event;
 mod window_event_controller;
 mod workspace_controller;
 // Allocation forensics gate — see `alloc_probe` for env vars / threshold.

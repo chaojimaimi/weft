@@ -1,559 +1,64 @@
 //! Window event controller. The ApplicationHandler trait forwards here.
+//!
+//! v1.12.27b (P1-04): the `Resized` arm (the largest, ~190 lines at baseline)
+//! lives in the `window_event/` child module — the same-file split landed at
+//! 813 lines, so the plan's sanctioned contingency moved it out
+//! (`paint/settings/`+`pages.rs` child-module precedent).
 
 use super::*;
 
+/// v1.12.27b (P1-04): the early-return signal for extracted
+/// `dispatch_window_event` arms — `PhaseOutcome` precedent (v1.12.25 3-B-2).
+/// The `CursorMoved` arm contained two inline `return`s that skip the
+/// `should_exit` tail; the extracted arm reports `Abort` and the dispatch
+/// skeleton performs the plain `return` at the exact original timing — no
+/// return-timing semantics change.
+#[must_use]
+enum DispatchOutcome {
+    /// The arm ran to its end — fall through to the `should_exit` tail.
+    Continue,
+    /// The arm hit an original early `return` — the caller must return from
+    /// `dispatch_window_event` immediately (skipping the tail, as before).
+    Abort,
+}
+
 impl App {
+    /// v1.12.27b (P1-04): dispatch keeps only the event-class match skeleton
+    /// plus the `should_exit` tail (:559-568 at baseline); each arm's body
+    /// moved verbatim into the `on_*` method family below (zero behavior
+    /// change). The `CursorMoved` arm reports its two original early returns
+    /// through `DispatchOutcome` instead of returning directly.
     pub(super) fn dispatch_window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => {
-                self.request_application_close(event_loop);
-            }
-            WindowEvent::Resized(physical_size) => {
-                // PLAN_zoom (field run): a PROGRAMMATIC zoom (double-click)
-                // shows up here as a one-shot size jump with inLiveResize
-                // already FALSE (the zoom's internal live-resize window has
-                // closed before winit dispatches Resized) -- while a drag
-                // streams small steps with inLiveResize true. v4 (field run
-                // 2): the zoom ANIMATES -- a stream of small-step Resized
-                // events (~100 ms total) with inLiveResize false throughout,
-                // so no single frame ever exceeds a jump threshold. Arm on
-                // ANY size change; the inLiveResize guard below separates it
-                // from drags.
-                let size_changed = self.window_runtime.last_resized_physical
-                    != Some((physical_size.width, physical_size.height));
-                self.window_runtime.last_resized_physical =
-                    Some((physical_size.width, physical_size.height));
-                // Grid/PTY tracks the renderer's visible terminal content
-                // rectangle. The editor box is an overlay, but title/tab
-                // chrome is outside that rectangle and must be subtracted.
-                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
-                    // Responsive geometry depends on the new viewport, so
-                    // update the renderer before asking for sidebar/chrome
-                    // metrics or terminal rows/cols.
-                    renderer.resize(window, physical_size);
-                    // v0.9 W5: subtract sidebar width when the panel is open so
-                    // the grid reflows beside the sidebar (mirrors grid_dims).
-                    let chrome_left = if self.panel.open {
-                        renderer.sidebar_push_width() as f64
-                    } else {
-                        0.0
-                    };
-                    let base_layout =
-                        terminal_layout_for_renderer(renderer, physical_size, chrome_left);
-
-                    if base_layout.cols > 0 && base_layout.rows > 0 {
-                        // Queue every pane's latest target geometry. The active
-                        // pane commits PTY then Grid on this redraw; background
-                        // panes coalesce the cascade and commit both together
-                        // after it settles. Keeping the pair transactional
-                        // prevents old-width output from wrapping in a Grid
-                        // that has already adopted the new width.
-                        //
-                        // v1.3 Batch 6: resize ALL panes per tab according to
-                        // their split-tree rects. For single-pane tabs this is
-                        // equivalent to the old `resize_terminal_and_queue`.
-                        let header_rows = renderer.block_header_rows();
-                        let layout_ctx = base_layout.layout_ctx();
-                        let content_rect: weft_core::pane_layout::Rect = [
-                            base_layout.content.left as f32,
-                            base_layout.content.top as f32,
-                            base_layout.content.right as f32,
-                            base_layout.content.bottom as f32,
-                        ];
-                        let cell_w = base_layout.cell_width as f32;
-                        let cell_h = base_layout.cell_height as f32;
-                        for (tab_index, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
-                            if tab.terminal.is_some() {
-                                tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
-
-                                // `block_scroll_offset` is measured from the
-                                // bottom of a width-dependent document. A
-                                // larger viewport usually wraps fewer rows and
-                                // shows more of them, so an offset that was
-                                // valid before maximize can exceed the new
-                                // range and make the transcript tail
-                                // unreachable. Reconcile against the detached
-                                // snapshot now, before SIGWINCH causes the TUI
-                                // to repaint asynchronously.
-                                let previous = tab.block_scroll();
-                                let reconciliation = tab.terminal.as_ref().and_then(|terminal| {
-                                    crate::block_component::reconciled_terminal_block_scroll(
-                                        terminal,
-                                        &layout_ctx,
-                                        header_rows,
-                                        previous,
-                                    )
-                                });
-                                if let Some((reconciled, total, visible)) = reconciliation {
-                                    if previous != reconciled {
-                                        info!(
-                                            tab = tab_index,
-                                            previous,
-                                            reconciled,
-                                            total,
-                                            visible,
-                                            "reconciled block scroll during resize"
-                                        );
-                                        tab.set_block_scroll(reconciled);
-                                    }
-                                }
-                            }
-                        }
-                        info!(
-                            rows = base_layout.rows,
-                            cols = base_layout.cols,
-                            "all tabs resized (event)"
-                        );
-                        self.window_runtime.last_resize_instant = std::time::Instant::now();
-                        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING)
-                        // DEBUG probe (stage 1/4): the Resized event — anchor
-                        // for the ioctl-commit / first-pty-output / first-present
-                        // RESIZE_PROBE chain that quantifies the resize blank
-                        // interval and the omp repaint latency.
-                        tracing::debug!(
-                            rows = base_layout.rows,
-                            cols = base_layout.cols,
-                            "RESIZE_PROBE window_resized",
-                        );
-                        // `renderer.resize()` above already armed the stage-4
-                        // first-present probe.
-                        // v1.2-fix: re-clamp tab scroll offset after resize.
-                        // The window may have grown/shrunk, changing max_scroll.
-                        // Without this, a stale scroll_offset can leave tabs
-                        // culled (invisible) after resize.
-                        self.clamp_tab_scroll();
-                        self.scroll_active_tab_into_view();
-                    }
-                }
-                // v1.11.10 (PLAN_v11110 M-B/D-d): synchronous same-tick draw
-                // while live resizing. The bounds change stretches the
-                // previous drawable the instant AppKit commits it; a queued
-                // RedrawRequested lands a beat later, so
-                // presentsWithTransaction never saw the intermediate sizes.
-                // Polling here (before the draw) plus the forced path
-                // (bypassing the sync-output / route-consume early returns)
-                // gives every resize tick an atomic frame — the missing two
-                // of Warp's three-piece guarantee. Unconditional
-                // set_live_resize: the false reset must not depend on a
-                // later RedrawRequested arriving (the last drag event can be
-                // a Resized).
-                if let (Some(renderer), window) = (&mut self.renderer, self.window.as_ref()) {
-                    // PLAN_zoom Z-d: the zoom-sequence marker is armed by
-                    // `is_programmatic_resize_jump` outside a live-resize
-                    // gesture (arm block below); when hot it extends the
-                    // same-tick draw to the programmatic zoom.
-                    // HIGH-1 (round 3): arm the zoom channel ONLY outside a
-                    // live-resize gesture -- a fast drag coalesces Resized
-                    // events with >120 physical-px deltas (2x screen: 60 pt),
-                    // which would re-arm it (per-frame CA flush through the
-                    // drag plus a 300 ms tail, the cost PLAN §四 froze). The
-                    // zoom's own Resized arrives with inLiveResize already
-                    // false, so the guard separates the two cleanly. Arm
-                    // BEFORE the zoom_jump_hot read: the zoom's own final
-                    // Resized then engages the channel same-frame.
-                    // v4/Z-f: arm on EVERY non-gesture Resized with a size
-                    // change (the zoom animates in small steps). Z-f retires
-                    // the per-step forced DRAW below -- the arming survives
-                    // as observation/degrade marking only; animation-step
-                    // frames are supplied by the displayLayer pull
-                    // (paint/zoom_render.rs). Drags stream with inLiveResize
-                    // true and are excluded by the same guard (their sync
-                    // draw comes from the inLiveResize half).
-                    let in_live_resize_now =
-                        window.is_some_and(crate::macos_window::window_in_live_resize);
-                    if crate::paint::zoom_render::zoom_jump_should_arm(
-                        size_changed,
-                        in_live_resize_now,
-                    ) {
-                        self.window_runtime.zoom_jump_until =
-                            Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
-                        // Appendix F-3C: per-step watch update -- the first
-                        // zoom-channel step opens the window, later steps
-                        // extend it; the verdict runs at the deterministic
-                        // WaitUntil expiry (zoom_wait_policy), not here.
-                        crate::paint::zoom_render::note_zoom_step();
-                        // Phase F self-healing: re-assert the window beside
-                        // the watch -- closes the razor-thin re-zoom window
-                        // where a pending flush could clear the flag under a
-                        // live second animation.
-                        crate::paint::zoom_render::set_self_zoom_window(true);
-                    }
-                    // PLAN_zoom_drawable_stall Phase E: set_live_resize is fed
-                    // the gesture-only `in_live_resize_now` poll. The retired
-                    // `|| zoom_jump_hot` leg (Z-c/Z-d tx-release timing, dead
-                    // since the 1.12.10 binding removal) would arm the
-                    // serialized-present regime on animated programmatic
-                    // resizes (snap/tiling) where nothing presents new-size
-                    // frames until the <=300 ms flush.
-                    renderer.set_live_resize(in_live_resize_now);
-                    // PLAN_zoom Z-f (Appendix E-3): the v4 per-step forced
-                    // draw is RETIRED for the zoom channel -- a 5-9 ms
-                    // synchronous draw per animation step blocked the
-                    // system's zoom animation itself, which stretched the
-                    // distortion window (Appendix D-0). Only a real drag
-                    // gesture (inLiveResize true at dispatch) keeps the
-                    // same-tick synchronous draw.
-                    if crate::paint::zoom_render::forced_sync_draw_for_resize(in_live_resize_now) {
-                        self.handle_redraw_requested_forced();
-                    }
-                }
-            }
+            WindowEvent::CloseRequested => self.on_close_requested(event_loop),
+            WindowEvent::Resized(physical_size) => self.on_window_resized(physical_size),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // Moving between Retina and non-Retina displays changes every
-                // physical metric used by the renderer: glyph cells, padding,
-                // title/tab chrome and sidebar width. Refresh those first,
-                // then recompute Grid/PTY dimensions from the same geometry.
-                // Winit follows this event with Resized on macOS; doing the
-                // recompute here also covers a retained physical inner size.
-                let padding = (
-                    self.config_state.config.window.padding_x,
-                    self.config_state.config.window.padding_y,
-                );
-                let changed = self
-                    .renderer
-                    .as_mut()
-                    .is_some_and(|renderer| renderer.update_scale(scale_factor, padding));
-                if changed {
-                    self.recompute_layout();
-                    self.request_redraw();
-                }
+                self.on_scale_factor_changed(scale_factor);
             }
-            WindowEvent::RedrawRequested => {
-                // v1.11.6 (PLAN_v1116 M2 step 3): poll the macOS live-resize
-                // state right before the redraw. While true the renderer
-                // presents through the current Core Animation transaction
-                // (presentsWithTransaction), committing the resized layer
-                // bounds and the new frame atomically instead of CA stretching
-                // the previous drawable. `self.window` / `self.renderer` are
-                // disjoint fields, so the borrows coexist. Polled here (the
-                // winit dispatch point) rather than at the draw call site in
-                // redraw_controller.rs because that file sits at its audited
-                // 866-line ceiling; same frame, same result.
-                // PLAN_zoom_drawable_stall Phase E: this poll feeds
-                // set_live_resize GESTURE-ONLY — the retired Z-d/v4
-                // `|| zoom_jump_hot` leg armed the present-mode machinery on
-                // animated programmatic resizes (snap/tiling), where nothing
-                // would present new-size frames until the <=300 ms flush.
-                let in_live_resize = self
-                    .window
-                    .as_ref()
-                    .is_some_and(crate::macos_window::window_in_live_resize);
-                let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.set_live_resize(in_live_resize);
-                }
-                // PLAN_zoom appendix F-3B: `zoom_jump_hot` is only the
-                // NECESSARY half of "the pull should supply this frame"; the
-                // tightened gate adds the cache-side sufficiency (lever
-                // armed, cache populated, stale watermark, no pull in flight
-                // -- see pull_can_freshen). While it holds, the displayLayer
-                // pull is this frame's ONLY supplier: a full draw here would
-                // restamp the watermark with this step's drawable
-                // (apply_stash) and dedupe the pull away -- the 1.12.11
-                // "every step races the pull" defect (F-2). No draw happens,
-                // so the probe records nothing.
-                // PLAN_zoom_drawable_stall Phase C: the Appendix I-6
-                // main-path deferral is RETIRED. Its premise -- the shrink
-                // direction's reflow costs 0.4-1 s/step (field: a 1.0 s
-                // stall at cols~130) -- was falsified by the G6 bench
-                // (resize_commit_bench G4/G6: 2.0-2.6 ms at 37k lines); the
-                // real mid-animation stall was nextDrawable's <=1 s block
-                // (PLAN section 0), now bounded by Fix A's present-rate
-                // limiter. During a self-zoom the main draw is therefore
-                // UNCONDITIONAL: live tracking in BOTH directions through
-                // the drag-validated pipeline (the pull stands down for the
-                // animation inside redraw_cached_frame). Outside a
-                // self-zoom (drags) the F-3B `hot && pull_can_freshen`
-                // suppression above is preserved verbatim. Single-jump
-                // resizes open the Phase F window flag for ≤300 ms (the
-                // hardening re-arms it beside note_zoom_step), so their tail
-                // runs main-draw-supplied instead of pull-supplied — the
-                // plan's documented fail-safe direction. Phase F: the gate
-                // reads the self-zoom WINDOW flag, which spans arm→flush
-                // (animation + the ≤300 ms hot tail) — at the last step the
-                // anim is already cleared when this gate re-runs for the
-                // final geometry, so zoom_anim_active() was too weak.
-                let self_zoom_window = crate::paint::zoom_render::self_zoom_window();
-                let pull_supplies_frame = zoom_jump_hot
-                    && !self_zoom_window
-                    && self.window.as_ref().is_some_and(|window| {
-                        let inner = window.inner_size();
-                        crate::paint::zoom_render::pull_can_freshen(
-                            inner.width as f32,
-                            inner.height as f32,
-                        )
-                    });
-                if !pull_supplies_frame {
-                    let started = std::time::Instant::now();
-                    self.handle_redraw_requested();
-                    self.performance_probe.record_redraw(started.elapsed());
-                }
+            WindowEvent::RedrawRequested => self.on_redraw_requested(),
+            WindowEvent::KeyboardInput { event, .. } => self.on_keyboard_input(event),
+            WindowEvent::ModifiersChanged(new_mods) => self.on_modifiers_changed(new_mods),
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.on_mouse_input(state, button);
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                // KB_DIAG (PLAN_v11217 §3.6, T6): winit entry-layer evidence
-                // for the synthetic fast-typing space/underscore loss (T9
-                // groundwork). The three-layer counting experiment pairs this
-                // log's per-key count against the script-sent char count and
-                // the "key → pty" count (app/keyboard.rs). `logical_key` is
-                // the new value here: it exposes winit's NamedKey/Character
-                // decision directly, so a space deformed at this layer
-                // (Named vs Character) is visible. Released events are
-                // included by design — hence the neutral message name.
-                // Debug-gated (RUST_LOG=weft_app=debug); zero cost by
-                // default in release (tracing macro semantics).
-                tracing::debug!(
-                    physical = ?event.physical_key,
-                    logical = ?event.logical_key,
-                    text = ?event.text,
-                    repeat = event.repeat,
-                    state = ?event.state,
-                    "KB_DIAG key"
-                );
-                // v1.11.4 (PLAN_v1114 §2.2, L2 pipe): winit 0.30 delivers
-                // Pressed (first), Pressed+repeat (macOS hold-to-repeat) and
-                // Released. The kind flows to the InputHandler so a kitty
-                // event-types (0b10) app receives `:N` sub-segments — the
-                // handling below stays behavior-identical at flags=0 (the
-                // encoder ignores the kind; Releases were dropped before).
-                let kind = match event.state {
-                    winit::event::ElementState::Pressed if event.repeat => {
-                        weft_core::input::KittyEventKind::Repeat
-                    }
-                    winit::event::ElementState::Pressed => weft_core::input::KittyEventKind::Press,
-                    winit::event::ElementState::Released => {
-                        weft_core::input::KittyEventKind::Release
-                    }
-                };
-                if let PhysicalKey::Code(key_code) = event.physical_key {
-                    // `event.text` already reflects Shift (and the keymap),
-                    // e.g. Shift+A -> "A", Shift+1 -> "!". The editor uses it
-                    // so typed commands keep their case / shifted symbols.
-                    self.handle_key_event(
-                        kind,
-                        key_code,
-                        self.interaction.mods,
-                        event.text.as_deref(),
-                    );
-                }
-            }
-            WindowEvent::ModifiersChanged(new_mods) => {
-                self.interaction.mods = new_mods;
-            }
-            WindowEvent::MouseInput { state, button, .. } => match state {
-                winit::event::ElementState::Pressed => {
-                    let modal_open = self.palette.open
-                        || self.settings.open
-                        || self.interaction.context_menu.is_some();
-                    let capture_active = self.interaction.modal_mouse_capture.is_active();
-                    if modal_open || capture_active {
-                        self.interaction
-                            .modal_mouse_capture
-                            .capture_press(true, button);
-                    } else if let Some(session) = self.sessions.tab(self.sessions.active_idx()) {
-                        self.interaction.modal_mouse_capture.capture_terminal_press(
-                            button,
-                            session.session_id,
-                            false,
-                        );
-                    }
-                    // A newly modal-owned press is delivered to that modal.
-                    // Extra presses during an already captured gesture stay
-                    // captured without falling through to the terminal.
-                    if modal_open || !capture_active {
-                        self.handle_mouse_press(
-                            self.interaction.last_mouse_x,
-                            self.interaction.last_mouse_y,
-                            button,
-                        );
-                    }
-                    // A terminal-routed press can itself open ContextMenu.
-                    // Record that ownership after the handler as well: the
-                    // menu consumed the press without emitting PTY bytes, so
-                    // its later release belongs to the same modal gesture.
-                    self.interaction.modal_mouse_capture.capture_press(
-                        self.palette.open
-                            || self.settings.open
-                            || self.interaction.context_menu.is_some(),
-                        button,
-                    );
-                }
-                winit::event::ElementState::Released => {
-                    match self.interaction.modal_mouse_capture.consume_release(button) {
-                        Some(crate::input_router::MouseGestureOwner::Modal)
-                        | Some(crate::input_router::MouseGestureOwner::Suppressed) => {
-                            // v1.11.13: a press that fell through to the tab
-                            // bar while a modal (palette/settings) was open
-                            // may have set `tab_drag`; its release is consumed
-                            // here, so cancel the gesture or it would pin the
-                            // ghost pill and swallow later CursorMoved events.
-                            self.cancel_tab_drag();
-                        }
-                        Some(crate::input_router::MouseGestureOwner::TerminalSession(
-                            session_id,
-                        )) => {
-                            self.handle_mouse_release(
-                                self.interaction.last_mouse_x,
-                                self.interaction.last_mouse_y,
-                                button,
-                                Some(session_id),
-                                true,
-                            );
-                        }
-                        Some(crate::input_router::MouseGestureOwner::LocalSession(session_id)) => {
-                            self.handle_mouse_release(
-                                self.interaction.last_mouse_x,
-                                self.interaction.last_mouse_y,
-                                button,
-                                Some(session_id),
-                                false,
-                            );
-                        }
-                        None if crate::input_router::route_modal_pointer(
-                            self.palette.open,
-                            self.settings.open,
-                            self.interaction.context_menu.is_some(),
-                            self.interaction.modal_mouse_capture.is_active(),
-                            !self.sessions.is_empty(),
-                        ) == crate::input_router::SessionInputRoute::Dispatch =>
-                        {
-                            self.handle_mouse_release(
-                                self.interaction.last_mouse_x,
-                                self.interaction.last_mouse_y,
-                                button,
-                                None,
-                                false,
-                            );
-                        }
-                        None => {}
-                    }
-                }
-            },
             WindowEvent::CursorMoved { position, .. } => {
-                self.interaction.last_mouse_x = position.x;
-                self.interaction.last_mouse_y = position.y;
-                // v1.11: tab drag-to-reorder takes priority over all other
-                // pointer routing. Must run before the modal/terminal routing
-                // because a tab press switches tabs, which changes the active
-                // session — the normal routing would then send CursorMoved to
-                // the wrong session and skip handle_mouse_move entirely.
-                if self.interaction.tab_drag.is_some() {
-                    tracing::debug!(
-                        "TAB_DRAG_DIAG: CursorMoved at ({}, {}), tab_drag is some, calling handle_tab_drag_move",
-                        position.x, position.y
-                    );
-                    self.handle_tab_drag_move(position.x, position.y);
+                // v1.12.27b (P1-04): the original inline `return`s skip the
+                // `should_exit` tail below; the extracted arm surfaces them
+                // as `Abort` so the return happens here, unchanged.
+                if let DispatchOutcome::Abort = self.on_cursor_moved(position) {
                     return;
                 }
-                // v1.10.34: context menu hover — update the highlighted item
-                // as the pointer slides over the menu. The menu is modal
-                // (route_modal_pointer returns Consume below), so this is the
-                // only pointer handling that runs while it is open.
-                if self.interaction.context_menu.is_some() {
-                    self.update_context_menu_hover(position.x, position.y);
-                    return;
-                }
-                if crate::input_router::route_modal_pointer(
-                    self.palette.open,
-                    self.settings.open,
-                    self.interaction.context_menu.is_some(),
-                    self.interaction.modal_mouse_capture.is_active(),
-                    !self.sessions.is_empty(),
-                ) == crate::input_router::SessionInputRoute::Dispatch
-                {
-                    let active_session = self
-                        .sessions
-                        .tab(self.sessions.active_idx())
-                        .map(|tab| tab.session_id);
-                    let owner = self
-                        .interaction
-                        .modal_mouse_capture
-                        .terminal_move_owner()
-                        .map(|(_, owner)| owner);
-                    match crate::input_router::route_owned_pointer_move(active_session, owner) {
-                        crate::input_router::OwnedPointerMoveRoute::TerminalOwner(_) => {
-                            if self.terminal_content_contains(position.x, position.y) {
-                                let pos = self.pixel_to_grid(position.x, position.y);
-                                self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
-                            }
-                        }
-                        crate::input_router::OwnedPointerMoveRoute::Suppress => {}
-                        crate::input_router::OwnedPointerMoveRoute::ActiveSession => {
-                            self.handle_mouse_move(position.x, position.y);
-                        }
-                    }
-                }
             }
-            WindowEvent::CursorLeft { .. } => {
-                // v1.11.13: a drag that ends with the pointer outside the
-                // window is cancelled (not committed) — the release event may
-                // never arrive, and a stale tab_drag would pin the ghost pill
-                // to the screen edge and swallow every later CursorMoved.
-                self.cancel_tab_drag();
-                if self.interaction.scrollbar_hovered && self.interaction.scrollbar_drag.is_none() {
-                    self.interaction.scrollbar_hovered = false;
-                    if let Some(window) = &self.window {
-                        window.set_cursor(winit::window::CursorIcon::Default);
-                    }
-                    self.request_redraw();
-                }
-                if self.tab_bar.hovered_tab.is_some()
-                    || self.tab_bar.plus_hovered
-                    || self.tab_bar.arrow_left_hovered
-                    || self.tab_bar.arrow_right_hovered
-                {
-                    self.tab_bar.clear_hover();
-                    self.request_redraw();
-                }
-            }
+            WindowEvent::CursorLeft { .. } => self.on_cursor_left(),
             WindowEvent::MouseWheel { delta, phase, .. } => {
-                if crate::input_router::route_modal_pointer(
-                    self.palette.open,
-                    self.settings.open,
-                    self.interaction.context_menu.is_some(),
-                    self.interaction.modal_mouse_capture.is_active(),
-                    !self.sessions.is_empty(),
-                ) == crate::input_router::SessionInputRoute::Dispatch
-                {
-                    self.handle_scroll(
-                        delta,
-                        phase,
-                        self.interaction.last_mouse_x,
-                        self.interaction.last_mouse_y,
-                    );
-                }
+                self.on_mouse_wheel(delta, phase);
             }
-            WindowEvent::Ime(ime_event) => self.handle_ime_event(ime_event),
-            WindowEvent::Focused(focused) => {
-                // v1.11.5 (PLAN_v1115 §M2): focus drives the notification
-                // gate — long commands notify only while the window is out
-                // of focus. Initial state is `true` (see `App::new`).
-                self.window_focused = focused;
-                // v1.11.15 (FIX C, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §3):
-                // winit only delivers ModifiersChanged while this window is
-                // the event target — switching apps mid-press can leave
-                // stale mods behind (the incident's Cb=48 Move+CONTROL
-                // hover report). Reset to the same default InteractionState
-                // constructs with (app_state.rs) on BOTH the gain- and
-                // lose-focus branches; the failure direction is dropping
-                // modifier bits, which is safe.
-                self.interaction.mods = winit::event::Modifiers::default();
-                // Reset blink timer on focus change
-                if focused {
-                    self.window_runtime.cursor_blink_on = true;
-                    self.window_runtime.cursor_blink_time = std::time::Instant::now();
-                } else {
-                    // v1.11.13: switching apps mid-drag (Cmd+Tab) can drop the
-                    // mouse release — cancel the drag so the ghost doesn't
-                    // stay pinned and future moves aren't swallowed.
-                    self.cancel_tab_drag();
-                    self.interaction.modal_mouse_capture.suspend_active();
-                    self.reset_ime_context("window focus lost");
-                }
-            }
+            WindowEvent::Ime(ime_event) => self.on_ime_event(ime_event),
+            WindowEvent::Focused(focused) => self.on_focus_changed(focused),
             _ => {}
         }
         // v1.0 H4: check should_exit flag (set by close_tab on last tab).
@@ -565,6 +70,396 @@ impl App {
         if self.should_exit {
             self.recovery.mark_clean_shutdown();
             event_loop.exit();
+        }
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `CloseRequested` arm body
+    /// (baseline :12-14).
+    fn on_close_requested(&mut self, event_loop: &ActiveEventLoop) {
+        self.request_application_close(event_loop);
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `ScaleFactorChanged` arm body
+    /// (baseline :205-224).
+    fn on_scale_factor_changed(&mut self, scale_factor: f64) {
+        // Moving between Retina and non-Retina displays changes every
+        // physical metric used by the renderer: glyph cells, padding,
+        // title/tab chrome and sidebar width. Refresh those first,
+        // then recompute Grid/PTY dimensions from the same geometry.
+        // Winit follows this event with Resized on macOS; doing the
+        // recompute here also covers a retained physical inner size.
+        let padding = (
+            self.config_state.config.window.padding_x,
+            self.config_state.config.window.padding_y,
+        );
+        let changed = self
+            .renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.update_scale(scale_factor, padding));
+        if changed {
+            self.recompute_layout();
+            self.request_redraw();
+        }
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `RedrawRequested` arm body
+    /// (baseline :225-295).
+    fn on_redraw_requested(&mut self) {
+        // v1.11.6 (PLAN_v1116 M2 step 3): poll the macOS live-resize
+        // state right before the redraw. While true the renderer
+        // presents through the current Core Animation transaction
+        // (presentsWithTransaction), committing the resized layer
+        // bounds and the new frame atomically instead of CA stretching
+        // the previous drawable. `self.window` / `self.renderer` are
+        // disjoint fields, so the borrows coexist. Polled here (the
+        // winit dispatch point) rather than at the draw call site in
+        // redraw_controller.rs because that file sits at its audited
+        // 866-line ceiling; same frame, same result.
+        // PLAN_zoom_drawable_stall Phase E: this poll feeds
+        // set_live_resize GESTURE-ONLY — the retired Z-d/v4
+        // `|| zoom_jump_hot` leg armed the present-mode machinery on
+        // animated programmatic resizes (snap/tiling), where nothing
+        // would present new-size frames until the <=300 ms flush.
+        let in_live_resize = self
+            .window
+            .as_ref()
+            .is_some_and(crate::macos_window::window_in_live_resize);
+        let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_live_resize(in_live_resize);
+        }
+        // PLAN_zoom appendix F-3B: `zoom_jump_hot` is only the
+        // NECESSARY half of "the pull should supply this frame"; the
+        // tightened gate adds the cache-side sufficiency (lever
+        // armed, cache populated, stale watermark, no pull in flight
+        // -- see pull_can_freshen). While it holds, the displayLayer
+        // pull is this frame's ONLY supplier: a full draw here would
+        // restamp the watermark with this step's drawable
+        // (apply_stash) and dedupe the pull away -- the 1.12.11
+        // "every step races the pull" defect (F-2). No draw happens,
+        // so the probe records nothing.
+        // PLAN_zoom_drawable_stall Phase C: the Appendix I-6
+        // main-path deferral is RETIRED. Its premise -- the shrink
+        // direction's reflow costs 0.4-1 s/step (field: a 1.0 s
+        // stall at cols~130) -- was falsified by the G6 bench
+        // (resize_commit_bench G4/G6: 2.0-2.6 ms at 37k lines); the
+        // real mid-animation stall was nextDrawable's <=1 s block
+        // (PLAN section 0), now bounded by Fix A's present-rate
+        // limiter. During a self-zoom the main draw is therefore
+        // UNCONDITIONAL: live tracking in BOTH directions through
+        // the drag-validated pipeline (the pull stands down for the
+        // animation inside redraw_cached_frame). Outside a
+        // self-zoom (drags) the F-3B `hot && pull_can_freshen`
+        // suppression above is preserved verbatim. Single-jump
+        // resizes open the Phase F window flag for ≤300 ms (the
+        // hardening re-arms it beside note_zoom_step), so their tail
+        // runs main-draw-supplied instead of pull-supplied — the
+        // plan's documented fail-safe direction. Phase F: the gate
+        // reads the self-zoom WINDOW flag, which spans arm→flush
+        // (animation + the ≤300 ms hot tail) — at the last step the
+        // anim is already cleared when this gate re-runs for the
+        // final geometry, so zoom_anim_active() was too weak.
+        let self_zoom_window = crate::paint::zoom_render::self_zoom_window();
+        let pull_supplies_frame = zoom_jump_hot
+            && !self_zoom_window
+            && self.window.as_ref().is_some_and(|window| {
+                let inner = window.inner_size();
+                crate::paint::zoom_render::pull_can_freshen(inner.width as f32, inner.height as f32)
+            });
+        if !pull_supplies_frame {
+            let started = std::time::Instant::now();
+            self.handle_redraw_requested();
+            self.performance_probe.record_redraw(started.elapsed());
+        }
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `KeyboardInput` arm body
+    /// (baseline :296-342).
+    fn on_keyboard_input(&mut self, event: winit::event::KeyEvent) {
+        // KB_DIAG (PLAN_v11217 §3.6, T6): winit entry-layer evidence
+        // for the synthetic fast-typing space/underscore loss (T9
+        // groundwork). The three-layer counting experiment pairs this
+        // log's per-key count against the script-sent char count and
+        // the "key → pty" count (app/keyboard.rs). `logical_key` is
+        // the new value here: it exposes winit's NamedKey/Character
+        // decision directly, so a space deformed at this layer
+        // (Named vs Character) is visible. Released events are
+        // included by design — hence the neutral message name.
+        // Debug-gated (RUST_LOG=weft_app=debug); zero cost by
+        // default in release (tracing macro semantics).
+        tracing::debug!(
+            physical = ?event.physical_key,
+            logical = ?event.logical_key,
+            text = ?event.text,
+            repeat = event.repeat,
+            state = ?event.state,
+            "KB_DIAG key"
+        );
+        // v1.11.4 (PLAN_v1114 §2.2, L2 pipe): winit 0.30 delivers
+        // Pressed (first), Pressed+repeat (macOS hold-to-repeat) and
+        // Released. The kind flows to the InputHandler so a kitty
+        // event-types (0b10) app receives `:N` sub-segments — the
+        // handling below stays behavior-identical at flags=0 (the
+        // encoder ignores the kind; Releases were dropped before).
+        let kind = match event.state {
+            winit::event::ElementState::Pressed if event.repeat => {
+                weft_core::input::KittyEventKind::Repeat
+            }
+            winit::event::ElementState::Pressed => weft_core::input::KittyEventKind::Press,
+            winit::event::ElementState::Released => weft_core::input::KittyEventKind::Release,
+        };
+        if let PhysicalKey::Code(key_code) = event.physical_key {
+            // `event.text` already reflects Shift (and the keymap),
+            // e.g. Shift+A -> "A", Shift+1 -> "!". The editor uses it
+            // so typed commands keep their case / shifted symbols.
+            self.handle_key_event(kind, key_code, self.interaction.mods, event.text.as_deref());
+        }
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `ModifiersChanged` arm body
+    /// (baseline :343-345).
+    fn on_modifiers_changed(&mut self, new_mods: winit::event::Modifiers) {
+        self.interaction.mods = new_mods;
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `MouseInput` arm body
+    /// (baseline :346-434).
+    fn on_mouse_input(
+        &mut self,
+        state: winit::event::ElementState,
+        button: winit::event::MouseButton,
+    ) {
+        match state {
+            winit::event::ElementState::Pressed => {
+                let modal_open = self.palette.open
+                    || self.settings.open
+                    || self.interaction.context_menu.is_some();
+                let capture_active = self.interaction.modal_mouse_capture.is_active();
+                if modal_open || capture_active {
+                    self.interaction
+                        .modal_mouse_capture
+                        .capture_press(true, button);
+                } else if let Some(session) = self.sessions.tab(self.sessions.active_idx()) {
+                    self.interaction.modal_mouse_capture.capture_terminal_press(
+                        button,
+                        session.session_id,
+                        false,
+                    );
+                }
+                // A newly modal-owned press is delivered to that modal.
+                // Extra presses during an already captured gesture stay
+                // captured without falling through to the terminal.
+                if modal_open || !capture_active {
+                    self.handle_mouse_press(
+                        self.interaction.last_mouse_x,
+                        self.interaction.last_mouse_y,
+                        button,
+                    );
+                }
+                // A terminal-routed press can itself open ContextMenu.
+                // Record that ownership after the handler as well: the
+                // menu consumed the press without emitting PTY bytes, so
+                // its later release belongs to the same modal gesture.
+                self.interaction.modal_mouse_capture.capture_press(
+                    self.palette.open
+                        || self.settings.open
+                        || self.interaction.context_menu.is_some(),
+                    button,
+                );
+            }
+            winit::event::ElementState::Released => {
+                match self.interaction.modal_mouse_capture.consume_release(button) {
+                    Some(crate::input_router::MouseGestureOwner::Modal)
+                    | Some(crate::input_router::MouseGestureOwner::Suppressed) => {
+                        // v1.11.13: a press that fell through to the tab
+                        // bar while a modal (palette/settings) was open
+                        // may have set `tab_drag`; its release is consumed
+                        // here, so cancel the gesture or it would pin the
+                        // ghost pill and swallow later CursorMoved events.
+                        self.cancel_tab_drag();
+                    }
+                    Some(crate::input_router::MouseGestureOwner::TerminalSession(session_id)) => {
+                        self.handle_mouse_release(
+                            self.interaction.last_mouse_x,
+                            self.interaction.last_mouse_y,
+                            button,
+                            Some(session_id),
+                            true,
+                        );
+                    }
+                    Some(crate::input_router::MouseGestureOwner::LocalSession(session_id)) => {
+                        self.handle_mouse_release(
+                            self.interaction.last_mouse_x,
+                            self.interaction.last_mouse_y,
+                            button,
+                            Some(session_id),
+                            false,
+                        );
+                    }
+                    None if crate::input_router::route_modal_pointer(
+                        self.palette.open,
+                        self.settings.open,
+                        self.interaction.context_menu.is_some(),
+                        self.interaction.modal_mouse_capture.is_active(),
+                        !self.sessions.is_empty(),
+                    ) == crate::input_router::SessionInputRoute::Dispatch =>
+                    {
+                        self.handle_mouse_release(
+                            self.interaction.last_mouse_x,
+                            self.interaction.last_mouse_y,
+                            button,
+                            None,
+                            false,
+                        );
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `CursorMoved` arm body
+    /// (baseline :435-489). The two inline `return`s become
+    /// `DispatchOutcome::Abort` (reported to the skeleton — same timing).
+    fn on_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) -> DispatchOutcome {
+        self.interaction.last_mouse_x = position.x;
+        self.interaction.last_mouse_y = position.y;
+        // v1.11: tab drag-to-reorder takes priority over all other
+        // pointer routing. Must run before the modal/terminal routing
+        // because a tab press switches tabs, which changes the active
+        // session — the normal routing would then send CursorMoved to
+        // the wrong session and skip handle_mouse_move entirely.
+        if self.interaction.tab_drag.is_some() {
+            tracing::debug!(
+                "TAB_DRAG_DIAG: CursorMoved at ({}, {}), tab_drag is some, calling handle_tab_drag_move",
+                position.x, position.y
+            );
+            self.handle_tab_drag_move(position.x, position.y);
+            return DispatchOutcome::Abort;
+        }
+        // v1.10.34: context menu hover — update the highlighted item
+        // as the pointer slides over the menu. The menu is modal
+        // (route_modal_pointer returns Consume below), so this is the
+        // only pointer handling that runs while it is open.
+        if self.interaction.context_menu.is_some() {
+            self.update_context_menu_hover(position.x, position.y);
+            return DispatchOutcome::Abort;
+        }
+        if crate::input_router::route_modal_pointer(
+            self.palette.open,
+            self.settings.open,
+            self.interaction.context_menu.is_some(),
+            self.interaction.modal_mouse_capture.is_active(),
+            !self.sessions.is_empty(),
+        ) == crate::input_router::SessionInputRoute::Dispatch
+        {
+            let active_session = self
+                .sessions
+                .tab(self.sessions.active_idx())
+                .map(|tab| tab.session_id);
+            let owner = self
+                .interaction
+                .modal_mouse_capture
+                .terminal_move_owner()
+                .map(|(_, owner)| owner);
+            match crate::input_router::route_owned_pointer_move(active_session, owner) {
+                crate::input_router::OwnedPointerMoveRoute::TerminalOwner(_) => {
+                    if self.terminal_content_contains(position.x, position.y) {
+                        let pos = self.pixel_to_grid(position.x, position.y);
+                        self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
+                    }
+                }
+                crate::input_router::OwnedPointerMoveRoute::Suppress => {}
+                crate::input_router::OwnedPointerMoveRoute::ActiveSession => {
+                    self.handle_mouse_move(position.x, position.y);
+                }
+            }
+        }
+        DispatchOutcome::Continue
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `CursorLeft` arm body
+    /// (baseline :490-511).
+    fn on_cursor_left(&mut self) {
+        // v1.11.13: a drag that ends with the pointer outside the
+        // window is cancelled (not committed) — the release event may
+        // never arrive, and a stale tab_drag would pin the ghost pill
+        // to the screen edge and swallow every later CursorMoved.
+        self.cancel_tab_drag();
+        if self.interaction.scrollbar_hovered && self.interaction.scrollbar_drag.is_none() {
+            self.interaction.scrollbar_hovered = false;
+            if let Some(window) = &self.window {
+                window.set_cursor(winit::window::CursorIcon::Default);
+            }
+            self.request_redraw();
+        }
+        if self.tab_bar.hovered_tab.is_some()
+            || self.tab_bar.plus_hovered
+            || self.tab_bar.arrow_left_hovered
+            || self.tab_bar.arrow_right_hovered
+        {
+            self.tab_bar.clear_hover();
+            self.request_redraw();
+        }
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `MouseWheel` arm body
+    /// (baseline :512-528).
+    fn on_mouse_wheel(
+        &mut self,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+    ) {
+        if crate::input_router::route_modal_pointer(
+            self.palette.open,
+            self.settings.open,
+            self.interaction.context_menu.is_some(),
+            self.interaction.modal_mouse_capture.is_active(),
+            !self.sessions.is_empty(),
+        ) == crate::input_router::SessionInputRoute::Dispatch
+        {
+            self.handle_scroll(
+                delta,
+                phase,
+                self.interaction.last_mouse_x,
+                self.interaction.last_mouse_y,
+            );
+        }
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `Ime` arm body
+    /// (baseline :529).
+    fn on_ime_event(&mut self, ime_event: winit::event::Ime) {
+        self.handle_ime_event(ime_event);
+    }
+
+    /// v1.12.27b (P1-04): verbatim move of the `Focused` arm body
+    /// (baseline :530-556).
+    fn on_focus_changed(&mut self, focused: bool) {
+        // v1.11.5 (PLAN_v1115 §M2): focus drives the notification
+        // gate — long commands notify only while the window is out
+        // of focus. Initial state is `true` (see `App::new`).
+        self.window_focused = focused;
+        // v1.11.15 (FIX C, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §3):
+        // winit only delivers ModifiersChanged while this window is
+        // the event target — switching apps mid-press can leave
+        // stale mods behind (the incident's Cb=48 Move+CONTROL
+        // hover report). Reset to the same default InteractionState
+        // constructs with (app_state.rs) on BOTH the gain- and
+        // lose-focus branches; the failure direction is dropping
+        // modifier bits, which is safe.
+        self.interaction.mods = winit::event::Modifiers::default();
+        // Reset blink timer on focus change
+        if focused {
+            self.window_runtime.cursor_blink_on = true;
+            self.window_runtime.cursor_blink_time = std::time::Instant::now();
+        } else {
+            // v1.11.13: switching apps mid-drag (Cmd+Tab) can drop the
+            // mouse release — cancel the drag so the ghost doesn't
+            // stay pinned and future moves aren't swallowed.
+            self.cancel_tab_drag();
+            self.interaction.modal_mouse_capture.suspend_active();
+            self.reset_ime_context("window focus lost");
         }
     }
 
