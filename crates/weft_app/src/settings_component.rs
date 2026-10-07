@@ -46,6 +46,8 @@ pub(crate) enum SettingsTarget {
     /// v1.8.3: LocalAi → "Test Connection:" row. Enter/click spawns a
     /// `/api/tags` refresh and updates the connection status line.
     LocalAiTestConnection,
+    /// v1.13.0: Update "Check Now" row — one-shot Sparkle check (plan D4).
+    UpdateCheckNow,
 }
 
 pub(crate) const APPEARANCE_ADJUSTMENT_ROWS: usize = 6;
@@ -295,10 +297,10 @@ pub(crate) fn build_settings_scene(
             if active_tab == SettingsTab::Advanced {
                 continue;
             }
-            // v1.8.3: LocalAi row 7 is the "Test Connection" action button —
-            // it gets a dedicated `LocalAiTestConnection` hit target below,
-            // so skip the generic ContentRow registration for it.
-            if active_tab == SettingsTab::LocalAi && row == 7 {
+            // LocalAi row 7 / Update row 2 (v1.13.0): action rows, dedicated targets below.
+            if (active_tab == SettingsTab::LocalAi && row == 7)
+                || (active_tab == SettingsTab::Update && row == 2)
+            {
                 continue;
             }
             let row_y = layout.content_top + visible_index as f32 * cell_h;
@@ -336,6 +338,21 @@ pub(crate) fn build_settings_scene(
                 state: String::new(),
             });
         }
+    }
+
+    // v1.13.0: Update "Check Now" hit + semantics (LocalAi row-7 twin, plan D4).
+    if layout.show_content && active_tab == SettingsTab::Update && layout.max_rows > 2 {
+        let row_y = layout.content_top + 2.0 * cell_h;
+        let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
+        let target = SettingsTarget::UpdateCheckNow;
+        scene.hits.push(HitRegion::from_rect(row_rect, target));
+        scene.semantics.push(SemanticNode {
+            role: SemanticRole::Button,
+            label: "Check for updates".into(),
+            bounds: row_rect,
+            focus: Some(FocusId::Settings),
+            state: String::new(),
+        });
     }
 
     // v1.5.2: Advanced → Import/Export action rows. Rows 2 and 3 in the

@@ -209,15 +209,16 @@ fn settings_tab_labels_are_distinct() {
 }
 
 #[test]
-fn settings_tab_all_has_seven_visible_categories() {
+fn settings_tab_all_has_eight_visible_categories() {
     // F5: Logo merged into Appearance; Font merged into Appearance.
     // v1.8.3: LocalAi added as the 7th category (between Window and Advanced).
     // v1.11.0: Advanced removed from the visible list — placeholder rows have
     // no real config backing (PLAN_v111 item 1); the enum variant is kept.
     // v1.12.19 (PLAN_v11217 §3.8 T13b): Blocks joins right after Terminal.
+    // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Update joins after LocalAi.
     // Visible: Appearance, Terminal, Blocks, Input, Keybindings, Window,
-    // LocalAi.
-    assert_eq!(SettingsTab::ALL.len(), 7);
+    // LocalAi, Update.
+    assert_eq!(SettingsTab::ALL.len(), 8);
     assert_eq!(SettingsTab::ALL[0], SettingsTab::Appearance);
     assert_eq!(SettingsTab::ALL[1], SettingsTab::Terminal);
     assert_eq!(SettingsTab::ALL[2], SettingsTab::Blocks);
@@ -225,6 +226,7 @@ fn settings_tab_all_has_seven_visible_categories() {
     assert_eq!(SettingsTab::ALL[4], SettingsTab::Keybindings);
     assert_eq!(SettingsTab::ALL[5], SettingsTab::Window);
     assert_eq!(SettingsTab::ALL[6], SettingsTab::LocalAi);
+    assert_eq!(SettingsTab::ALL[7], SettingsTab::Update);
 }
 
 #[test]
@@ -297,6 +299,7 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         blocks_output_cap_mib: 1,
         blocks_history_max_age_days: 90,
         blocks_history_max_db_mb: 512,
+        update_tier: weft_core::config::UpdateCheckTier::Daily,
     };
     let mut missing = HashSet::new();
     OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -365,6 +368,7 @@ fn settings_overlay_is_modal_and_highest_z() {
                     blocks_output_cap_mib: 1,
                     blocks_history_max_age_days: 90,
                     blocks_history_max_db_mb: 512,
+                    update_tier: weft_core::config::UpdateCheckTier::Daily,
                 }),
             },
         ],

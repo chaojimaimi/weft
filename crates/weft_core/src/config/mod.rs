@@ -75,7 +75,8 @@ pub use sections::{
     AiConfig, BlocksConfig, ClipboardConfig, CompatConfig, EditorConfig, ExperimentalConfig,
     FontConfig, LogoConfig, LogoVariant, NotificationsConfig, Osc52Mode, OutputSemanticConfig,
     PasteConfig, RecoveryMode, ScrollbackConfig, SessionConfig, SyntaxConfig, ThemeConfig,
-    UiConfig, WindowConfig, PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    UiConfig, UpdateCheckTier, UpdateConfig, WindowConfig, PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{OutputSemanticColors, SyntaxColors, Theme, ThemeUi};
 pub use theme_import::{
@@ -123,6 +124,10 @@ pub struct Config {
     /// (`[session].recovery` — crash-recovery prompt behavior). Global only
     /// (`ProfileConfig` has no `session` field, like `[ai]`).
     pub session: SessionConfig,
+    /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Sparkle update-check tier
+    /// (`[update].check`). Global only (`ProfileConfig` has no `update`
+    /// field, like `[session]`).
+    pub update: UpdateConfig,
     pub logo: LogoConfig,
     /// v1.6 AI integration. Disabled by default (`provider = None`).
     /// Config schema is parsed/serialized today so existing config files keep
@@ -664,6 +669,10 @@ impl Config {
                 doc.remove("session");
             }
         }
+
+        // [update] section — v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Sparkle
+        // check tier. Writer lives in save.rs (line budget; plan R4: 勿内联).
+        save::write_update_section(&mut doc, &self.update);
 
         // [keybindings] section.
         if !self.keybindings.is_empty() {

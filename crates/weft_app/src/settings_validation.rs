@@ -398,6 +398,9 @@ pub(crate) fn settings_tab_row_count(
         // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +
         // Cmd Generation + Error Diagnosis + Test Connection.
         SettingsTab::LocalAi => 8,
+        // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Check tier + Status +
+        // Check Now (action button).
+        SettingsTab::Update => 3,
         // v1.11.5 (PLAN_v1115 §M8): 4 rows added (Notify Enabled /
         // Threshold / Notify Sound / OSC52 Clipboard); Import/Export
         // stay at rows 2/3 so the v1.5.2 Enter mapping never moves.

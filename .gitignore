@@ -45,3 +45,9 @@ assets/icon.iconset/
 
 releases/
 .workbuddy/
+
+# v1.13.0 (PLAN_v1.13.0_SPARKLE WP4): Sparkle source tarball + tool binaries
+# are local-only (CI downloads its own pinned tarball); the framework and
+# LICENSE under vendor/ are committed.
+vendor/*.tar.xz
+vendor/bin/

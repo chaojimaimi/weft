@@ -250,6 +250,10 @@ impl App {
         let effective = loaded.effective.clone();
         self.apply_config(effective);
         self.config_state.set_loaded(loaded);
+        // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): the ConfigReload hot-reload
+        // path and the settings save path both converge here — re-apply the
+        // update tier so a hand-edited [update] takes effect live.
+        crate::updater::apply_tier(self.config_state.config.update.check);
     }
 
     /// Re-read config from disk and apply it live. Triggered by the

@@ -1,7 +1,13 @@
 # v1.7.8: Unsigned release builder for Weft.app
 #
+# v1.13.0 (PLAN_v1.13.0_SPARKLE WP5, D3): tag triggering REMOVED — this
+# pipeline is workflow_dispatch-only from now on. sparkle-release.yml is the
+# sole tag owner: this pipeline and the Sparkle pipeline would otherwise race
+# to upload a same-named DMG asset onto the same draft release, and two
+# byte-different DMGs under one EdDSA signature = every client-side update
+# check fails verification (spike §〇 rejection path).
+#
 # Triggers on:
-#   - Push of version tags (v1.0.0, v1.7.8, ...)
 #   - Manual dispatch via Actions UI (Run workflow → 输入 tag/branch)
 #
 # Produces:
@@ -15,9 +21,8 @@
 name: Build (unsigned)
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  # v1.13.0 (WP5): `push.tags` trigger removed — workflow_dispatch-only
+  # (sparkle-release.yml owns the v*.*.* tags).
   workflow_dispatch:
     inputs:
       ref:

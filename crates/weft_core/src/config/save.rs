@@ -58,6 +58,7 @@ pub(super) fn parse_existing(existing: &str) -> Result<toml_edit::DocumentMut, C
         "compat",
         "logo",
         "ai",
+        "update",
         "keybindings",
         "profiles",
     ] {
@@ -377,6 +378,37 @@ fn write_paste_keys(
         paste_entry["size_threshold_kib"] = toml_edit::value(i64::from(paste.size_threshold_kib));
     } else if paste_entry.contains_key("size_threshold_kib") {
         paste_entry.remove("size_threshold_kib");
+    }
+}
+
+/// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): write the `[update]` section
+/// (Sparkle check tier). Global only — `ProfileConfig` has no `update`
+/// field (the SESSION/AI precedent). Only non-default values persist; a
+/// stale `check` key is removed when the tier returns to `daily` so the
+/// factory default always wins on reload. Lives here (not `mod.rs`) per
+/// plan R4 — the parent file stays within its architecture-gate budget.
+pub(super) fn write_update_section(doc: &mut toml_edit::DocumentMut, update: &super::UpdateConfig) {
+    let default = super::UpdateConfig::default();
+    if update.check != default.check {
+        let entry = doc.entry("update").or_insert_with(toml_edit::table);
+        if entry.is_none() {
+            *entry = toml_edit::table();
+        }
+        // v1.11.0-style tolerance: a hand-written `update = "x"` scalar is
+        // skipped with a warn instead of panicking the save path.
+        match entry.as_table_mut() {
+            Some(table) => {
+                table["check"] = toml_edit::value(update.check.as_str());
+            }
+            None => {
+                tracing::warn!("[update] section is not a table; skipping update section write");
+            }
+        }
+    } else if let Some(table) = doc.get_mut("update").and_then(|item| item.as_table_mut()) {
+        table.remove("check");
+        if table.iter().count() == 0 {
+            doc.remove("update");
+        }
     }
 }
 

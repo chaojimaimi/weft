@@ -119,6 +119,9 @@ pub struct SettingsViewParams<'a> {
     /// draft-projection discipline as the T13 fields above.
     pub settings_blocks_history_max_age_days: u32,
     pub settings_blocks_history_max_db_mb: u32,
+    /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Update tab draft tier (draft
+    /// projection, same discipline as the T13/T14 fields).
+    pub settings_update_tier: weft_core::config::UpdateCheckTier,
 }
 
 /// v1.11 audit (PLAN_audit_fix_batch3 C4): settings-domain *owned* computed
@@ -204,6 +207,7 @@ impl crate::app_state::SettingsState {
             settings_blocks_output_cap_mib: self.draft.blocks.output_cap_mib,
             settings_blocks_history_max_age_days: self.draft.blocks.history_max_age_days,
             settings_blocks_history_max_db_mb: self.draft.blocks.history_max_db_mb,
+            settings_update_tier: self.draft.update.check,
         }
     }
 }

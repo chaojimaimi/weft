@@ -21,6 +21,7 @@ mod advanced;
 mod keybindings;
 mod local_ai;
 mod pages;
+mod update;
 
 use crate::paint::primitives::{color_to_normalized, push_filled_triangle, push_line, push_quad};
 use crate::renderer::MetalRenderer;
@@ -473,6 +474,27 @@ impl MetalRenderer {
                         label_c,
                         accent,
                         warning_c,
+                    );
+                }
+                SettingsTab::Update => {
+                    // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): body in
+                    // settings/update.rs (line-budget split, local_ai.rs
+                    // precedent).
+                    self.render_update_content(
+                        &mut verts,
+                        s,
+                        content_top,
+                        content_x0,
+                        content_x1,
+                        value_x,
+                        cw,
+                        ch,
+                        content_cols,
+                        bg_uv,
+                        selection_bg,
+                        fg,
+                        label_c,
+                        accent,
                     );
                 }
             }

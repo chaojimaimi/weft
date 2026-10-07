@@ -118,6 +118,14 @@ impl App {
                 self.test_ai_connection_from_draft();
                 self.request_redraw();
             }
+            // v1.13.0: Update → "Check Now" action row. Click selects row 2
+            // and runs a one-shot Sparkle check (no draft save — LocalAi
+            // row-7 flow).
+            Some(SettingsTarget::UpdateCheckNow) => {
+                self.settings.selection = 2;
+                crate::updater::check_for_updates();
+                self.request_redraw();
+            }
             None if !self.point_inside_settings_box(x, y) => {
                 self.close_settings();
                 self.request_redraw();
@@ -276,6 +284,13 @@ impl App {
                             // draft config (without saving first, so the user
                             // can test before committing).
                             self.test_ai_connection_from_draft();
+                        } else if self.settings.tab == SettingsTab::Update
+                            && self.settings.selection == 2
+                        {
+                            // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Update
+                            // row 2 — "Check Now" action button (one-shot
+                            // Sparkle check, no draft save).
+                            crate::updater::check_for_updates();
                         } else {
                             self.apply_settings_selection();
                             self.save_settings_draft(false);
@@ -617,6 +632,25 @@ impl App {
                 // triggers it, ←/→ is a no-op.
                 _ => {}
             },
+            // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Update — row 0 cycles the
+            // check tier. The tier applies to Sparkle immediately (plan WP2
+            // 当场 apply_tier) and marks the draft dirty so the existing
+            // save path persists [update] (write_update_section). Rows 1
+            // (status) / 2 (Check Now button) are not ←/→-adjustable.
+            SettingsTab::Update => {
+                if self.settings.selection == 0 {
+                    let tiers = weft_core::config::UpdateCheckTier::ALL;
+                    let cur = tiers
+                        .iter()
+                        .position(|t| *t == self.settings.draft.update.check)
+                        .unwrap_or(0);
+                    let next = (cur as i32 + delta).rem_euclid(tiers.len() as i32) as usize;
+                    self.settings.draft.update.check = tiers[next];
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::UPDATE);
+                    crate::updater::apply_tier(tiers[next]);
+                }
+            }
             SettingsTab::Advanced => match self.settings.selection {
                 // v1.11.5 (PLAN_v1115 §M8): rows 4-7 are the new
                 // notification / clipboard rows; rows 0-3 (Debug Logging,
@@ -838,10 +872,11 @@ impl App {
             | SettingsTab::Keybindings
             | SettingsTab::Window
             | SettingsTab::LocalAi
+            | SettingsTab::Update
             | SettingsTab::Advanced => {
                 // ←/→ handles adjustments; Enter is a no-op for standard rows.
-                // (LocalAi row 7 / Advanced rows 2-3 are action buttons —
-                // handled in `handle_settings_key`'s Enter branch.)
+                // (LocalAi row 7 / Advanced rows 2-3 / Update row 2 are action
+                // buttons — handled in `handle_settings_key`'s Enter branch.)
             }
         }
     }
@@ -980,6 +1015,7 @@ impl App {
                 weft_core::config::Action::InsertAiSuggestion => "Insert AI Suggestion",
                 weft_core::config::Action::CancelAiRequest => "Cancel AI Request",
                 weft_core::config::Action::DiagnoseBlock => "Diagnose Block (AI)",
+                weft_core::config::Action::CheckForUpdates => "Check for Updates",
             };
             views.push(SettingsKeybindingView {
                 action: label.to_string(),

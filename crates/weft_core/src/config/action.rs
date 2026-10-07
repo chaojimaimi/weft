@@ -140,6 +140,11 @@ pub enum Action {
     /// block has no exit code (still running or succeeded).
     #[serde(rename = "diagnose_block")]
     DiagnoseBlock,
+    /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP3): Run a one-shot Sparkle update
+    /// check (menu "Check for Updates…"). Any tier dispatches it (plan D4);
+    /// no default keybinding. Menu tag = 35 (declaration order).
+    #[serde(rename = "check_for_updates")]
+    CheckForUpdates,
 }
 
 /// v1.5.0: Canonical string form of an [`Action`], matching the serde
@@ -183,5 +188,6 @@ pub fn action_to_str(action: &Action) -> &'static str {
         Action::InsertAiSuggestion => "insert_ai_suggestion",
         Action::CancelAiRequest => "cancel_ai_request",
         Action::DiagnoseBlock => "diagnose_block",
+        Action::CheckForUpdates => "check_for_updates",
     }
 }

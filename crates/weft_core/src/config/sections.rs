@@ -737,6 +737,62 @@ impl AiConfig {
     }
 }
 
+/// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Sparkle update-check cadence.
+/// `daily`（默认）= 后台每日自动检查（静默，只提示不自动下载安装）；
+/// `manual` = 仅手动检查；`off` = 不迟启动 updater（菜单点击仍执行一次性
+/// 检查，方案 D4）。Parse contract: an unknown string FAILS the whole
+/// config parse → loader falls back to defaults + warn (the existing
+/// `[font] size` convention, NOT the never-fail `Osc52Mode::parse` style).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub enum UpdateCheckTier {
+    #[serde(rename = "daily")]
+    #[default]
+    Daily,
+    #[serde(rename = "manual")]
+    Manual,
+    #[serde(rename = "off")]
+    Off,
+}
+
+impl UpdateCheckTier {
+    /// All tiers in the Settings Update tab ←/→ cycle order.
+    pub const ALL: [UpdateCheckTier; 3] = [Self::Daily, Self::Manual, Self::Off];
+
+    /// Canonical TOML spelling (lowercase).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Manual => "manual",
+            Self::Off => "off",
+        }
+    }
+
+    /// Human-readable label for the Settings Update tab.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "Daily",
+            Self::Manual => "Manual",
+            Self::Off => "Off",
+        }
+    }
+}
+
+/// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): `[update]` section. Global only —
+/// `ProfileConfig` has no `update` field (the `[session]` precedent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    pub check: UpdateCheckTier,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: UpdateCheckTier::Daily,
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "sections/tests.rs"]
 mod tests;

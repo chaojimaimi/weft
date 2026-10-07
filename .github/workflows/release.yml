@@ -1,7 +1,14 @@
 # v1.9: Release pipeline for Weft.app
 #
+# v1.13.0 (PLAN_v1.13.0_SPARKLE WP5, D3): tag triggering REMOVED — this
+# pipeline is workflow_dispatch-only from now on. sparkle-release.yml is the
+# sole tag owner: two pipelines writing the same draft-release DMG asset
+# would break the EdDSA signature ↔ byte correspondence (the appcast signs
+# one byte stream; a racing re-upload invalidates every client's check).
+# Re-enable the tag trigger below when a Developer ID + notarization account
+# becomes available.
+#
 # Triggers on:
-#   - Push of semantic version tags (v1.10.3, v1.10.4, v1.10.5, ...)
 #   - Manual dispatch from Actions tab
 #
 # Produces:
@@ -20,9 +27,8 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  # v1.13.0 (WP5): `push.tags` trigger removed — workflow_dispatch-only
+  # (sparkle-release.yml owns the v*.*.* tags).
   workflow_dispatch:
     inputs:
       version:

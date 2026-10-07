@@ -1,0 +1,245 @@
+# v1.13.0 (PLAN_v1.13.0_SPARKLE WP5): Sparkle auto-update release pipeline —
+# the SOLE owner of `v*.*.*` tags (D3: release.yml and build-unsigned.yml are
+# workflow_dispatch-only from now on).
+#
+# Pipeline: quality gates → build → DMG → EdDSA sign (sign_update) → appcast
+# item → gh-pages feed push (continue-on-error, plan R2) → draft GitHub
+# Release with DMG + SHA256SUMS (D2: draft:true — publishing the release is a
+# manual step; the appcast item's download URL targets the release asset and
+# goes live with the publish).
+#
+# ONE-TIME SETUP (see docs/RELEASE_SPARKLE.md for the full walkthrough):
+#   1. Secret SPARKLE_ED_PRIVATE_KEY = base64 of the Ed25519 seed
+#      (~/.weft-sparkle/seed.b64; the private key NEVER enters the repo).
+#   2. GitHub Pages enabled for the repo (gh-pages branch) so
+#      https://chaojimaimi.github.io/weft/appcast.xml resolves.
+#   3. `permissions: contents: write` (below) covers the gh-pages push and
+#      the draft release creation.
+#
+# The tag-built DMG is the byte stream every user auto-updates to — the
+# quality gates below MUST stay aligned with release.yml's (fmt/test/clippy/
+# architecture_gate); ci.yml only covers main/PR, so without this gate a tag
+# push ships untested bytes.
+
+name: Sparkle Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: Weft
+  BUNDLE_ID: dev.weft.terminal
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+  # Sparkle 2.10.0 official release tarball — sha256 PINNED; bumping the
+  # version requires re-pinning here AND re-running the local rehearsal
+  # (plan §一: 升级须重钉 sha256 + 重跑本地演练).
+  SPARKLE_VERSION: "2.10.0"
+  SPARKLE_SHA256: "c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c"
+  FEED_URL_BASE: "https://chaojimaimi.github.io/weft"
+
+jobs:
+  sparkle-release:
+    name: Build, sign, publish (Sparkle)
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate release version contract
+        id: release
+        env:
+          REQUESTED_VERSION: ${{ github.ref_name }}
+        run: |
+          requested="${REQUESTED_VERSION#v}"
+          workspace=$(awk '
+            /^\[workspace\.package\]$/ { in_section=1; next }
+            /^\[/ && in_section { exit }
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/.*=[[:space:]]*"|"[[:space:]]*$/, ""); print; exit
+            }
+          ' Cargo.toml)
+          if [[ -z "${requested}" || "${requested}" != "${workspace}" ]]; then
+            echo "Tag '${requested}' does not match workspace '${workspace}'" >&2
+            exit 1
+          fi
+          echo "version=${workspace}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${workspace}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Pinned to match rust-toolchain.toml (release.yml alignment).
+          toolchain: "1.98.1"
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tag 产物是全体用户自动更新到的字节 — 门禁等级不得低于被替换的旧
+      # tag 管线 (release.yml:89-94 对齐; plan WP5).
+      - name: Run release quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          ./scripts/architecture_gate.sh
+
+      - name: Download Sparkle tools (sha256-pinned)
+        run: |
+          curl --fail --location --retry 3 \
+            -o sparkle.tar.xz \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          echo "${SPARKLE_SHA256}  sparkle.tar.xz" | shasum -a 256 --check
+          mkdir sparkle-tools
+          tar -xJf sparkle.tar.xz -C sparkle-tools
+          test -x "sparkle-tools/bin/sign_update"
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Assemble .app bundle (embeds Sparkle.framework + SU keys)
+        run: ./scripts/build-app.sh
+
+      - name: Create distributable DMG
+        env:
+          DMG_VERSION: ${{ steps.release.outputs.version }}
+        run: ./scripts/build-dmg.sh
+
+      - name: Release verification gates
+        run: |
+          APP="target/release/osx/Weft.app"
+          # SU keys present (per-artifact EdDSA iron law, spike §〇).
+          for key in SUPublicEDKey SUFeedURL SUEnableAutomaticChecks SUScheduledCheckInterval SUAutomaticallyUpdate; do
+            plutil -extract "${key}" raw "${APP}/Contents/Info.plist" > /dev/null
+          done
+          # Framework in place.
+          test -d "${APP}/Contents/Frameworks/Sparkle.framework"
+          # Strict signature verification (deep-signed ad-hoc bundle).
+          codesign --verify --deep --strict "${APP}"
+
+      - name: Sign DMG (EdDSA via sign_update)
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          DMG="target/release/osx/Weft-${VERSION}.dmg"
+          [[ -n "${SPARKLE_ED_PRIVATE_KEY}" ]] || { echo "FATAL: secret SPARKLE_ED_PRIVATE_KEY is not configured" >&2; exit 1; }
+          # The secret is the base64 of the 32-byte Ed25519 seed — exactly the
+          # format sign_update --ed-key-file consumes (spike §三).
+          KEY_FILE="$RUNNER_TEMP/sparkle-ed-key.b64"
+          printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" > "${KEY_FILE}"
+          chmod 600 "${KEY_FILE}"
+          sparkle-tools/bin/sign_update --ed-key-file "${KEY_FILE}" "${DMG}" > sign_output.txt
+          rm -f "${KEY_FILE}"
+          cat sign_output.txt
+
+      - name: Generate appcast item
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          TAG="${{ steps.release.outputs.tag }}"
+          DMG="target/release/osx/Weft-${VERSION}.dmg"
+          # The download URL points at the RELEASE ASSET (live once the draft
+          # is published — D2); NOT gh-pages, which would grow forever.
+          ./scripts/sparkle/appcast-item.sh "${DMG}" "${VERSION}" \
+            "$(cat sign_output.txt)" \
+            "https://github.com/chaojimaimi/weft/releases/download/${TAG}" \
+            > appcast_item.xml
+          cat appcast_item.xml
+
+      # Plan R2: a feed push failure must NOT block the DMG release — the
+      # DMG lands on the draft release regardless; fixing appcast later is
+      # enough because clients re-fetch the feed on every check.
+      - name: Publish appcast to gh-pages
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          REPO="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          rm -rf pages && mkdir pages
+          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+            git clone --depth 1 --branch gh-pages "${REPO}" pages
+          else
+            echo "==> No gh-pages branch — bootstrapping (first-run path)"
+            git clone "${REPO}" pages
+            cd pages
+            git checkout --orphan gh-pages
+            git rm -rf --quiet . 2>/dev/null || true
+            cd ..
+          fi
+          python3 - "pages/appcast.xml" "appcast_item.xml" <<'PYEOF'
+          import os, re, sys
+
+          feed_path, item_path = sys.argv[1], sys.argv[2]
+          with open(item_path, encoding="utf-8") as f:
+              item = f.read().rstrip("\n")
+          skeleton = '''<?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <channel>
+                  <title>Weft</title>
+                  <link>https://chaojimaimi.github.io/weft/appcast.xml</link>
+                  <description>Most recent changes with links to updates.</description>
+                  <language>en</language>
+          {items}
+              </channel>
+          </rss>
+          '''
+          if os.path.exists(feed_path):
+              with open(feed_path, encoding="utf-8") as f:
+                  doc = f.read()
+              version = re.search(r"<sparkle:version>([^<]+)</sparkle:version>", item).group(1)
+              item_re = re.compile(
+                  r"[ \t]*<item>(?:(?!</item>).)*<sparkle:version>"
+                  + re.escape(version)
+                  + r"</sparkle:version>(?:(?!</item>).)*</item>\n",
+                  re.S,
+              )
+              if item_re.search(doc):
+                  doc = item_re.sub(item + "\n", doc)
+              else:
+                  doc = doc.replace("<channel>\n", "<channel>\n" + item + "\n", 1)
+          else:
+              print("bootstrapping appcast.xml")
+              doc = skeleton.format(items=item)
+          with open(feed_path, "w", encoding="utf-8") as f:
+              f.write(doc)
+          PYEOF
+          cd pages
+          if [[ -f .nojekyll ]] || true; then touch .nojekyll; fi
+          git add appcast.xml .nojekyll
+          git -c user.name="weft-ci" -c user.email="actions@github.com" \
+            commit -m "appcast: Weft ${VERSION} (sparkle-release)"
+          git push origin gh-pages
+
+      - name: Create artifact checksums
+        run: |
+          cd target/release/osx
+          VERSION="${{ steps.release.outputs.version }}"
+          shasum -a 256 "Weft-${VERSION}.dmg" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release (draft — publish manually, D2)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/osx/Weft-*.dmg
+            target/release/osx/SHA256SUMS
+          draft: true
+          generate_release_notes: true
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Weft ${{ steps.release.outputs.tag }}

@@ -113,6 +113,8 @@ pub enum SettingsTab {
     Window,
     /// v1.8.3: Local Ollama AI (enable/model/test/toggles/max_tokens/timeout).
     LocalAi,
+    /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): update tier / status / Check Now.
+    Update,
     /// v1.11.0 隐藏入口（placeholder 无配置支撑，见 docs/PLAN_v111.md 第 1 项）。
     /// 变体与 match 臂保留，仅从 `ALL` 移除；补实配置即加回。
     Advanced,
@@ -125,8 +127,9 @@ impl SettingsTab {
     /// 见 AUDIT_v1.10.39 P2-M7 / PLAN_v111 第 1 项）。变体仍存在以满足
     /// 各 match 的穷尽性；键盘导航（Tab/↑/↓）与绘制/命中区全部由本列表
     /// 驱动，故移除即全局隐藏。v1.12.19 (T13b): `Blocks` joins right
-    /// after `Terminal` (7 categories).
-    pub const ALL: [SettingsTab; 7] = [
+    /// after `Terminal`; v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): `Update`
+    /// joins after `LocalAi` (8 categories).
+    pub const ALL: [SettingsTab; 8] = [
         SettingsTab::Appearance,
         SettingsTab::Terminal,
         SettingsTab::Blocks,
@@ -134,6 +137,7 @@ impl SettingsTab {
         SettingsTab::Keybindings,
         SettingsTab::Window,
         SettingsTab::LocalAi,
+        SettingsTab::Update,
     ];
 
     /// Human-readable label for the sidebar.
@@ -146,6 +150,7 @@ impl SettingsTab {
             SettingsTab::Keybindings => "Keybindings",
             SettingsTab::Window => "Window",
             SettingsTab::LocalAi => "Local AI",
+            SettingsTab::Update => "Update",
             SettingsTab::Advanced => "Advanced",
         }
     }
@@ -313,6 +318,8 @@ pub struct SettingsDrawParams<'a> {
     /// (draft projections like the T13 fields above — never snapshot).
     pub blocks_history_max_age_days: u32,
     pub blocks_history_max_db_mb: u32,
+    /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Update tab draft tier (projection).
+    pub update_tier: weft_core::config::UpdateCheckTier,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -468,10 +475,11 @@ impl OverlayWarmup for OverlayContent<'_> {
                 // hidden from the sidebar (see SettingsTab::ALL).
                 // v1.12.19: Blocks tab + Terminal's Session recovery row.
                 missing.extend(
-                    "Settings Appearance Terminal Blocks Input Keybindings Window Local AI".chars(),
+                    "Settings Appearance Terminal Blocks Input Keybindings Window Local AI Update"
+                        .chars(),
                 );
                 missing.extend(
-                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off Enabled: Model: URL: Tokens: Timeout: Cmd Generation: Error Diagnosis: Test Connection Connected models Failed Not tested Testing Session recovery: Retained limit: Output cap: Unlimited MiB applies on next launch Ask after unexpected quit Auto-restore without prompting Skip crash-recovery prompt 0 keeps every block in memory — raise only with care"
+                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off Enabled: Model: URL: Tokens: Timeout: Cmd Generation: Error Diagnosis: Test Connection Connected models Failed Not tested Testing Session recovery: Retained limit: Output cap: Unlimited MiB applies on next launch Ask after unexpected quit Auto-restore without prompting Skip crash-recovery prompt 0 keeps every block in memory — raise only with care Check: Daily Manual Off Status: Sparkle framework available unavailable Now ▶"
                         .chars(),
                 );
                 // v1.0 fix: warm up the actual footer glyphs. The footer
@@ -781,6 +789,7 @@ pub fn build_overlay_stack<'a>(
                 blocks_output_cap_mib: settings.settings_blocks_output_cap_mib,
                 blocks_history_max_age_days: settings.settings_blocks_history_max_age_days,
                 blocks_history_max_db_mb: settings.settings_blocks_history_max_db_mb,
+                update_tier: settings.settings_update_tier,
             }),
         });
     }

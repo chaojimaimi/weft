@@ -70,6 +70,15 @@ fn action_from_isize(tag: isize) -> Option<Action> {
         28 => Action::FocusPaneDown,
         29 => Action::FocusPaneLeft,
         30 => Action::FocusPaneRight,
+        // v1.8.1-1.8.2 AI actions (31-34) have no menu items today but are
+        // mapped so the table covers EVERY variant (v1.13.0 sync test: Action
+        // 变体数 == 映射覆盖数).
+        31 => Action::GenerateCommand,
+        32 => Action::InsertAiSuggestion,
+        33 => Action::CancelAiRequest,
+        34 => Action::DiagnoseBlock,
+        // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP3): one-shot update check.
+        35 => Action::CheckForUpdates,
         _ => return None,
     })
 }
@@ -362,6 +371,16 @@ fn build_app_menu(mtm: MainThreadMarker, target: &WeftMenuTarget) -> Retained<NS
         ns_string!(""),
     ));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP3): standard macOS position, right
+    // after the About separator — every tier dispatches a one-shot check
+    // (plan D4). Tag 35 → action_from_isize (keep-in-sync test below).
+    menu.addItem(&action_item(
+        mtm,
+        target,
+        ns_string!("Check for Updates…"),
+        Action::CheckForUpdates,
+    ));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Services submenu — macOS fills it in; we just provide the placeholder
     // menu and register it via setServicesMenu.
     let services_item = stock_item(mtm, ns_string!("Services"), None, ns_string!(""));
@@ -463,4 +482,78 @@ fn add_submenu(
     unsafe { parent_item.setTitle(title) };
     parent_item.setSubmenu(Some(&sub));
     parent.addItem(&parent_item);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{action_from_isize, action_to_isize};
+    use weft_core::config::Action;
+
+    /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP3): `action_from_isize`'s table must
+    /// cover every `Action` variant at its exact discriminant — a missed arm
+    /// means the menu click is silently swallowed (`_ => None`). The table
+    /// comment requires "Keep in sync"; this test enforces it.
+    #[test]
+    fn menu_tag_table_covers_every_action_variant() {
+        // Declaration order == discriminant order (the `a as isize` cast
+        // relies on it). A new variant MUST be appended here AND to the
+        // `action_from_isize` table.
+        let all = [
+            Action::Copy,
+            Action::Paste,
+            Action::ReloadConfig,
+            Action::ScrollPageUp,
+            Action::ScrollPageDown,
+            Action::ScrollLineUp,
+            Action::ScrollLineDown,
+            Action::ScrollToTop,
+            Action::ScrollToBottom,
+            Action::ToggleBlockPanel,
+            Action::ToggleCommandPalette,
+            Action::ZoomIn,
+            Action::ZoomOut,
+            Action::ZoomReset,
+            Action::FindInGrid,
+            Action::ToggleTheme,
+            Action::NewTab,
+            Action::CloseTab,
+            Action::NextTab,
+            Action::PrevTab,
+            Action::ToggleSettings,
+            Action::SplitHorizontal,
+            Action::SplitVertical,
+            Action::FocusNextPane,
+            Action::FocusPrevPane,
+            Action::ClosePane,
+            Action::TogglePaneZoom,
+            Action::FocusPaneUp,
+            Action::FocusPaneDown,
+            Action::FocusPaneLeft,
+            Action::FocusPaneRight,
+            Action::GenerateCommand,
+            Action::InsertAiSuggestion,
+            Action::CancelAiRequest,
+            Action::DiagnoseBlock,
+            Action::CheckForUpdates,
+        ];
+        for (tag, action) in all.iter().enumerate() {
+            assert_eq!(
+                action_to_isize(*action),
+                tag as isize,
+                "discriminant drift at index {tag} ({action:?})"
+            );
+            assert_eq!(
+                action_from_isize(tag as isize),
+                Some(*action),
+                "action_from_isize table miss at index {tag} ({action:?})"
+            );
+        }
+        // One past the end must NOT map — if it does, the table grew without
+        // this list (a new variant was added to the table only).
+        assert_eq!(
+            action_from_isize(all.len() as isize),
+            None,
+            "table longer than the known variant list — append the new variant above"
+        );
+    }
 }

@@ -262,6 +262,13 @@ pub(super) fn merge_settings_draft(
         candidate.session = draft.session;
     }
 
+    // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): [update] check tier is global
+    // only too — `ProfileConfig` has no `update` field (SESSION/AI
+    // precedent), so the Update tab always writes the base config.
+    if dirty.contains(weft_core::config::ConfigSectionMask::UPDATE) {
+        candidate.update = draft.update;
+    }
+
     candidate
         .resolve_active_profile()
         .map_err(ProfileTransactionError::Resolve)?;

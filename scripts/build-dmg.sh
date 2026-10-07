@@ -57,6 +57,18 @@ fi
 # --strict also rejects ad-hoc signatures that only cover part of the bundle.
 codesign --verify --strict "${APP_DIR}"
 
+# v1.13.0 (PLAN_v1.13.0_SPARKLE WP4): the DMG is the FINAL gate — the
+# "reuse existing .app" bypass above could otherwise package a stale bundle
+# without the Sparkle SU keys (EdDSA per-artifact iron law, spike §〇: a
+# keyless inner .app can never be replaced by Sparkle later).
+DMG_INFO_PLIST="${APP_DIR}/Contents/Info.plist"
+for su_key in SUPublicEDKey SUFeedURL SUEnableAutomaticChecks SUScheduledCheckInterval SUAutomaticallyUpdate; do
+    if ! plutil -extract "${su_key}" raw "${DMG_INFO_PLIST}" > /dev/null 2>&1; then
+        echo "FATAL: ${APP_DIR} Info.plist is missing the ${su_key} key" >&2
+        exit 1
+    fi
+done
+
 echo "==> Preparing DMG staging directory"
 STAGING_DIR="${OSX_DIR}/dmg-staging"
 rm -rf "${STAGING_DIR}"

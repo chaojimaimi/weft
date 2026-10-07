@@ -104,6 +104,8 @@ mod tab_drag_controller;
 mod terminal_geometry;
 mod transfer_controller;
 mod ui_tokens;
+// v1.13.0: Sparkle 2 auto-update bridge (PLAN_v1.13.0_SPARKLE WP1).
+mod updater;
 // v1.12.27b (P1-04): dispatch_window_event's Resized arm, moved verbatim out
 // of window_event_controller.rs (same-file split exceeded the 800 ceiling).
 mod window_event;
@@ -420,6 +422,8 @@ impl App {
         // the struct initializer below. `AiState` owns its own copy so it can
         // keep driving requests even while the user edits other settings.
         let ai_config_snapshot = config_state.config.ai.clone();
+        // v1.13.0 (WP1): Sparkle init — tier source closed here, main thread.
+        crate::updater::init(config_state.config.update.check);
         Self {
             window: None,
             renderer: None,

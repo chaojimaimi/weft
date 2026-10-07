@@ -121,6 +121,10 @@ bitflags! {
         /// has no `session` field, so the merge writes it to the base config
         /// regardless of the active profile (the AI-mask precedent).
         const SESSION = 1 << 13;
+        /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): `[update].check` (Settings
+        /// Update tab). Global only — `ProfileConfig` has no `update` field
+        /// (the SESSION precedent).
+        const UPDATE = 1 << 14;
     }
 }
 

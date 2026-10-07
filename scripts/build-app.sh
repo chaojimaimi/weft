@@ -21,6 +21,21 @@ if [[ -z "${VERSION}" ]]; then
 fi
 MIN_OS="12.0"
 
+# v1.13.0 (PLAN_v1.13.0_SPARKLE WP4): Sparkle auto-update keys. EVERY
+# produced artifact must carry SUPublicEDKey — the spike §〇 iron law: a
+# version whose inner .app lacks the key can NEVER be replaced by Sparkle
+# (the "removal of EdDSA keys" policy rejects it with an unfriendly error).
+# Fail fast instead of shipping an unupdatable build.
+SU_PUBKEY_FILE="scripts/sparkle/ed_public_key.b64"
+if [[ ! -f "${SU_PUBKEY_FILE}" ]]; then
+    echo "FATAL: ${SU_PUBKEY_FILE} missing — the Sparkle public key is mandatory" >&2
+    exit 1
+fi
+SU_PUBLIC_ED_KEY="$(tr -d '[:space:]' < "${SU_PUBKEY_FILE}")"
+# Default feed = GitHub Pages appcast (plan D1); WEFT_FEED_URL is the
+# single-point override for local rehearsal / feed relocation.
+SU_FEED_URL="${WEFT_FEED_URL:-https://chaojimaimi.github.io/weft/appcast.xml}"
+
 # Paths
 RELEASE_DIR="target/release"
 APP_DIR="${RELEASE_DIR}/osx/${APP_NAME}.app"
@@ -86,12 +101,47 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
     <string>public.app-category.developer-tools</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>SUPublicEDKey</key>
+    <string>${SU_PUBLIC_ED_KEY}</string>
+    <key>SUFeedURL</key>
+    <string>${SU_FEED_URL}</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
 </dict>
 </plist>
 PLIST
 
 # PkgInfo (8-byte signature: APPL + 4 reserved bytes)
 printf "APPL????" > "${CONTENTS_DIR}/PkgInfo"
+
+# v1.13.0 (WP4): embed Sparkle.framework — the runtime NSBundle load in
+# updater/mod.rs resolves it from Contents/Frameworks/. Commit-invariant:
+# the framework ships with every artifact (same iron law as SUPublicEDKey).
+if [[ ! -d "vendor/Sparkle.framework" ]]; then
+    echo "FATAL: vendor/Sparkle.framework missing — the update feature cannot ship" >&2
+    exit 1
+fi
+echo "==> Embedding Sparkle.framework"
+mkdir -p "${CONTENTS_DIR}/Frameworks"
+rm -rf "${CONTENTS_DIR}/Frameworks/Sparkle.framework"
+cp -R vendor/Sparkle.framework "${CONTENTS_DIR}/Frameworks/"
+
+# v1.13.0 (WP4): packaging self-check — fail fast on a missing/empty SU key
+# (plutil reads the ACTUAL generated plist; set -e aborts on any mismatch).
+for su_key in SUPublicEDKey SUFeedURL SUEnableAutomaticChecks SUScheduledCheckInterval SUAutomaticallyUpdate; do
+    if ! plutil -extract "${su_key}" raw "${CONTENTS_DIR}/Info.plist" > /dev/null 2>&1; then
+        echo "FATAL: Info.plist is missing the ${su_key} key" >&2
+        exit 1
+    fi
+done
+if [[ -z "$(plutil -extract SUPublicEDKey raw "${CONTENTS_DIR}/Info.plist")" ]]; then
+    echo "FATAL: SUPublicEDKey is empty" >&2
+    exit 1
+fi
 
 echo "==> Bundle assembled at ${APP_DIR}"
 
@@ -115,9 +165,13 @@ else
     # intentionally absent — no benefit without notarization).
     # Side effect: every repackaged DMG has a new cdhash, so macOS re-prompts
     # for notification permission on the first launch of each build.
-    echo "==> Ad-hoc signing bundle (UNUserNotificationCenter requires a signed bundle)"
-    codesign --force --sign - --identifier "${BUNDLE_ID}" "${APP_DIR}"
-    codesign --verify "${APP_DIR}"
+    # v1.13.0 (WP4): --deep is MANDATORY now — the embedded
+    # Sparkle.framework carries nested code (Sparkle dylib + Updater.app +
+    # XPCServices) that a plain ad-hoc sign leaves unsigned, and
+    # codesign --verify --strict then fails on the nested bundles.
+    echo "==> Ad-hoc DEEP signing bundle (UNUserNotificationCenter requires a signed bundle)"
+    codesign --force --deep --sign - --identifier "${BUNDLE_ID}" "${APP_DIR}"
+    codesign --verify --strict "${APP_DIR}"
 fi
 
 echo "==> Done: ${APP_DIR}"

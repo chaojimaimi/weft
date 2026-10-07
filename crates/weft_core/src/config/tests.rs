@@ -3297,3 +3297,81 @@ fn presents_with_transaction_live_resize_roundtrip_and_default_omission() {
         .unwrap()
         .contains("presents_with_transaction"));
 }
+
+// ── v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): [update] section ──────────────
+
+#[test]
+fn update_check_parses_all_three_tiers() {
+    for (raw, expected) in [
+        ("daily", UpdateCheckTier::Daily),
+        ("manual", UpdateCheckTier::Manual),
+        ("off", UpdateCheckTier::Off),
+    ] {
+        let text = format!("[update]\ncheck = \"{raw}\"\n");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.update.check, expected, "input: {text}");
+    }
+}
+
+#[test]
+fn update_section_defaults_to_daily() {
+    // No [update] section at all.
+    let cfg: Config = toml::from_str("").unwrap();
+    assert_eq!(cfg.update.check, UpdateCheckTier::Daily);
+    // Empty [update] table (missing `check` field).
+    let cfg: Config = toml::from_str("[update]\n").unwrap();
+    assert_eq!(cfg.update.check, UpdateCheckTier::Daily);
+}
+
+#[test]
+fn update_check_illegal_value_fails_whole_parse() {
+    // Existing convention (plan §WP2): a bad value fails the whole config
+    // parse; `Config::load` then falls back to defaults + warn. Deliberately
+    // NOT the never-fail `Osc52Mode::parse` style.
+    let parsed: Result<Config, _> = toml::from_str("[update]\ncheck = \"hourly\"\n");
+    assert!(
+        parsed.is_err(),
+        "illegal tier must fail the parse (whole-config fallback convention)"
+    );
+}
+
+#[test]
+fn update_save_reload_round_trip() {
+    // Non-default tiers persist and survive a reload.
+    for tier in [UpdateCheckTier::Manual, UpdateCheckTier::Off] {
+        let path = unique_tmp_path("update-rt");
+        let mut cfg = Config::default();
+        cfg.update.check = tier;
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&format!("check = \"{}\"", tier.as_str())),
+            "tier {tier:?} persisted: {text}"
+        );
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.update.check, tier);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Toggling back to Daily (default): the stale key must be cleared, not
+    // left behind by the toml_edit incremental edit (v1.7.5 residue class).
+    let path = unique_tmp_path("update-back-to-daily");
+    let mut cfg = Config::default();
+    cfg.update.check = UpdateCheckTier::Off;
+    cfg.save_to_path(&path).expect("save should succeed");
+    let mut back = Config::default();
+    back.update.check = UpdateCheckTier::Daily;
+    back.save_to_path(&path).expect("re-save should succeed");
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(!after.contains("check ="), "stale key cleared: {after}");
+
+    // A fully default config never writes the [update] section at all.
+    let path2 = unique_tmp_path("update-default");
+    Config::default()
+        .save_to_path(&path2)
+        .expect("default save should succeed");
+    let text2 = std::fs::read_to_string(&path2).unwrap();
+    assert!(!text2.contains("[update]"), "minimal write: {text2}");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(path2.parent().unwrap());
+}

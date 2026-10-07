@@ -935,7 +935,7 @@
       "footer_y": 596.0,
       "max_rows": 25,
       "scene": {
-        "hit_count": 8,
+        "hit_count": 9,
         "hits": [
           {
             "bounds": [
@@ -1002,6 +1002,15 @@
           },
           {
             "bounds": [
+              70.0,
+              248.0,
+              430.0,
+              266.0
+            ],
+            "target": "SidebarCategory(Update)"
+          },
+          {
+            "bounds": [
               205.9,
               596.0,
               272.05,
@@ -1010,7 +1019,7 @@
             "target": "ApplyButton"
           }
         ],
-        "semantic_count": 9,
+        "semantic_count": 10,
         "semantics": [
           {
             "bounds": [
@@ -1110,6 +1119,18 @@
           },
           {
             "bounds": [
+              70.0,
+              248.0,
+              430.0,
+              266.0
+            ],
+            "focus": "Settings",
+            "label": "Update",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
               205.9,
               596.0,
               272.05,
@@ -1146,7 +1167,7 @@
       "footer_y": 774.0,
       "max_rows": 33,
       "scene": {
-        "hit_count": 29,
+        "hit_count": 30,
         "hits": [
           {
             "bounds": [
@@ -1210,6 +1231,15 @@
               270.0
             ],
             "target": "SidebarCategory(LocalAi)"
+          },
+          {
+            "bounds": [
+              201.6,
+              270.0,
+              491.904,
+              288.0
+            ],
+            "target": "SidebarCategory(Update)"
           },
           {
             "bounds": [
@@ -1410,7 +1440,7 @@
             "target": "SaveButton"
           }
         ],
-        "semantic_count": 29,
+        "semantic_count": 30,
         "semantics": [
           {
             "bounds": [
@@ -1505,6 +1535,18 @@
             ],
             "focus": "Settings",
             "label": "Local AI",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              270.0,
+              491.904,
+              288.0
+            ],
+            "focus": "Settings",
+            "label": "Update",
             "role": "Tab",
             "state": ""
           },

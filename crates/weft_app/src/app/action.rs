@@ -387,6 +387,12 @@ impl crate::App {
                 self.spawn_block_diagnose_from_hover();
                 true
             }
+            // v1.13.0 (PLAN_v1.13.0_SPARKLE §WP3): one-shot Sparkle check.
+            // Any tier dispatches it (plan D4); no default keybinding.
+            Action::CheckForUpdates => {
+                crate::updater::check_for_updates();
+                true
+            }
         }
     }
 }
