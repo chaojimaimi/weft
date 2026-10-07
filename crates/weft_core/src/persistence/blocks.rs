@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS tabs (\
     block_scroll_offset INTEGER NOT NULL DEFAULT 0,\
     editor_buffer       TEXT,\
     shell_phase         TEXT,\
-    block_ids           TEXT\
+    block_ids           TEXT,\
+    panes               TEXT\
 );\
 CREATE INDEX IF NOT EXISTS idx_tabs_position ON tabs(position);\
 CREATE TABLE IF NOT EXISTS meta (\
@@ -113,6 +114,9 @@ impl BlockStore {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "tabs", "block_ids", "TEXT")?;
+        // v1.12.28 (P1-02 ①): per-pane split-tree JSON (single-pane tabs and
+        // pre-v1.12.28 rows store NULL → single-pane restore).
+        ensure_column(&conn, "tabs", "panes", "TEXT")?;
         let needs_vacuum_migration = if file_existed {
             let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
             mode == 0 // 0=NONE, 1=FULL, 2=INCREMENTAL

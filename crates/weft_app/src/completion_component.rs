@@ -29,7 +29,12 @@ pub(crate) fn derive_completion_layout(
     let anchor_y =
         crate::layout::layout_prompt(ctx, prompt_line_count, cursor.0, cursor.1, 0).box_rect[1];
     let prompt_indent = usize::from(cursor.0 == 0) * 2;
-    let box_x0 = (prompt_indent + cursor.1) as f32 * ctx.cell_w + ctx.padding_x + ctx.chrome_left;
+    // v1.12.28 (P1-01 ②): anchor at the PANE's content left edge —
+    // `ctx.left()` = padding_x + chrome_left + pane_origin.0. The old
+    // window-level basis dropped pane_origin.0, so with the active pane in
+    // the right half of a vertical split the popup sat one pane-width too
+    // far left (visually detached from the prompt, crossing the divider).
+    let box_x0 = (prompt_indent + cursor.1) as f32 * ctx.cell_w + ctx.left();
     let (start, end, _) = completion_window(
         anchor_y,
         ctx.cell_h,
@@ -188,5 +193,34 @@ mod tests {
         let prompt_top = crate::layout::layout_prompt(&ctx, 50, 49, 3, 44).box_rect[1];
         assert_eq!(layout.popup_rect[3], prompt_top);
         assert!(layout.popup_rect[3] > 0.0);
+    }
+
+    /// v1.12.28 (P1-01 ②) double assertion: with the active pane in the right
+    /// half of a split, the popup's left edge must be ≥ the pane's left edge
+    /// (the old box_x0 dropped pane_origin.0 — the popup sat one pane-width
+    /// too far left) and its right edge must be ≤ the pane's right edge (the
+    /// width budget now rides ctx.width(), the clamp rides ctx.right()).
+    /// for_pane numbers follow the layout/tests.rs:90 precedent.
+    #[test]
+    fn completion_popup_stays_inside_its_pane_in_a_split() {
+        let mut ctx = LayoutCtx::new((1600.0, 1200.0), 10.0, 20.0, 16.0, 12.0);
+        ctx.chrome_top = 45.0;
+        ctx.chrome_left = 240.0;
+        let pane = [800.0, 600.0, 1584.0, 1188.0];
+        let pane_ctx = ctx.for_pane(pane);
+        let matches = [candidate("cargo"), candidate("clippy")];
+        let layout = derive_completion_layout(&pane_ctx, &matches, 0, 1, (0, 0), 8, 0.6).unwrap();
+        assert!(
+            layout.popup_rect[0] >= pane_ctx.left(),
+            "popup left edge {} must not cross the pane's left edge {}",
+            layout.popup_rect[0],
+            pane_ctx.left()
+        );
+        assert!(
+            layout.popup_rect[2] <= pane_ctx.right(),
+            "popup right edge {} must not cross the pane's right edge {}",
+            layout.popup_rect[2],
+            pane_ctx.right()
+        );
     }
 }

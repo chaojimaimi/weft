@@ -55,11 +55,15 @@ mod workspace_profile;
 pub(crate) use workspace_profile::WorkspaceRestoreOutcome;
 use workspace_profile::{profile_restore_target, ProfileRestoreTarget, WorkspaceRestoreWarning};
 
-/// Type alias for the closure used by [`build_subtree`] to create a new pane
-/// when descending into a `Split` node's second child. The closure receives
-/// the leaf pane id to split, the split direction + ratio, and the new pane's
-/// cwd; it returns the new pane's id on success or `None` on spawn failure.
-type SplitFn<'a> = &'a mut dyn FnMut(&mut Tab, PaneId, SplitDirection, f32, &str) -> Option<PaneId>;
+// v1.12.28 (P1-02 ⑤): the recursive split-tree rebuild moved behind a
+// payload-generic trait (`workspace_pane_rebuild.rs`) so the SQLite
+// split-persistence restore reuses the exact topology algorithm instead of
+// copy-pasting it (拓扑陷阱: the split-before-descend order is load-bearing).
+// This file is at its zero-margin allowlist ceiling — the extraction is net
+// negative here.
+#[path = "workspace_pane_rebuild.rs"]
+mod pane_rebuild;
+pub(crate) use pane_rebuild::{build_subtree, PaneTreeRebuild};
 
 /// Per-pane payload captured from the live session tree. The workspace
 /// controller walks the `SplitTree` and produces a `PaneTree<PanePayload>`
@@ -512,74 +516,9 @@ fn pane_tree_to_workspace_node(tree: PaneTree<PanePayload>) -> WorkspacePaneNode
     }
 }
 
-/// Recursively rebuild a tab's split tree from a [`WorkspacePaneNode`].
-///
-/// `pane_id` is the pane that already exists in `tab` and corresponds to
-/// the root leaf of `node`'s subtree.
-///
-/// For a `Split` node, the algorithm is:
-/// 1. Split `pane_id` FIRST to create `second`'s root pane. This produces
-///    `Split{first: Leaf(pane_id), second: Leaf(new_pane_id)}`.
-/// 2. Set up `second`'s root pane (draft, cwd).
-/// 3. Recursively build `first`'s subtree using `pane_id` as root. Since
-///    `pane_id` is still a leaf (it's the `first` child of the new Split),
-///    `split_leaf` can find and replace it.
-/// 4. Recursively build `second`'s subtree using `new_pane_id` as root.
-///
-/// Splitting BEFORE building subtrees ensures the tree topology matches
-/// the saved document. If we built `first` first and then split, the
-/// split would wrap `pane_id` inside `first`'s subtree, producing the
-/// wrong tree shape.
-///
-/// `split_fn` creates a new pane by splitting `leaf` in `tab` with the
-/// given `direction`, `ratio`, and `cwd`. In production, this spawns a
-/// real PTY via `Pane::spawn` + `Tab::split_pane_with_pane`. In tests,
-/// it injects a no-PTY pane via `Pane::with_terminal_only`.
-fn build_subtree(tab: &mut Tab, node: &WorkspacePaneNode, pane_id: PaneId, mut split_fn: SplitFn) {
-    match node {
-        WorkspacePaneNode::Pane { cwd, draft } => {
-            // Base case: set the draft on this pane. The pane already
-            // exists (created by the tab-opening path for the root leaf,
-            // or by split_fn for non-root leaves). The draft is set here
-            // so every leaf gets its draft regardless of whether it's
-            // a root, first child, or second child.
-            if let Some(pane) = tab.pane_mut(pane_id) {
-                pane.set_restored_cwd_fallback(Some(cwd.to_string_lossy().into_owned()));
-                if !draft.is_empty() {
-                    if let Some(terminal) = pane.terminal.as_mut() {
-                        terminal.editor_mut().buffer.set_text(draft);
-                    }
-                }
-            }
-        }
-        WorkspacePaneNode::Split {
-            direction,
-            ratio,
-            first,
-            second,
-        } => {
-            // Step 1: Split `pane_id` to create `second`'s root pane.
-            // This must happen BEFORE building `first`'s subtree so the
-            // tree topology matches the saved document.
-            let second_cwd = root_leaf_cwd(second).unwrap_or_else(|| "/".to_string());
-            let new_pane_id = match split_fn(tab, pane_id, *direction, *ratio, &second_cwd) {
-                Some(id) => id,
-                None => return,
-            };
-
-            // Step 2: recursively build `first`'s subtree. `pane_id` is
-            // still a leaf (the `first` child of the new Split), so
-            // `split_leaf` inside recursive calls can find and replace it.
-            build_subtree(tab, first, pane_id, &mut split_fn);
-
-            // Step 3: recursively build `second`'s subtree.
-            build_subtree(tab, second, new_pane_id, &mut split_fn);
-        }
-    }
-}
-
 /// Find the root leaf's cwd (the leftmost-topmost pane's cwd). Used to
-/// open the initial tab.
+/// open the initial tab (and, with a `"/"` fallback, to spawn the second
+/// child's pane in `pane_rebuild::build_subtree`).
 fn root_leaf_cwd(node: &WorkspacePaneNode) -> Option<String> {
     match node {
         WorkspacePaneNode::Pane { cwd, .. } => {

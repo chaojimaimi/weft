@@ -32,7 +32,7 @@ pub mod tabs;
 
 pub use blocks::BlockStore;
 pub use prune::{run_block_prune, PrunePlan, PruneReport, PruneTerminal};
-pub use tabs::TabSnapshot;
+pub use tabs::{PaneTreeSnapshot, SnapshotPaneNode, TabSnapshot};
 
 use std::time::{Duration, SystemTime};
 

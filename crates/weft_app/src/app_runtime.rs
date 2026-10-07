@@ -917,19 +917,25 @@ impl App {
             None => Vec::new(),
         };
         for tab in self.sessions.tabs_mut() {
-            // Clone first to avoid borrow conflict with terminal.as_mut().
-            let tab_block_ids: Vec<u64> = tab
-                .restored_snapshot
-                .as_ref()
-                .map(|snap| snap.block_ids.clone())
-                .unwrap_or_default();
-            if let Some(terminal) = tab.terminal.as_mut() {
-                hydrate_persisted_history(
-                    terminal,
-                    &persisted_history,
-                    &tab_block_ids,
-                    block_id_allocator.clone(),
-                );
+            // v1.12.28 (P1-02 ⑤): per-leaf hydration — every pane reads its
+            // OWN attached snapshot (the split-tree restore attaches
+            // per-leaf), REPLACING the old Deref pass that reached the
+            // active pane only; the active pane is covered by this walk
+            // exactly once, so no double hydration.
+            for pane in tab.panes_mut() {
+                let pane_block_ids: Vec<u64> = pane
+                    .restored_snapshot
+                    .as_ref()
+                    .map(|snap| snap.block_ids.clone())
+                    .unwrap_or_default();
+                if let Some(terminal) = pane.terminal.as_mut() {
+                    hydrate_persisted_history(
+                        terminal,
+                        &persisted_history,
+                        &pane_block_ids,
+                        block_id_allocator.clone(),
+                    );
+                }
             }
         }
     }
@@ -1193,6 +1199,7 @@ mod tests {
                 editor_buffer: String::new(),
                 shell_phase: "AtPrompt".into(),
                 block_ids: vec![10, 20],
+                panes: None,
             })
         );
 

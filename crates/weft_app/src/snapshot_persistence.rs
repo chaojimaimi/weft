@@ -28,6 +28,7 @@ mod tests {
             editor_buffer: "{}".to_string(),
             shell_phase: "AtPrompt".to_string(),
             block_ids: Vec::new(),
+            panes: None,
         }
     }
 

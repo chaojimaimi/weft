@@ -192,22 +192,24 @@ fn completion_10_items_scrolls_to_keep_selected_visible() {
     assert!(layout.popup_rect[1] >= ctx.top());
 }
 
-/// An extremely long label drives popup_cols above the viewport cap,
-/// forcing a clamp. Verifies popup_x1 never exceeds `vp_w - padding_x`.
+/// An extremely long label drives popup_cols above the pane-width cap,
+/// forcing a clamp. Verifies popup_x1 never exceeds the content right edge.
+/// v1.12.28 (P1-01 ②): the cap rides `ctx.width()` (= 1600 − 2×16 padding),
+/// not the raw viewport, so the numbers below follow the new budget.
 #[test]
 fn completion_long_label_clamps_to_viewport_width() {
     let ctx = sample_ctx(); // vp_w=1600, padding_x=16
     let anchor_y = 1100.0;
 
     // max_label_cols = 200 → popup_cols would be 1+2+200+2+10+1 = 216
-    // popup_max_cols = (1600 * 0.6) / 7.2 = 133
-    // → popup_cols clamps to 133
+    // scale_cols = (ctx.width() * 0.6) / 7.2 = (1568 * 0.6) / 7.2 = 130
+    // → popup_cols clamps to 130
     let layout = layout_completion(&ctx, 0, 3, 200, anchor_y, 16.0, 0.6);
-    // popup_x1 must not exceed vp_w - padding_x = 1584
+    // popup_x1 must not exceed the content right edge (1584).
     assert!(layout.popup_rect[2] <= 1600.0 - 16.0 + 1e-3);
     // And popup_cols >= 25 (the floor).
-    // Width = 133 * 7.2 = 957.6
-    assert!((layout.popup_rect[2] - (16.0 + 957.6)).abs() < 1e-3);
+    // Width = 130 * 7.2 = 936.0
+    assert!((layout.popup_rect[2] - (16.0 + 936.0)).abs() < 1e-3);
 }
 
 /// Anchor very close to the top: avail_rows becomes 1, so even with
@@ -491,6 +493,39 @@ fn find_layout_preserves_popup_and_button_geometry() {
     assert_eq!(layout.case_rect, [916.0, 24.0, 938.0, 48.0]);
     assert_eq!(layout.down_rect, Some([898.0, 24.0, 911.0, 48.0]));
     assert_eq!(layout.up_rect, Some([880.0, 24.0, 893.0, 48.0]));
+}
+
+/// v1.12.28 (P1-01 ①): in a narrow split pane the find bar's left edge must
+/// never cross `ctx.left()` — the 48-cell width floor yields to the pane's
+/// available width (the old `.max(cw * 48.0)` pushed the bar out of a
+/// 20-column pane by hundreds of pixels; screenshot G-3).
+#[test]
+fn find_bar_left_edge_stays_inside_a_20_column_pane() {
+    // for_pane precedent (layout/tests.rs:90): right pane of a vertical
+    // split, 200px wide = 20 content columns at cw = 10.
+    let mut ctx = LayoutCtx::new((1600.0, 1200.0), 10.0, 20.0, 16.0, 12.0);
+    ctx.chrome_top = 45.0;
+    ctx.chrome_left = 240.0;
+    let pane = [800.0, 600.0, 1000.0, 1188.0];
+    let pane_ctx = ctx.for_pane(pane);
+    assert!(
+        (pane_ctx.width() - 200.0).abs() < 1e-3,
+        "precondition: 20-column pane"
+    );
+
+    let layout = layout_find(&pane_ctx, 3);
+    // Old math: popup_w = max(min(500, 160), 480) = 480 → x0 = 980 − 480 = 500,
+    // 300px left of the pane. New math: the floor yields → x0 ≥ pane left.
+    assert!(
+        layout.popup_rect[0] >= pane_ctx.left(),
+        "find bar left edge {:?} must not cross the pane's left edge {}",
+        layout.popup_rect[0],
+        pane_ctx.left()
+    );
+    assert!(
+        layout.popup_rect[2] <= pane_ctx.right(),
+        "find bar right edge must stay inside the pane"
+    );
 }
 
 /// Click near right edge: menu clamps left so its right edge stays

@@ -581,6 +581,7 @@ mod tests {
             editor_buffer: String::new(),
             shell_phase: "AtPrompt".to_string(),
             block_ids: vec![7, 8],
+            panes: None,
         };
         assert!(
             tab.attach_recovery_snapshot(&snap),

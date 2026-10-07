@@ -8,6 +8,141 @@ fn tab_with_terminal() -> Tab {
     tab
 }
 
+/// v1.12.28 (P1-02 ②): single-pane tabs must NOT write the `panes` field —
+/// the single-pane snapshot path is byte-identical to v1.12.27 apart from
+/// the new (absent) field, so old readers and the single-pane restore path
+/// see no change.
+#[test]
+fn to_snapshot_single_pane_omits_panes_field() {
+    let tab = tab_with_terminal();
+    let snap = tab.to_snapshot(0, true).unwrap();
+    assert!(
+        snap.panes.is_none(),
+        "single-pane tabs must not persist a pane tree"
+    );
+}
+
+/// v1.12.28 (P1-02 ②): a multi-pane tab persists the split structure tree —
+/// direction/ratio at the split node, one Pane leaf per live pane in DFS
+/// order, and the active leaf's DFS index (the freshly split pane becomes
+/// active, so index 1 of [root, new]).
+#[test]
+fn to_snapshot_multi_pane_writes_split_tree_with_active_leaf_index() {
+    use weft_core::persistence::SnapshotPaneNode;
+    let mut tab = tab_with_terminal();
+    tab.split_active_pane_test(SplitDirection::Vertical, 0.5, 100)
+        .expect("test split succeeds");
+    let snap = tab.to_snapshot(0, true).expect("multi-pane tab serializes");
+    let panes = snap
+        .panes
+        .expect("a multi-pane tab must persist its pane tree");
+    assert_eq!(panes.active_leaf, 1, "the new pane is active (DFS index 1)");
+    match panes.tree {
+        SnapshotPaneNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            assert_eq!(direction, SplitDirection::Vertical);
+            assert!((ratio - 0.5).abs() < 1e-6);
+            match *first {
+                SnapshotPaneNode::Pane {
+                    cwd,
+                    editor_buffer,
+                    block_ids,
+                } => {
+                    assert_eq!(cwd, None, "no OSC 7 yet → cwd None");
+                    // A fresh terminal's empty EditorBuffer still encodes as
+                    // a JSON object — assert it decodes back cleanly.
+                    assert!(TabSnapshot::decode_editor_buffer(&editor_buffer).is_some());
+                    assert!(block_ids.is_empty());
+                }
+                other => panic!("expected a Pane leaf, got {other:?}"),
+            }
+            assert!(matches!(*second, SnapshotPaneNode::Pane { .. }));
+        }
+        other => panic!("expected a Split root, got {other:?}"),
+    }
+}
+
+/// v1.12.28 (P1-02 ②): the PaneTree → SnapshotPaneNode fold pairs leaves in
+/// DFS order (first child before second) and records the active pane's DFS
+/// index — here a 3-leaf tree with a nested Split whose ACTIVE pane is the
+/// second child's first leaf (index 1 of [A, B, C]).
+#[test]
+fn snapshot_tree_conversion_pairs_leaves_in_dfs_order() {
+    use weft_core::persistence::SnapshotPaneNode;
+    let leaf = |id: u64, cwd: &str| {
+        (
+            PaneId(id),
+            SnapshotPaneNode::Pane {
+                cwd: Some(cwd.to_string()),
+                editor_buffer: String::new(),
+                block_ids: Vec::new(),
+            },
+        )
+    };
+    // Split { first: Leaf(A), second: Split { first: Leaf(B), second: Leaf(C) } }
+    let tree = PaneTree::Split {
+        direction: SplitDirection::Vertical,
+        ratio: 0.5,
+        first: Box::new(PaneTree::Leaf(leaf(1, "/a"))),
+        second: Box::new(PaneTree::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.4,
+            first: Box::new(PaneTree::Leaf(leaf(2, "/b"))),
+            second: Box::new(PaneTree::Leaf(leaf(3, "/c"))),
+        }),
+    };
+    let mut index = 0usize;
+    let mut active_leaf = 0usize;
+    let node = snapshot_node_from_tree(tree, PaneId(2), &mut index, &mut active_leaf);
+    assert_eq!(
+        active_leaf, 1,
+        "DFS order is A=0, B=1, C=2 (first before second)"
+    );
+    assert_eq!(index, 3, "all three leaves folded");
+    match node {
+        SnapshotPaneNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            assert_eq!(direction, SplitDirection::Vertical);
+            assert!((ratio - 0.5).abs() < 1e-6);
+            match *first {
+                SnapshotPaneNode::Pane { cwd, .. } => assert_eq!(cwd.as_deref(), Some("/a")),
+                other => panic!("expected leaf A, got {other:?}"),
+            }
+            match *second {
+                SnapshotPaneNode::Split {
+                    direction,
+                    ratio,
+                    first,
+                    second,
+                } => {
+                    assert_eq!(direction, SplitDirection::Horizontal);
+                    assert!((ratio - 0.4).abs() < 1e-6);
+                    match (*first, *second) {
+                        (
+                            SnapshotPaneNode::Pane { cwd: b, .. },
+                            SnapshotPaneNode::Pane { cwd: c, .. },
+                        ) => {
+                            assert_eq!(b.as_deref(), Some("/b"));
+                            assert_eq!(c.as_deref(), Some("/c"));
+                        }
+                        _ => panic!("expected leaves B and C"),
+                    }
+                }
+                other => panic!("expected nested split, got {other:?}"),
+            }
+        }
+        other => panic!("expected split root, got {other:?}"),
+    }
+}
+
 #[test]
 fn empty_tab_starts_without_transient_pending_state() {
     let tab = Tab::empty();
@@ -60,6 +195,7 @@ fn snapshot(cwd: &str, editor: &EditorBuffer) -> TabSnapshot {
         editor_buffer: TabSnapshot::encode_editor_buffer(editor),
         shell_phase: "AtPrompt".to_string(),
         block_ids: Vec::new(),
+        panes: None,
     }
 }
 

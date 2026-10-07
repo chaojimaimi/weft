@@ -137,6 +137,7 @@ fn prune_age_gate_deletes_only_old_blocks_and_keeps_tabs() {
             editor_buffer: String::new(),
             shell_phase: "AtPrompt".into(),
             block_ids: vec![1, 4],
+            panes: None,
         }])
         .unwrap();
 
@@ -223,6 +224,7 @@ fn prune_budget_unreachable_when_blocks_drained_but_live_over_budget() {
             editor_buffer: "y".repeat(2 * 1024 * 1024),
             shell_phase: "AtPrompt".into(),
             block_ids: vec![1],
+            panes: None,
         }])
         .unwrap();
     // 1 MiB budget ≪ the ~2 MiB live tabs data.
@@ -472,6 +474,7 @@ fn end_to_end_prune_shrinks_file_and_cascades_three_tables() {
                 editor_buffer: String::new(),
                 shell_phase: "AtPrompt".into(),
                 block_ids: vec![5, 160],
+                panes: None,
             }])
             .unwrap();
     }

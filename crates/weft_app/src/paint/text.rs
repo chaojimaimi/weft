@@ -265,10 +265,18 @@ pub(crate) const NOTE_CARD_LABEL: &str = "Note: ";
 /// v1.12.24.1: note-card width from the shared layout consts — 60% of the
 /// viewport width clamped to [40cw, 80cw]. One formula for the renderer
 /// (overlays.rs) and the IME anchor so they cannot diverge.
+///
+/// v1.12.28 (P1-01 ③): window-level narrow-window clamp — a viewport
+/// narrower than the 40-cell floor used to push the card past the window
+/// edges (the 40-cell floor won). The card is now clamped to the window's
+/// usable width with an 8-cell absolute floor. Scope stays WINDOW-level by
+/// design (v1.12.24 review P1): in a split the card intentionally centers
+/// across the whole window, like the palette.
 pub(crate) fn note_card_width(vp_w: f32, cw: f32) -> f32 {
     (vp_w * NOTE_CARD_WIDTH_FRACTION)
         .max(cw * NOTE_CARD_MIN_WIDTH_CELLS)
         .min(cw * NOTE_CARD_MAX_WIDTH_CELLS)
+        .min((vp_w - 16.0).max(cw * 8.0))
 }
 
 /// v1.12.24.1 (N-4): cell-based display window for the note editor buffer.
@@ -648,16 +656,50 @@ mod note_window_tests {
         assert_eq!(NOTE_CARD_LABEL, "Note: ");
         let ctx = ime_ctx();
         let area = note_editor_ime_area(&ctx);
-        // Two-step form mirrors the renderer formula's max→min order without
-        // tripping clippy::manual_clamp on the test-only literal chain.
+        // Three-step form mirrors the renderer formula's max→min→min order
+        // without tripping clippy::manual_clamp on the test-only literal
+        // chain. v1.12.28 (P1-01 ③): third step = window-level narrow clamp
+        // (a no-op at this 1600px viewport — regular range unchanged).
         let target_w = (1600.0_f32 * 0.6).max(CW * 40.0);
         let target_w = target_w.min(CW * 80.0);
+        let target_w = target_w.min((1600.0_f32 - 16.0).max(CW * 8.0));
         let popup_x0 = (1600.0 - target_w) * 0.5;
         let popup_y0 = ctx.top() + 10.0;
         let line_h = (CH * 1.75).max(CH + 16.0);
         assert_eq!(area.x, popup_x0 + 3.0 + 8.0 + "Note: ".len() as f32 * CW);
         assert_eq!(area.y, popup_y0 + (line_h - CH) * 0.5);
         assert_eq!((area.width, area.height), (CW, CH));
+    }
+
+    /// v1.12.28 (P1-01 ③) double assertion: the regular width range is
+    /// unchanged (60% clamped to [40, 80] cells) AND a window narrower than
+    /// the 40-cell floor clamps the card inside the viewport (8-cell
+    /// absolute floor) instead of overflowing the window edges.
+    #[test]
+    fn note_card_width_clamps_inside_a_narrow_window() {
+        // Regular range unchanged: 60% of 1600 = 960, inside [700, 1400].
+        assert!((note_card_width(1600.0, CW) - 960.0).abs() < 1e-2);
+        // Narrow window: the 40-cell floor (700) exceeds the usable width —
+        // the card must shrink to fit (16px total margin), not overflow.
+        let narrow = note_card_width(600.0, CW);
+        assert!(
+            (narrow - (600.0 - 16.0)).abs() < 1e-3,
+            "600px window: card clamps to usable width, got {narrow}"
+        );
+        assert!(narrow < 600.0);
+        // Extreme window: the 8-cell absolute floor keeps the card usable.
+        // At CW = 17.5 the floor is 140px, so containment holds for windows
+        // ≥ 8cw + 16 px; below that the card may overflow (documented
+        // extreme, same caveat as the find bar's 8-column floor).
+        let tiny = note_card_width(150.0, CW);
+        assert!(
+            (tiny - (CW * 8.0)).abs() < 1e-3,
+            "150px window: 8-cell floor holds, got {tiny}"
+        );
+        assert!(
+            tiny < 150.0,
+            "at the floor the card still stays inside the window"
+        );
     }
 }
 

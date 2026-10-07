@@ -82,8 +82,6 @@ pub fn layout_completion(
 ) -> CompletionLayout {
     let cw = ctx.cell_w;
     let ch = ctx.cell_h;
-    let vp_w = ctx.viewport.0;
-    let padding_x = ctx.padding_x;
 
     let shown = end - start;
     // Floor at 10 so an empty (or short) visible slice still has a sane
@@ -93,11 +91,18 @@ pub fn layout_completion(
     let gap_cols = 2usize;
     // popup_cols = left_pad(1) + icon(2) + label + gap(2) + suffix(10) + right_pad(1)
     let popup_cols = 1 + 2 + max_label_cols + gap_cols + suffix_cols + 1;
-    let popup_max_cols = ((vp_w * popup_width_scale) / cw) as usize;
-    let popup_cols = popup_cols.clamp(25, popup_max_cols.max(25));
+    // v1.12.28 (P1-01 ②): the width budget and the 25-col floor ride the
+    // ACTIVE PANE's width (`ctx.width()`), not the whole window — find-family
+    // `min(floor, avail)` so a narrow pane shrinks the floor (labels truncate;
+    // documented degradation) instead of letting the popup cross the split
+    // divider. The right edge clamps to the pane's right edge (ctx.right()).
+    let avail_cols = (ctx.width() / cw) as usize;
+    let scale_cols = ((ctx.width() * popup_width_scale) / cw) as usize;
+    let floor_cols = 25usize.min(avail_cols.max(1));
+    let popup_cols = popup_cols.clamp(floor_cols, scale_cols.max(floor_cols));
     let popup_w = popup_cols as f32 * cw;
     let popup_x0 = box_x0;
-    let popup_x1 = (popup_x0 + popup_w).min(vp_w - padding_x);
+    let popup_x1 = (popup_x0 + popup_w).min(ctx.right());
 
     // v1.11.6: Spacing tokens removed (D-g) — only 2 consumers
     let pad = ctx.cell_w * 0.5; // former sm token
@@ -336,7 +341,14 @@ pub fn layout_find(ctx: &LayoutCtx, total_matches: usize) -> FindLayout {
     let target_w = 500.0_f32;
     let right_margin = 20.0;
     let min_w = cw * 48.0;
-    let popup_w = target_w.min(ctx.width() - right_margin - 20.0).max(min_w);
+    // v1.12.28 (P1-01 ①): the 48-cell floor yields to the pane's available
+    // width (find-family `min(floor, avail)` pattern) so the bar's LEFT edge
+    // never crosses `ctx.left()` in a narrow split pane. The 8-cell absolute
+    // floor keeps the bar usable; below ~8 cols of budget the left edge may
+    // still hug/cross `ctx.left()` and the button cluster draws outside the
+    // bar — documented extreme, not fixed.
+    let avail = ctx.width() - right_margin - 20.0;
+    let popup_w = target_w.min(avail).max(min_w.min(avail)).max(cw * 8.0);
     let popup_h = (ch * 1.75).max(ch + 16.0);
     let popup_x1 = ctx.right() - right_margin;
     let popup_x0 = popup_x1 - popup_w;

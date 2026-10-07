@@ -7,6 +7,7 @@
 
 use rusqlite::{params, Row};
 
+use crate::pane_layout::SplitDirection;
 use crate::persistence::blocks::BlockStore;
 use crate::persistence::PersistenceError;
 
@@ -14,7 +15,10 @@ use crate::persistence::PersistenceError;
 /// SQLite so the tab layout survives restarts. The PTY itself is NOT
 /// restored (impossible); on restore, the tab shows the saved editor draft
 /// + block history, and the user presses Enter to spawn a fresh shell.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// v1.12.28 (P1-02 ①): `Eq` is no longer derived — the new optional
+/// `panes` tree carries an f32 `ratio`, which is `PartialEq`-only.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TabSnapshot {
     /// Position in the tab bar (0-based).
     pub position: usize,
@@ -40,6 +44,52 @@ pub struct TabSnapshot {
     /// v1.7.6 (tab starts with no restored block-view content).
     #[serde(default)]
     pub block_ids: Vec<u64>,
+    /// v1.12.28 (P1-02 ①): per-pane split-tree snapshot for multi-pane
+    /// tabs. `None` = single-pane tab (and what every pre-v1.12.28 row
+    /// decodes to) — the restore path spawns one pane exactly as before.
+    /// Serde attrs: `default` keeps old JSON payloads decodable;
+    /// `skip_serializing_if` keeps single-pane payloads field-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panes: Option<PaneTreeSnapshot>,
+}
+
+/// v1.12.28 (P1-02 ①): serialized split-tree snapshot of a multi-pane tab —
+/// the pane structure (`tree`) plus the DFS leaf index to focus after the
+/// rebuild. Persisted as JSON in the `tabs.panes` TEXT column; an encode
+/// failure (or a legacy row's NULL) stores/reads as `None` → single-pane
+/// restore (plan fallback).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PaneTreeSnapshot {
+    /// Split-tree structure; leaves carry per-pane state.
+    pub tree: SnapshotPaneNode,
+    /// DFS index (first child before second) of the leaf to activate.
+    pub active_leaf: usize,
+}
+
+/// v1.12.28 (P1-02 ①): one node of the serialized split tree. Leaf order is
+/// DFS, first child before second (the `export_tree` / `pane_id_at_index`
+/// order). `direction` reuses the serde-ized
+/// [`SplitDirection`](crate::pane_layout::SplitDirection), so an unknown
+/// direction value fails JSON decode → the row naturally falls back to a
+/// single-pane restore.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SnapshotPaneNode {
+    /// A leaf pane: spawn cwd + editor draft JSON + owned block ids. The
+    /// shell phase is deliberately NOT carried per leaf — a restored pane
+    /// spawns a fresh shell (AtPrompt), mirroring the single-pane path.
+    Pane {
+        cwd: Option<String>,
+        editor_buffer: String,
+        block_ids: Vec<u64>,
+    },
+    /// An internal split node. `ratio` is the first-child (top/left) share;
+    /// the restore path clamps it to [0.1, 0.9] (workspace validate parity).
+    Split {
+        direction: SplitDirection,
+        ratio: f32,
+        first: Box<SnapshotPaneNode>,
+        second: Box<SnapshotPaneNode>,
+    },
 }
 
 impl TabSnapshot {
@@ -87,9 +137,16 @@ impl BlockStore {
         for snap in snapshots {
             let block_ids_json =
                 serde_json::to_string(&snap.block_ids).unwrap_or_else(|_| "[]".into());
+            // v1.12.28 (P1-02 ①): per-pane tree JSON. A `None` field OR an
+            // encode failure stores NULL → the row restores as a single-pane
+            // tab (plan fallback); an encode failure never blocks the save.
+            let panes_json: Option<String> = snap
+                .panes
+                .as_ref()
+                .and_then(|tree| serde_json::to_string(tree).ok());
             tx.execute(
-                "INSERT INTO tabs (id, position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids) \
-                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tabs (id, position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids, panes) \
+                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     snap.position as i64,
                     snap.active as i64,
@@ -98,6 +155,7 @@ impl BlockStore {
                     &snap.editor_buffer,
                     &snap.shell_phase,
                     &block_ids_json,
+                    panes_json,
                 ],
             )?;
         }
@@ -110,7 +168,7 @@ impl BlockStore {
     /// or after [`BlockStore::clear_tabs`]).
     pub fn load_tabs(&self) -> Result<Vec<TabSnapshot>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids \
+            "SELECT position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids, panes \
              FROM tabs ORDER BY position ASC",
         )?;
         let rows = stmt.query_map([], row_to_tab_snapshot)?;
@@ -148,6 +206,14 @@ pub(crate) fn row_to_tab_snapshot(row: &Row) -> rusqlite::Result<TabSnapshot> {
         .as_deref()
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
+    // v1.12.28 (P1-02 ①): column-level backward compat — the v1.12.28
+    // migration adds the `panes` column, so pre-v1.12.28 rows read back
+    // NULL → `None` → single-pane restore. A decode failure (corrupt JSON
+    // or an unknown `SplitDirection` enum value) also decodes to `None`.
+    let panes_json: Option<String> = row.get(7).ok();
+    let panes: Option<PaneTreeSnapshot> = panes_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok());
     Ok(TabSnapshot {
         position: position as usize,
         active,
@@ -156,6 +222,7 @@ pub(crate) fn row_to_tab_snapshot(row: &Row) -> rusqlite::Result<TabSnapshot> {
         editor_buffer,
         shell_phase,
         block_ids,
+        panes,
     })
 }
 
@@ -197,6 +264,7 @@ mod tests {
                 .to_string(),
             shell_phase: phase.to_string(),
             block_ids: Vec::new(),
+            panes: None,
         }
     }
 
@@ -429,6 +497,7 @@ mod tests {
             editor_buffer: TabSnapshot::encode_editor_buffer(&buf),
             shell_phase: "AtPrompt".to_string(),
             block_ids: Vec::new(),
+            panes: None,
         };
         store.save_tabs(&[snap]).unwrap();
         let loaded = store.load_tabs().unwrap();
@@ -436,5 +505,125 @@ mod tests {
         let decoded = TabSnapshot::decode_editor_buffer(&loaded[0].editor_buffer).expect("decode");
         assert_eq!(decoded.lines, vec!["ls -la /home".to_string()]);
         assert_eq!(decoded.cursor, (0, 13));
+    }
+
+    /// v1.12.28 (P1-02 ①): a dual-pane v2 snapshot survives save→load with
+    /// full field fidelity — including the `panes` column (SQL round-trip,
+    /// NOT serde round-trip): the tree structure, per-leaf state, and the
+    /// active-leaf DFS index.
+    #[test]
+    fn split_panes_snapshot_roundtrips_through_sqlite() {
+        use crate::pane_layout::SplitDirection;
+        let store = temp_store();
+        let leaf = |cwd: &str, editor: &str, ids: &[u64]| SnapshotPaneNode::Pane {
+            cwd: Some(cwd.to_string()),
+            editor_buffer: editor.to_string(),
+            block_ids: ids.to_vec(),
+        };
+        // Split { first: Pane(/a), second: Split { first: Pane(/b), second: Pane(/c) } }
+        let tree = SnapshotPaneNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.4,
+            first: Box::new(leaf("/a", r#"{"lines":["git st"]}"#, &[1, 2])),
+            second: Box::new(SnapshotPaneNode::Split {
+                direction: SplitDirection::Horizontal,
+                ratio: 0.6,
+                first: Box::new(leaf("/b", "{}", &[3])),
+                second: Box::new(leaf("/c", "{}", &[])),
+            }),
+        };
+        let snap = TabSnapshot {
+            position: 0,
+            active: true,
+            cwd: Some("/a".to_string()),
+            block_scroll_offset: 5,
+            editor_buffer: r#"{"lines":["git st"]}"#.to_string(),
+            shell_phase: "AtPrompt".to_string(),
+            block_ids: vec![1, 2],
+            panes: Some(PaneTreeSnapshot {
+                tree,
+                active_leaf: 2,
+            }),
+        };
+        store.save_tabs(&[snap]).unwrap();
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let panes = loaded[0]
+            .panes
+            .as_ref()
+            .expect("the panes column must survive the round-trip");
+        assert_eq!(panes.active_leaf, 2);
+        match &panes.tree {
+            SnapshotPaneNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                assert_eq!(*direction, SplitDirection::Vertical);
+                assert!((ratio - 0.4).abs() < 1e-6);
+                match &**first {
+                    SnapshotPaneNode::Pane {
+                        cwd,
+                        editor_buffer,
+                        block_ids,
+                    } => {
+                        assert_eq!(cwd.as_deref(), Some("/a"));
+                        assert_eq!(editor_buffer, r#"{"lines":["git st"]}"#);
+                        assert_eq!(block_ids, &[1, 2]);
+                    }
+                    other => panic!("expected first leaf, got {other:?}"),
+                }
+                match &**second {
+                    SnapshotPaneNode::Split {
+                        direction, ratio, ..
+                    } => {
+                        assert_eq!(*direction, SplitDirection::Horizontal);
+                        assert!((ratio - 0.6).abs() < 1e-6);
+                    }
+                    other => panic!("expected nested split, got {other:?}"),
+                }
+            }
+            other => panic!("expected split tree, got {other:?}"),
+        }
+    }
+
+    /// v1.12.28 (P1-02 ①) v1 backward compat (column level): a pre-v1.12.28
+    /// database (bare-SQL schema with `block_ids`/`active` but no `panes`
+    /// column, tabs.rs legacy-migration precedent) migrates cleanly and the
+    /// old row loads with `panes = None` → the restore path spawns a single
+    /// pane exactly as v1.12.27 did.
+    #[test]
+    fn legacy_row_without_panes_column_loads_as_single_pane() {
+        let path = std::env::temp_dir().join(format!(
+            "weft-tabs-v1-no-panes-{}-{}.db",
+            std::process::id(),
+            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tabs (\
+                    id INTEGER PRIMARY KEY, position INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0,\
+                    cwd TEXT, block_scroll_offset INTEGER NOT NULL DEFAULT 0,\
+                    editor_buffer TEXT, shell_phase TEXT, block_ids TEXT\
+                 );\
+                 INSERT INTO tabs (position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids)\
+                 VALUES (0, 1, '/v1/split', 3, '{}', 'AtPrompt', '[7,42]');",
+            )
+            .unwrap();
+        }
+        let store = BlockStore::open(&path).unwrap();
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cwd.as_deref(), Some("/v1/split"));
+        assert_eq!(loaded[0].block_scroll_offset, 3);
+        assert_eq!(loaded[0].block_ids, vec![7, 42]);
+        assert!(
+            loaded[0].panes.is_none(),
+            "a pre-v1.12.28 row must restore as a single-pane tab"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
