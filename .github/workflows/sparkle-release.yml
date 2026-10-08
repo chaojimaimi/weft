@@ -232,12 +232,24 @@ jobs:
           shasum -a 256 "Weft-${VERSION}.dmg" > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Extract release notes from the release commit
+        run: |
+          # v1.13.3 GUI feedback: auto-generated notes are a bare compare link
+          # on a PR-less repo. The tag points at the chore(release) commit
+          # whose body IS the curated version summary (train discipline) —
+          # strip the subject line and use it as the release body; the auto
+          # compare link is still appended below it.
+          git log --format=%B -n 1 "${GITHUB_SHA}" | tail -n +2 | sed -e '/./,$!d' > release_notes_body.md
+          echo "--- release_notes_body.md ---"
+          cat release_notes_body.md
+
       - name: Create GitHub Release (draft — publish manually, D2)
         uses: softprops/action-gh-release@v2
         with:
           files: |
             target/release/osx/Weft-*.dmg
             target/release/osx/SHA256SUMS
+          body_path: release_notes_body.md
           draft: true
           generate_release_notes: true
           tag_name: ${{ steps.release.outputs.tag }}

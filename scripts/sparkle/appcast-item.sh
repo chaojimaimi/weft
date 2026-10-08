@@ -78,7 +78,7 @@ cat > "${ITEM_FILE}" <<ITEM_EOF
             <enclosure url="${DOWNLOAD_URL_ESC}" length="${LENGTH}" type="application/x-bzip2-diskimage" sparkle:edSignature="${ED_SIGNATURE_ESC}" />
             <description><![CDATA[
                 <h2>Weft ${VERSION_ESC}</h2>
-                <p>See the <a href="https://github.com/chaojimaimi/weft/releases">release notes</a>.</p>
+                <p>See the <a href="https://github.com/chaojimaimi/weft/releases/tag/v${VERSION_ESC}">release notes</a>.</p>
             ]]></description>
         </item>
 ITEM_EOF
