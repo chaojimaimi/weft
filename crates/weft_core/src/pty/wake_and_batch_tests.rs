@@ -390,3 +390,94 @@ fn pty_wake_due_wakes_a_caught_up_consumer_immediately() {
 fn pty_wake_due_exit_bypasses_the_throttle() {
     assert!(pty_wake_due(true, false, 1_000, 1_001));
 }
+
+// ── T16a (PLAN_v11217 §3.11): WEFT_READ_* tuning resolver ─────────
+// The pure resolver is driven with an injected env map (no process env
+// mutation — race-free and hermetic). Defaults == the three audited
+// constants; fallback is field-by-field.
+
+use super::read_loop::{
+    read_tuning, resolve_tuning, ReadLoopTuning, HOLD_MAX_MS, READ_BATCH_TARGET,
+    STREAM_ACTIVE_WINDOW_MS,
+};
+
+fn env_map(entries: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    // Fully owned map: the returned closure must not borrow `entries`, or
+    // the `impl Fn` return type would need an explicit lifetime (E0700).
+    let map: std::collections::HashMap<String, String> = entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    move |key| map.get(key).cloned()
+}
+
+#[test]
+fn read_tuning_resolver_unset_env_yields_audited_defaults() {
+    let t = resolve_tuning(env_map(&[]));
+    assert_eq!(t.stream_active_window_ms, STREAM_ACTIVE_WINDOW_MS);
+    assert_eq!(t.hold_max_ms, HOLD_MAX_MS);
+    assert_eq!(t.read_batch_target, READ_BATCH_TARGET);
+}
+
+#[test]
+fn read_tuning_resolver_applies_valid_overrides() {
+    let t = resolve_tuning(env_map(&[
+        ("WEFT_READ_ACTIVE_MS", "8"),
+        ("WEFT_READ_HOLD_MS", "16"),
+        ("WEFT_READ_BATCH_BYTES", "15360"),
+    ]));
+    assert_eq!(t.stream_active_window_ms, 8);
+    assert_eq!(t.hold_max_ms, 16);
+    assert_eq!(t.read_batch_target, 15_360);
+}
+
+#[test]
+fn read_tuning_resolver_falls_back_per_field() {
+    // One malformed key must not discard the other two overrides.
+    let t = resolve_tuning(env_map(&[
+        ("WEFT_READ_ACTIVE_MS", "not-a-number"),
+        ("WEFT_READ_HOLD_MS", "8"),
+        ("WEFT_READ_BATCH_BYTES", "0x40"),
+    ]));
+    assert_eq!(t.stream_active_window_ms, STREAM_ACTIVE_WINDOW_MS);
+    assert_eq!(t.hold_max_ms, 8);
+    assert_eq!(t.read_batch_target, READ_BATCH_TARGET);
+}
+
+#[test]
+fn read_tuning_resolver_clamps_batch_target_to_event_cap() {
+    // The soft target participates in read_batch's batch-size decision —
+    // EVENT_CAP itself is safe (the append check is `>=`, and the request
+    // is capped to the batch's remaining room, so `== EVENT_CAP` flushes
+    // on the SoftTarget check without ever overshooting), but nothing
+    // beyond it can ever be honored.
+    let t = resolve_tuning(env_map(&[("WEFT_READ_BATCH_BYTES", "999999999")]));
+    assert_eq!(t.read_batch_target, EVENT_CAP);
+    let t = resolve_tuning(env_map(&[("WEFT_READ_BATCH_BYTES", "0")]));
+    assert_eq!(t.read_batch_target, 1, "0 would degenerate the aggregation");
+}
+
+#[test]
+fn read_tuning_ms_overrides_are_capped() {
+    let t = resolve_tuning(env_map(&[
+        ("WEFT_READ_ACTIVE_MS", "99999999"),
+        ("WEFT_READ_HOLD_MS", "99999999"),
+    ]));
+    assert_eq!(t.stream_active_window_ms, 1_000);
+    assert_eq!(t.hold_max_ms, 1_000);
+}
+
+/// Test-isolation pin (review P2): under `cfg(test)` the env is never
+/// read — a user shell's leftover `WEFT_READ_*` must not pollute the
+/// exact batch-shape assertions above.
+#[test]
+fn read_tuning_is_env_immutable_under_test() {
+    assert_eq!(
+        read_tuning(),
+        &ReadLoopTuning {
+            stream_active_window_ms: STREAM_ACTIVE_WINDOW_MS,
+            hold_max_ms: HOLD_MAX_MS,
+            read_batch_target: READ_BATCH_TARGET,
+        }
+    );
+}

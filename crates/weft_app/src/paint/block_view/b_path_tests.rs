@@ -363,7 +363,7 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
     // its end (display col 5).
     let live = terminal.block_tracker().in_flight().unwrap();
     let cursor_line = live.output.lines().count().saturating_sub(1);
-    let cursor_col = crate::paint::ui_helpers::tui_cursor_display_col(
+    let cursor_col = crate::paint::tui_caret::tui_cursor_display_col(
         live.output,
         cursor_line,
         terminal.grid().num_cols,
@@ -493,7 +493,7 @@ fn pw_prompt_caret_anchors_after_prompt_when_cursor_row_unmaterialized() {
     let live = terminal.block_tracker().in_flight().unwrap();
     // T16b: mirrors renderer's None branch — tail line + display col.
     let line = live.output.lines().count().saturating_sub(1);
-    let col = crate::paint::ui_helpers::tui_cursor_display_col(
+    let col = crate::paint::tui_caret::tui_cursor_display_col(
         live.output,
         line,
         terminal.grid().num_cols,
@@ -521,7 +521,7 @@ fn pw_prompt_caret_anchors_after_prompt_when_cursor_row_unmaterialized() {
     );
     // T16b: the tail anchor ignores the parked grid cursor entirely.
     let line = live.output.lines().count().saturating_sub(1);
-    let col = crate::paint::ui_helpers::tui_cursor_display_col(
+    let col = crate::paint::tui_caret::tui_cursor_display_col(
         live.output,
         line,
         terminal.grid().num_cols,
@@ -546,7 +546,7 @@ fn pw_prompt_caret_anchors_on_retry_prompt() {
     let live = terminal.block_tracker().in_flight().unwrap();
     // T16b: mirrors renderer's None branch — tail line + display col.
     let line = live.output.lines().count().saturating_sub(1);
-    let col = crate::paint::ui_helpers::tui_cursor_display_col(
+    let col = crate::paint::tui_caret::tui_cursor_display_col(
         live.output,
         line,
         terminal.grid().num_cols,
@@ -572,8 +572,7 @@ fn tui_caret_col_follows_wrapped_content_end_after_resize() {
     let live = t.block_tracker().in_flight().unwrap();
     // T16b: mirrors renderer's None branch — tail line + display col.
     let line = live.output.lines().count().saturating_sub(1);
-    let col =
-        crate::paint::ui_helpers::tui_cursor_display_col(live.output, line, t.grid().num_cols);
+    let col = crate::paint::tui_caret::tui_cursor_display_col(live.output, line, t.grid().num_cols);
     assert_eq!((line, col), (0, 180), "caret at wrapped content end");
 }
 
@@ -617,8 +616,7 @@ fn brew_progress_caret_anchors_capture_tail_not_grid_cursor() {
     //    tail line and its display column at the new width.
     let live = t.block_tracker().in_flight().unwrap();
     let line = live.output.lines().count().saturating_sub(1);
-    let col =
-        crate::paint::ui_helpers::tui_cursor_display_col(live.output, line, t.grid().num_cols);
+    let col = crate::paint::tui_caret::tui_cursor_display_col(live.output, line, t.grid().num_cols);
     assert_eq!(
         line, 30,
         "caret on the last live capture line (newest rewritten row)"

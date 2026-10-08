@@ -413,14 +413,34 @@ pub(crate) fn build_styled_output_from_runs(
     text: &str,
     runs: &[CapturedStyleRun],
 ) -> Option<StyledOutput> {
+    build_styled_from_runs_at(text, runs, 0, 0)
+}
+
+/// v1.13.5 T16a: windowed twin of [`build_styled_output_from_runs`] — the
+/// caller hands a TAIL SLICE of the full text plus the coordinates that
+/// re-anchor it:
+///
+/// - `slice` starts on a line boundary whose char index (in FULL-text
+///   coordinates) is `slice_start_char` and whose absolute line index is
+///   `slice_line_index`;
+/// - `runs` are pre-sliced to those overlapping the window.
+///
+/// Byte-equal to the full build restricted to the window's lines. The full
+/// build stays the finalize path (complete styles, unbounded cost).
+pub(crate) fn build_styled_from_runs_at(
+    text: &str,
+    runs: &[CapturedStyleRun],
+    slice_start_char: u32,
+    slice_line_index: u32,
+) -> Option<StyledOutput> {
     if runs.is_empty() {
         return None;
     }
     let mut lines: Vec<StyledLine> = Vec::new();
-    let mut line_start_char: u32 = 0;
+    let mut line_start_char: u32 = slice_start_char;
     let mut run_idx = 0usize;
 
-    for (line_index, line_text) in (0u32..).zip(text.split('\n')) {
+    for (line_index, line_text) in (slice_line_index..).zip(text.split('\n')) {
         // FIX_LIVE_STYLED_OUTPUT (review s1): peek_styled makes this a ~10Hz
         // hot path; once every run is consumed no later line can produce a
         // span, so stop instead of char-counting a MiB-scale plain tail.
@@ -513,6 +533,86 @@ pub(crate) fn build_styled_output_from_runs(
     } else {
         Some(StyledOutput { lines })
     }
+}
+
+/// Tail-window size for the live styled snapshot rebuild, in BYTES (≈256K
+/// chars at the 3-byte/CJK worst case). v1.13.5 T16a candidate ① (PLAN_v11217
+/// §3.11): the 100ms-throttled `peek_styled` rebuild used to walk O(total
+/// text) per publish (measured 8.4ms spikes at ~6MB on the styled stream);
+/// windowing bounds it to O(window) per publish. Trade-off (plan-sanctioned):
+/// styles older than the window freeze out of the LIVE view while a command
+/// streams; finalize's `take_styled` still rebuilds the complete styled
+/// output, so history keeps every color.
+pub(crate) const LIVE_STYLED_WINDOW_BYTES: usize = 768 * 1024;
+
+/// v1.13.5 T16a: tail-windowed [`build_styled_output_from_runs`] — rebuild
+/// spans only for the last `window_bytes` of `text`, re-indexing lines to
+/// their ABSOLUTE indices via `total_newlines` (the capture's maintained
+/// newline ledger). Byte-equal to the full build inside the window; every
+/// degenerate shape falls back to the full build, staying byte-identical to
+/// the pre-window behavior:
+/// - text fits inside the window (nothing to save);
+/// - styles end before the window (the full build's s1 early-stop already
+///   bounds it below the window walk, and it keeps the old styles intact);
+/// - no line boundary inside the window (single mega-line tail).
+pub(crate) fn build_styled_output_windowed(
+    text: &str,
+    runs: &[CapturedStyleRun],
+    total_newlines: usize,
+    total_chars: usize,
+    window_bytes: usize,
+) -> Option<StyledOutput> {
+    let full = || build_styled_output_from_runs(text, runs);
+    let Some(raw_cut) = tail_window_start(text, window_bytes) else {
+        return full();
+    };
+    // Re-align the raw byte cut to the NEXT line boundary so the window's
+    // first line carries true line-local span coordinates.
+    let ahead = &text[raw_cut..];
+    let Some(nl) = ahead.find('\n') else {
+        return full();
+    };
+    let window_start = raw_cut + nl + 1;
+    let slice = &text[window_start..];
+    if slice.is_empty() {
+        return full();
+    }
+    // Runs are char-indexed over the FULL text, so every coordinate below
+    // stays in full-text space: the window's absolute first char is
+    // `total_chars − tail_chars` (the walk-back + line re-alignment only
+    // SHRANK the tail, so the anchor is exact for whatever slice remains).
+    let tail_chars = slice.chars().count() as u32;
+    let window_start_char = total_chars as u32 - tail_chars;
+    if runs
+        .last()
+        .is_some_and(|run| run.end_char <= window_start_char)
+    {
+        return full();
+    }
+    let run_first = runs.partition_point(|run| run.end_char <= window_start_char);
+    // Absolute line index of the window's first line: every newline of the
+    // full text is either before the window or inside it.
+    let newlines_in_window = slice.bytes().filter(|byte| *byte == b'\n').count();
+    let line_index_offset = (total_newlines - newlines_in_window) as u32;
+    build_styled_from_runs_at(
+        slice,
+        &runs[run_first..],
+        window_start_char,
+        line_index_offset,
+    )
+}
+
+/// Byte offset where a tail window of `window_bytes` begins, char-boundary
+/// aligned; `None` when the whole text fits inside the window.
+fn tail_window_start(text: &str, window_bytes: usize) -> Option<usize> {
+    if text.len() <= window_bytes {
+        return None;
+    }
+    let mut cut = text.len() - window_bytes;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    Some(cut)
 }
 
 fn push_or_coalesce_color(spans: &mut Vec<ForegroundSpan>, start: u32, end: u32, color: CellColor) {

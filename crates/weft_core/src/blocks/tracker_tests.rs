@@ -554,3 +554,36 @@ fn command_after_clear_does_not_affect_history() {
     assert_eq!(t.blocks()[1].id, BlockId(2));
     assert_eq!(t.blocks()[2].id, BlockId(3));
 }
+
+/// v1.13.5 T16b: finalize bumps the live-view version. 133;D is the one
+/// streaming-boundary event the per-print bumps never cover, and the
+/// renderer's background block-pane cache keys its fingerprint on this
+/// version — without the bump a background pane would never render the
+/// finished block until the next command started in that tab.
+#[test]
+fn finalize_bumps_live_output_version() {
+    let mut t = BlockTracker::new();
+    t.on_prompt_start();
+    t.on_command_start("echo".to_string());
+    t.on_print_ascii_run(b"hi", CapturedStyle::default());
+    let streaming_version = t.in_flight().unwrap().version;
+    t.on_command_end(0);
+    assert!(t.in_flight().is_none(), "command done, live handle closed");
+    assert_eq!(
+        t.live_output_version(),
+        streaming_version + 1,
+        "finalize must move the version (finished block appeared)"
+    );
+
+    // Interrupt path (133;A without 133;D) goes through the same finalize.
+    let v = t.live_output_version();
+    t.on_command_start("sleep".to_string());
+    let during = t.live_output_version();
+    t.on_prompt_start();
+    assert_eq!(
+        t.live_output_version(),
+        during + 1,
+        "interrupt finalize must move the version too"
+    );
+    assert!(t.live_output_version() > v);
+}

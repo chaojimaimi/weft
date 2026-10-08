@@ -171,6 +171,12 @@ impl BlockTracker {
         self.dirty_blocks.insert(block.id.0);
         self.blocks.push(block.clone());
         self.unpersisted.push(block);
+        // v1.13.5 T16b: a finalize changes the rendered block view (finished
+        // block appears / continuation merges) while the owning pane may be
+        // a BACKGROUND pane — the renderer's per-pane vertex cache keys its
+        // fingerprint on this version, and 133;D is the one streaming-boundary
+        // event the per-print bumps never cover.
+        self.live_output_version = self.live_output_version.wrapping_add(1);
         // v1.11.2 X4 (PLAN_v1112 §1.2): retention runs after BOTH pushes —
         // see the timing note on `enforce_retention` for why a popped block
         // may still sit in `unpersisted` (benign; the drain persists it).
@@ -189,6 +195,9 @@ impl BlockTracker {
         if let Some(base) = self.continuation_base.take() {
             self.blocks.push(base);
         }
+        // v1.13.5 T16b: the restored continuation base joins the finished
+        // list — same background-pane visibility as finalize's bump above.
+        self.live_output_version = self.live_output_version.wrapping_add(1);
     }
 }
 

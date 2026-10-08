@@ -59,6 +59,80 @@ pub(crate) const STREAM_ACTIVE_WINDOW_MS: u64 = 50;
 /// never held at all).
 pub(crate) const HOLD_MAX_MS: u64 = 4;
 
+/// T16a (PLAN_v11217 §3.11): the three audited constants above become
+/// DEFAULTS that a `WEFT_READ_*` env var can override, for the user's
+/// three-step tuning sweep (4/8/16 ms hold) before new defaults are
+/// pinned. Tuning-only by design — no behavioral branch reads these.
+///
+/// Resolution is PROCESS-LEVEL, once, via `OnceLock` (review P2: a
+/// read_loop is spawned per tab, so per-thread `env::var` would pay the
+/// process-global lock once per tab for a value that never changes).
+///
+/// Test isolation (review P2): under `cfg(test)` the env is NEVER read —
+/// `wake_and_batch_tests` pins exact batch shapes against the defaults,
+/// and a user shell's leftover `WEFT_READ_*` must not pollute `cargo test`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadLoopTuning {
+    /// Overrides [`STREAM_ACTIVE_WINDOW_MS`] (`WEFT_READ_ACTIVE_MS`).
+    pub(crate) stream_active_window_ms: u64,
+    /// Overrides [`HOLD_MAX_MS`] (`WEFT_READ_HOLD_MS`).
+    pub(crate) hold_max_ms: u64,
+    /// Overrides [`READ_BATCH_TARGET`] (`WEFT_READ_BATCH_BYTES`).
+    pub(crate) read_batch_target: usize,
+}
+
+/// Single source for the defaults: the three constants above verbatim, so
+/// a constant change cannot drift from the resolver's fallback.
+const DEFAULT_TUNING: ReadLoopTuning = ReadLoopTuning {
+    stream_active_window_ms: STREAM_ACTIVE_WINDOW_MS,
+    hold_max_ms: HOLD_MAX_MS,
+    read_batch_target: READ_BATCH_TARGET,
+};
+
+/// Ceiling for the millisecond overrides — a garbage value (or typo like
+/// `16000`) must not turn the hold into a multi-second echo freeze.
+const TUNING_MS_CAP: u64 = 1_000;
+
+/// Pure resolver: field-by-field fallback, so a single malformed key
+/// cannot discard the other two overrides. Unit-testable with an injected
+/// getter; production feeds `std::env::var`. `pub(crate)` for the test
+/// module only (wake_and_batch_tests drives it with a fake env map).
+pub(crate) fn resolve_tuning(get: impl Fn(&str) -> Option<String>) -> ReadLoopTuning {
+    let mut tuning = DEFAULT_TUNING;
+    if let Some(v) = get("WEFT_READ_ACTIVE_MS").and_then(|s| s.parse::<u64>().ok()) {
+        tuning.stream_active_window_ms = v.min(TUNING_MS_CAP);
+    }
+    if let Some(v) = get("WEFT_READ_HOLD_MS").and_then(|s| s.parse::<u64>().ok()) {
+        tuning.hold_max_ms = v.min(TUNING_MS_CAP);
+    }
+    if let Some(v) = get("WEFT_READ_BATCH_BYTES").and_then(|s| s.parse::<usize>().ok()) {
+        // The soft target must stay under the structural EVENT_CAP hard
+        // bound (read_batch's induction depends on it); 0 would flush per
+        // read, degenerating the aggregation entirely.
+        tuning.read_batch_target = v.clamp(1, EVENT_CAP);
+    }
+    tuning
+}
+
+/// Process-level tuning snapshot. Test builds always get the defaults
+/// (see the isolation note above); production parses the env exactly once.
+#[cfg(test)]
+pub(crate) fn read_tuning() -> &'static ReadLoopTuning {
+    &DEFAULT_TUNING
+}
+
+#[cfg(not(test))]
+pub(crate) fn read_tuning() -> &'static ReadLoopTuning {
+    static TUNING: std::sync::OnceLock<ReadLoopTuning> = std::sync::OnceLock::new();
+    TUNING.get_or_init(|| {
+        let tuning = resolve_tuning(|key| std::env::var(key).ok());
+        if tuning != DEFAULT_TUNING {
+            tracing::info!(?tuning, "WEFT_READ_* override applied (tuning sweep)");
+        }
+        tuning
+    })
+}
+
 /// T5' pure hold decision (truth-tabled in `wake_and_batch_tests.rs`):
 /// `None` — no data has EVER arrived in this session — is deliberately NOT
 /// active (review P3a): a naive `0` default would misjudge the session's
@@ -66,15 +140,16 @@ pub(crate) const HOLD_MAX_MS: u64 = 4;
 pub(crate) fn stream_active(last_data_ms: Option<u64>, now_ms: u64) -> bool {
     match last_data_ms {
         None => false,
-        Some(last) => now_ms.saturating_sub(last) < STREAM_ACTIVE_WINDOW_MS,
+        Some(last) => now_ms.saturating_sub(last) < read_tuning().stream_active_window_ms,
     }
 }
 
-/// T5' pure hold decision: true once [`HOLD_MAX_MS`] have elapsed since the
-/// held batch's FIRST byte arrived — the batch must flush regardless of
-/// stream activity (the hold ceiling is absolute, not per-append).
+/// T5' pure hold decision: true once the hold window (default
+/// [`HOLD_MAX_MS`]) has elapsed since the held batch's FIRST byte arrived —
+/// the batch must flush regardless of stream activity (the hold ceiling is
+/// absolute, not per-append).
 pub(crate) fn hold_expired(first_byte_ms: u64, now_ms: u64) -> bool {
-    now_ms.saturating_sub(first_byte_ms) >= HOLD_MAX_MS
+    now_ms.saturating_sub(first_byte_ms) >= read_tuning().hold_max_ms
 }
 
 /// Why an aggregated read batch ended. `Eof` / `Error` are terminal: the
@@ -110,7 +185,11 @@ pub(crate) fn read_batch<R>(read_fn: &mut R, scratch: &mut [u8]) -> (Vec<u8>, Ba
 where
     R: FnMut(&mut [u8]) -> io::Result<usize>,
 {
-    let mut batch: Vec<u8> = Vec::with_capacity(READ_BATCH_TARGET);
+    // T16a: the soft target is env-overridable (process-level, resolved
+    // once); the EVENT_CAP hard bound is NOT — read_batch's structural
+    // induction (`request ≤ EVENT_CAP − batch.len()`) must never bend.
+    let soft_target = read_tuning().read_batch_target;
+    let mut batch: Vec<u8> = Vec::with_capacity(soft_target);
     loop {
         // Hard-cap structure: never ask a read for more than the batch's
         // remaining room, so `batch.len() ≤ EVENT_CAP` holds by induction —
@@ -127,7 +206,7 @@ where
             Ok(0) => return (batch, BatchStop::Eof),
             Ok(n) => {
                 batch.extend_from_slice(&scratch[..n]);
-                if batch.len() >= READ_BATCH_TARGET {
+                if batch.len() >= soft_target {
                     return (batch, BatchStop::SoftTarget);
                 }
             }
@@ -264,13 +343,15 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
         // anchor: `first_byte_ms` only changes when the pending batch is
         // replaced, so as `now` advances the remaining time shrinks and the
         // absolute deadline stays put — a trickle append does NOT reset the
-        // timer.
+        // timer. T16a: the hold ceiling is env-overridable (resolved once
+        // per process).
+        let hold_max_ms = read_tuning().hold_max_ms;
         let mut guard = if let Some((_, first_byte_ms)) = &pending {
             let held_for = monotonic_millis()
                 .saturating_sub(*first_byte_ms)
-                .min(HOLD_MAX_MS);
+                .min(hold_max_ms);
             let deadline =
-                tokio::time::Instant::now() + Duration::from_millis(HOLD_MAX_MS - held_for);
+                tokio::time::Instant::now() + Duration::from_millis(hold_max_ms - held_for);
             tokio::select! {
                 biased;
                 readable = async_fd.readable() => match readable {

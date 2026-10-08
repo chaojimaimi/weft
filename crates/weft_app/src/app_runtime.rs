@@ -341,6 +341,12 @@ impl ApplicationHandler<AppEvent> for App {
                 self.reload_config();
                 self.request_redraw();
             }
+            AppEvent::PathBinsResolved(bins) => {
+                // v1.13.5 (T16c): async PATH backfill — requests before this
+                // used the env-PATH fast subset; the thread already wrote the
+                // cache, and reloads never touch path_bins (swap persists).
+                self.config_state.path_bins = bins;
+            }
             AppEvent::TabsAutoSave => {
                 // v1.10.23: while the recovery prompt is up (deferred
                 // runModal keeps this runloop alive), the 1 Hz autosave

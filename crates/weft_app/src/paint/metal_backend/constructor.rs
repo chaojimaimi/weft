@@ -333,6 +333,7 @@ impl MetalRenderer {
             // + the drag-time warmup watermark table (cleared on atlas
             // rebuilds by update_scale/rebuild_atlas).
             background_grid_row_caches: RefCell::new(HashMap::new()),
+            background_block_caches: RefCell::new(HashMap::new()),
             background_grid_generation: Cell::new(1),
             block_scan_watermarks: RefCell::new(
                 crate::renderer::atlas_warmup::BlockScanWatermarks::default(),

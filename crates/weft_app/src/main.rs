@@ -79,6 +79,7 @@ mod pane;
 mod panel_component;
 mod panel_controller;
 mod panel_scrollbar;
+mod path_scan;
 mod performance_probe;
 mod profiles_controller;
 mod recovery_controller;
@@ -123,8 +124,7 @@ use block_component::block_content_metrics_with_cache;
 use effect::Effect;
 use macos_system::{
     clipboard_copy, clipboard_paste, load_window_icon, open_url, reveal_path_in_finder,
-    scan_path_bins, set_dock_icon, system_appearance_is_dark, system_increase_contrast,
-    system_reduce_motion,
+    set_dock_icon, system_appearance_is_dark, system_increase_contrast, system_reduce_motion,
 };
 use macos_window::configure_titlebar;
 use paint::overlays::FindDrawState;
@@ -224,6 +224,9 @@ pub(crate) enum AppEvent {
     NotificationActivated(i64),
     PerformanceProbeStart,
     PerformanceProbeFinish,
+    /// v1.13.5 (T16c): background PATH scan done — payload backfills
+    /// `ConfigState::path_bins` (async fill semantics in path_scan.rs).
+    PathBinsResolved(Vec<String>),
 }
 
 // ── Application ──────────────────────────────────────────────────────
@@ -245,16 +248,14 @@ struct App {
     /// [0, total_tab_width - visible_width] each frame.
     window_runtime: WindowRuntimeState,
     interaction: InteractionState,
-    /// Proxy used by background threads (PTY reader, blink timer) to wake the
-    /// event loop without a vsync busy-loop.
+    /// Proxy used by background threads (PTY reader, path scan, blink) to wake the loop.
     proxy: EventLoopProxy<AppEvent>,
     screen_exit_watchdog_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     config_state: ConfigState,
     /// Whether the command-history sidebar panel is shown.
     panel: PanelState,
-    /// v0.9 W2: block currently highlighted in the terminal because the user
-    /// clicked its row in the history panel. The renderer draws an accent
-    /// border around this block. Cleared after 1.5s.
+    /// v0.9 W2: history-panel-highlighted block — the renderer draws an
+    /// accent border around it; cleared after 1.5s.
     // ── Command Palette (v0.7) ────────────────────────────────────────
     palette: PaletteState,
 
@@ -265,9 +266,8 @@ struct App {
     settings: SettingsState,
     accessibility: accessibility::AccessibilityBridge,
     performance_probe: performance_probe::PerformanceProbe,
-    /// Frame-trace state (WARP_REFERENCE R3 task 6). Monotonic frame id
-    /// stamped on each render; the GPU-completion receiver drains
-    /// `add_completed_handler` messages posted from Metal internal threads.
+    /// Frame-trace state (WARP_REFERENCE R3 task 6): monotonic frame id per
+    /// render; the GPU-completion receiver drains Metal's completion posts.
     frame_id: u64,
     frame_trace_enabled: bool,
     gpu_completion_rx: std::sync::mpsc::Receiver<frame_trace::FrameGpuComplete>,
@@ -344,18 +344,19 @@ struct App {
     /// `AiResultEvent::ModelsRefreshed` with the Settings "Test Connection"
     /// button. `None` when no refresh is pending.
     ai_models_request_id: Option<u64>,
-    /// T14 (PLAN_v11217 §3.9): when the first block-prune may run — the App
-    /// construction instant; the gate requires 10s of elapsed time to stay
-    /// out of the cold-start measurement window.
+    /// T14 (PLAN_v11217 §3.9): App construction instant — the gate requires
+    /// 10s elapsed, keeping the prune out of the cold-start window.
     block_prune_arm: std::time::Instant,
-    /// T14: last prune trigger time (set at spawn time on the main thread);
-    /// `None` until the first prune — the 24h gate in
-    /// `run_tabs_autosave_tick` re-arms from it.
+    /// T14: last prune trigger time (set at spawn); `None` until the first
+    /// prune — the 24h gate in `run_tabs_autosave_tick` re-arms from it.
     last_block_prune: Option<std::time::Instant>,
-    /// T14: re-entrancy guard for the background prune thread — swap
-    /// false→true on the main thread before spawning, cleared by the thread
-    /// when the pass finishes (success, failure, or busy skip).
+    /// T14: re-entrancy guard for the prune thread — swapped false→true
+    /// before spawn, cleared by the thread when the pass finishes.
     block_prune_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// T16d (PLAN_v11217 §3.11): 60s debounce anchor for the 1 Hz
+    /// memory-pressure tick (T14 field pattern; doc compaction above offsets
+    /// main.rs's MAIN_RS_MAX ceiling). `None` until the first response.
+    last_memory_pressure_response: Option<std::time::Instant>,
 }
 
 impl App {
@@ -372,11 +373,9 @@ impl App {
         // save). On any error (missing file, parse error, profile error)
         // we fall back to defaults — matching the legacy `Config::load()`
         // startup behavior so a broken config never blocks app launch.
-        let path_bins = scan_path_bins();
-        // v1.11.12 (PLAN_v11112 M-B): PATH-scan phase boundary — the scan
-        // spawns the login shell (1500ms deadline) and is the top "+63ms"
-        // cold-start suspect (architect P1-3); without this boundary its
-        // cost blurs into the config phase.
+        // v1.13.5 (T16c): cache hit = zero-cost sync read; miss = env-PATH
+        // fast subset now + background scan backfill (semantics: path_scan.rs).
+        let path_bins = path_scan::startup_path_bins(&proxy);
         performance_probe::report_phase(performance_probe::StartupPhase::PathScan);
         let config_state = match weft_core::config::load_resolved() {
             Ok(loaded) => {
@@ -495,6 +494,7 @@ impl App {
             block_prune_arm: std::time::Instant::now(),
             last_block_prune: None,
             block_prune_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_memory_pressure_response: None,
         }
     }
 }

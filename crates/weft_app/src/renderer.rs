@@ -16,6 +16,8 @@ use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
 pub(crate) mod atlas_warmup;
+// v1.13.5 T16b: bg block-pane vertex cache (gate in renderer/bg_block_cache.rs).
+pub(crate) mod bg_block_cache;
 // v1.12.27b (P1-01): draw()'s phase family (all `&self`) + the pure-data
 // frame structs, moved verbatim out of the 791-line draw() body.
 mod draw_phases;
@@ -278,6 +280,12 @@ pub struct MetalRenderer {
     /// or primary-screen mask movement.
     pub(crate) background_grid_row_caches:
         RefCell<HashMap<u64, crate::paint::grid::BackgroundGridRowCache>>,
+    /// v1.13.5 T16b (PLAN_v11217 §3.11): per-background-pane block-view vertex
+    /// cache, keyed by `pane_session_id` (monotonic — retained against the live
+    /// pane list each frame). Gate: composite fingerprint + 60ms throttle
+    /// (`renderer/bg_block_cache.rs`); color/font hooks clear it wholesale.
+    pub(crate) background_block_caches:
+        RefCell<HashMap<u64, crate::renderer::bg_block_cache::BgBlockCache>>,
     /// v1.12.2 B3-2 P1 fix (rust-reviewer): monotonically increasing invalida-
     /// tion counter for [`Self::background_grid_row_caches`]. Bumped by
     /// `set_theme` / `set_minimum_contrast` / `set_bold_is_bright` (colors are
@@ -391,10 +399,14 @@ impl MetalRenderer {
                 // compaction makes its tail == the newest frame's end == the caret
                 // position for every non-TUI command (echo-input preedit anchors at
                 // the echo write head — correct too).
-                let line = live.output.lines().count().saturating_sub(1);
-                let col = crate::paint::ui_helpers::tui_cursor_display_col(
+                // v1.13.5 T16a: the line index comes from the tracker's O(1)
+                // newline ledger and the column scans ONLY the tail line — the
+                // old `lines().count()` + `lines().nth()` pair cost two full
+                // O(capture) passes per frame (seq bench top hotspot:
+                // 2.1ms/frame at the 1 MiB capture cap).
+                let line = terminal.block_tracker().live_cursor_tail_line();
+                let col = crate::paint::tui_caret::tui_cursor_tail_display_col(
                     live.output,
-                    line,
                     grid.num_cols,
                 );
                 (line, col)
@@ -636,11 +648,14 @@ impl MetalRenderer {
                 let bg_ctx = base_ctx.for_pane(bg.rect);
                 self.layout_ctx = Some(bg_ctx);
                 let start = background_vertices.len();
-                background_vertices.extend(self.build_background_pane_content(
+                // v1.13.5 T16b: block panes append their (cache-gated)
+                // vertices directly into the legacy stream.
+                let _ = self.build_background_pane_content(
                     bg,
+                    &mut background_vertices,
                     &mut bg_stream,
                     &mut glyph_stream,
-                ));
+                );
                 let end = background_vertices.len();
                 if end > start {
                     self.pane_vertex_ranges
@@ -693,6 +708,10 @@ impl MetalRenderer {
         let live_ids: std::collections::HashSet<u64> =
             background_panes.iter().map(|p| p.pane_session_id).collect();
         self.background_grid_row_caches
+            .borrow_mut()
+            .retain(|id, _| live_ids.contains(id));
+        // v1.13.5 T16b: same retain lifecycle — close/promotion both prune.
+        self.background_block_caches
             .borrow_mut()
             .retain(|id, _| live_ids.contains(id));
 

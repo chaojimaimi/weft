@@ -285,8 +285,9 @@ fn extract_path_from_output(s: &str) -> Option<&str> {
 /// even when the real shell is bash/fish. `dscl . -read ... UserShell`
 /// reads the actual login shell from the directory service without touching
 /// any rc file. Best-effort: any failure returns `None`, letting the
-/// caller fall back.
-fn resolve_user_shell() -> Option<std::ffi::OsString> {
+/// caller fall back. v1.13.5 (T16c): `pub(super)` — path_scan.rs keys its
+/// cache fingerprint off the same shell this resolves.
+pub(super) fn resolve_user_shell() -> Option<std::ffi::OsString> {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -425,19 +426,18 @@ fn is_executable_file(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Collect executable names from *multiple* PATH sources and take their
-/// union (BTreeSet dedupes + sorts). Sources, in order:
-///
-/// 1. login-shell PATH (`resolve_login_path`, via `resolve_user_shell`)
-/// 2. `/usr/libexec/path_helper -s` output (reads /etc/paths + /etc/paths.d,
-///    where Homebrew/Docker installers register their bin dirs)
-/// 3. process env PATH (macOS default four dirs for GUI-launched apps)
-///
-/// Best-effort: unreadable/missing dirs are skipped, failing sources are
-/// ignored. Cached once at startup by the caller.
+/// Collect executable names from the *union* of all PATH sources (login
+/// shell → path_helper → env PATH; see `path_sources`). v1.13.5 (T16c):
+/// runs only on the path_scan background thread / cache-miss path.
 pub(super) fn scan_path_bins() -> Vec<String> {
+    bins_from_path_strings(path_sources())
+}
+
+/// The shared PATH-string traversal behind `scan_path_bins` and the
+/// env-PATH fast path (path_scan.rs) — BTreeSet dedupes + sorts.
+pub(super) fn bins_from_path_strings(sources: Vec<std::ffi::OsString>) -> Vec<String> {
     let mut bins = std::collections::BTreeSet::new();
-    for path in path_sources() {
+    for path in sources {
         for dir in std::env::split_paths(&path) {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -455,8 +455,8 @@ pub(super) fn scan_path_bins() -> Vec<String> {
 
 /// The ordered list of PATH strings to scan, deduped (a dir appearing in
 /// several sources is only scanned once — split_paths cost is negligible,
-/// the BTreeSet dedupe in `scan_path_bins` covers names).
-fn path_sources() -> Vec<std::ffi::OsString> {
+/// the BTreeSet dedupe in `bins_from_path_strings` covers names).
+pub(super) fn path_sources() -> Vec<std::ffi::OsString> {
     let mut sources: Vec<std::ffi::OsString> = Vec::new();
     if let Some(path) = resolve_login_path() {
         sources.push(path);

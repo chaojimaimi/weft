@@ -22,3 +22,8 @@ pub(crate) mod keyboard;
 pub(crate) mod session_pump;
 // v1.11.5 (PLAN_v1115 §M2): UI-event dispatch table + Dock badge debounce.
 pub(crate) mod ui_events;
+// v1.13.5 (T16d, PLAN_v11217 §3.11): memory-pressure response —
+// os_proc_available_memory dual thresholds on the 1 Hz tick; releases the
+// render caches that have existing release paths (inventory + exclusions in
+// the module docs).
+pub(crate) mod pressure;

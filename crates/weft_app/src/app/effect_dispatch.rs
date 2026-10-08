@@ -593,10 +593,10 @@ impl crate::App {
         }
         // v1.11.1: paste-toast expiry rides this tick.
         self.expire_paste_toast_tick();
-        // T14 (PLAN_v11217 §3.9): the block-prune 24h gate rides this 1 Hz
-        // tick too — O(1) checks (two Instant compares + one AtomicBool swap)
-        // and the actual prune runs on its own background thread/connection.
+        // T14 (PLAN_v11217 §3.9): the block-prune 24h gate rides this 1 Hz tick too (O(1) checks; the prune runs on its own background thread).
         self.maybe_run_block_prune_tick();
+        // T16d (PLAN_v11217 §3.11): the memory-pressure check rides this tick too — one O(1) FFI read + compares; a 60s debounce anchors any response.
+        self.maybe_run_memory_pressure_tick();
     }
 
     /// T14 (PLAN_v11217 §3.9 3): block-library auto-cleanup scheduling.

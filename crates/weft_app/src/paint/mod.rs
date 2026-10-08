@@ -49,6 +49,7 @@ pub(crate) mod status_hint;
 pub(crate) mod styled_line_cache;
 pub(crate) mod tab_bar;
 pub(crate) mod text;
+pub(crate) mod tui_caret;
 // v1.13.1 (PLAN_v1.13.1 §二.1): settings free-standing text wrapping.
 pub(crate) mod text_wrap;
 pub(crate) mod ui_helpers;

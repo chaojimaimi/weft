@@ -20,6 +20,10 @@ mod rows;
 mod style;
 mod surfaces;
 
+#[cfg(test)]
+#[path = "block_view/streaming_bench.rs"]
+mod streaming_bench;
+
 pub(crate) use actions::block_header_action_rects;
 pub(crate) use rows::sticky_block_id;
 

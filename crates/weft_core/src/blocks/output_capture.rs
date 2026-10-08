@@ -11,14 +11,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::style::{
-    build_styled_output_from_runs, CapturedStyle, CapturedStyleRun, MAX_STYLE_RUNS_PER_BLOCK,
+    build_styled_output_from_runs, build_styled_output_windowed, CapturedStyle, CapturedStyleRun,
+    LIVE_STYLED_WINDOW_BYTES, MAX_STYLE_RUNS_PER_BLOCK,
 };
 use super::DEFAULT_OUTPUT_CAP;
 
 /// PLAN_v11217 §3.5 (T4): the finalize truncation marker. Reports the cap in
-/// MiB and clarifies that only the block excerpt is bounded — the full output
-/// remains in the grid/scrollback (the "truncation = data loss" misreading is
-/// the T4 copy fix).
+/// MiB; only the excerpt is bounded — full output remains in scrollback.
 fn truncation_marker(cap_bytes: usize) -> String {
     format!(
         "\n…(block excerpt truncated at {} MiB — full output remains in scrollback)",
@@ -30,6 +29,8 @@ fn truncation_marker(cap_bytes: usize) -> String {
 mod crlf_tests;
 mod cursor;
 #[cfg(test)]
+mod line_ledger_tests;
+#[cfg(test)]
 mod prompt_sp_tests;
 #[cfg(test)]
 mod watermark_tests;
@@ -38,13 +39,11 @@ mod watermark_tests;
 pub(crate) struct OutputCapture {
     text: String,
     cursor: usize,
-    /// Char index parallel to `cursor` (byte index). Tracked incrementally so
-    /// style-run splice operations stay O(log n) instead of recomputing from
-    /// the byte cursor on every print.
+    /// Char index parallel to `cursor` (byte index), kept incremental so
+    /// style-run splices stay O(log n).
     char_cursor: u32,
-    /// Char index of the start of the current line (the char after the last
-    /// `\n`). Used by `carriage_return` and `erase_line` to translate line
-    /// operations into char-indexed style splice operations.
+    /// Char index of the current line start (char after the last `\n`), used
+    /// by CR/EL to splice in char space.
     line_start_char: u32,
     truncated: bool,
     style_runs: Vec<CapturedStyleRun>,
@@ -68,6 +67,16 @@ pub(crate) struct OutputCapture {
     /// Invariant tests pin counter == recompute
     /// (`vt/screen_exit/tests.rs`).
     line_count: usize,
+    /// v1.13.5 T16a: newline ledger for `text` itself, same discipline as the
+    /// `screen_prefix` ledger (fuzz-pinned in `line_ledger_tests.rs`). Replaces
+    /// the O(total text) `lines().count()` scan the live caret paid every
+    /// streaming frame (2.1ms/frame @750k lines, top seq bench hotspot).
+    /// In-place rewrites are line-confined: no `\n` added or removed.
+    text_line_count: usize,
+    /// v1.13.5 T16a: char-count twin of `text_line_count` — the windowed
+    /// styled rebuild re-anchors runs (char-indexed over the FULL text) at
+    /// the window's absolute char offset: `total_chars - tail_chars`.
+    text_char_count: usize,
     /// M6-a (PLAN_M6 §A-1): rewrite watermark — the EARLIEST byte offset any
     /// content/cursor operation touched since the last sync consumption.
     /// `usize::MAX` means "pure append since the last take". Every mutation
@@ -102,6 +111,8 @@ impl Clone for OutputCapture {
             screen_prefix: self.screen_prefix.clone(),
             screen_prefix_styled: self.screen_prefix_styled.clone(),
             line_count: self.line_count,
+            text_line_count: self.text_line_count,
+            text_char_count: self.text_char_count,
             // The clone inherits the current watermark value (clones of a
             // capture are snapshots; the atomic itself must stay unique to
             // the live handle chain).
@@ -124,6 +135,8 @@ impl Default for OutputCapture {
             screen_prefix: String::new(),
             screen_prefix_styled: None,
             line_count: 0,
+            text_line_count: 0,
+            text_char_count: 0,
             min_write_offset: AtomicUsize::new(usize::MAX),
             // Review P2c fallback: every Default-constructed capture reports
             // the historical 1 MiB default, never 0.
@@ -135,6 +148,20 @@ impl Default for OutputCapture {
 impl OutputCapture {
     pub(crate) fn as_str(&self) -> &str {
         &self.text
+    }
+
+    /// v1.13.5 T16a: O(1) newline count of `text` (the maintained ledger).
+    /// Semantics identical to `text.bytes().filter(|b| *b == b'\n').count()`.
+    pub(crate) fn text_line_count(&self) -> usize {
+        self.text_line_count
+    }
+
+    /// v1.13.5 T16a: O(1) char count of `text` (the maintained ledger).
+    /// Production reads the field via `peek_styled`; the accessor is the
+    /// ledger invariant tests' read.
+    #[cfg(test)]
+    pub(crate) fn text_char_count(&self) -> usize {
+        self.text_char_count
     }
 
     /// PLAN_v11217 §3.5 (T4): record the cap the finalize truncation marker
@@ -195,6 +222,8 @@ impl OutputCapture {
         // v1.11.12 (PLAN_v11112 M-A): the second reset mechanism (alongside
         // `ScreenHistory::default`) — the ledger must be zeroed with the text.
         self.line_count = 0;
+        self.text_line_count = 0;
+        self.text_char_count = 0;
         // M6-a: the cleared document shares no bytes with the prefix the live
         // cache already consumed. Recording offset 0 makes the next sync's
         // watermark guard fail whenever a consumption boundary exists
@@ -230,6 +259,10 @@ impl OutputCapture {
         self.text.push_str(&text[..end]);
         self.cursor = self.text.len();
         self.char_cursor = self.text.chars().count() as u32;
+        // T16a ledger: wholesale replacement — recount once (screen-snapshot
+        // path only, 50ms-throttled; same cost class as the char count above).
+        self.text_line_count = self.text.bytes().filter(|b| *b == b'\n').count();
+        self.text_char_count = self.text.chars().count();
         self.truncated = end < text.len();
         // Screen-snapshot replace path: the caller supplies its own
         // StyledOutput via `replace_screen_snapshot`, so any previously
@@ -283,6 +316,13 @@ impl OutputCapture {
         } else {
             self.text.insert(self.cursor, c);
         }
+        if c == '\n' {
+            self.text_line_count += 1;
+        }
+        if replaced_len == 0 {
+            // Overwrite path swaps one char 1:1 — net count unchanged.
+            self.text_char_count += 1;
+        }
         self.cursor += c.len_utf8();
         self.char_cursor += 1;
     }
@@ -301,12 +341,29 @@ impl OutputCapture {
             let accepted = remaining.min(bytes.len());
             if accepted > 0 {
                 // Callers guarantee printable ASCII.
-                self.text
-                    .push_str(std::str::from_utf8(&bytes[..accepted]).unwrap_or(""));
+                let pushed = std::str::from_utf8(&bytes[..accepted]).unwrap_or("");
+                self.text.push_str(pushed);
                 self.cursor = self.text.len();
                 // ASCII batch: one RLE splice covering [char_cursor, char_cursor + accepted).
                 self.splice_style(self.char_cursor, self.char_cursor + accepted as u32, style);
                 self.char_cursor += accepted as u32;
+                // T16a ledger: ONE pass over the pushed bytes maintains both
+                // counters (T0 keeps this path ns/byte-sensitive). The
+                // splice's `accepted` arithmetic stays byte/char conflated
+                // EXACTLY as before (1 byte = 1 char for the production
+                // ASCII-only caller), so style indexing is untouched.
+                let mut newlines = 0usize;
+                let mut continuation_bytes = 0usize;
+                for &byte in pushed.as_bytes() {
+                    if byte == b'\n' {
+                        newlines += 1;
+                    } else if byte & 0xC0 == 0b1000_0000 {
+                        continuation_bytes += 1;
+                    }
+                }
+                self.text_line_count += newlines;
+                // chars = bytes − UTF-8 continuation bytes.
+                self.text_char_count += pushed.len() - continuation_bytes;
             }
             if accepted < bytes.len() {
                 self.truncated = true;
@@ -349,6 +406,10 @@ impl OutputCapture {
             self.cursor = self.text.len();
             self.char_cursor += 1;
             self.line_start_char = self.char_cursor;
+            // T16a ledger: a fresh LF appended (the consume branch above
+            // steps over an LF the ledger already counted).
+            self.text_line_count += 1;
+            self.text_char_count += 1;
         } else {
             self.truncated = true;
         }
@@ -367,13 +428,16 @@ impl OutputCapture {
         match mode {
             0 => {
                 // Erase from cursor to end of line.
+                // T16a ledger: removals shrink the char count.
+                self.text_char_count -= self.text[self.cursor..end].chars().count();
                 self.text.replace_range(self.cursor..end, "");
                 self.erase_style_range(self.char_cursor, line_end_char);
             }
             1 => {
                 // Erase from start of line to cursor (inclusive). The erased
                 // range is replaced with spaces, which are default-styled —
-                // drop any style runs in the range.
+                // drop any style runs in the range. Same-length rewrite: the
+                // char ledger is untouched.
                 let replacement = " ".repeat(self.text[start..self.cursor].chars().count());
                 self.text.replace_range(start..self.cursor, &replacement);
                 self.cursor = start + replacement.len();
@@ -381,6 +445,7 @@ impl OutputCapture {
             }
             2 => {
                 // Erase entire line.
+                self.text_char_count -= self.text[start..end].chars().count();
                 self.text.replace_range(start..end, "");
                 self.cursor = start;
                 self.erase_style_range(line_start_char, line_end_char);
@@ -397,7 +462,9 @@ impl OutputCapture {
         if self.truncated {
             return;
         }
-        let existing_rows = self.text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        // T16a ledger: the O(text) rescan is replaced by the maintained
+        // newline count (identical semantics: rows == newlines + 1).
+        let existing_rows = self.text_line_count + 1;
         for _ in existing_rows..=row {
             if self.text.len() >= max_bytes {
                 self.truncated = true;
@@ -406,6 +473,8 @@ impl OutputCapture {
             self.text.push('\n');
             self.char_cursor += 1;
             self.line_start_char = self.char_cursor;
+            self.text_line_count += 1;
+            self.text_char_count += 1;
         }
 
         let line_start = if row == 0 {
@@ -448,6 +517,7 @@ impl OutputCapture {
                 self.text.insert(cursor, ' ');
                 cursor += 1;
                 char_offset_in_line += 1;
+                self.text_char_count += 1;
             } else {
                 self.truncated = true;
                 return;
@@ -471,6 +541,8 @@ impl OutputCapture {
         self.line_start_char = 0;
         self.truncated = false;
         self.style_overflow = false;
+        self.text_line_count = 0;
+        self.text_char_count = 0;
 
         // WHY: zsh's PROMPT_SP prompt-cleanup mechanism emits a full line
         // width of literal spaces + \r\r before every prompt; those bytes
@@ -510,11 +582,21 @@ impl OutputCapture {
     /// run cap overflowed (mirroring take_styled's semantics).
     /// Deliberately does NOT apply take_styled's finalize-only transforms
     /// (PROMPT_SP tail strip, truncation marker) — those stay finalize-only.
+    ///
+    /// v1.13.5 T16a: the build is TAIL-WINDOWED (candidate ① — see
+    /// [`build_styled_output_windowed`]); the ledger feeds the absolute line
+    /// re-indexing. Every degenerate shape falls back to the full build.
     pub(crate) fn peek_styled(&self) -> Option<StyledOutput> {
         if self.style_overflow || self.style_runs.is_empty() {
             return None;
         }
-        build_styled_output_from_runs(&self.text, &self.style_runs)
+        build_styled_output_windowed(
+            &self.text,
+            &self.style_runs,
+            self.text_line_count,
+            self.text_char_count,
+            LIVE_STYLED_WINDOW_BYTES,
+        )
     }
 
     /// Whether the per-block style-run cap has overflowed. `peek_styled`

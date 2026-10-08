@@ -5,6 +5,7 @@ use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::overlays::FindDrawState;
 use crate::paint::prompt::PromptDrawParams;
 use crate::paint::tab_bar::TabBarDrawState;
+use crate::renderer::bg_block_cache;
 use crate::renderer::MetalRenderer;
 use weft_core::input::InputMode;
 use weft_core::selection::SelectionHandler;
@@ -95,12 +96,20 @@ impl MetalRenderer {
     /// caller's flat buffers and recorded as a `PaneInstanceRanges` entry
     /// (paired with the pane's scissor rect). Interactive state stays
     /// active-only.
+    ///
+    /// v1.13.5 T16b (PLAN_v11217 §3.11): the block branch is gated by the
+    /// per-pane vertex cache (`renderer/bg_block_cache.rs`) — composite
+    /// fingerprint + 60ms throttle. Vertices are appended into
+    /// `background_vertices` (legacy stream, like the grid branch's dual
+    /// streams); returns whether the cache REBUILT this frame (test /
+    /// observability; false for grid panes).
     pub(super) fn build_background_pane_content(
         &self,
         pane: &PaneRenderInfo<'_>,
+        background_vertices: &mut Vec<f32>,
         bg_stream: &mut Vec<f32>,
         glyph_stream: &mut Vec<f32>,
-    ) -> Vec<f32> {
+    ) -> bool {
         match pane_base_view(pane.terminal) {
             PaneBaseView::Grid => {
                 let bg_start = bg_stream.len();
@@ -129,11 +138,57 @@ impl MetalRenderer {
                     rebuilt_rows,
                     "built background grid pane"
                 );
-                Vec::new()
+                false
             }
             PaneBaseView::Block => {
                 let editor_mode = pane.terminal.effective_input_mode() == InputMode::Editor;
                 let prompt = background_prompt(pane);
+                // v1.13.5 T16b: composite gate key — every input that bakes
+                // into the vertices (see BgBlockFingerprint's field docs).
+                let fingerprint = bg_block_cache::BgBlockFingerprint {
+                    live_output_version: pane.terminal.block_tracker().live_output_version(),
+                    screen_head_lines: pane.terminal.screen_head_lines(),
+                    cwd: pane.terminal.cwd().map(str::to_string),
+                    git_branch: pane.terminal.git_branch().map(str::to_string),
+                    theme_generation: self.background_grid_generation.get(),
+                    cell_dims: (self.cell_width(), self.cell_height()),
+                    rect: pane.rect,
+                    block_scroll: pane.block_scroll,
+                    editor_mode,
+                };
+                let now = std::time::Instant::now();
+                let action = {
+                    let caches = self.background_block_caches.borrow();
+                    caches.get(&pane.pane_session_id).map_or(
+                        bg_block_cache::BgBlockCacheAction::RebuildNow,
+                        |entry| {
+                            bg_block_cache::bg_block_cache_action(
+                                Some((&entry.fingerprint, entry.last_rebuild)),
+                                &fingerprint,
+                                now,
+                                bg_block_cache::BG_BLOCK_CACHE_THROTTLE,
+                            )
+                        },
+                    )
+                };
+                if matches!(
+                    action,
+                    bg_block_cache::BgBlockCacheAction::Reuse
+                        | bg_block_cache::BgBlockCacheAction::Throttled
+                ) {
+                    // Reuse (or throttle-hold): serve the previous build.
+                    let caches = self.background_block_caches.borrow();
+                    let entry = caches
+                        .get(&pane.pane_session_id)
+                        .expect("Reuse/Throttled imply a cache entry");
+                    background_vertices.extend_from_slice(&entry.vertices);
+                    tracing::debug!(
+                        bg_rect = ?pane.rect,
+                        ?action,
+                        "reused background block pane vertices"
+                    );
+                    return false;
+                }
                 let ctx = self.layout_ctx.expect("background pane LayoutCtx");
                 let region_bottom_y = prompt.as_ref().map_or_else(
                     || ctx.bottom(),
@@ -176,10 +231,34 @@ impl MetalRenderer {
                 if let Some(prompt) = prompt {
                     vertices.extend(self.build_prompt_vertices(&prompt, 0.0, false));
                 }
+                // Store, then append the stored copy (one authoritative blob).
+                {
+                    let mut caches = self.background_block_caches.borrow_mut();
+                    caches.insert(
+                        pane.pane_session_id,
+                        bg_block_cache::BgBlockCache {
+                            vertices,
+                            fingerprint,
+                            last_rebuild: now,
+                        },
+                    );
+                    let entry = caches.get(&pane.pane_session_id).expect("just inserted");
+                    background_vertices.extend_from_slice(&entry.vertices);
+                }
                 tracing::debug!(bg_rect = ?pane.rect, "built background block pane");
-                vertices
+                true
             }
         }
+    }
+
+    /// v1.13.5 T16b test/observability hook: prune background block-vertex
+    /// caches against the live pane list (the draw() B3-2 retain pattern —
+    /// session ids are monotonic, so a plain retain keeps the map bounded).
+    #[cfg(test)]
+    pub(super) fn retain_background_block_caches(&self, live_ids: &std::collections::HashSet<u64>) {
+        self.background_block_caches
+            .borrow_mut()
+            .retain(|id, _| live_ids.contains(id));
     }
 
     pub(crate) fn draw_legacy_vertex_ranges(
@@ -250,6 +329,15 @@ mod tests {
     use super::*;
     use weft_core::pane_layout::PaneId;
 
+    /// Mirror the golden skip precedent: no Metal device (CI without GPU)
+    /// skips instead of failing.
+    fn headless_renderer_or_skip() -> Option<crate::renderer::MetalRenderer> {
+        metal::Device::system_default()?;
+        Some(crate::renderer::MetalRenderer::new_headless_paint(
+            weft_core::config::Theme::weft_warm(),
+        ))
+    }
+
     /// T15b truth table: first multi-pane frame, same-pane steady state,
     /// in-split pane switch, and tab switch (fresh monotonic id).
     #[test]
@@ -286,6 +374,186 @@ mod tests {
         terminal.process(b"\x1b[?1049h");
         assert!(!terminal.show_block_view());
         assert_eq!(pane_base_view(&terminal), PaneBaseView::Grid);
+    }
+
+    /// T16b headless double-frame stub: version unchanged → the second
+    /// frame performs NO rebuild (build count 0); a content bump inside the
+    /// throttle window holds the old vertices; after the window it rebuilds;
+    /// a rect-only delta rebuilds immediately.
+    #[test]
+    fn background_block_pane_cache_gates_rebuilds() {
+        let Some(renderer) = headless_renderer_or_skip() else {
+            eprintln!("skipping bg block cache test: no Metal device available");
+            return;
+        };
+        let mut terminal = weft_core::vt::Terminal::new(6, 40);
+        terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07seq 10\n\x1b]133;C\x07one\ntwo\n");
+        // Per-frame pane builder (a closure would hold the &terminal across
+        // the process() calls below).
+        fn make_pane<'a>(
+            terminal: &'a weft_core::vt::Terminal,
+            rect: crate::layout::Rect,
+        ) -> PaneRenderInfo<'a> {
+            PaneRenderInfo {
+                rect,
+                terminal,
+                block_scroll: 0.0,
+                submit_on_ctrl_enter: true,
+                pane_session_id: 4242,
+            }
+        }
+
+        let mut stream: Vec<f32> = Vec::new();
+        assert!(
+            renderer.build_background_pane_content(
+                &make_pane(&terminal, [0.0; 4]),
+                &mut stream,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            "first frame must rebuild (cold cache)"
+        );
+        let first_len = stream.len();
+        assert!(first_len > 0, "cold build must produce vertices");
+
+        // Second frame, byte-identical inputs: no rebuild, same bytes.
+        let mut stream2: Vec<f32> = Vec::new();
+        assert!(
+            !renderer.build_background_pane_content(
+                &make_pane(&terminal, [0.0; 4]),
+                &mut stream2,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            "second frame with an unchanged fingerprint must NOT rebuild"
+        );
+        assert_eq!(stream, stream2, "reused vertices must be byte-equal");
+
+        // Content bump (streaming) inside the 60ms window: throttled —
+        // no rebuild, but the (stale) vertices still serve.
+        terminal.process(b"three\n");
+        let mut stream3: Vec<f32> = Vec::new();
+        assert!(
+            !renderer.build_background_pane_content(
+                &make_pane(&terminal, [0.0; 4]),
+                &mut stream3,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            "content bump inside the throttle window must be held"
+        );
+        assert_eq!(
+            stream3.len(),
+            first_len,
+            "throttled frame still serves vertices"
+        );
+
+        // After the window: rebuild with the new content.
+        std::thread::sleep(
+            crate::renderer::bg_block_cache::BG_BLOCK_CACHE_THROTTLE
+                + std::time::Duration::from_millis(5),
+        );
+        let mut stream4: Vec<f32> = Vec::new();
+        assert!(
+            renderer.build_background_pane_content(
+                &make_pane(&terminal, [0.0; 4]),
+                &mut stream4,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            "content bump after the throttle window must rebuild"
+        );
+
+        // rect-only delta: immediate rebuild, no throttle wait.
+        let mut stream5: Vec<f32> = Vec::new();
+        assert!(
+            renderer.build_background_pane_content(
+                &make_pane(&terminal, [0.0, 0.0, 200.0, 100.0]),
+                &mut stream5,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            "rect-only delta must rebuild immediately"
+        );
+    }
+
+    /// T16b: the color/font invalidation hooks clear the whole map.
+    #[test]
+    fn theme_and_atlas_hooks_clear_background_block_caches() {
+        let Some(mut renderer) = headless_renderer_or_skip() else {
+            eprintln!("skipping bg block cache hook test: no Metal device available");
+            return;
+        };
+        let mut terminal = weft_core::vt::Terminal::new(6, 40);
+        terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07seq 2\n\x1b]133;C\x07a\n");
+        let pane = PaneRenderInfo {
+            rect: [0.0; 4],
+            terminal: &terminal,
+            block_scroll: 0.0,
+            submit_on_ctrl_enter: true,
+            pane_session_id: 7,
+        };
+        let mut sink: Vec<f32> = Vec::new();
+        assert!(renderer.build_background_pane_content(
+            &pane,
+            &mut sink,
+            &mut Vec::new(),
+            &mut Vec::new()
+        ));
+        assert_eq!(renderer.background_block_caches.borrow().len(), 1);
+
+        renderer.set_theme(weft_core::config::Theme::weft_warm());
+        assert!(
+            renderer.background_block_caches.borrow().is_empty(),
+            "set_theme must clear the background block caches"
+        );
+
+        // Rebuild, then the atlas/font hook.
+        let mut sink: Vec<f32> = Vec::new();
+        assert!(renderer.build_background_pane_content(
+            &pane,
+            &mut sink,
+            &mut Vec::new(),
+            &mut Vec::new()
+        ));
+        renderer.rebuild_atlas(weft_core::config::FontConfig::default());
+        assert!(
+            renderer.background_block_caches.borrow().is_empty(),
+            "rebuild_atlas must clear the background block caches"
+        );
+    }
+
+    /// T16b: the draw()-side retain prunes closed/active panes' entries.
+    #[test]
+    fn background_block_caches_retain_live_panes_only() {
+        let Some(renderer) = headless_renderer_or_skip() else {
+            eprintln!("skipping bg block cache retain test: no Metal device available");
+            return;
+        };
+        let mut terminal = weft_core::vt::Terminal::new(6, 40);
+        terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07seq 2\n\x1b]133;C\x07a\n");
+        for id in [1u64, 2u64, 3u64] {
+            let pane = PaneRenderInfo {
+                rect: [0.0; 4],
+                terminal: &terminal,
+                block_scroll: 0.0,
+                submit_on_ctrl_enter: true,
+                pane_session_id: id,
+            };
+            let mut sink: Vec<f32> = Vec::new();
+            assert!(renderer.build_background_pane_content(
+                &pane,
+                &mut sink,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ));
+        }
+        assert_eq!(renderer.background_block_caches.borrow().len(), 3);
+        let live: std::collections::HashSet<u64> = [2u64, 3u64].into_iter().collect();
+        renderer.retain_background_block_caches(&live);
+        assert_eq!(renderer.background_block_caches.borrow().len(), 2);
+        assert!(renderer.background_block_caches.borrow().contains_key(&2));
+        assert!(!renderer.background_block_caches.borrow().contains_key(&1));
     }
 
     #[test]

@@ -41,6 +41,8 @@ mod screen_capture;
 mod screen_capture_tests;
 mod semantic;
 mod style;
+#[cfg(test)]
+mod styled_window_tests;
 
 pub(crate) use output_capture::OutputCapture;
 pub(crate) use screen_capture::{
@@ -420,6 +422,33 @@ impl BlockTracker {
     pub fn set_output_cap(&mut self, cap: usize) {
         self.output_cap = cap.clamp(OUTPUT_CAP_MIN_MIB * MIB, OUTPUT_CAP_MAX_MIB * MIB);
         self.output.set_cap_bytes(self.output_cap);
+    }
+
+    /// v1.13.5 T16b: public read of the live-view content version for the
+    /// renderer's background block-pane cache fingerprint. Consumers outside
+    /// this crate previously reached it only via
+    /// [`Self::in_flight`](Self::in_flight)`().version`, which is `None` at
+    /// the prompt — exactly when the finished-block list is the thing that
+    /// changed. Structural sites (finalize / clear_pending_capture) bump the
+    /// same counter, so "version unchanged" means "nothing about the
+    /// rendered block view changed". Extra bumps are always conservative:
+    /// the renderer-side cache at worst does one extra rebuild, never
+    /// serves stale bytes.
+    pub fn live_output_version(&self) -> u64 {
+        self.live_output_version
+    }
+
+    /// v1.13.5 T16a: O(1) tail-line index of the live capture — byte-equal
+    /// to `in_flight().output.lines().count().saturating_sub(1)` (the
+    /// renderer caret fallback's formula) via the maintained newline
+    /// ledger. The formula scan used to cost O(total captured text) on
+    /// EVERY rendered frame of a streaming plain command (no cursor
+    /// snapshot exists off the screen-exit path): measured 2.1ms/frame at
+    /// 750k lines, the seq bench's top hotspot.
+    pub fn live_cursor_tail_line(&self) -> usize {
+        self.output
+            .text_line_count()
+            .saturating_sub(usize::from(self.output.as_str().ends_with('\n')))
     }
 
     // ── ShellPhase accessors ─────────────────────────────────────────────

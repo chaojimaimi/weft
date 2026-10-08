@@ -56,8 +56,8 @@ pub(crate) fn report_first_frame_once() {
 /// `cold_start` line except `first_frame` is one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StartupPhase {
-    /// Login-shell PATH scan (`scan_path_bins`) — spawns the login shell,
-    /// 1500ms deadline; the top "+63ms" suspect.
+    /// PATH-bin resolution — since v1.13.5 (T16c) a cache hit or the
+    /// env-PATH fast path; the login-shell scan runs on a background thread.
     PathScan,
     /// Config load + `ConfigState` build (excludes the PATH scan).
     Config,

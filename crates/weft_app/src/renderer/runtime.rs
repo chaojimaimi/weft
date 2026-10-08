@@ -20,6 +20,10 @@ impl MetalRenderer {
     fn bump_background_grid_generation(&self) {
         self.background_grid_generation
             .set(self.background_grid_generation.get().wrapping_add(1).max(1));
+        // v1.13.5 T16b: theme/contrast/bold-is-bright/scale colors are baked
+        // into the background block-pane vertices — clear the cache map
+        // outright (belt to the fingerprint's theme_generation member).
+        self.background_block_caches.borrow_mut().clear();
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
@@ -384,6 +388,11 @@ impl MetalRenderer {
         // v1.4.1: font/line-height change invalidates glyph UVs and cell
         // geometry baked into cached block-view vertices.
         self.styled_line_cache.borrow_mut().bump_generation();
+        // v1.13.5 T16b: cell dims change → the background block-pane vertex
+        // caches are stale too (explicit hook — the fingerprint's cell_dims
+        // member covers the same event, this is the belt-and-braces site
+        // config_controller's rebuild_font path lands on).
+        self.background_block_caches.borrow_mut().clear();
         // v1.12.2 B3-3 (PLAN_S2_render): same watermark invalidation as
         // update_scale — the new atlas starts empty.
         self.block_scan_watermarks.borrow_mut().clear();
