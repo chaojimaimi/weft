@@ -60,28 +60,29 @@ fn frozen_clock() -> impl Fn() -> Instant {
     move || t0
 }
 
-/// 层 1 — §3.2 测试验收 1（真值表，钉选择层）：frame_budget 四象限。
+/// 层 1 — §3.2 测试验收 1（真值表，钉选择层）：frame_budget 四象限 +
+/// T15c ×pane_count 扩容/饱和（编译级加参：N=1 时语义与 T1 逐位一致）。
 #[test]
 fn frame_budget_truth_table_four_quadrants() {
-    let base = frame_budget(0, false);
+    let base = frame_budget(0, false, 1);
     assert_eq!(base.time, BASE_TIME_BUDGET, "0 积压 → 基础时间档");
     assert_eq!(base.bytes, BASE_BYTES_PER_FRAME, "0 积压 → 基础字节档");
 
-    let base = frame_budget(15, false);
+    let base = frame_budget(15, false, 1);
     assert_eq!(
         base.time, BASE_TIME_BUDGET,
         "15 < 16 → 仍基础（阈值反转在此红）"
     );
     assert_eq!(base.bytes, BASE_BYTES_PER_FRAME, "15 < 16 → 仍基础字节档");
 
-    let flood = frame_budget(16, false);
+    let flood = frame_budget(16, false, 1);
     assert_eq!(
         flood.time, FLOOD_TIME_BUDGET,
         "16 ≥ 16 → 洪水（flood==base 在此红）"
     );
     assert_eq!(flood.bytes, FLOOD_BYTES_PER_FRAME, "16 ≥ 16 → 洪水字节档");
 
-    let flood = frame_budget(0, true);
+    let flood = frame_budget(0, true, 1);
     assert_eq!(
         flood.time, FLOOD_TIME_BUDGET,
         "零积压但有切分尾 → 洪水（tail 信号独立生效）"
@@ -90,6 +91,25 @@ fn frame_budget_truth_table_four_quadrants() {
         flood.bytes, FLOOD_BYTES_PER_FRAME,
         "零积压但有切分尾 → 洪水字节档"
     );
+
+    // T15c（PLAN_v11217 §3.10）：字节档 ×pane_count、饱和于 4；时间档不动
+    // （R3 修订：仅放宽字节维）。
+    let duo = frame_budget(0, false, 2);
+    assert_eq!(
+        duo.time, BASE_TIME_BUDGET,
+        "时间档不随 N 放大（tab 级共享红线不动）"
+    );
+    assert_eq!(duo.bytes, BASE_BYTES_PER_FRAME * 2, "N=2 基础字节档 ×2");
+    let trio = frame_budget(16, false, 3);
+    assert_eq!(trio.bytes, FLOOD_BYTES_PER_FRAME * 3, "N=3 洪水字节档 ×3");
+    let eight = frame_budget(16, false, 8);
+    assert_eq!(
+        eight.bytes,
+        FLOOD_BYTES_PER_FRAME * 4,
+        "N=8 洪水字节档饱和于 ×4（单屏可读性上限 ~4 pane）"
+    );
+    let huge = frame_budget(0, false, 100);
+    assert_eq!(huge.bytes, BASE_BYTES_PER_FRAME * 4, "基础档同样饱和于 ×4");
 }
 
 /// 层 2 — §3.2 测试验收 2（基础模式无条件断言，机器无关底线）：15×80KB
@@ -183,14 +203,15 @@ fn jumping_clock_time_check_fires_before_the_byte_cap() {
     );
 }
 
-/// 层 4 — §3.2 测试验收 4（多窗格 Σ 接线端到端钉）：背景窗格灌
-/// 150×8KB、active 空 + 冻结时钟 → 恰排 128 条。若 Σ 误写为只算
-/// active pane（FIX_background_pane_pump 修掉的历史 bug 形态），预算
-/// 退为基础 256KB → 只排 32 条，本测试红。
+/// 层 4 — §3.2 测试验收 4（多窗格 Σ 接线端到端钉）+ T15c ×N 扩容钉：
+/// 背景窗格灌 300×8KB、active 空 + 冻结时钟 → 洪水 1MiB×2（N=2）= 2MiB →
+/// 恰排 256 条余 44。三重判别：Σ 误只算 active（FIX_background_pane_pump
+/// 修掉的历史 bug 形态）→ 基础 256KB×2 → 排 64 条余 236 → 红；×N 扩容
+/// 缺失（恒 1MiB）→ 排 128 条余 172 → 红。
 #[test]
 fn background_only_backlog_sums_across_panes_into_flood_budget() {
     let (mut tab, bg, _active) = two_pane_tab();
-    for _ in 0..150 {
+    for _ in 0..300 {
         inject(bg, AppMsg::PtyOutput(vec![b'x'; 8 * KB]))(&mut tab);
     }
 
@@ -198,7 +219,7 @@ fn background_only_backlog_sums_across_panes_into_flood_budget() {
 
     assert_eq!(
         tab.pane(bg).map(|p| p.msg_rx.len()),
-        Some(22),
-        "Σ 所有窗格 = 150 → 洪水 1MiB → 背景窗格恰排 128 条（active-only 会得 32）"
+        Some(44),
+        "Σ 所有窗格 = 300 → 洪水 1MiB×2 → 恰排 256 条余 44（active-only 得 236、无 ×N 得 172）"
     );
 }

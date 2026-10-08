@@ -394,6 +394,36 @@ fn run_block_prune_reports_and_keeps_recent() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// T15a (§3.10): `BlockStore::open` applies the WAL journal_size_limit to
+/// its connection, and a second open of the same file re-applies it
+/// idempotently (the pragma is per-connection, not persisted).
+#[test]
+fn wal_size_limit_applied_on_open_and_idempotent() {
+    const SIXTEEN_MIB: i64 = 16 * 1024 * 1024;
+    let path = temp_path("wallimit");
+    let _ = std::fs::remove_file(&path);
+    {
+        let store = BlockStore::open(&path).unwrap();
+        let limit: i64 = store
+            .conn
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(limit, SIXTEEN_MIB, "first open sets the limit");
+    }
+    {
+        let store = BlockStore::open(&path).unwrap();
+        let limit: i64 = store
+            .conn
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            limit, SIXTEEN_MIB,
+            "second open re-applies the limit (idempotent)"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── end-to-end shrink (§3.9 acceptance, #[ignore]) ──────────────────
 
 /// Seed output + annotations + FTS docs + a tab snapshot, prune, and
@@ -491,6 +521,15 @@ fn end_to_end_prune_shrinks_file_and_cascades_three_tables() {
         assert_eq!(report.age_deleted, 150);
         assert_eq!(report.size_deleted, 0);
         assert_eq!(report.terminal, PruneTerminal::AgeDone);
+        // T15a (§3.10): the prune pass truncates the WAL — assert while
+        // THIS connection is still open (once dropped, SQLite checkpoints
+        // and unlinks the WAL anyway, which would mask a regression).
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_len <= 16 * 1024 * 1024,
+            "WAL must be at/below the 16 MiB cap after prune: {wal_len} bytes"
+        );
     }
 
     // Row counts + cascade survival.

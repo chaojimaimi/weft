@@ -60,6 +60,11 @@ impl SearchIndex {
     /// using `fts5`. If that fails, sets `fts5_available = false` and
     /// creates a plain table for substring fallback.
     pub fn open(conn: Connection) -> rusqlite::Result<Self> {
+        // T15a (PLAN_v11217 §3.10): this connection is the startup-time
+        // FTS replace_kinds bulk writer — its WAL traffic must respect the
+        // same 16 MiB high-water cap as the block store's (per-connection
+        // pragma; idempotent on the shared DB file).
+        crate::persistence::apply_wal_limits(&conn)?;
         let fts5_available = Self::probe_fts5(&conn);
         if fts5_available {
             conn.execute_batch(

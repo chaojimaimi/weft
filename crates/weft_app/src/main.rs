@@ -96,6 +96,7 @@ mod selection;
 mod settings_component;
 mod settings_controller;
 mod settings_validation;
+mod single_instance;
 mod smart_select_controller;
 mod snapshot_persistence;
 mod tab;
@@ -501,6 +502,7 @@ impl App {
 fn main() {
     performance_probe::start_startup_clock();
     app_runtime::install_runtime_diagnostics();
+    single_instance::ensure_single_instance_or_exit();
     info!("Starting Weft v1.0 \"Weave\"");
 
     // Create a tokio runtime for PTY async operations.
@@ -515,9 +517,8 @@ fn main() {
     let proxy = event_loop.create_proxy();
     crate::macos_zoom::stash_resize_wake_proxy(proxy.clone());
     // v1.11.13 (PLAN_v11113 §M2): install the UN notification delegate
-    // BEFORE winit's didFinishLaunching (runs inside run_app) so a
-    // cold-start notification click reaches the app (bundle-identity gate
-    // + exception::catch inside; no-op for dev binaries).
+    // BEFORE winit's didFinishLaunching so a cold-start notification click
+    // reaches the app (bundle-identity gate + exception::catch inside).
     crate::macos_notifications::install_early_delegate(&proxy);
     let mut app = App::new(proxy);
     // A run-loop error falls through to the hard exit below as well -- the

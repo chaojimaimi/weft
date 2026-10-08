@@ -231,9 +231,48 @@ impl MetalRenderer {
     }
 }
 
+/// T15b (PLAN_v11217 §3.10): identity truth table for the active-pane full
+/// rebuild in `draw()`'s multi-pane branch. Force exactly when the pane the
+/// global grid row cache held changed since the last multi-pane frame
+/// (`prev == None` = first frame). Tab switches always differ because pane
+/// session ids are globally monotonic, so the new tab's active pane id is
+/// fresh; a same-pane layout move intentionally returns false — that case
+/// is owned by the origin fingerprint inside `build_grid_instances`.
+pub(super) fn should_force_full_redraw(
+    prev: Option<weft_core::pane_layout::PaneId>,
+    current: weft_core::pane_layout::PaneId,
+) -> bool {
+    prev != Some(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_core::pane_layout::PaneId;
+
+    /// T15b truth table: first multi-pane frame, same-pane steady state,
+    /// in-split pane switch, and tab switch (fresh monotonic id).
+    #[test]
+    fn should_force_full_redraw_truth_table() {
+        let a = PaneId(1);
+        let b = PaneId(2);
+        assert!(
+            should_force_full_redraw(None, a),
+            "first multi-pane frame: no recorded pane → force"
+        );
+        assert!(
+            !should_force_full_redraw(Some(a), a),
+            "same pane as last frame → incremental, no force"
+        );
+        assert!(
+            should_force_full_redraw(Some(a), b),
+            "active pane switch inside the split → force"
+        );
+        assert!(
+            should_force_full_redraw(Some(b), a),
+            "different pane (tab switch lands on a fresh monotonic id) → force"
+        );
+    }
 
     #[test]
     fn background_pane_uses_its_own_terminal_view_mode() {

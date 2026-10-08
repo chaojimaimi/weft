@@ -187,9 +187,26 @@ impl MetalRenderer {
         let selection_bg = sel_colors.quad;
         let selection_painted = sel_colors.painted;
 
+        // T15b (PLAN_v11217 §3.10): layout-origin fingerprint, mirroring the
+        // background path's `entry.origin` check below. A pane move (split
+        // drag, pane close re-layout) changes the baked row coordinates
+        // without touching dims, scroll, or dirty rows; the renderer's
+        // per-frame unconditional force used to mask this gap.
+        let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
+        let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
+        // v1.10.19: primary-screen TUI grid views inset by the BlockView
+        // gutter (grid_content_origin_x) so a scroll-up into
+        // primary_history_view doesn't shift content 1.5 cols to the right.
+        let origin_x = self
+            .layout_ctx
+            .map(|ctx| grid_content_origin_x(&ctx, policy.inset_block_gutter))
+            .unwrap_or(self.padding_x);
+        let origin_y_base = self.padding_y + chrome_top + pane_origin_y;
+
         let force_full = self.force_full_grid.get()
             || grid.scroll_offset() != self.prev_scroll_offset.get()
             || self.grid_cache_dims.get() != (num_rows, num_cols)
+            || self.prev_grid_origin.get() != (origin_x, origin_y_base)
             || primary_screen_mask_changed(
                 self.prev_primary_screen_row_start.get(),
                 policy.hidden_before_row,
@@ -261,6 +278,11 @@ impl MetalRenderer {
         self.prev_primary_screen_row_start
             .set(policy.hidden_before_row);
         self.grid_cache_dims.set((num_rows, num_cols));
+        // T15b: advance the origin fingerprint unconditionally after the
+        // force decision (same semantics as prev_scroll_offset: only the
+        // decision above snapshots it, and the force_full_grid flag path
+        // does not reset it — the next frame compares against reality).
+        self.prev_grid_origin.set((origin_x, origin_y_base));
 
         let mut cache = self.grid_row_cache.borrow_mut();
         if cache.len() != num_rows {
@@ -282,17 +304,9 @@ impl MetalRenderer {
         }
         self.instances_unchanged.set(false);
 
-        // Layout offsets read from `self.layout_ctx` (set by draw() entry).
-        let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
-        let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
-        // v1.10.19: primary-screen TUI grid views inset by the BlockView
-        // gutter (grid_content_origin_x) so a scroll-up into
-        // primary_history_view doesn't shift content 1.5 cols to the right.
-        let origin_x = self
-            .layout_ctx
-            .map(|ctx| grid_content_origin_x(&ctx, policy.inset_block_gutter))
-            .unwrap_or(self.padding_x);
-        let origin_y_base = self.padding_y + chrome_top + pane_origin_y;
+        // Layout offsets (chrome_top/origin_x/origin_y_base) were computed
+        // above the force-full fingerprint — T15b moved them up so the
+        // origin participates in the invalidation decision.
 
         let mut rebuilt_rows = 0usize;
         for &row in &rows_to_rebuild {

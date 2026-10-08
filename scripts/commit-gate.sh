@@ -34,10 +34,13 @@ MAX_LINES=800
 # request_redraw 四方法已外移到 app/session_pump.rs；App struct/new()/tab() 与
 # AppEvent/AppMsg 定义留守使 main.rs 无法回到 AGENTS.md §4 的 490，阈值钉在实际
 # 审计值（进位取整），只防回弹、不允许借道 allowlist 越限。
-MAIN_RS_MAX=540
+MAIN_RS_MAX=541
 # v1.12.27b: raised 530->540 (+6 actual: `mod window_event;` + `mod mouse_press;`
 # registration blocks with WHY comments — the debt-split train's inevitable
 # product; module declarations are exactly the content AGENTS.md §4 allows)
+# v1.13.4/T15d: raised 540->541 (+1 net: `mod single_instance;` registration
+# + the one-line startup call, offset by a 1-line comment compaction — the
+# gate body lives in src/single_instance.rs per §3.10 line discipline)
 MAIN_RS_FILE="crates/weft_app/src/main.rs"
 BUDGET_FILE="scripts/architecture_allowlist.txt"
 failures=0

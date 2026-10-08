@@ -399,6 +399,12 @@ impl BlockStore {
             }
         }
         report.bytes_after = self.page_bytes()?;
+        // T15a (§3.10): the prune pass just wrote a big DELETE transaction
+        // through the WAL — truncate it now that the writer is idle.
+        // Best-effort: busy is an expected, logged skip (the prune
+        // connection's 2s busy_timeout is already spent by then), and any
+        // failure never blocks the report.
+        wal_checkpoint_truncate(&self.conn);
         Ok(())
     }
 
@@ -438,6 +444,12 @@ impl BlockStore {
             Ok(()) => {
                 self.needs_vacuum_migration = false;
                 tracing::info!("blocks.db migrated to auto_vacuum=INCREMENTAL");
+                // T15a (§3.10): the one-time migration VACUUM is a single
+                // huge transaction that write-passthroughs the ENTIRE DB
+                // image into the WAL (the measured 125 MB `blocks.db-wal`
+                // signature) — truncate it immediately, before the WAL
+                // high-water cap ever has to engage.
+                wal_checkpoint_truncate(&self.conn);
             }
             Err(e) => {
                 // The pragma SET itself persisted nothing until VACUUM
@@ -535,6 +547,24 @@ fn run_void_pragma(conn: &Connection, sql: &str) -> Result<(), PersistenceError>
     let mut rows = stmt.query([])?;
     while rows.next()?.is_some() {}
     Ok(())
+}
+
+/// T15a (§3.10): `PRAGMA wal_checkpoint(TRUNCATE)` — shrink the WAL file
+/// back to zero once the writer is idle. The TRUNCATE mode's busy signal
+/// lives in the RETURNED ROW's `busy` column (not in a call error), so this
+/// must go through `query_row`; `run_void_pragma` would drain the row and
+/// swallow exactly the signal we need. Best-effort by contract: busy →
+/// logged skip (a reader or the main writer holds the WAL), any other
+/// error → logged, never propagated.
+fn wal_checkpoint_truncate(conn: &Connection) {
+    match conn.query_row::<i64, _, _>("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0)) {
+        Ok(0) => {}
+        Ok(busy) => tracing::info!(
+            busy,
+            "prune wal_checkpoint(TRUNCATE) skipped: database busy"
+        ),
+        Err(e) => tracing::warn!(error = %e, "prune wal_checkpoint(TRUNCATE) failed; skipped"),
+    }
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool, PersistenceError> {

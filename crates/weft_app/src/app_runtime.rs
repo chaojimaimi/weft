@@ -22,6 +22,9 @@ pub(crate) fn install_runtime_diagnostics() {
     }
     // v1.12.24: precedes the open — renaming an open handle would write into the rotated file.
     rotate_log_if_huge(&log_path);
+    // T15e (PLAN_v11217 §3.10): drop rotated generations past 7 days —
+    // v1.12.24's rotation never cleaned them (field residue: 167MB .log.1).
+    remove_stale_rotated_log(&log_path);
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -138,6 +141,36 @@ fn rotate_log_if_huge(log_path: &std::path::Path) {
                 .map_err(|e| tracing::debug!(error = %e, "log rotate: rename failed"));
         }
     }
+}
+
+/// T15e (PLAN_v11217 §3.10): v1.12.24's rotation keeps ONE generation
+/// (`weft.log.1`) but nothing ever removed it — the field accumulated a
+/// 167MB residue. At startup, delete `weft.log.1` when its mtime is older
+/// than 7 days: rename preserves mtime, so the stamp is the old log's
+/// LAST-WRITE time, not the rotation moment. The window keeps the newest
+/// generation; the worst in-window coexistence (~200MB) is an accepted
+/// hygiene tradeoff.
+fn remove_stale_rotated_log(log_path: &std::path::Path) {
+    let mut rotated = log_path.to_path_buf();
+    rotated.set_extension("log.1");
+    let Ok(meta) = std::fs::metadata(&rotated) else {
+        return; // no generation on disk — nothing to clean
+    };
+    let Ok(mtime) = meta.modified() else {
+        return; // unreadable stamp — keep the file
+    };
+    if rotated_log_is_stale(mtime, std::time::SystemTime::now()) {
+        let _ = std::fs::remove_file(&rotated)
+            .map_err(|e| tracing::debug!(error = %e, "stale log.1 removal failed"));
+    }
+}
+
+/// T15e age predicate, factored for the truth-table test (the temp-dir test
+/// covers the real path by backdating mtime via `File::set_times`).
+fn rotated_log_is_stale(mtime: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    const STALE_ROTATED_LOG_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    now.duration_since(mtime)
+        .is_ok_and(|age| age > STALE_ROTATED_LOG_AGE)
 }
 
 fn schedule_synchronized_output_watchdog(

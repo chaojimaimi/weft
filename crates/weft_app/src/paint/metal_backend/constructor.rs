@@ -358,6 +358,12 @@ impl MetalRenderer {
             prev_primary_screen_row_start: Cell::new(None),
             grid_cache_dims: Cell::new((0, 0)),
             prev_scroll_offset: Cell::new(0),
+            // T15b: NaN so the first origin comparison always differs →
+            // force (same first-frame strategy as grid_cache_dims (0, 0)).
+            prev_grid_origin: Cell::new((f32::NAN, f32::NAN)),
+            // T15b: no multi-pane frame yet → the identity check forces on
+            // the first background-pane frame.
+            last_drawn_active_pane: None,
             offscreen_texture: RefCell::new(None),
             offscreen_dims: Cell::new((0.0, 0.0)),
             pending_scroll_delta: Cell::new(0),

@@ -7,13 +7,13 @@
 //! (`self.msg_rx` through `Deref`). A background pane's output stalled in
 //! its own bounded channel with zero consumers, so its picture froze until
 //! it gained focus. Both halves now walk EVERY pane; the tab-level frame
-//! budget (flood-aware clock/byte cap — base 8ms/256KB, flood 16ms/1MiB
-//! when the consumer falls behind, `frame_budget` below) bounds the worst
-//! case so N panes cannot eat N× the old frame cost (spec §2.1–§2.3).
+//! budget (flood-aware clock/byte cap — base 8ms/256KB×N, flood 16ms/1MiB×N
+//! when the consumer falls behind, N saturating at 4 [T15c]; the clock
+//! stays tab-level, `frame_budget` below) bounds the worst case per frame
+//! (spec §2.1–§2.3).
 //!
-//! The per-pane dispatch lives here so `tab.rs` stays at its architecture
-//! allowlist ceiling: this module owns the multi-pane orchestration, the
-//! per-pane PtyExit semantics (§2.2), and the shared frame budget (§2.3).
+//! Per-pane dispatch lives here so `tab.rs` stays at its allowlist ceiling:
+//! this module owns orchestration, PtyExit semantics (§2.2), budget (§2.3).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -24,21 +24,21 @@ use weft_core::pane_layout::PaneId;
 
 /// Split threshold for a single oversized PTY message. T8 (PLAN_v11217 §3.4):
 /// single source of truth `weft_core::pty::EVENT_CAP` (the hard cap read_batch
-/// enforces; value unchanged) — a production message can never exceed this,
-/// so the split path stays test-injection-only. Oversize split: the head is
-/// processed now, the tail is re-queued ON THE PANE ahead of every later
-/// AppMsg (esp. PtyExit) — PTY byte order never inverts. T1 (R2): FROZEN.
+/// enforces; value unchanged) — a production message can never exceed this.
+/// Oversize split: the head is processed now, the tail is re-queued ON THE
+/// PANE ahead of every later AppMsg (esp. PtyExit) — order never inverts.
+/// T1 (R2): FROZEN.
 const MAX_BYTES_PER_MESSAGE: usize = weft_core::pty::EVENT_CAP;
 /// Time-check granularity: the clock is consulted at most once per this
 /// many bytes so clock reads cannot dominate tiny messages. T1: unchanged.
 const MIN_BYTES_FOR_TIME_CHECK: usize = 32 * 1024;
 /// T1 (PLAN_v11217 §3.2): the tab-level frame budget is FLOOD-AWARE —
 /// chosen ONCE per frame by [`frame_budget`] from a backlog snapshot.
-/// Base = 8ms/256KB (the exact v1.0 + FIX_background_pane_pump budget;
-/// clock stays TAB-level — N panes share ONE window per frame, R3; bytes
-/// counted include oversized heads). Flood = 16ms/1MiB while the consumer
-/// is visibly behind, raising pump duty cycle from ~48% toward ~100%;
-/// deferred panes resume next frame (bounded channel, round-robin rotation).
+/// Base = 8ms/256KB×N and flood = 16ms/1MiB×N (T15c: the byte cap scales
+/// with pane_count, saturating at 4; the clock stays TAB-level — N panes
+/// share ONE window per frame, R3; bytes counted include oversized heads).
+/// Flood raises pump duty cycle toward ~100% while the consumer is visibly
+/// behind; deferred panes resume next frame (bounded channel, rotation).
 const FLOOD_BACKLOG_MSGS: usize = 16;
 const BASE_TIME_BUDGET: Duration = Duration::from_millis(8);
 const FLOOD_TIME_BUDGET: Duration = Duration::from_millis(16);
@@ -52,35 +52,35 @@ struct FrameBudget {
 }
 
 /// 洪水判定：tab 内所有窗格 msg 通道积压之和 + 超长消息尾存在性。
-/// crossbeam bounded(1024)；pump 高水位 768，洪水期积压可达数百，
-/// 阈值 16 只在"消费端明显落后"时触发。
+/// crossbeam bounded(1024)；pump 高水位 768，阈值 16 只在"消费端明显
+/// 落后"时触发。[评审 P2] 生产中 PTY 读缓冲 256KB = MAX_BYTES_PER_MESSAGE，
+/// 单条 PtyOutput 永不超限——`has_pending_tail` 恒 false，仅为防御/测试
+/// 注入路径信号；生产唯一真实洪水信号是 Σ msg_rx.len() >= 16。[误触发
+/// 无害·天花板不是地板] 上限只在被绑定时生效：误入洪水模式而工作量在
+/// 预算内消化完毕时与基础模式逐位一致。[洪水期键入回显上界] ≈
+/// FLOOD_TIME_BUDGET(16ms) + 唤醒间隔(≤16ms) + vsync(≤16.6ms) ≈ 48ms。
 ///
-/// [评审修订 P2] 生产事实：PTY 读缓冲 256KB（pty.rs BUF_SIZE）恰好等于
-/// MAX_BYTES_PER_MESSAGE，生产单条 PtyOutput 永不超限、永不切分——
-/// `has_pending_tail` 在生产中恒 false，是防御/测试注入路径的信号；
-/// 生产唯一真实洪水信号是 Σ msg_rx.len() >= 16。保留 tail 信号无害
-/// （对注入式测试有用），但维护者不得按"尾=洪水"推理生产行为。
-///
-/// [误触发无害性 · 天花板不是地板] 预算/字节上限只在被绑定时才生效：
-/// TUI 全屏重绘（vim 刷新等）瞬间产生 ≥16 条小消息误入洪水模式时，
-/// 若实际工作量在 8ms/256KB 内即消化完毕，行为与基础模式逐位一致；
-/// 上限放宽不改变任何排水前的处理顺序或内容。
-///
-/// [洪水期最坏交互代价] 非洪水场景行为逐位不变；洪水期键入回显上界
-/// ≈ FLOOD_TIME_BUDGET(16ms) + 唤醒间隔(≤16ms) + vsync(≤16.6ms) ≈ 48ms
-/// （评审 P3 修正：原 32ms 低估了上屏 vsync 项），实测 Warp 同场景零
-/// 退化，可接受。
-fn frame_budget(total_backlog_msgs: usize, has_pending_tail: bool) -> FrameBudget {
+/// `pane_count`（T15c, PLAN_v11217 §3.10）：`self.panes.len()`；字节档
+/// 乘 `min(pane_count, 4)`——单屏可读性上限约 4 pane，更大 split 属异常
+/// 布局且扩容后时间预算成为主约束（§2 R3 修订：仅放宽字节维，时间维
+/// 保持 tab 级共享；"背景不冻结"实质保证仍由改写后的层 4/FIX 守门簇
+/// 看守）。
+fn frame_budget(
+    total_backlog_msgs: usize,
+    has_pending_tail: bool,
+    pane_count: usize,
+) -> FrameBudget {
+    let scale = pane_count.clamp(1, 4);
     let flood = total_backlog_msgs >= FLOOD_BACKLOG_MSGS || has_pending_tail;
     if flood {
         FrameBudget {
             time: FLOOD_TIME_BUDGET,
-            bytes: FLOOD_BYTES_PER_FRAME,
+            bytes: FLOOD_BYTES_PER_FRAME * scale,
         }
     } else {
         FrameBudget {
             time: BASE_TIME_BUDGET,
-            bytes: BASE_BYTES_PER_FRAME,
+            bytes: BASE_BYTES_PER_FRAME * scale,
         }
     }
 }
@@ -107,11 +107,10 @@ impl Tab {
     /// - the alt flip history is per pane (`Tab::alt_flip_history` map), so
     ///   one pane's isolated flip cannot reset another pane's storm record.
     ///
-    /// The v1.11.5 F18 warning — "only the ACTIVE pane is pumped … would-be
-    /// producers in background panes simply don't run … Do not 'fix' this by
-    /// pumping every pane here" — described the active-only design this fix
-    /// retires; its hidden premise, that multi-source dispatch needs no
-    /// source disambiguation, is resolved by the tagging above.
+    /// The v1.11.5 F18 warning — "only the ACTIVE pane is pumped … Do not
+    /// 'fix' this by pumping every pane here" — described the active-only
+    /// design this fix retires; its hidden premise (multi-source dispatch
+    /// needs no source disambiguation) is resolved by the tagging above.
     ///
     /// PtyExit per pane (spec §2.2): a non-last pane's shell exit walks the
     /// existing pane-close infrastructure (`SplitTree::close_pane`) and does
@@ -136,10 +135,9 @@ impl Tab {
     /// 改动点 2): `now` is the frame clock; the production entry passes
     /// `Instant::now` (path bit-identical to pre-T1). HARD RULE: budget
     /// checks read the clock ONLY via this closure — `frame_start.elapsed()`
-    /// implicitly consults the real clock and bypasses the seam. Real-clock
-    /// touch points per frame: EXACTLY three — frame-start init, the
-    /// between-panes check, the per-message check; the post-drain
-    /// `Instant::now()` (settle/idle) stays on the REAL clock, not in the seam.
+    /// bypasses the seam. Real-clock touches per frame: EXACTLY three —
+    /// frame-start init, between-panes check, per-message check; the
+    /// post-drain `Instant::now()` stays on the REAL clock (不入缝).
     fn process_messages_with_clock(
         &mut self,
         now: impl Fn() -> std::time::Instant,
@@ -167,15 +165,15 @@ impl Tab {
             .panes
             .values()
             .any(|pane| pane.pending_pty_output.is_some());
-        let budget = frame_budget(total_backlog_msgs, has_pending_tail);
+        let budget = frame_budget(total_backlog_msgs, has_pending_tail, self.panes.len());
 
         // Deterministic order (HashMap keys() is process-randomly shuffled,
         // which both flaked the byte-cap test and pinned the deferral on one
         // arbitrary pane). When last frame's budget ran out on a pane, THAT
-        // pane goes first now: it was deferred, and a `pos + 1` rotation
-        // would be an identity rotation in the common two-pane case (the
-        // saturating pane always re-spends the cap before its sibling runs),
-        // keeping the deferral pinned forever.
+        // pane goes first now: a `pos + 1` rotation would be an identity
+        // rotation in the common two-pane case (the saturating pane always
+        // re-spends the cap before its sibling runs), pinning the deferral
+        // forever.
         let mut pane_ids: Vec<PaneId> = self.panes.keys().copied().collect();
         pane_ids.sort_unstable();
         if let Some(last_deferred) = self.pump_rotation.take() {
@@ -186,11 +184,10 @@ impl Tab {
         let mut rotation_tail: Option<PaneId> = None;
         for pane_id in pane_ids {
             // Shared frame budget: once the tab's window has lapsed (and
-            // enough bytes have flowed to make the check meaningful) or the
-            // total byte cap is spent, leave every remaining pane for the
-            // next frame — bounded channel, no loss; the rotation above
-            // makes the deferral round-robin across frames, not a fixed
-            // priority. T1: dynamic budget; seam touch 2/3 via `now()`.
+            // enough bytes have flowed for the check to matter) or the total
+            // byte cap is spent, leave every remaining pane for the next
+            // frame — bounded channel, no loss; the rotation above makes the
+            // deferral round-robin. T1: dynamic budget; seam touch 2/3.
             if frame_bytes >= budget.bytes
                 || (frame_bytes >= MIN_BYTES_FOR_TIME_CHECK
                     && now().saturating_duration_since(frame_start) >= budget.time)
@@ -212,8 +209,7 @@ impl Tab {
             if !pane_exited {
                 continue;
             }
-            // v1.11.4: kitty negotiated flags die with the shell (both exit
-            // paths below).
+            // v1.11.4: kitty negotiated flags die with the shell.
             if let Some(t) = self
                 .panes
                 .get_mut(&pane_id)
@@ -232,16 +228,14 @@ impl Tab {
             }
         }
 
-        // Post-drain pass — per pane (was active-pane-only). Each pane's
-        // sequence matches the original single-pane post-loop exactly:
+        // Post-drain pass — per pane (was active-pane-only); the sequence
+        // matches the original single-pane post-loop exactly:
         // keypress-bypass refresh → settle → block drain → ui events →
         // split-head anchor compensation → block-completion snap.
-        // T1 seam rule: REAL clock, NOT the injected frame clock — settle/
-        // idle timing must keep ticking under a frozen test clock (不入缝).
+        // T1: REAL clock, NOT the injected seam clock (不入缝).
         let now = std::time::Instant::now();
         // Sorted to match the consume pass above — drained blocks / ui
-        // events then append in a stable pane order (no correctness impact,
-        // just deterministic output assembly).
+        // events append in a stable pane order (determinism, not correctness).
         let mut survivor_ids: Vec<PaneId> = self.panes.keys().copied().collect();
         survivor_ids.sort_unstable();
         for pane_id in survivor_ids {
@@ -316,15 +310,13 @@ impl Tab {
     }
 
     /// Drain ONE pane's channel for this frame. Returns `true` when the
-    /// pane's shell exited (PtyExit consumed — PtyExit is always the last
-    /// message the pump ever enqueues for a session).
-    ///
-    /// Budget accounting is tab-level (`frame_bytes` accumulates across
-    /// panes; `frame_start` + injected `now` form the shared frame clock —
-    /// seam touch point 3/3; `budget` is this frame's base-or-flood
-    /// FrameBudget, chosen once at frame start). When a budget trips, THIS
-    /// pane's drain ends; the caller's top-of-loop check defers the
-    /// remaining panes to the next frame.
+    /// pane's shell exited (PtyExit consumed — it is always the last
+    /// message the pump ever enqueues for a session). Budget accounting is
+    /// tab-level (`frame_bytes` accumulates across panes; `frame_start` +
+    /// injected `now` form the shared frame clock — seam touch point 3/3;
+    /// `budget` is this frame's base-or-flood FrameBudget, chosen once at
+    /// frame start): a tripped budget ends THIS pane's drain, and the
+    /// caller's top-of-loop check defers the remaining panes.
     // T1: budget + injected clock must reach the per-message check —
     // explicit params, mirroring paint/'s why-commented allowances.
     #[allow(clippy::too_many_arguments)]
@@ -366,9 +358,9 @@ impl Tab {
                         }
                         *need_redraw |= self.process_pty_output_for_pane(pane_id, &data);
                         processed_panes.insert(pane_id);
-                        // The head is real processing cost: it counts toward
-                        // the tab cap, and this pane's drain ends for this
-                        // frame (the tail resumes next frame, in order).
+                        // The head counts toward the tab cap; this pane's
+                        // drain ends for the frame (tail resumes next frame,
+                        // in order).
                         *frame_bytes = frame_bytes.saturating_add(MAX_BYTES_PER_MESSAGE);
                         return false;
                     }
@@ -397,11 +389,10 @@ impl Tab {
     /// §2.2: a NON-last pane's shell exit. Mirrors the user pane-close path:
     /// force-settle the dying shell's primary-screen state and drain its
     /// finished blocks + ui events first (they must persist like any other
-    /// pane's — `finish_pending_blocks` parity), then shrink the tree with
-    /// the existing [`weft_core::pane_layout::SplitTree::close_pane`]
-    /// infrastructure and drop the pane. NEVER touches `alive` — surviving
-    /// panes keep the tab open. (`kitty_reset` already ran at exit
-    /// detection.)
+    /// pane's — `finish_pending_blocks` parity), then shrink the tree via
+    /// [`weft_core::pane_layout::SplitTree::close_pane`] and drop the pane.
+    /// NEVER touches `alive` — surviving panes keep the tab open.
+    /// (`kitty_reset` already ran at exit detection.)
     fn close_exited_pane(
         &mut self,
         pane_id: PaneId,
@@ -455,25 +446,21 @@ impl Tab {
     /// delegate). `pane_id` is the pane whose terminal consumes `data` — the
     /// per-pane consume pass routes each channel's bytes here.
     ///
-    /// v1.10.4: detect alt-screen (DEC 1049) enter/exit. When a TUI toggles
-    /// between alt-screen and primary screen, the PTY cols must switch
-    /// between full-width (alt-screen: TUI needs every column to paint
-    /// borders/layout) and gutter-subtracted (primary screen: BlockView
-    /// reserves breathing room).
+    /// v1.10.4: detect alt-screen (DEC 1049) enter/exit — the PTY cols must
+    /// switch between full-width (alt: TUI needs every column for borders)
+    /// and gutter-subtracted (primary: BlockView reserves breathing room).
     ///
     /// v1.10.26 Batch D (D-2): alt toggles are detected by the terminal's
     /// u64 flip-counter diff across the `process()` batch, not by comparing
-    /// the `alt_active` boolean before/after — a batch that contains an h→l
-    /// pair nets the boolean to zero yet still performed two real flips, and
-    /// those must refresh the flip history / debounce window or the burst
-    /// lock expires early (v1.10.19 loop loophole). FIX §2.5: the flips are
-    /// recorded in the SOURCE pane's history slot.
+    /// the `alt_active` boolean — an h→l pair nets the boolean to zero yet
+    /// performed two real flips, which must refresh the flip history /
+    /// debounce window or the burst lock expires early (v1.10.19 loophole).
+    /// FIX §2.5: the flips are recorded in the SOURCE pane's history slot.
     ///
     /// v1.10.21: same capture-before pattern for the alt-screen history peek
-    /// — the VT core clears the flag itself on CSI ?1049l (deep in the
-    /// parser, unreachable from the app layer), and the entry gate's
-    /// re-entry lockout must arm on that exit too. `note_exit` runs after
-    /// the terminal borrow ends because the gate is a sibling Pane field.
+    /// — the VT core clears the flag itself on CSI ?1049l, and the entry
+    /// gate's re-entry lockout must arm on that exit too. `note_exit` runs
+    /// after the terminal borrow ends (the gate is a sibling Pane field).
     pub(super) fn process_pty_output_for_pane(&mut self, pane_id: PaneId, data: &[u8]) -> bool {
         let was_peeking = self
             .panes
@@ -495,10 +482,9 @@ impl Tab {
         };
         // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING) DEBUG probe
         // (stage 3/4): first PTY output after a committed resize — measures
-        // when omp starts repainting (the ioctl-to-repaint gap). Fires once
-        // per resize, then disarms. Tab-level single slot: with multiple
-        // panes the first pane to produce output after any resize commit is
-        // the one that logs (debug instrumentation only).
+        // the ioctl-to-repaint gap. Fires once per resize, then disarms.
+        // Tab-level slot: with multiple panes the first pane to produce
+        // output after any resize commit logs (debug instrumentation only).
         if let Some(since_ioctl) = self.take_resize_output_probe() {
             tracing::debug!(
                 since_ioctl_ms = since_ioctl.as_millis(),
@@ -509,12 +495,12 @@ impl Tab {
         if alt_flips > 0 {
             self.pending_alt_rescale = true;
             // v1.10.19: arm the debounce window — take_pending_alt_rescale
-            // holds the recompute while toggles repeat inside it so a burst
-            // coalesces into one recompute (see tab/resize.rs).
-            // v1.10.26 (D-1/D-2) + v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): the
-            // flip history (last two instants per source pane) is driven off
-            // the counter diff — the burst-storm signature for the cols
-            // mirror freeze (`burst_locked_cols`). FIX §2.5: per-pane slot.
+            // holds the recompute while toggles repeat so a burst coalesces
+            // into one recompute (see tab/resize.rs). v1.10.26 (D-1/D-2) +
+            // v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): the flip history (last
+            // two instants per source pane) is driven off the counter diff —
+            // the burst-storm signature for the cols mirror freeze
+            // (`burst_locked_cols`). FIX §2.5: per-pane slot.
             self.record_alt_flip_instants(pane_id, alt_flips);
         }
         if was_peeking && !still_peeking {
@@ -543,8 +529,7 @@ mod tests {
     /// Two-pane test tab built from `with_terminal_only` panes (no real
     /// PTY — messages are injected straight into each pane's channel).
     /// Returns `(tab, background_id, active_id)`: `split_active_pane_test`
-    /// focuses the NEW pane, so `first` (the original root) ends up in the
-    /// background — exactly the frozen-pane scenario under repair.
+    /// focuses the NEW pane, so `first` ends up in the background.
     fn two_pane_tab() -> (Tab, PaneId, PaneId) {
         let mut tab = Tab::with_single_pane(Pane::with_terminal_only(1000));
         let first = tab.active_pane_id();
@@ -564,6 +549,14 @@ mod tests {
         }
     }
 
+    /// Byte-determined stop points for the ×N cap test: a clock that never
+    /// advances (same shape as `pane_pump_budget_tests::frozen_clock`,
+    /// kept local because that helper is private to the child module).
+    fn test_frozen_clock() -> impl Fn() -> std::time::Instant {
+        let t0 = std::time::Instant::now();
+        move || t0
+    }
+
     fn row_text(tab: &Tab, pane_id: PaneId, row: usize) -> String {
         tab.pane(pane_id)
             .and_then(|pane| pane.terminal.as_ref())
@@ -573,8 +566,7 @@ mod tests {
 
     /// §三 background-pane end to end: output injected into a BACKGROUND
     /// pane's PTY channel must advance THAT pane's terminal after one
-    /// pump+process pass. Red before the fix: the background channel had
-    /// zero consumers, so its grid never moved.
+    /// pump+process pass (red before the fix: zero consumers, grid froze).
     #[test]
     fn background_pane_output_advances_its_terminal() {
         let (mut tab, bg, active) = two_pane_tab();
@@ -656,25 +648,31 @@ mod tests {
         assert_eq!(tab.pane_count(), 1);
     }
 
-    /// §二.3 tab-level per-frame total byte cap (256KB): when one pane's
-    /// traffic exhausts the frame budget, the OTHER pane's channel is
-    /// deferred to the next frame — not lost (the channel is bounded and
-    /// every pane gets its turn again).
+    /// §二.3 tab-level per-frame total byte cap (256KB × pane_count, T15c):
+    /// when one pane's traffic exhausts the frame budget, the OTHER pane's
+    /// channel is deferred to the next frame — not lost (the channel is
+    /// bounded and every pane gets its turn again).
+    ///
+    /// T15c: N=2 → cap = 512KB, so the injection rises to 7×80KB = 560KB
+    /// and the frame runs on the frozen-clock seam: a per-pane oversize
+    /// head can no longer spend the whole ×N cap in one frame (one head is
+    /// fixed 256KB), and only a byte-determined stop (time criteria dead)
+    /// still pins the cap exactly — msg6 480KB < 512KB continues, msg7
+    /// 560KB ≥ 512KB stops with the marker pane untouched.
     #[test]
     fn tab_byte_cap_defers_remaining_panes_to_next_frame() {
         let (mut tab, bg, active) = two_pane_tab();
-        // Deterministic sorted order is [bg, active] (the root pane's id is
-        // smaller than the split pane's), so the oversized message goes on
-        // the FIRST pane: its head exactly hits the per-message split
-        // threshold (= the tab frame cap), the tail re-queues, and the
-        // SECOND pane's marker is deferred — the cap semantics must not
-        // depend on which role a pane plays.
-        let mut big = vec![b'x'; 256 * 1024 + 1];
-        big.extend_from_slice(b"TAIL");
-        inject(bg, AppMsg::PtyOutput(big))(&mut tab);
+        // Sorted order is [bg, active] (the root pane's id is smaller than
+        // the split pane's): bg's 560KB spend trips the 512KB ×2 cap, the
+        // marker pane is deferred — cap semantics must not depend on which
+        // role a pane plays.
+        for _ in 0..7 {
+            inject(bg, AppMsg::PtyOutput(vec![b'x'; 80 * 1024]))(&mut tab);
+        }
         inject(active, AppMsg::PtyOutput(b"\x1b[2J\x1b[HMARKER".to_vec()))(&mut tab);
 
-        let _ = tab.process_messages();
+        let frozen = test_frozen_clock();
+        let _ = tab.process_messages_with_clock(frozen);
         assert!(
             !row_text(&tab, active, 0).contains("MARKER"),
             "frame 1: the second pane is deferred once the tab byte cap is spent"
@@ -686,13 +684,13 @@ mod tests {
         );
 
         // Subsequent frames drain the remainder (the rotation start makes
-        // the deferred pane go first, then the re-queued tail) — bounded
-        // loop so a regression fails instead of hanging.
+        // the deferred pane go first) — bounded loop so a regression fails
+        // instead of hanging.
         for _ in 0..10 {
             if tab.pane(active).map(|p| p.msg_rx.len()) != Some(1) {
                 break;
             }
-            let _ = tab.process_messages();
+            let _ = tab.process_messages_with_clock(test_frozen_clock());
         }
         assert_eq!(
             row_text(&tab, active, 0),
@@ -705,19 +703,22 @@ mod tests {
     /// tab 字节上限时，高 id 窗格必须在第 2 帧被消费。`rotate_left(pos+1)`
     /// 的 off-by-one 在双窗格下是恒等旋转——饱和窗格每次都重新吃满上限、
     /// 被推迟窗格无限饥饿，正是本测试钉死的回归形态。
+    ///
+    /// T15c：N=2 基础上限 = 512KB。灌 14×80KB = 1.12MB（2× 超 512KB）：
+    /// 第 1 帧饱和窗格排 7 条触顶（560KB ≥ 512KB）推迟 marker；第 2 帧若
+    /// 轮转失灵（恒等旋转），饱和窗格用剩余 7 条重新吃满上限、marker 再度
+    /// 被推迟 → 断言红；轮转正确时 marker 先行消费 → 绿。
     #[test]
     fn saturating_sibling_rotates_deferred_pane_in_on_the_next_frame() {
         let (mut tab, bg, active) = two_pane_tab();
-        // Sorted order is [bg, active]; bg streams an oversize message per
-        // frame (two queued up front), active waits with one marker.
-        for _ in 0..2 {
-            let mut big = vec![b'x'; 256 * 1024 + 1];
-            big.extend_from_slice(b"TAIL");
-            inject(bg, AppMsg::PtyOutput(big))(&mut tab);
+        // Sorted order is [bg, active]; bg queues two cap's worth (2 × 7
+        // × 80KB), active waits with one marker.
+        for _ in 0..14 {
+            inject(bg, AppMsg::PtyOutput(vec![b'x'; 80 * 1024]))(&mut tab);
         }
         inject(active, AppMsg::PtyOutput(b"\x1b[2J\x1b[HMARKER".to_vec()))(&mut tab);
 
-        // Frame 1: bg's head spends the whole cap before active runs.
+        // Frame 1: bg spends 560KB ≥ the 512KB ×2 cap before active runs.
         let _ = tab.process_messages();
         assert!(
             !row_text(&tab, active, 0).contains("MARKER"),
@@ -790,11 +791,10 @@ mod tests {
     }
 }
 
-/// T1 flood-aware frame budget tests (PLAN_v11217 §3.2). A CHILD module (via
-/// `#[path]`, file `src/tab/pane_pump_budget_tests.rs`) so the strategy fn
+/// T1 flood-aware frame budget tests (PLAN_v11217 §3.2). A CHILD module
+/// (`#[path]`, `src/tab/pane_pump_budget_tests.rs`) so the strategy fn
 /// [`frame_budget`], its constants, and the [`Tab::process_messages_with_clock`]
-/// seam stay private while being pinned end to end. Split out of `mod tests`
-/// to keep this file under the commit-gate 800-line ceiling.
+/// seam stay private while being pinned end to end.
 #[cfg(test)]
 #[path = "pane_pump_budget_tests.rs"]
 mod budget_tests;

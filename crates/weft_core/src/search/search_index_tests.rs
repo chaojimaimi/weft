@@ -25,6 +25,20 @@ fn open_and_probe_fts5() {
     let _ = idx.fts5_available();
 }
 
+/// T15a (PLAN_v11217 §3.10): `SearchIndex::open` sets the WAL
+/// journal_size_limit on its own connection — this connection is the
+/// startup-time FTS replace_kinds bulk writer (the pragma is
+/// per-connection, so it must be applied here, not only on BlockStore).
+#[test]
+fn open_applies_wal_size_limit_to_its_connection() {
+    let idx = open_test_index();
+    let limit: i64 = idx
+        .conn
+        .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(limit, 16 * 1024 * 1024);
+}
+
 #[test]
 fn upsert_and_search_basic() {
     let idx = open_test_index();

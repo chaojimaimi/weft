@@ -68,6 +68,9 @@ impl AnnotationStore {
     /// Open (creating if needed) the annotation store at `path`, which is
     /// typically the same `blocks.db` file used by `BlockStore`.
     pub fn open(path: &Path) -> Result<Self, PersistenceError> {
+        // T15a note: deliberately NOT covered by the WAL size-limit helper
+        // (see persistence::apply_wal_limits) — bookmark/note upserts are
+        // single-row and rare, orders of magnitude below WAL-bloat scale.
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })

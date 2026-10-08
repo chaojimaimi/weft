@@ -101,6 +101,10 @@ impl BlockStore {
         {
             tracing::warn!(error = %e, "journal_mode=WAL failed; keeping current journal mode");
         }
+        // T15a (§3.10): cap the WAL high-water mark on THIS connection —
+        // the pragma is per-connection and the main writer must be covered
+        // (idempotent: a repeated SET is a no-op).
+        crate::persistence::apply_wal_limits(&conn)?;
         conn.execute_batch(SCHEMA)?;
         // CREATE TABLE IF NOT EXISTS does not evolve databases created by an
         // older Weft version, so migrate the D5 active-tab field explicitly.

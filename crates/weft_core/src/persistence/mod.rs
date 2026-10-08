@@ -34,6 +34,7 @@ pub use blocks::BlockStore;
 pub use prune::{run_block_prune, PrunePlan, PruneReport, PruneTerminal};
 pub use tabs::{PaneTreeSnapshot, SnapshotPaneNode, TabSnapshot};
 
+use rusqlite::Connection;
 use std::time::{Duration, SystemTime};
 
 /// Errors from the block store: filesystem (opening/creating the DB file) or
@@ -61,4 +62,21 @@ pub(crate) fn millis_to_system_time(ms: i64) -> SystemTime {
     } else {
         SystemTime::UNIX_EPOCH - Duration::from_millis(ms.unsigned_abs())
     }
+}
+
+/// T15a (PLAN_v11217 §3.10): WAL high-water-mark cap, 16 MiB.
+pub(crate) const WAL_JOURNAL_SIZE_LIMIT: i64 = 16 * 1024 * 1024;
+
+/// T15a (PLAN_v11217 §3.10): cap the WAL high-water mark at
+/// [`WAL_JOURNAL_SIZE_LIMIT`]. `journal_size_limit` is a PER-CONNECTION
+/// pragma — SQLite only truncates the WAL when the connection that SET it
+/// runs a checkpoint — so every long-lived writer must apply it on its own
+/// connection: `BlockStore::open` (main writer + the prune connection it
+/// opens) and `SearchIndex::open` (the startup-time FTS replace_kinds bulk
+/// writer). `AnnotationStore` is deliberately excluded: bookmark/note
+/// upserts are single-row and rare, far below any WAL bloat scale.
+pub(crate) fn apply_wal_limits(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "PRAGMA journal_size_limit = {WAL_JOURNAL_SIZE_LIMIT};"
+    ))
 }

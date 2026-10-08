@@ -5,7 +5,7 @@
 
 use super::{
     alt_screen_cursor_color, grid_content_origin_x, primary_screen_mask_changed,
-    primary_screen_row_hidden,
+    primary_screen_row_hidden, GridViewPolicy,
 };
 use crate::layout::LayoutCtx;
 use weft_core::grid::CursorStyle;
@@ -209,6 +209,56 @@ fn background_pane_cache_invalidates_on_origin_dims_and_namespace() {
     let (_, rebuilt_7) = renderer.build_grid_instances_for_background_pane(&terminal, 7);
     assert_eq!(rebuilt_7, 0, "pane 7's cache survived pane 8's build");
 }
+
+/// T15b (PLAN_v11217 §3.10): the ACTIVE path's force condition must also
+/// fingerprint the layout origin. Same semantics as the background-path
+/// harness above (`background_pane_cache_invalidates_on_origin_dims_and_namespace`):
+/// a same-pane origin move (split drag / pane close re-layout) changes the
+/// baked row coordinates without touching dims, scroll, or dirty rows —
+/// this used to be masked by draw()'s per-frame unconditional force.
+#[test]
+fn active_pane_cache_invalidates_on_layout_origin_move() {
+    let Some(mut renderer) = headless_renderer_or_skip() else {
+        eprintln!("skipping active-pane origin test: no Metal device available");
+        return;
+    };
+    let mut terminal = weft_core::vt::Terminal::new(4, 20);
+    let build = |renderer: &crate::renderer::MetalRenderer, terminal: &weft_core::vt::Terminal| {
+        let grid = terminal.grid();
+        renderer.build_grid_instances(
+            grid,
+            terminal.palette(),
+            &grid.cursor,
+            &weft_core::selection::SelectionHandler::new(),
+            GridViewPolicy {
+                show_cursor: false,
+                cursor_style: terminal.cursor_style,
+                hidden_before_row: None,
+                owned_rows: None,
+                is_alt_screen: false,
+                inset_block_gutter: false,
+            },
+        )
+    };
+
+    let (_, rebuilt) = build(&renderer, &terminal);
+    assert_eq!(rebuilt, 4, "first build for a fresh renderer is full");
+
+    // Steady state: dirty flags cleared (the redraw_controller's post-frame
+    // clear on the live path), no scroll/dims/cursor change → incremental.
+    terminal.grid_mut().clear_all_dirty();
+    let (_, rebuilt) = build(&renderer, &terminal);
+    assert_eq!(rebuilt, 0, "idle active pane must not rebuild any row");
+
+    // Layout origin moved (split drag / sidebar) with the SAME pane →
+    // full rebuild even though the grid has no dirty rows.
+    if let Some(ctx) = renderer.layout_ctx.as_mut() {
+        ctx.padding_x += 5.0;
+    }
+    let (_, rebuilt) = build(&renderer, &terminal);
+    assert_eq!(rebuilt, 4, "origin move invalidates baked row coordinates");
+}
+
 /// P0 regression (rust-reviewer): a full-viewport scroll records ONLY a
 /// pending_scroll delta — it marks no rows dirty. The background cache
 /// must force one full rebuild on that delta, or cached rows lag streamed

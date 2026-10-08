@@ -241,6 +241,19 @@ pub struct MetalRenderer {
     /// scrollback, the rendered cells come from history (not dirty-tracked),
     /// so a full redraw is needed.
     pub(crate) prev_scroll_offset: Cell<usize>,
+    /// T15b (PLAN_v11217 §3.10): previous frame's baked active-grid layout
+    /// origin (x, y). A pane move (split drag, pane close re-layout) changes
+    /// the baked row coordinates without touching dims, scroll, or dirty
+    /// rows — same invalidation role as the background path's `entry.origin`
+    /// fingerprint. NaN initial value so the first comparison always
+    /// differs → first frame forces a full rebuild.
+    pub(crate) prev_grid_origin: Cell<(f32, f32)>,
+    /// T15b (PLAN_v11217 §3.10): identity of the pane whose grid the global
+    /// per-row cache held during the last multi-pane frame. The cache is
+    /// global (not per-pane), so a changed active pane forces one full
+    /// rebuild; layout moves of the *same* pane are covered by
+    /// `prev_grid_origin` instead. `None` until the first multi-pane frame.
+    pub(crate) last_drawn_active_pane: Option<weft_core::pane_layout::PaneId>,
     /// v1.0 P0-c: Persistent offscreen texture used as the render target
     /// instead of drawing directly to the drawable. This enables GPU-side
     /// scroll blit: on scroll, copy the unchanged region within the
@@ -645,11 +658,22 @@ impl MetalRenderer {
             // the full viewport directly and are unaffected.
             self.layout_ctx = Some(active_ctx);
             // The renderer's per-row grid cache is global, not per-pane.
-            // When the active pane changes (e.g. after a split) the cache may
-            // hold content from a different pane; a newly-created pane may
-            // also have no dirty rows. Force a full rebuild of the active
-            // pane so its grid renders correctly on the first multi-pane frame.
-            self.force_full_grid_redraw();
+            // When the active pane changes (e.g. after a split) the cache
+            // may hold content from a different pane; a newly-created pane
+            // may also have no dirty rows. Force a full rebuild of the
+            // active pane ONLY when its identity changed since the last
+            // multi-pane frame (first frame = None); same-pane layout moves
+            // are covered by the prev_grid_origin fingerprint inside
+            // build_grid_instances (T15b, PLAN_v11217 §3.10).
+            if crate::renderer::panes::should_force_full_redraw(
+                self.last_drawn_active_pane,
+                active_pane_id,
+            ) {
+                self.force_full_grid_redraw();
+            }
+            // Record every background frame unconditionally (T15b): the
+            // comparison above already consumed the previous value.
+            self.last_drawn_active_pane = Some(active_pane_id);
         }
         // v1.12.27a (P1-04): the ONE `expect` anchor for the rest of draw().
         // `LayoutCtx` is `Copy`, and this sits AFTER the background-pane

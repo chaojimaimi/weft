@@ -44,7 +44,7 @@ objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeomet
 # plan's primary CG-bitmap path is unavailable and drawing goes through
 # lockFocus + NSBezierPath (deprecated lockFocus is allow(deprecated)'d at
 # the call site).
-objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSAlert", "NSButton", "NSDockTile", "NSBezierPath", "NSColor", "NSGraphics"] }
+objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "libc", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSAlert", "NSButton", "NSDockTile", "NSBezierPath", "NSColor", "NSGraphics"] }
 objc2-quartz-core = { version = "0.2", features = ["CAMetalLayer", "CATransaction"] }
 objc2-user-notifications = { version = "=0.2.2", features = ["UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSound", "UNNotification", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }
 block2 = "=0.5.1"
