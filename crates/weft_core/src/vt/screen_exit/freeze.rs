@@ -1,6 +1,7 @@
 //! Document-boundary freeze and scroll-driven ownership transforms for the
 //! primary screen.
 
+use super::ownership::PrimaryScreenOwnership;
 use super::Terminal;
 use crate::blocks::{
     extract_owned_pushed_rows, line_boundary_at_or_before, styled_lines_from, styled_lines_in,
@@ -68,11 +69,15 @@ impl Terminal {
             // stay out), a form `primary_screen_document_snapshot` cannot
             // express; Phase 1 migrates this path to the index mapping.
             let text_cap = self.block_tracker.output_cap();
+            let scrollback_mask = self
+                .capabilities
+                .primary_screen_ownership
+                .scrollback_mask_tail_aligned(self.grid.scrollback.len());
             let (text, styled, _) = self
                 .grid
                 .document_snapshot_from_position_with_ownership_masks_and_resolver(
                     document_start,
-                    &self.capabilities.primary_screen_ownership.scrollback,
+                    scrollback_mask,
                     &[],
                     |id| self.hyperlinks.url(id).map(std::sync::Arc::<str>::from),
                     text_cap,
@@ -344,12 +349,20 @@ impl Terminal {
             return;
         };
         let scrollback_from = self.grid.scrollback.index_since(document_start);
+        // F2: skip the transient trim excess so the read stays tail-aligned
+        // with the scrollback rows (see ownership.rs TRIM_BATCH).
+        let mask_excess = self
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .len()
+            .saturating_sub(self.grid.scrollback.len());
         let owned: Vec<bool> = self
             .capabilities
             .primary_screen_ownership
             .scrollback
             .iter()
-            .skip(scrollback_from)
+            .skip(mask_excess + scrollback_from)
             .copied()
             .collect();
         if !owned.iter().any(|owned| *owned) {
@@ -371,12 +384,19 @@ impl Terminal {
         // The captured rows now live in the prefix — flip them so the
         // snapshot walk skips them (keeping them owned would duplicate them
         // in the composed block text).
+        // F2: same excess adjustment as the read above.
+        let mask_excess = self
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .len()
+            .saturating_sub(self.grid.scrollback.len());
         for entry in self
             .capabilities
             .primary_screen_ownership
             .scrollback
             .iter_mut()
-            .skip(scrollback_from)
+            .skip(mask_excess + scrollback_from)
         {
             *entry = false;
         }
@@ -620,19 +640,16 @@ impl Terminal {
                     .primary_screen_ownership
                     .scrollback
                     .extend(owned.iter().take(pushed.min(owned.len())).copied());
-                if self.capabilities.primary_screen_ownership.scrollback.len()
-                    > self.grid.scrollback.len()
-                {
-                    let expired = self
-                        .capabilities
-                        .primary_screen_ownership
-                        .scrollback
-                        .len()
-                        .saturating_sub(self.grid.scrollback.len());
-                    self.capabilities
-                        .primary_screen_ownership
-                        .scrollback
-                        .drain(..expired);
+                // F2 (PLAN_v1137): amortized front trim — drain in batches of
+                // TRIM_BATCH instead of one row per LF (a 10KB memmove per
+                // line at the scrollback cap). Consumers read through
+                // `scrollback_mask_tail_aligned`, so the transient excess is
+                // invisible to them.
+                let mask = &mut self.capabilities.primary_screen_ownership.scrollback;
+                let target = self.grid.scrollback.len();
+                if mask.len() > target + PrimaryScreenOwnership::TRIM_BATCH {
+                    let expired = mask.len() - target;
+                    mask.drain(..expired);
                 }
                 while self.capabilities.primary_screen_ownership.scrollback.len()
                     < self.grid.scrollback.len()

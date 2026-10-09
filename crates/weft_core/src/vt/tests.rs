@@ -738,6 +738,62 @@ fn primary_screen_ownership_follows_rows_into_scrollback() {
 }
 
 #[test]
+fn ownership_mask_reads_stay_tail_aligned_under_trim_batch() {
+    // F2 adversarial (PLAN_v1137, rust-reviewer P1): with the trim batch
+    // deferring front drains, the physical scrollback mask may be up to
+    // TRIM_BATCH longer than the scrollback; the extra front entries are
+    // stale. Consumers must read tail-aligned. Distinguishability: the
+    // pushed scrollback row is OWNED, so the stale front `false` makes a
+    // raw prefix-aligned read DROP "old shell" from the transcript — the
+    // mutation has been verified to turn this test red on the raw path.
+    let build = || {
+        let mut terminal = Terminal::new(3, 24);
+        for (row, text) in ["old shell", "owned answer", "owned prompt"]
+            .into_iter()
+            .enumerate()
+        {
+            for (col, character) in text.chars().enumerate() {
+                terminal.grid_mut().viewport[row].cells[col].character = character;
+            }
+        }
+        terminal.capabilities.primary_screen_ownership.viewport = Some(vec![true, true, true]);
+        terminal.process(b"\x1b[S");
+        terminal
+    };
+
+    let canonical = build();
+    let expected = ownership_document_text(&canonical);
+    assert!(
+        expected.contains("old shell"),
+        "owned scrollback row in doc"
+    );
+
+    let mut with_excess = build();
+    // Simulate a pending trim: one stale front entry, physical length one
+    // past the scrollback.
+    with_excess
+        .capabilities
+        .primary_screen_ownership
+        .scrollback
+        .insert(0, false);
+    assert_eq!(
+        with_excess
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .len(),
+        with_excess.grid().scrollback.len() + 1
+    );
+    assert_eq!(ownership_document_text(&with_excess), expected);
+}
+
+/// The document transcript through the PRODUCTION consumer
+/// (`Terminal::primary_screen_document_snapshot` -> capture.rs), so the
+/// tail-aligned wiring itself is what this pins.
+fn ownership_document_text(terminal: &Terminal) -> String {
+    terminal.primary_screen_document_snapshot(0).0
+}
+#[test]
 fn primary_screen_ownership_resizes_with_dimension_only_primary_grid() {
     let mut terminal = Terminal::new(3, 32);
     terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[Hbanner\x1b[2;1Hprompt");
@@ -3980,6 +4036,24 @@ mod perf_benchmarks {
             ms < target,
             "seq 1 10000 took {ms:.2}ms, target < {target:.0}ms"
         );
+    }
+
+    /// v1.13.7 profiling bench: the exact GUI flood scenario — 2M short
+    /// lines, capture engaged (seq_output wraps in 133 A/B/C), desktop-size
+    /// grid. Pair with macOS `sample` on the running test process to
+    /// attribute the per-line cost (PLAN_v1137).
+    #[test]
+    #[ignore]
+    fn bench_seq_2m_profiling() {
+        println!("\n=== v1.13.7 profiling bench: seq 2m, 45x170 grid ===");
+        let bytes = seq_output(2_000_000);
+        let mut t = Terminal::with_scrollback(45, 170, 10_000);
+        // Warm pass not needed — flood-shaped cold start IS the scenario.
+        let start = Instant::now();
+        t.process(&bytes);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let mbps = bytes.len() as f64 / 1_048_576.0 / (ms / 1000.0);
+        println!("  seq 2m (45x170, capture on)   {ms:>8.2} ms  | {mbps:>7.1} MB/s");
     }
 
     /// `seq 1 100000` — plan target: < 300ms (Warp ~50ms).

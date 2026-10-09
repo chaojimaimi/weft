@@ -18,6 +18,23 @@ pub struct Row {
 }
 
 impl Row {
+    /// F1 (PLAN_v1137 §1): index of the last non-default cell (a
+    /// never-written blank is `' '` + empty flags), or -1 for an all-default
+    /// row. Load-bearing for `FlatStorage::encode_row`'s tail truncation:
+    /// written cells set DIRTY and erase/wide-pair clears use the
+    /// all-default `reset()`, so `flags.is_empty()` ⇒ all-default attributes
+    /// — the suffix past this index emits no bytes unless the encoder's
+    /// running attribute state is non-default (then exactly one reset space
+    /// cell is materialized there).
+    pub(crate) fn last_written_cell(&self) -> isize {
+        for (i, c) in self.cells.iter().enumerate().rev() {
+            if c.character != ' ' || !c.flags.is_empty() {
+                return i as isize;
+            }
+        }
+        -1
+    }
+
     pub fn new(cols: usize) -> Self {
         Self {
             cells: vec![Cell::default(); cols],

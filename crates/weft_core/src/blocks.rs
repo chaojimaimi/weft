@@ -278,6 +278,13 @@ pub struct BlockTracker {
     /// Reset at command start so the 100ms interval never leaks across
     /// commands.
     last_live_styled_publish: Option<Instant>,
+    /// v1.13.7 F3 (PLAN_v1137): batch-level clock, synced once per
+    /// `Terminal::process` call. The live-styled publish throttle only needs
+    /// ~ms precision; per-line `Instant::now()` was 2 clock_gettime syscalls
+    /// per line over 2M-line floods (~3% of parse). Direct tracker callers
+    /// outside `process` (tests, hydrate) see the stale construction clock —
+    /// throttle decisions only, no semantic effect (PLAN_v1137 §1 F3).
+    pub(crate) batch_clock: Instant,
     /// v1.10.23: live-output content version, exposed via
     /// [`in_flight`](Self::in_flight); bumped on every mutation.
     live_output_version: u64,
@@ -374,6 +381,7 @@ impl BlockTracker {
             styled_output: None,
             live_styled_snapshot: None,
             last_live_styled_publish: None,
+            batch_clock: Instant::now(),
             live_output_version: 0,
             screen_document_start: None,
             screen_owned_blocks: HashSet::new(),
@@ -664,13 +672,22 @@ impl BlockTracker {
     /// v1.7.0-A: `style` captures the current VT SGR attributes for the whole
     /// ASCII run — all bytes share one style since the fast path only fires
     /// when no SGR change occurred mid-run.
+    /// F3 (PLAN_v1137): one clock sample per `Terminal::process` batch —
+    /// the live-styled publish throttle needs only ~ms precision, and
+    /// per-line `Instant::now()` was 2 clock_gettime per line over 2M-line
+    /// floods (~3% of parse). Stale between batches by design (throttle
+    /// decisions only).
+    pub(crate) fn begin_batch(&mut self, now: Instant) {
+        self.batch_clock = now;
+    }
+
     pub fn on_print_ascii_run(&mut self, bytes: &[u8], style: CapturedStyle) {
         if !self.is_capturing() || bytes.is_empty() {
             return;
         }
         self.output.print_ascii(bytes, style, self.output_cap);
         self.live_output_version = self.live_output_version.wrapping_add(1);
-        self.maybe_publish_live_styled(Instant::now());
+        self.maybe_publish_live_styled(self.batch_clock);
     }
 
     /// Append a newline to the in-flight block's output. No-op unless a command
@@ -763,7 +780,8 @@ impl BlockTracker {
     /// refreshes stay on the 100ms throttle like the print paths.
     fn boundary_publish_live_styled(&mut self) {
         let peek_some = !(self.output.style_overflow() || self.output.style_runs_empty());
-        let now = Instant::now();
+        // F3: batch clock (synced per process call) instead of per-line now.
+        let now = self.batch_clock;
         if peek_some != self.live_styled_snapshot.is_some()
             || Self::live_styled_publish_due(self.last_live_styled_publish, now)
         {

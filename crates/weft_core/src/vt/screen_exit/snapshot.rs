@@ -79,6 +79,10 @@ impl Terminal {
         // PLAN_v11217 §3.5 (T4): the replayed walk must use the SAME derived
         // text budget as the snapshot builder — the tracker's configured cap.
         let text_cap = self.block_tracker.output_cap();
+        let scrollback_mask = self
+            .capabilities
+            .primary_screen_ownership
+            .scrollback_mask_tail_aligned(self.grid.scrollback.len());
         let line = match self
             .capabilities
             .primary_screen_ownership
@@ -89,7 +93,7 @@ impl Terminal {
                 viewport_row,
                 scrollback_start,
                 viewport_start,
-                Some(&self.capabilities.primary_screen_ownership.scrollback),
+                Some(scrollback_mask),
                 Some(owned),
                 text_cap,
             ),

@@ -568,6 +568,7 @@ impl Terminal {
     /// per-byte state machine. Only ESC (0x1B) and C0 controls go through
     /// `parser.advance()`. See `parser_in_ground_state` and inline notes.
     pub fn process(&mut self, bytes: &[u8]) {
+        self.block_tracker.begin_batch(std::time::Instant::now());
         let mut parser = std::mem::take(&mut self.parser);
         let mut i = 0;
         while i < bytes.len() {

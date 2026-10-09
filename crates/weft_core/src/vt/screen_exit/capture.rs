@@ -80,10 +80,16 @@ impl Terminal {
                     )
                 },
                 |owned| {
+                    // F2: tail-aligned read — the physical mask may carry up
+                    // to TRIM_BATCH stale front entries (see ownership.rs).
+                    let scrollback_mask = self
+                        .capabilities
+                        .primary_screen_ownership
+                        .scrollback_mask_tail_aligned(self.grid.scrollback.len());
                     self.grid
                         .document_snapshot_from_position_with_ownership_masks_and_resolver(
                             document_start,
-                            &self.capabilities.primary_screen_ownership.scrollback,
+                            scrollback_mask,
                             owned,
                             url_resolver,
                             text_cap,

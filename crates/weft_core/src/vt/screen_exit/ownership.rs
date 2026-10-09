@@ -17,6 +17,19 @@ pub(in crate::vt) struct PrimaryScreenOwnership {
 }
 
 impl PrimaryScreenOwnership {
+    /// v1.13.7 F2 (PLAN_v1137): the scroll handler lets the physical mask
+    /// run up to [`Self::TRIM_BATCH`] entries longer than the scrollback
+    /// before draining (amortized front trim — draining 1 row per LF was
+    /// a 10KB memmove per line at the scrollback cap). Consumers therefore
+    /// read the TAIL-ALIGNED slice: the last `scrollback_len` entries are
+    /// exactly the logical mask for the current scrollback rows.
+    pub(in crate::vt) const TRIM_BATCH: usize = 256;
+
+    pub(in crate::vt) fn scrollback_mask_tail_aligned(&self, scrollback_len: usize) -> &[bool] {
+        let excess = self.scrollback.len().saturating_sub(scrollback_len);
+        &self.scrollback[excess..]
+    }
+
     pub(in crate::vt) fn resize_viewport(&mut self, rows: usize) {
         if let Some(viewport) = &mut self.viewport {
             viewport.resize(rows, false);
@@ -88,11 +101,14 @@ impl Terminal {
             .primary_screen_ownership
             .viewport
             .is_some();
+        // F2: tail-aligned clone — the physical mask may carry up to
+        // TRIM_BATCH stale front entries; pre_flags must key on the logical
+        // scrollback rows (see scrollback_mask_tail_aligned).
         let mut pre_flags = self
             .capabilities
             .primary_screen_ownership
-            .scrollback
-            .clone();
+            .scrollback_mask_tail_aligned(grid.scrollback.len())
+            .to_vec();
         match &self.capabilities.primary_screen_ownership.viewport {
             Some(viewport_owned) => pre_flags.extend_from_slice(viewport_owned),
             None => pre_flags.resize(grid.scrollback.len() + grid.num_rows, false),

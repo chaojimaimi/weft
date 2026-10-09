@@ -46,7 +46,7 @@ mod encode_fast_path_tests;
 
 use std::sync::Arc;
 
-use super::cell::{CellColor, CellFlags, CellWidth};
+use super::cell::{Cell, CellColor, CellFlags, CellWidth};
 use super::row::Row;
 use content::{ByteOffset, Content};
 use grapheme::Grapheme;
@@ -536,14 +536,26 @@ impl FlatStorage {
         // rows take the identical code path as before this gate.
         let extras_empty = row.extras.is_empty();
 
-        for (idx, cell) in row.cells.iter().enumerate() {
-            let idx = idx as isize;
+        let default_style = BgAndStyle::from_cell(&Cell::default());
+        let carried_default = extras_empty
+            && fg_color == CellColor::Default
+            && hyperlink_id.is_none()
+            && bg_and_style == default_style;
+        let last_idx: isize = if carried_default {
+            row.last_written_cell()
+        } else {
+            row.cells.len() as isize - 1
+        };
 
+        // Returns "running state non-default" (reset-materialization test).
+        let mut emit_cell = |idx: isize, cell: &Cell| -> bool {
             // Wide-char spacer cells carry no bytes — the lead glyph owns
             // the width (D2: WIDE_SPACER 不产字节).
             if cell.flags.contains(CellFlags::WIDE_SPACER) {
                 last_cell = idx;
-                continue;
+                return fg_color != CellColor::Default
+                    || bg_and_style != default_style
+                    || hyperlink_id.is_some();
             }
 
             let cluster = if extras_empty {
@@ -598,6 +610,19 @@ impl FlatStorage {
                 entry_builder.process_grapheme_info_unchecked(grapheme.sizing_info());
                 self.content.push_grapheme(&grapheme);
             }
+
+            fg_color != CellColor::Default
+                || bg_and_style != default_style
+                || hyperlink_id.is_some()
+        };
+
+        let mut state_nondefault = false;
+        for idx in 0..=last_idx {
+            state_nondefault = emit_cell(idx, &row.cells[idx as usize]);
+        }
+        // Reset-cell materialization: at most one suffix cell can matter.
+        if carried_default && state_nondefault && last_idx + 1 < row.cells.len() as isize {
+            emit_cell(last_idx + 1, &row.cells[(last_idx + 1) as usize]);
         }
 
         // D2 行界: `wrapped == true` is a soft-wrapped continuation (no
