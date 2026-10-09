@@ -20,6 +20,7 @@ pub(crate) mod keyboard;
 // `weft-parse-<session_id>` thread feeding the pane's FairMutex terminal
 // directly; the main thread keeps only control events + the post pass.
 pub(crate) mod parse_worker;
+pub(crate) mod parse_worker_stats;
 // v1.12.25 (3-B-2 P2-01): per-frame session I/O core (`spawn_pty` /
 // `pump_pty` / `process_messages` / `request_redraw`) moved verbatim out of
 // `main.rs`; bodies zero-rewritten, visibility `pub(crate)`.

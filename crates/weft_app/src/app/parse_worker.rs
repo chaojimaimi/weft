@@ -47,6 +47,7 @@ use tokio::sync::mpsc;
 use weft_core::pty::{monotonic_millis, pty_wake_due, PtyEvent, PtyWriter, WakeThrottle};
 use weft_core::vt::Terminal;
 
+use crate::app::parse_worker_stats::ParseWorkerStats;
 use crate::AppMsg;
 
 /// The UI wake seam. `EventLoopProxy<AppEvent>` in production (sending
@@ -141,6 +142,7 @@ fn process_batch<P>(
     writer: &PtyWriter,
     ctrl_tx: &crossbeam_channel::Sender<AppMsg>,
     had_output: &AtomicBool,
+    stats: &mut ParseWorkerStats,
     data: &[u8],
     parse: P,
 ) -> Result<(), String>
@@ -151,17 +153,21 @@ where
     // D2 step 2 — LOCKED: parse + extraction only. The FairMutex lock here
     // is the pane's own; nothing below the extraction touches the guard.
     // D9 rule 6: catch_unwind around the parse (parking_lot has no poison).
+    let t_lock = Instant::now();
     let parsed = catch_unwind(AssertUnwindSafe(|| {
         let mut guard = terminal.lock();
+        let lock_wait = t_lock.elapsed();
+        let t_parse = Instant::now();
         let parsed = parse(&mut guard, data);
+        let parse_busy = t_parse.elapsed();
         // Worker-side stamp at the diff point — consumed for the
         // AltFlipped payload so the main thread's storm/debounce windows
         // don't drift by one frame (P2 review).
         let at = (parsed.alt_flips > 0).then(Instant::now);
-        (parsed, at)
+        (parsed, at, lock_wait, parse_busy)
     }));
-    let (parsed, at) = match parsed {
-        Ok((parsed, at)) => (parsed, at),
+    let (parsed, at, lock_wait, parse_busy) = match parsed {
+        Ok((parsed, at, lock_wait, parse_busy)) => (parsed, at, lock_wait, parse_busy),
         Err(payload) => {
             let reason = payload
                 .downcast_ref::<&str>()
@@ -171,6 +177,11 @@ where
             return Err(reason);
         }
     };
+    // Drain telemetry (§5.1 lock probe): lock_wait is the starvation signal
+    // (main-thread render/pump holding the pane lock), parse_busy the
+    // worker's own cost. Emission is gated by WEFT_TRACE_CHANNELS=1.
+    stats.record(lock_wait, parse_busy, data.len(), Instant::now());
+    stats.emit_if_due(Instant::now(), crate::frame_trace::trace_enabled(false));
     // D2 step 3 — UNLOCKED: reply write (D5: freshest cursor/mode state,
     // serialized with main-thread input by the PtyWriter's D4 lock) →
     // control event → wake handled by the caller.
@@ -213,6 +224,7 @@ fn run(
     wake: &WakeFn,
 ) {
     let mut throttle = WakeThrottle::default();
+    let mut stats = ParseWorkerStats::default();
     loop {
         // D2 step 1: block until the reader delivers a batch (or the pane
         // dies → channel closed → thread ends).
@@ -230,6 +242,7 @@ fn run(
                     writer,
                     ctrl_tx,
                     had_output,
+                    &mut stats,
                     &data,
                     parse_batch_locked,
                 ) {
@@ -405,11 +418,13 @@ mod tests {
     fn worker_panic_reports_pty_exited_and_stops() {
         let h = Harness::new();
         let had_output = Arc::clone(&h.had_output);
+        let mut stats = ParseWorkerStats::default();
         let err = process_batch(
             &h.terminal,
             &h.writer,
             &h.ctrl_tx,
             &had_output,
+            &mut stats,
             b"whatever",
             |_terminal, _data| panic!("synthetic parse panic"),
         )
@@ -632,118 +647,11 @@ mod tests {
         assert!(pane.take_had_output());
         assert!(!pane.take_had_output(), "take clears the flag");
     }
-    // ── P3 wall-clock probes (PLAN_v1136 §3 P3) ─────────────────────────
-    // #[ignore] benchmarks: run manually with
-    //   cargo test -p weft_app --release -- --ignored --nocapture probe_real_pty
-    // Real PTY + real reader (T8/T5' batching) + real parse worker — the
-    // full production pipeline minus GUI render/present. The user-facing
-    // `time seq 2000000` acceptance number includes render; this isolates
-    // the scheduling win.
-
-    /// One production pipeline: real Pty -> parse worker -> FairMutex
-    /// Terminal. Returns wall time from spawn until PtyExited (FIFO
-    /// guarantees the terminal is fully caught up at that point).
-    fn probe_pipeline(
-        program: &str,
-        args: &[&str],
-        min_scrollback_lines: u64,
-    ) -> std::time::Duration {
-        use weft_core::input::mouse_suppress::new_flag;
-        use weft_core::pty::Pty;
-
-        // Pty::spawn_with_args tokio::spawns its reader, so the probe needs
-        // a runtime context (the real app provides main's runtime).
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("probe runtime");
-        let _runtime = rt.enter();
-
-        let t0 = Instant::now();
-        let mut pty = Pty::spawn_with_args(program, args, (30, 100), &[], None, new_flag())
-            .expect("probe spawns a shell");
-        let rx = pty.take_event_rx().expect("probe pty has a receiver");
-        let writer = pty.writer();
-        let terminal = Arc::new(FairMutex::new(Terminal::with_scrollback(30, 100, 10_000)));
-        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
-        let had_output = Arc::new(AtomicBool::new(false));
-        // Record the LAST wake: the worker wakes (throttled ~2ms) per batch
-        // drain, so `last_wake - t0` ≈ the `time seq` drain semantics of the
-        // comparison reports (seq exits once the reader has drained the
-        // pty), while the returned wall time is the stricter full-parse
-        // completion (PtyExited fires after the FIFO tail is parsed).
-        let last_wake: Arc<StdMutex<Option<Instant>>> = Arc::new(StdMutex::new(None));
-        let wake_sink = Arc::clone(&last_wake);
-        let wake: WakeFn = Box::new(move || {
-            *wake_sink.lock().unwrap() = Some(Instant::now());
-        });
-        spawn(
-            0,
-            rx,
-            Arc::clone(&terminal),
-            writer,
-            ctrl_tx,
-            had_output,
-            wake,
-        );
-        loop {
-            match ctrl_rx
-                .recv_timeout(std::time::Duration::from_secs(120))
-                .expect("probe pipeline reports PtyExited")
-            {
-                AppMsg::PtyExited(_) => break,
-                AppMsg::AltFlipped { .. } => continue,
-            }
-        }
-        let wall = t0.elapsed();
-        // FIFO + exit contract: at PtyExited the terminal has every byte.
-        // Bare /bin/sh emits no OSC 133, so completeness is proven by the
-        // scrollback's monotonic rows-ever-pushed counter (`position`
-        // survives truncation) — seq 2M must have pushed ~2M lines.
-        let lines = terminal.lock().grid().scrollback.position();
-        assert!(
-            lines >= min_scrollback_lines,
-            "output tail missing after PtyExited (scrollback position {lines})"
-        );
-        if let Some(lw) = *last_wake.lock().unwrap() {
-            println!(
-                "[probe]   drain-to-last-wake = {:?}  full-parse = {wall:?}",
-                lw.duration_since(t0)
-            );
-        }
-        wall
-    }
-
-    #[test]
-    #[ignore = "wall-clock probe: cargo test -p weft_app --release -- --ignored --nocapture probe_real_pty"]
-    fn probe_real_pty_seq2m_single_pane() {
-        let wall = probe_pipeline("/bin/sh", &["-c", "seq 2000000"], 1_990_000);
-        println!("[probe] seq2m single-pane wall = {wall:?} (headless: no render/present)");
-    }
-
-    #[test]
-    #[ignore = "wall-clock probe: cargo test -p weft_app --release -- --ignored --nocapture probe_real_pty"]
-    fn probe_real_pty_seq2m_two_pane_parallel() {
-        // Two independent pipelines at once — the multi-pane amplification
-        // probe (§5.1: amplification <= +15% over single-pane).
-        let (t1, t2) = std::thread::scope(|scope| {
-            let a = scope.spawn(|| probe_pipeline("/bin/sh", &["-c", "seq 2000000"], 1_990_000));
-            let b = scope.spawn(|| probe_pipeline("/bin/sh", &["-c", "seq 2000000"], 1_990_000));
-            (a.join().unwrap(), b.join().unwrap())
-        });
-        let worst = t1.max(t2);
-        println!("[probe] seq2m two-pane walls = {t1:?} / {t2:?} (worst {worst:?})");
-    }
-
-    #[test]
-    #[ignore = "wall-clock probe: cargo test -p weft_app --release -- --ignored --nocapture probe_real_pty"]
-    fn probe_real_pty_echo_and_cat_sanity() {
-        let echo = probe_pipeline("/bin/sh", &["-c", "echo hi"], 0);
-        let cat = probe_pipeline(
-            "/bin/sh",
-            &["-c", "yes AB0123456789 | head -c 1048576"],
-            70_000,
-        );
-        println!("[probe] echo wall = {echo:?}   cat 1MiB wall = {cat:?}");
-    }
 }
+
+// P3 wall-clock probes live in parse_worker_probes.rs (cfg(test) sibling,
+// line-count gate) — run with:
+//   cargo test -p weft_app --release -- --ignored --nocapture probe_real_pty
+#[cfg(test)]
+#[path = "parse_worker_probes.rs"]
+mod probes;
