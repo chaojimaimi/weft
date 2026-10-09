@@ -282,7 +282,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // Appendix H: see reflow_if_live_size_moved (zoom burst).
                 self.reflow_if_live_size_moved(event_loop);
                 self.performance_probe.record_wake();
-                self.pump_pty();
+                // v1.13.6 T10 P2 (D6): no main-thread byte pump — the parse
+                // workers own it; this drains their control events only.
                 self.process_messages();
                 // v1.11.15 (FIX B, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §2):
                 // process_messages → remove_dead can empty `tabs` when the

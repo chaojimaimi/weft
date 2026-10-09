@@ -173,6 +173,11 @@ impl App {
 
     fn perform_clean_shutdown(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("application close confirmed");
+        // [T10 P2 已接受语义·评审 P2-2] `release_pty` 之后主线程**不等待**
+        // 解析 worker 排空积压：最终快照与 worker 并发，退出时最坏丢失
+        // ≤通道容量（~8MiB）的尾部输出。旧 `drain_bounded_close_tail` 的
+        // 兜底本就只有 2MiB/256 事件且与 reader 竞速——有界尾损、幅度可
+        // 接受；worker 全 detached，无悬挂退出风险。
         // DIAGNOSTIC step markers (hang-after-confirm, v1.12.5): the confirm
         // line is the LAST log the field shows -- these pinpoint which
         // teardown stage stops emitting.
@@ -359,7 +364,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_pty_foreground_group_distinguishes_shell_and_external_job() {
-        let pty = weft_core::pty::Pty::spawn("/bin/sh", (24, 80), || {}).unwrap();
+        let pty = weft_core::pty::Pty::spawn("/bin/sh", (24, 80)).unwrap();
+        // v1.13.6 T10 P2 (D4): writes/interrupts go through the shared write
+        // half (assertion semantics unchanged).
+        let writer = pty.writer();
         let shell = pty.child_pid().as_raw();
         let mut shell_seen = false;
         for _ in 0..50 {
@@ -371,7 +379,7 @@ mod tests {
         }
         assert!(shell_seen, "idle PTY foreground group should be the shell");
 
-        pty.write_sync(b"sleep 5\n").unwrap();
+        writer.write_sync(b"sleep 5\n").unwrap();
         let mut job_seen = false;
         for _ in 0..100 {
             if foreground_process_group(pty.master_fd()).is_some_and(|pgid| pgid != shell) {
@@ -381,6 +389,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(job_seen, "external foreground job should own the PTY");
-        assert!(pty.send_interrupt());
+        assert!(writer.send_interrupt());
     }
 }

@@ -339,6 +339,13 @@ impl App {
         // terminal lock (set_block_scroll → sync_primary_history_view), so the
         // guard below only covers the read/metrics phase and is released
         // before the match.
+        //
+        // [P2 TOCTOU 登记·评审裁定本轮不修] the read/metrics lock and the
+        // apply lock are deliberately SEPARATE (the scroll calls re-enter);
+        // the parse worker can change grid/metrics between the two, so the
+        // scroll target can be computed from one-batch-stale metrics. Same
+        // staleness the pre-worker pump produced between its read and the
+        // same-frame scroll; accepted for P2.
         let (rows, _cols, block_view, max_scroll) = {
             let Some(terminal) = tab.lock_terminal() else {
                 return;

@@ -24,14 +24,14 @@
 //! `(&terminal, &mut pane.selection_handler)` in the draw path, or
 //! `terminal ∥ pty` in `interrupt_pty`) keep compiling unchanged.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{ArcMutexGuard, FairMutex, RawFairMutex};
 use weft_core::input::{new_flag, InputHandler, MouseSuppressFlag};
 use weft_core::persistence::TabSnapshot;
-use weft_core::pty::{Pty, PtyError, PtyEvent};
+use weft_core::pty::{Pty, PtyError, PtyWriter};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
@@ -76,6 +76,20 @@ pub struct Pane {
     /// the Arc; the main thread short-scope locks.
     terminal: Option<Arc<FairMutex<Terminal>>>,
     pub pty: Option<Pty>,
+    /// v1.13.6 T10 P2 (D4): the shared PTY write half. The main thread
+    /// (user input / paste / Ctrl+C) and the parse worker (VT query
+    /// replies) each hold an `Arc` clone; the single write mutex lives
+    /// inside [`PtyWriter`]. `None` together with `pty` (spawn failure /
+    /// test panes).
+    pub writer: Option<Arc<PtyWriter>>,
+    /// v1.13.6 T10 P2 (D6): lock-free "the parse worker produced output
+    /// for this pane since the main pump last looked". The retired
+    /// `need_redraw` signal fell out of the main thread draining the bytes
+    /// itself; with parsing in the worker, the pump observes this flag
+    /// instead — it feeds `had_output` (frame trace, the running-output
+    /// follow snap, TUI-scroll resolution) without a lock or a frame of
+    /// artificial delay. Worker sets / `Tab::process_messages` take-clears.
+    pub(crate) had_output: Arc<AtomicBool>,
     /// v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §1.2): reader-side
     /// mouse-suppression flag — shared with this pane's PTY read loop and
     /// Terminal parser. While it is set, weft must not write hover/wheel
@@ -84,6 +98,10 @@ pub struct Pane {
     /// mouse sends are suppressed, never a sibling pane's.
     pub mouse_suppress: MouseSuppressFlag,
     pub msg_rx: Receiver<AppMsg>,
+    /// Worker → main control channel. Since T10 P2 the WORKER holds the
+    /// producing clone; the pane's own handle is the test-injection seam
+    /// (the production main thread only consumes `msg_rx`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub msg_tx: Sender<AppMsg>,
     pub input_handler: InputHandler,
     pub selection_handler: SelectionHandler,
@@ -94,6 +112,21 @@ pub struct Pane {
     /// position the caret at.
     pub ime_preedit_cursor: Option<(usize, usize)>,
     pub pending_pty_resize: Option<(usize, usize)>,
+    /// v1.13.6 T10 P2 review P1-1 (close watchdog): stamped when a close
+    /// initiation drops this pane's PTY (`Tab::begin_close` /
+    /// `close_active_pane`). A SIGHUP-immune child (nohup/setsid) holding the
+    /// slave fd keeps the reader alive forever — no EOF, no `Exit`, no
+    /// `PtyExited` — so the pump finalizes the pane itself once the deadline
+    /// passes (same tail as the exit arm). `None` for every non-closing
+    /// pane; the dedicated `weft-close-watchdog` wake thread guarantees the
+    /// check runs even with zero further output.
+    pub(crate) close_deadline: Option<std::time::Instant>,
+    /// Watchdog/exit double-settle guard: set the moment a pane is finalized
+    /// (watchdog path, or a late real `PtyExited` after the watchdog) so the
+    /// second arrival is consumed as a no-op. Natural exits never need it
+    /// (the pane leaves the map), but the flag makes the race explicit and
+    /// testable.
+    pub(crate) close_settled: bool,
     /// FIX-α (docs/FIX_DRAG_RESIZE_STUTTER.md): instant of the last
     /// SUCCESSFUL resize commit. Stamped only by the apply point after
     /// `commit_pty_resize_result` succeeds — an ioctl failure keeps
@@ -111,7 +144,6 @@ pub struct Pane {
     /// one SIGWINCHes the foreground app — the feedback that keeps a resize
     /// loop alive). `None` until the first successful ioctl.
     pub(crate) last_sent_winsize: Option<(usize, usize)>,
-    pub(crate) pending_pty_output: Option<Vec<u8>>,
     /// R2-1: private — use the block-scroll API methods below instead.
     /// Replaces the raw `usize` offset with a `BlockScrollAnchor` so the
     /// snap-to-bottom caller can tell follow-tail apart from detached-read.
@@ -172,20 +204,18 @@ impl Pane {
         let env_refs: Vec<(&str, &str)> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        let wake_proxy = proxy.clone();
         // v1.11.15 (FIX A): one flag per pane — the PTY reader thread and the
         // Terminal parser share it (see the field doc).
         let mouse_suppress = new_flag();
-        let pty = match Pty::spawn_with_args(
+        // v1.13.6 T10 P2 (D3): no wake closure any more — the parse worker
+        // owns UI wakes; this proxy clone is handed to it below.
+        let mut pty = match Pty::spawn_with_args(
             &shell,
             &[],
             (rows as u16, cols as u16),
             &env_refs,
             cwd,
             mouse_suppress.clone(),
-            move || {
-                let _ = wake_proxy.send_event(AppEvent::Wake);
-            },
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -193,6 +223,11 @@ impl Pane {
                 return Self::empty();
             }
         };
+        // D2 split: the receive half belongs to the parse worker.
+        let event_rx = pty
+            .take_event_rx()
+            .expect("a freshly spawned Pty holds its receiver");
+        let writer = pty.writer();
 
         // v1.11.2 X3 defensive clamp (PLAN_v1112 §5): config values are
         // normalized at load time, but Pane can also be built from programmatic
@@ -207,11 +242,30 @@ impl Pane {
 
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         let terminal = Arc::new(FairMutex::new(terminal));
+        let pane_session_id = NEXT_PANE_SESSION.fetch_add(1, Ordering::Relaxed);
+        let had_output = Arc::new(AtomicBool::new(false));
+        // D2: spawn this pane's parse worker (Pane::empty — PTY spawn
+        // failure — reaches neither this code nor a worker: no receiver
+        // ⇒ no worker).
+        let wake_proxy = proxy.clone();
+        crate::app::parse_worker::spawn(
+            pane_session_id,
+            event_rx,
+            Arc::clone(&terminal),
+            Arc::clone(&writer),
+            msg_tx.clone(),
+            Arc::clone(&had_output),
+            Box::new(move || {
+                let _ = wake_proxy.send_event(AppEvent::Wake);
+            }),
+        );
         Self {
-            pane_session_id: NEXT_PANE_SESSION.fetch_add(1, Ordering::Relaxed),
+            pane_session_id,
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: Some(terminal),
             pty: Some(pty),
+            writer: Some(writer),
+            had_output,
             mouse_suppress,
             msg_rx,
             msg_tx,
@@ -220,9 +274,10 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            close_deadline: None,
+            close_settled: false,
             last_resize_commit: None,
             last_sent_winsize: None,
-            pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
             restored_snapshot: None,
@@ -246,6 +301,9 @@ impl Pane {
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: None,
             pty: None,
+            // T10 P2 (D2): PTY spawn failure — no receiver ⇒ no parse worker.
+            writer: None,
+            had_output: Arc::new(AtomicBool::new(false)),
             mouse_suppress: new_flag(),
             msg_rx,
             msg_tx,
@@ -254,9 +312,10 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            close_deadline: None,
+            close_settled: false,
             last_resize_commit: None,
             last_sent_winsize: None,
-            pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
             restored_snapshot: None,
@@ -285,6 +344,8 @@ impl Pane {
                 scrollback_lines,
             )))),
             pty: None,
+            writer: None,
+            had_output: Arc::new(AtomicBool::new(false)),
             mouse_suppress: new_flag(),
             msg_rx,
             msg_tx,
@@ -293,9 +354,10 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            close_deadline: None,
+            close_settled: false,
             last_resize_commit: None,
             last_sent_winsize: None,
-            pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
             restored_snapshot: None,
@@ -309,14 +371,40 @@ impl Pane {
         }
     }
 
-    // ── v1.13.6 T10 P1: controlled terminal accessors (D9) ───────────────
+    // ── v1.13.6 T10 P1/P2: controlled terminal accessors (D9) ────────────
+    //
+    // D9 RULE 5 — RE-ENTRANCY ROSTER (rust-reviewer P2-1; keep in sync).
+    // Every method below internally locks this pane's terminal. Calling any
+    // of them from inside a guard scope (`lock_terminal` guard live, or a
+    // `with_terminal` closure) DEADLOCKS AT RUNTIME — parking_lot re-locking
+    // is not a compile error. The roster:
+    //   Tab:  set_block_scroll / snap_to_bottom / scroll_up_by /
+    //         scroll_down_by / enter_primary_history_if_active /
+    //         sync_primary_history_view / clamp_block_scroll /
+    //         scroll_block_fractional / sync_mouse_modes /
+    //         resolve_pending_tui_scroll / active_pane_views /
+    //         clear_background_grid_dirty / any_synchronized_output /
+    //         to_snapshot / write_user_input / interrupt_pty /
+    //         process_messages / finish_pending_blocks
+    //   Pane: refresh_primary_history_snapshot(_now) /
+    //         resize_terminal_and_queue / set_blocks_retained_limit /
+    //         set_blocks_output_cap / set_tui_render_mode
+    //   App:  compute_block_view_rows / block_view_active /
+    //         terminal_content_contains / pixel_to_grid
+    // New re-entrant methods MUST be registered here.
+    //
+    // D9 RULE 4 — BLOCKING-OP EXEMPTIONS (rust-reviewer P3-1): channel
+    // `try_send`/`try_recv` (and other non-blocking forms) ARE allowed in a
+    // guard scope; blocking send/recv, fd writes, file IO, and joins are
+    // NOT. The parse worker's control-event send and reply write happen
+    // strictly after its unlock (D2 step 3).
 
     /// Lock this pane's terminal for a multi-statement scope (full draw
     /// frame, post-processing pass, resize commit, `write_user_input`, …).
     /// The returned guard is *owned* (`lock_arc` — holds an `Arc` clone), so
     /// sibling pane fields stay mutable while it is held. D9 discipline:
-    /// never re-lock the same pane inside the guard scope; never hold it
-    /// across channel send/recv, fd writes, or file IO.
+    /// never re-lock the same pane inside the guard scope (see the roster
+    /// above); never hold it across channel send/recv, fd writes, or file IO.
     pub(crate) fn lock_terminal(&self) -> Option<TerminalGuard> {
         self.terminal.as_ref().map(|t| t.lock_arc())
     }
@@ -324,11 +412,18 @@ impl Pane {
     /// Short-scope terminal access for point reads/writes (mode state, cwd,
     /// dims, editor text, …). Returns `None` when the pane has no terminal.
     /// The closure must not itself call `with_terminal`/`lock_terminal` on
-    /// the same pane (no nested locks — D9 rule 2) and must not perform
-    /// blocking operations (D9 rule 4).
+    /// the same pane (no nested locks — D9 rule 2, roster above) and must
+    /// not perform blocking operations (D9 rule 4).
     pub(crate) fn with_terminal<R>(&self, f: impl FnOnce(&mut Terminal) -> R) -> Option<R> {
         let mut guard = self.lock_terminal()?;
         Some(f(&mut guard))
+    }
+
+    /// v1.13.6 T10 P2 (D6): take-and-clear the worker's had_output flag —
+    /// the per-frame "this pane parsed output" signal that replaced the
+    /// main thread's own byte-drain observation.
+    pub(crate) fn take_had_output(&self) -> bool {
+        self.had_output.swap(false, Ordering::Relaxed)
     }
 
     /// Whether this pane has a live terminal (PTY-spawned or test-built).
@@ -341,6 +436,15 @@ impl Pane {
     #[cfg(test)]
     pub(crate) fn set_terminal_for_test(&mut self, terminal: Terminal) {
         self.terminal = Some(Arc::new(FairMutex::new(terminal)));
+    }
+
+    /// Test-only Arc clone of this pane's terminal — lets the REAL parse
+    /// worker thread be wired to a pane without a real PTY (the worker e2e
+    /// test). D9 rule 1 stands for production consumers: nothing outside
+    /// the test builds may obtain the Arc.
+    #[cfg(test)]
+    pub(crate) fn terminal_arc_for_test(&self) -> Option<Arc<FairMutex<Terminal>>> {
+        self.terminal.clone()
     }
 
     /// Bump and return the next per-pane input-event sequence number.
@@ -415,11 +519,33 @@ impl Pane {
     /// the runtime's `BlockingPool` teardown waits for it on the main
     /// thread -- the sampled "not responding" stall. Dropping the Pty sends
     /// SIGHUP and closes the master fd, which lets the wait4 return.
+    /// P1-1 close watchdog delay: how long a closing pane waits for its
+    /// worker's `PtyExited` before the pump finalizes it anyway. Generous
+    /// enough for a full 8 MiB channel backlog to drain at parse speed
+    /// (~200 ms typical), short enough that a hung child cannot leave a
+    /// visible zombie pane.
+    pub(crate) const CLOSE_WATCHDOG_DELAY: std::time::Duration =
+        std::time::Duration::from_millis(500);
+
+    /// Close-initiation teardown: stamp the watchdog deadline, then drop the
+    /// PTY (SIGHUP + master fd close → reader EOF → worker drains the
+    /// backlog → `PtyExited`). The single chokepoint for both close
+    /// initiators (`Tab::begin_close`, `Tab::close_active_pane`).
+    pub(crate) fn begin_close_teardown(&mut self) {
+        self.close_deadline = Some(std::time::Instant::now() + Self::CLOSE_WATCHDOG_DELAY);
+        self.release_pty();
+    }
+
     pub(crate) fn release_pty(&mut self) {
         self.pending_pty_resize = None;
+        // T10 P2: drop the pane's own write half too — post-release writes
+        // fail fast, and the worker's clone keeps the fd alive only until
+        // the event channel closes (then the worker exits and the last
+        // Arc drops the fd).
         if let Some(pty) = self.pty.take() {
             drop(pty);
         }
+        self.writer = None;
     }
 
     /// v1.10.19: Send a queued winsize to the PTY via TIOCSWINSZ, deduping
@@ -477,72 +603,42 @@ impl Pane {
             .or(self.restored_cwd.as_deref())
     }
 
-    /// Non-blocking drain of PTY events into channel. Capped per frame.
-    pub fn pump_pty(&mut self) {
-        let Some(pty) = &mut self.pty else {
-            return;
-        };
-        let tx = self.msg_tx.clone();
-        const MAX_EVENTS_PER_FRAME: usize = 64;
-        // AUDIT_v1.10.39: stop feeding the bounded(1024) channel before it
-        // fills. Producer (this pump) and consumer (process_messages) run on
-        // the SAME main thread in a fixed pump→process order, so a blocking
-        // `tx.send` on a full channel would wait for "ourselves" and hang the
-        // UI thread forever. The high-water check is race-free for exactly
-        // that reason — nothing else sends between check and send. Events
-        // left behind simply stay in the PTY's own queue until next frame.
-        const CHANNEL_HIGH_WATER: usize = 768;
-        let mut count = 0usize;
-        loop {
-            if tx.len() >= CHANNEL_HIGH_WATER {
-                break;
-            }
-            match pty.try_recv() {
-                Ok(PtyEvent::Output(data)) => {
-                    if tx.send(AppMsg::PtyOutput(data)).is_err() {
-                        break;
-                    }
-                }
-                Ok(PtyEvent::Exit(code)) => {
-                    let _ = tx.send(AppMsg::PtyExit(code));
-                    break;
-                }
-                Err(_) => break,
-            }
-            count += 1;
-            if count >= MAX_EVENTS_PER_FRAME {
-                break;
-            }
-        }
-    }
-
     /// Deliver one PTY-native interrupt without discarding command output.
     ///
     /// Ctrl+C is always one ETX byte, regardless of whether the foreground app
     /// uses the alternate screen, primary-screen cursor addressing, raw mode,
-    /// SSH, or a conventional shell command. Output is intentionally retained:
-    /// interactive tools write confirmation/resume tails after the first or
-    /// second Ctrl+C, and a post-write `tcflush` can race away the ETX itself.
+    /// SSH, or a conventional shell command. Output is intentionally retained
+    /// (interactive tools write confirmation/resume tails after the first or
+    /// second Ctrl+C) — with the T10 Flush-marker caveat that a FULL event
+    /// channel skips the marker and degrades to tcflush-only, weakening the
+    /// tail retention under flood (see `Pty::flush_input`).
     pub fn interrupt_pty(&mut self) -> bool {
         self.with_terminal(|t| t.begin_primary_screen_interrupt_capture());
-        // `send_interrupt` only needs `&self`, but `flush_input` needs `&mut`,
-        // so take a single `&mut` borrow of the pty field and keep it alive
-        // across both calls. The terminal guard above is a scoped
-        // with_terminal closure (T10 P1), so the disjoint `&mut self.pty`
-        // borrow below is uncontended.
-        let Some(pty) = self.pty.as_mut() else {
+        // T10 P2 (D4): the ETX goes through the shared writer (it takes the
+        // write lock, so it can never split a worker reply mid-write);
+        // `flush_input` stays on the Pty (tcflush + the Flush marker).
+        let Some(writer) = self.writer.as_ref() else {
             self.with_terminal(|t| t.cancel_primary_screen_interrupt_capture());
             return false;
         };
-        if !pty.send_interrupt() {
+        if !writer.send_interrupt() {
             self.with_terminal(|t| t.cancel_primary_screen_interrupt_capture());
             return false;
         }
         // Best-effort flush of pending input so a half-typed line doesn't
         // leak past the interrupt. `tcflush(TCIFLUSH)` on the master side
-        // clears the kernel's input queue; the app-side reader is the
-        // pump_pty loop, which keeps running and will drain the rest.
-        pty.flush_input();
+        // clears the kernel's input queue; the app-side half is the parse
+        // worker's Flush-marker sweep (D2). Review P2-1, exact semantics:
+        // output queued AHEAD of the marker was already parsed into the
+        // terminal (NOT dropped — today's Ctrl+C dropped it instantly);
+        // only what is still queued behind it is discarded; and when the
+        // bounded channel is full the marker is skipped entirely, so up to
+        // ~8 MiB of backlog keeps parsing past the interrupt — the v1.11.15
+        // resume-tail retention weakens in that arm (P3 probe tracks the
+        // worst-case truncation delay: channel capacity ÷ parse rate).
+        if let Some(pty) = self.pty.as_ref() {
+            pty.flush_input();
+        }
         true
     }
 

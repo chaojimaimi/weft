@@ -98,11 +98,36 @@ impl App {
     /// Cmd+Ctrl+W — close the current tab and return the ordered side effects the
     /// application shell must drain. Closing the last tab requests exit;
     /// otherwise the previous tab becomes active and a redraw is requested.
+    ///
+    /// v1.13.6 T10 P2 (D2): the close is ASYNC under the worker model —
+    /// `begin_close` drops every pane's PTY, each parse worker finishes its
+    /// backlog and reports `PtyExited`, and the exit arm runs the
+    /// settle+drain (`finish_pending_blocks` parity) while the last pane's
+    /// exit walks the existing remove_dead path (final snapshot via N-2,
+    /// final blocks via PersistBlocks). Only a tab with NO PTY-backed pane
+    /// (spawn failure) closes synchronously — nothing would ever report
+    /// `PtyExited` for it.
     pub(super) fn close_tab(&mut self) -> Vec<Effect> {
         // v1.11.13: closing a tab mid-drag would leave drag_index/insert_index
         // pointing past the shrunk Vec. Cancel the gesture first.
         self.cancel_tab_drag();
         let removed_idx = self.sessions.active_idx();
+        let async_pending = self
+            .sessions
+            .tab_mut(removed_idx)
+            .map(crate::tab::Tab::begin_close)
+            .unwrap_or(false);
+        if async_pending {
+            // P1-1b: arm the close watchdog — a SIGHUP-immune child may keep
+            // the reader alive forever; the one-shot wake guarantees the
+            // pump evaluates the stamped deadline.
+            self.schedule_close_watchdog_wake();
+            info!(
+                tab = removed_idx,
+                "tab close: PTY teardown initiated; finishing on PtyExited"
+            );
+            return Vec::new();
+        }
         let blocks = self
             .sessions
             .tab_mut(removed_idx)
@@ -132,6 +157,29 @@ impl App {
             effects.insert(0, Effect::PersistBlocks { blocks });
         }
         effects
+    }
+
+    /// P1-1 close watchdog wake: one-shot thread that fires
+    /// `AppEvent::Wake` at the close-watchdog deadline, so
+    /// `Tab::process_messages`'s deadline check runs even when the dying
+    /// session is completely silent (no output ⇒ no worker wakes). Mirrors
+    /// the `weft-timer` one-shot pattern (app_runtime). Harmless when every
+    /// pane already exited: the check simply finds nothing due.
+    pub(super) fn schedule_close_watchdog_wake(&self) {
+        let delay = crate::pane::Pane::CLOSE_WATCHDOG_DELAY;
+        let proxy = self.proxy.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(String::from("weft-close-watchdog"))
+            .spawn(move || {
+                std::thread::sleep(delay);
+                // EventLoopClosed = loop already gone (teardown won the race)
+                // — silent by design, the repo-wide wake convention
+                // (app_runtime.rs:145-150).
+                let _ = proxy.send_event(AppEvent::Wake);
+            })
+        {
+            tracing::warn!(?error, "weft-close-watchdog spawn failed");
+        }
     }
 
     pub(super) fn finish_all_pending_blocks(&mut self) -> Vec<weft_core::blocks::Block> {

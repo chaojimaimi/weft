@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use weft_core::grid::{CellFlags, CellWidth};
-use weft_core::pty::{Pty, PtyEvent};
+use weft_core::pty::{Pty, PtyEvent, PtyWriter};
 use weft_core::vt::Terminal;
 
 static SANDBOX_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -69,6 +69,11 @@ pub fn sandbox(tag: &str) -> PathBuf {
 /// back exactly as the App does, so Vim/less can finish terminal negotiation.
 pub struct TuiSession {
     pub pty: Pty,
+    /// v1.13.6 T10 P2 (D2): the receive half split off the Pty — this
+    /// harness plays the parse-worker role (recv + reply write) itself.
+    pub rx: tokio::sync::mpsc::Receiver<PtyEvent>,
+    /// The shared write half (D4) — user-input writes and query replies.
+    pub writer: std::sync::Arc<PtyWriter>,
     pub terminal: Terminal,
     pub raw_output: Vec<u8>,
     pub exited: bool,
@@ -92,17 +97,22 @@ impl TuiSession {
             ("EXINIT", ""),
             ("TMUX", ""),
         ];
-        let pty = Pty::spawn_with_args(
+        let mut pty = Pty::spawn_with_args(
             program,
             args,
             (rows, cols),
             &env,
             Some(cwd_text.as_ref()),
             weft_core::input::new_flag(),
-            || {},
         )
         .unwrap_or_else(|error| panic!("failed to spawn {program}: {error}"));
+        // v1.13.6 T10 P2 (D2): the receive half splits off the Pty; this
+        // harness plays the worker role itself (recv + reply write).
+        let rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
+        let writer = pty.writer();
         Self {
+            rx,
+            writer,
             pty,
             terminal: Terminal::new(rows as usize, cols as usize),
             raw_output: Vec::new(),
@@ -112,7 +122,7 @@ impl TuiSession {
     }
 
     pub fn send(&self, bytes: &[u8]) {
-        self.pty.write_sync(bytes).expect("write TUI input");
+        self.writer.write_sync(bytes).expect("write TUI input");
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -125,17 +135,18 @@ impl TuiSession {
         while tokio::time::Instant::now() < deadline && !self.exited {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let wait = remaining.min(Duration::from_millis(25));
-            match tokio::time::timeout(wait, self.pty.recv()).await {
+            match tokio::time::timeout(wait, self.rx.recv()).await {
                 Ok(Some(PtyEvent::Output(bytes))) => {
                     self.raw_output.extend_from_slice(&bytes);
                     self.terminal.process(&bytes);
                     let response = self.terminal.take_response();
                     if !response.is_empty() {
-                        self.pty
+                        self.writer
                             .write_sync(&response)
                             .expect("write terminal query response");
                     }
                 }
+                Ok(Some(PtyEvent::Flush)) => {}
                 Ok(Some(PtyEvent::Exit(status))) => {
                     self.exited = true;
                     self.exit_status = Some(status);

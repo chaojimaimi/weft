@@ -136,13 +136,6 @@ pub struct Tab {
     /// discard pane A's accumulated record, un-freezing A's storm early
     /// (the v1.10.19 "A 面板风暴误伤 B 面板" mirror regression).
     alt_flip_history: HashMap<PaneId, AltFlipHistory>,
-    /// FIX_background_pane_pump (rust-reviewer H-1): the FIRST pane the LAST
-    /// frame's shared budget deferred (`Some` only when panes were left for
-    /// the next frame). The next frame's per-pane pass rotates the sorted
-    /// order to start AT that pane, so a persistently saturating sibling
-    /// defers panes round-robin instead of pinning the deferral on one
-    /// arbitrary (HashMap-order) target.
-    pump_rotation: Option<PaneId>,
     /// v1.10.19: time the pending rescale was last consumed by
     /// `take_pending_alt_rescale`. A fresh toggle inside the debounce window
     /// after a consumed recompute marks a burst (the SIGWINCH feedback loop
@@ -480,6 +473,23 @@ impl Tab {
     /// happen — `active_pane` is always kept in sync with the tree).
     pub(crate) fn close_active_pane(&mut self) -> Result<bool, SplitError> {
         let closing = self.active_pane;
+        // v1.13.6 T10 P2 (D2): a PTY-backed pane closes ASYNCHRONOUSLY —
+        // drop its PTY (`begin_close`); the worker finishes the backlog and
+        // reports `PtyExited`, whose arm runs the finish-parity (force-settle
+        // + drain) and tree shrink via the SAME `close_exited_pane` a natural
+        // shell exit uses. A pane without a PTY (spawn failure, test panes —
+        // or a SECOND close after the first already dropped it) closes
+        // synchronously as before.
+        if self
+            .panes
+            .get(&closing)
+            .is_some_and(|pane| pane.pty.is_some())
+        {
+            if let Some(pane) = self.panes.get_mut(&closing) {
+                pane.begin_close_teardown();
+            }
+            return Ok(false);
+        }
         let new_active = self.split_tree.close_pane(closing)?;
         // Update `active_pane` BEFORE removing from `panes` so the invariant
         // ("active_pane always points at a live pane in `panes`") is never
@@ -596,7 +606,6 @@ impl Tab {
             pending_alt_rescale: false,
             alt_flip_history: HashMap::new(),
             alt_rescale_last_taken: None,
-            pump_rotation: None,
             resize_output_probe: None,
         }
     }
@@ -723,15 +732,6 @@ impl Tab {
         })
     }
 
-    /// Non-blocking drain of PTY events into channel. Capped per frame.
-    /// FIX_background_pane_pump §2.1: pumps EVERY pane (was active-only);
-    /// the implementation lives in `tab/pane_pump.rs` with the consume half.
-    pub fn pump_pty(&mut self) {
-        for pane in self.panes.values_mut() {
-            pane.pump_pty();
-        }
-    }
-
     /// v1.11.15 (FIX A, PLAN_v11115 §1.2): whether the active pane's PTY
     /// reader observed this session's mouse-disable sequence (or its exit).
     /// While true, no hover/wheel bytes may be written to this pane — the
@@ -747,8 +747,10 @@ impl Tab {
     /// shortcut, non-active owner tabs) — it reads the TARGET tab.
     /// Borrow-split precedent: mouse_controller.rs's sync.
     pub fn sync_mouse_modes(&mut self) {
-        // T10 P1: the guard is owned (`lock_arc`) so the `input_handler`
-        // writes below don't conflict with the terminal reads above.
+        // T10: mode flags read under ONE short guard ending at the `drop`
+        // below; the `input_handler` writes afterwards are lock-free pane
+        // fields (reads extracted first). Re-entrancy (D9 rule 5): this
+        // method locks — never call it inside another guard scope.
         let Some(terminal) = self.lock_terminal() else {
             return;
         };
@@ -799,6 +801,9 @@ impl Tab {
         // grid mid-interaction — the openclaw "jump to top" symptom. The
         // redraw_controller's follow logic already snaps on fresh output when
         // appropriate, so this snap is redundant during execution anyway.
+        // [P2 TOCTOU 登记·接受一帧滞后] executing=probe 短锁快照，与分支动
+        // 作之间 worker 可翻转 phase：最坏单键入走错分支、下一键自纠；PTY
+        // 写两分支均无条件执行，无输入丢失/数据损坏。
         let executing = self
             .with_terminal(|t| {
                 t.block_tracker().phase() == weft_core::blocks::ShellPhase::CommandExecuting
@@ -846,13 +851,15 @@ impl Tab {
         }
         let pane = self.active_mut();
         pane.with_terminal(|t| t.cancel_primary_screen_interrupt_capture());
-        let pty = pane.pty.as_ref().ok_or_else(|| {
+        // T10 P2 (D4): through the shared write half — this lock serializes
+        // against the parse worker's VT replies at the fd boundary.
+        let writer = pane.writer.as_ref().ok_or_else(|| {
             PtyError::Write(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "tab has no PTY",
             ))
         })?;
-        pty.write_sync_reported(data)
+        writer.write_sync_reported(data)
     }
 
     /// Directory inherited by a newly-created sibling tab. Prefer live OSC 7

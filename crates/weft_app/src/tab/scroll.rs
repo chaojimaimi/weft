@@ -102,9 +102,15 @@ impl Tab {
         // Does not touch block_scroll_anchor — only flips primary_history_view
         // so the renderer switches to the history snapshot. The anchor stays
         // whatever the user last set (FollowBottom until they scroll).
-        // T10 P1: two sequential short locks (mode probe, then the flip) —
-        // the pane's terminal cannot disappear between them on the single
-        // main thread, so the former `.expect` degenerates to `unwrap_or`.
+        // T10 P1: two sequential short locks (mode probe, then the flip).
+        //
+        // [P2 TOCTOU 登记·评审裁定本轮不修] probe→flip is now a REAL
+        // two-lock window: the parse worker can flip primary_screen_app_active
+        // (OSC-driven mode change) between the probe and the flip, so a
+        // just-died primary TUI could still enter history view. Pre-P2 the
+        // two steps were one drain-pass apart; the window is the same
+        // order. Accept for P2 (one-frame equivalent), revisit if the GUI
+        // checklist shows a stale history entry.
         let active = self
             .with_terminal(|t| t.primary_screen_app_active())
             .unwrap_or(false);
@@ -211,15 +217,21 @@ impl Tab {
     /// v1.10.20: made `pub(crate)` — mouse release re-syncs after the
     /// deferred history-view exit (改动 2).
     pub(crate) fn sync_primary_history_view(&mut self) {
-        // v1.3: snapshot the anchor offset before borrowing `terminal` so
-        // the disjoint-field borrow through `DerefMut` doesn't conflict.
-        // `block_scroll_anchor` and `terminal` are both on the active pane;
-        // reading the offset first releases the immutable pane borrow before
-        // `&mut pane.terminal` is taken.
+        // T10: the terminal is reached through the lock accessors (P1), so
+        // there is no long-lived field borrow to sequence around — the
+        // anchor read below is a plain pane field and the terminal state
+        // rides the short guard. Re-entrancy: this method itself locks
+        // (D9 rule 5 roster) — never call it inside a guard scope.
+        //
+        // [P2 TOCTOU 登记·评审裁定本轮不修] `detached` is probed BEFORE the
+        // locks below; with the parse worker running, a batch can settle
+        // between the probe and the `browsing` decision, so the view flip
+        // may lag one batch behind the newest state. Same single-frame
+        // window the pre-worker pump had (probe vs. drain order); accepted
+        // for P2, revisit only if the GUI checklist shows drift.
         let detached = !matches!(self.block_scroll_anchor, BlockScrollAnchor::FollowBottom);
-        // v1.10.21: snapshot the peek flag before the terminal borrow so the
-        // entry gate (sibling Tab field) can be armed afterwards — see
-        // snap_to_bottom for the DerefMut borrow constraint.
+        // v1.10.21: the peek flag is read under its own short lock so the
+        // entry gate (sibling pane field) can be armed afterwards.
         let peek_was_active = self
             .with_terminal(|t| t.is_alt_screen_history_peek())
             .unwrap_or(false);
@@ -302,9 +314,9 @@ impl Pane {
     pub(super) fn snap_to_bottom(&mut self) {
         self.block_scroll_anchor = BlockScrollAnchor::FollowBottom;
         self.block_scroll_fraction = 0.0;
-        // v1.10.21: snapshot the peek flag BEFORE the mutable terminal
-        // borrow — the entry gate is a sibling field and the closure
-        // below can't touch it while `self.terminal` is borrowed.
+        // v1.10.21: the peek flag is read under its own short lock (T10
+        // accessors) so the gate — a sibling pane field — can be armed
+        // after the lock ends.
         let peek_was_active = self
             .with_terminal(|t| t.is_alt_screen_history_peek())
             .unwrap_or(false);

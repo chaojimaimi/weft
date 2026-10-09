@@ -6,8 +6,6 @@
 //! while rewiring (same file split as `pty/tests.rs`), so the production
 //! file stays under its architecture budget. Changes living here:
 //!
-//! - Backlog-state UI wake interval tightened 16 ms → 2 ms (the decision
-//!   itself stays in the parent as `pty_wake_due`, T8);
 //! - Consecutive non-blocking reads are aggregated into one
 //!   `PtyEvent::Output` batch by the pure [`read_batch`] until the soft
 //!   target, a WouldBlock, the hard [`EVENT_CAP`], or EOF ends the batch —
@@ -18,6 +16,10 @@
 //!   a select-armed loop top, so a trickle can never strand the bytes), and
 //!   the batch count collapses from ~50k/s to hundreds/s. An idle stream's
 //!   first batch is never held — interactive echo is unchanged.
+//! - v1.13.6 T10 P2 (D3): the reader no longer wakes the UI — the wake
+//!   closure is gone and the `WakeThrottle` + `pty_wake_due` machinery was
+//!   handed to the weft_app parse worker (definitions stay in the parent,
+//!   exported).
 
 use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -27,7 +29,7 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::sync::mpsc;
 
-use super::{monotonic_millis, pty_wake_due, PtyEvent, WakeThrottle, PTY_CHANNEL_CAP};
+use super::{monotonic_millis, PtyEvent};
 use crate::input::{MouseDisableScanner, MouseSuppressFlag};
 
 /// Hard upper bound on one aggregated read batch — i.e. one `PtyEvent::Output`
@@ -35,11 +37,11 @@ use crate::input::{MouseDisableScanner, MouseSuppressFlag};
 /// STRUCTURALLY by [`read_batch`]: the first read is capped at the caller's
 /// scratch buffer (production: the 256 KiB PTY read buffer) and every
 /// continuation read requests `min(scratch_len, EVENT_CAP − batch.len())`,
-/// so no sequence of kernel reads can push a batch past `EVENT_CAP`. Single
-/// source of truth: the app crate's oversize-split threshold
-/// (`pane_pump.rs::MAX_BYTES_PER_MESSAGE`) re-exports this constant, so a
-/// production message can never trigger the split path and T1's
-/// `has_pending_tail`-is-production-false invariant stays true.
+/// so no sequence of kernel reads can push a batch past `EVENT_CAP`. T10 P2:
+/// the pre-worker main-thread pump re-exported this constant as its
+/// oversize-split threshold; that pump is retired (the parse worker consumes
+/// batches directly), so EVENT_CAP now solely bounds the channel message —
+/// and with it the worker's locked parse slice.
 pub const EVENT_CAP: usize = 256 * 1024;
 
 /// Soft flush target (T8): a batch is flushed once it holds at least this
@@ -223,9 +225,12 @@ where
 ///
 /// v1.11.2 X2 (PLAN_v1112 §2): `tx` is bounded; a full channel suspends this
 /// task on `send().await`, which backpressures into the kernel PTY buffer and
-/// ultimately blocks the child's writes — bytes are never dropped. UI wakes
-/// are throttled during floods (`WakeThrottle` + `pty_wake_due`); Exit
-/// always wakes.
+/// ultimately blocks the child's writes — bytes are never dropped.
+///
+/// v1.13.6 T10 P2 (D3): the reader NO LONGER wakes the UI — the `wake`
+/// closure parameter is gone and wake ownership moved to the weft_app parse
+/// worker (which reuses the exported `WakeThrottle` + `pty_wake_due`).
+/// Everything else is unchanged.
 ///
 /// v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §1): every chunk is fed
 /// through a persistent [`MouseDisableScanner`] BEFORE it is queued; the
@@ -251,23 +256,20 @@ where
 /// readability in a select-armed loop top), a terminal stop, or the EVENT_CAP
 /// pre-append check. Invariants untouched: the scanner/`WEFT_PTY_CAPTURE`
 /// tee stay per-read (so the suppression flag still flips the moment the
-/// bytes EXIST — on an active stream their forwarding to the UI may now lag
-/// by ≤4 ms, which is the declared echo-latency ceiling), caught-up is
-/// sampled before every send (inside [`flush_output`]), Exit always wakes,
-/// and the wake throttle is unchanged. An idle stream's first batch is never
-/// held: the activity decision uses the pre-batch stamp.
-pub(super) async fn read_loop<W: Fn() + Send + 'static>(
+/// bytes EXIST — on an active stream their forwarding to the consumer may
+/// now lag by ≤4 ms, which is the declared echo-latency ceiling). An idle
+/// stream's first batch is never held: the activity decision uses the
+/// pre-batch stamp.
+pub(super) async fn read_loop(
     fd: OwnedFd,
     child_pid: Pid,
     tx: mpsc::Sender<PtyEvent>,
     suppress: MouseSuppressFlag,
-    mut wake: W,
 ) {
     // Buffer size: 256KB as per architecture doc (== EVENT_CAP; read_batch
     // additionally caps every request to the batch's remaining room).
     const BUF_SIZE: usize = 256 * 1024;
 
-    let mut throttle = WakeThrottle::default();
     // Persistent across chunks: a sequence split across reads stays inside
     // the FSM (no carry buffer needed).
     let mut mouse_scanner = MouseDisableScanner::new();
@@ -361,7 +363,7 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
                         // Same rule as the terminal stops: bytes already
                         // read are flushed before the exit tail.
                         if let Some((held, _)) = pending.take() {
-                            let _ = flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await;
+                            let _ = flush_output(&tx, child_pid, held).await;
                         }
                         break;
                     }
@@ -371,7 +373,7 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
                     // drop back to the plain loop top — held bytes never
                     // wait on data that may never come.
                     let (held, _) = pending.take().expect("pending held across the timer arm");
-                    if !flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await {
+                    if !flush_output(&tx, child_pid, held).await {
                         break;
                     }
                     continue;
@@ -457,7 +459,7 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
                 // on child exit). Receiver gone or not, the tail runs
                 // either way; the helper already SIGHUP'd on Err.
                 if let Some((held, _)) = pending.take() {
-                    let _ = flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await;
+                    let _ = flush_output(&tx, child_pid, held).await;
                 }
                 break;
             }
@@ -498,7 +500,7 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
                 .is_some_and(|(held, _)| held.len() + data.len() >= EVENT_CAP);
             if cap_hit {
                 let (held, _) = pending.take().expect("cap_hit implies pending");
-                if !flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await {
+                if !flush_output(&tx, child_pid, held).await {
                     break;
                 }
             }
@@ -521,11 +523,11 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
         // Output can exceed EVENT_CAP; a failed first send short-circuits
         // the second (helper returns false → break).
         if let Some((held, _)) = pending.take() {
-            if !flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await {
+            if !flush_output(&tx, child_pid, held).await {
                 break;
             }
         }
-        if !flush_output(&tx, child_pid, &mut throttle, &mut wake, data).await {
+        if !flush_output(&tx, child_pid, data).await {
             break;
         }
         if terminal.is_some() {
@@ -553,53 +555,32 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
         }
         Err(e) => Err(format!("waitpid failed: {e}")),
     };
-    // v1.11.2 X2: Exit bypasses the throttle entirely (pty_wake_due's
-    // is_exit arm) — the UI must learn of the dead child immediately.
-    if tx.send(PtyEvent::Exit(exit_status)).await.is_ok() {
-        wake();
-    }
+    // v1.11.2 X2 → v1.13.6 T10 P2 (D3): Exit is enqueued behind the drained
+    // backlog; the parse worker's Exit arm forces the UI wake (bypassing its
+    // throttle) — the reader itself no longer wakes anyone.
+    let _ = tx.send(PtyEvent::Exit(exit_status)).await;
 }
 
 /// Shared Output flush (T5' second-round review P2): every send point in
 /// [`read_loop`] funnels through here, so the send-error semantics exist in
-/// exactly one place — sample `caught-up` BEFORE the send (v1.11.2 X2: an
-/// empty queue means the consumer must be woken so fresh output is pumped
-/// promptly; a full channel suspends here, the intended backpressure path),
-/// then send, then the wake check.
+/// exactly one place — a full channel suspends in `send().await` (the
+/// intended backpressure path).
 ///
-/// On `Err` (receiver dropped ⟹ Pty dropped — v1.11.16 Fix B1 semantics,
-/// explicitly preserved) the child is SIGHUP'd and `false` tells the caller
-/// to break into the shared exit tail; for a pending+data pair a failed
-/// first send short-circuits the second. `PtyEvent::Exit` does NOT go
-/// through here (it has its own always-wake arm).
+/// On `Err` (receiver dropped ⟹ the parse worker is gone and with it the
+/// pane — v1.11.16 Fix B1 semantics, explicitly preserved) the child is
+/// SIGHUP'd and `false` tells the caller to break into the shared exit tail;
+/// for a pending+data pair a failed first send short-circuits the second.
+/// `PtyEvent::Exit` does NOT go through here (it has its own arm).
 ///
-/// (tokio 1.53's Sender has no len(); full remaining capacity is exactly
-/// "queue is empty" for this single-producer task.)
-/// (`W` reaches the helper as `&mut W`: a mutable reference is `Send`
-/// whenever `W: Send`, so the spawned `read_loop` future stays `Send`
-/// without widening `Pty::spawn`'s public `W` bound to `Sync`.)
-async fn flush_output<W: Fn()>(
-    tx: &mpsc::Sender<PtyEvent>,
-    child_pid: Pid,
-    throttle: &mut WakeThrottle,
-    wake: &mut W,
-    data: Vec<u8>,
-) -> bool {
-    let consumer_caught_up = tx.capacity() >= PTY_CHANNEL_CAP;
+/// v1.13.6 T10 P2 (D3): the caught-up sample and the wake/throttle calls the
+/// v1.11.2 X2 design performed here are GONE — wake ownership moved to the
+/// parse worker; this helper is now a plain send.
+async fn flush_output(tx: &mpsc::Sender<PtyEvent>, child_pid: Pid, data: Vec<u8>) -> bool {
     if tx.send(PtyEvent::Output(data)).await.is_err() {
         // Drop::drop runs before field drops, so SIGHUP is already sent on
         // the Pty drop path; re-kill is a harmless ESRCH no-op.
         let _ = signal::kill(child_pid, Signal::SIGHUP);
         return false;
-    }
-    // Nudge the UI event loop so fresh output is pumped promptly, instead
-    // of idling until the next keyboard/mouse event — but at most once per
-    // `FLOOD_WAKE_INTERVAL_MS` while backlogged (T8 tightened the v1.11.2
-    // X2 interval from 16 ms ~60 Hz).
-    let now_ms = monotonic_millis();
-    if pty_wake_due(false, consumer_caught_up, throttle.last(), now_ms) {
-        wake();
-        throttle.stamp(now_ms);
     }
     true
 }

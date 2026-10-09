@@ -159,7 +159,7 @@ impl crate::App {
             // renderer (Batch 5) will make splits visible. Until then,
             // splits "work" (panes exist, focus cycles, PTYs run) but only
             // the active pane is drawn — the inactive panes keep their
-            // terminals updated in the background via pump_pty /
+            // terminals updated in the background via the parse workers /
             // process_messages on the active tab's Deref path.
             Action::SplitHorizontal | Action::SplitVertical => {
                 let direction = match action {
@@ -299,6 +299,11 @@ impl crate::App {
                     None => {}
                     Some(Ok(false)) => {
                         tracing::info!("pane closed, tab still has panes");
+                        // P1-1: a PTY-backed close is async (PtyExited-driven);
+                        // arm the watchdog wake so a SIGHUP-immune child cannot
+                        // leave the closing pane hanging past the deadline.
+                        // Harmless for the synchronous path (nothing due).
+                        self.schedule_close_watchdog_wake();
                         self.recompute_layout();
                         self.refresh_find_for_active_tab();
                         self.request_redraw();

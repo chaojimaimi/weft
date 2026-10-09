@@ -1,14 +1,13 @@
-//! PTY session pumping, message processing, and redraw requests — extracted
-//! from `main.rs` (v1.12.25 3-B-2 P2-01).
+//! PTY session message processing and redraw requests — extracted from
+//! `main.rs` (v1.12.25 3-B-2 P2-01).
 //!
-//! `spawn_pty` / `pump_pty` / `process_messages` / `request_redraw` are the
-//! per-frame session I/O core. Their call sites span the top-level controller
-//! family (`app_runtime`, `redraw_controller`, mouse / transfer /
-//! accessibility controllers, …), so the visibility is `pub(crate)` —
-//! `pub(super)` would only reach the `app` module tree and break every
-//! top-level caller. Method bodies are moved verbatim (zero behavior
-//! change); `main.rs` keeps the `App` struct definition, `new()` and
-//! `tab()`.
+//! `spawn_pty` / `process_messages` / `request_redraw` are the per-frame
+//! session I/O core. Their call sites span the top-level controller family
+//! (`app_runtime`, `redraw_controller`, mouse / transfer / accessibility
+//! controllers, …), so the visibility is `pub(crate)` — `pub(super)` would
+//! only reach the `app` module tree and break every top-level caller.
+//! v1.13.6 T10 P2 (D6): `pump_pty` is retired — the parse workers own the
+//! byte path; `process_messages` below consumes worker control events only.
 
 use crate::effect;
 use crate::first_run_welcome;
@@ -46,21 +45,12 @@ impl App {
         // out of zsh history). The marker file is created in
         // first_run_welcome() so this only fires once ever.
         if let Some(cmd) = first_run_welcome() {
-            if let Some(p) = tab.pty.as_ref() {
-                let _ = p.write_sync(cmd.as_bytes());
+            // T10 P2 (D4): through the shared write half.
+            if let Some(writer) = tab.writer.as_ref() {
+                let _ = writer.write_sync(cmd.as_bytes());
             }
         }
         self.sessions.push_tab(tab);
-    }
-
-    /// Non-blocking drain of PTY events into channel. Drains ALL tabs per
-    /// frame (v0.9 H1 decision: background tabs keep their PTY buffers
-    /// flushed so switching to them is instant; only the active tab is
-    /// rendered).
-    pub(crate) fn pump_pty(&mut self) {
-        for tab in self.sessions.tabs_mut() {
-            tab.pump_pty();
-        }
     }
 
     pub(crate) fn process_messages(&mut self) -> bool {

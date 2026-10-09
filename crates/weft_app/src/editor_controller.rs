@@ -746,16 +746,11 @@ impl App {
                 warn!(%error, "failed to submit editor command to PTY");
             }
         }
-        let resp = self
-            .sessions
-            .active_mut()
-            .and_then(|tab| tab.with_terminal(|t| t.take_response()))
-            .unwrap_or_default();
-        if !resp.is_empty() {
-            if let Some(pty) = self.sessions.active_mut().and_then(|tab| tab.pty.as_ref()) {
-                let _ = pty.write_sync(&resp);
-            }
-        }
+        // v1.13.6 T10 P2 (D5): NO take_response + write here — the parse
+        // worker owns the reply path (it answers VT queries right after the
+        // batch that carried them, with freshest cursor/mode state). The
+        // submit path never generates a response itself, so this was a
+        // double-consumption dead path in the worker world.
         // Snap the block view to the bottom so the user sees the new
         // command's output. Without this, a fast command (e.g. `echo hi`)
         // finishes before the next redraw's `had_output && phase ==

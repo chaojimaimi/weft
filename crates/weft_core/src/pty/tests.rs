@@ -3,8 +3,14 @@
 //! -> `tab/tests.rs`, `vt/mod.rs` -> `vt/tests.rs`). Declared in
 //! `pty.rs` via `#[cfg(test)] #[path = "pty/tests.rs"] mod tests;`.
 
+use std::time::Duration;
+
 use super::read_loop::{hold_expired, read_batch, stream_active, BatchStop, EVENT_CAP};
 use super::*;
+use std::os::unix::io::IntoRawFd;
+// The wake/batch child module re-imports through `super::*`; keep its
+// tokens importable here too.
+use tokio::sync::mpsc;
 
 #[test]
 fn resize_ioctl_failure_is_propagated() {
@@ -84,16 +90,18 @@ fn build_child_env_skips_nul_entries() {
 /// Test that spawning a PTY with /bin/cat works and we can read/write.
 #[tokio::test]
 async fn spawn_and_echo() {
-    let mut pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
+    let mut pty = Pty::spawn("/bin/cat", (24, 80)).expect("failed to spawn PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     // Give the child a moment to start.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Write something.
-    pty.write(b"hello\n").await.expect("write failed");
+    // Write something (the write half is now the shared PtyWriter, D4).
+    let writer = pty.writer();
+    writer.write(b"hello\n").await.expect("write failed");
 
     // Read it back (cat echoes input).
-    let output = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv())
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
         .expect("timeout waiting for output")
         .expect("channel closed");
@@ -106,6 +114,7 @@ async fn spawn_and_echo() {
                 "expected output to contain 'hello', got: {s:?}"
             );
         }
+        PtyEvent::Flush => {}
         PtyEvent::Exit(code) => {
             panic!("child exited unexpectedly: {code:?}");
         }
@@ -115,7 +124,7 @@ async fn spawn_and_echo() {
 /// Test that resize doesn't error.
 #[tokio::test]
 async fn resize_works() {
-    let pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
+    let pty = Pty::spawn("/bin/cat", (24, 80)).expect("failed to spawn PTY");
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -130,7 +139,7 @@ async fn resize_works() {
 fn spawn_rejects_nul_in_program_with_invalid_program() {
     // Match instead of formatting the whole Result: Pty is not Debug, and
     // the Err arm only needs the (Debug) error for the failure message.
-    match Pty::spawn_with_args("/bin/za\0sh", &[], (24, 80), &[], None, new_flag(), || {}) {
+    match Pty::spawn_with_args("/bin/za\0sh", &[], (24, 80), &[], None, new_flag()) {
         Err(err @ PtyError::InvalidProgram(_)) => {
             assert!(err.to_string().contains("NUL"), "{err}");
         }
@@ -141,15 +150,7 @@ fn spawn_rejects_nul_in_program_with_invalid_program() {
 
 #[test]
 fn spawn_rejects_nul_in_arg_with_invalid_program() {
-    match Pty::spawn_with_args(
-        "/bin/echo",
-        &["a\0b"],
-        (24, 80),
-        &[],
-        None,
-        new_flag(),
-        || {},
-    ) {
+    match Pty::spawn_with_args("/bin/echo", &["a\0b"], (24, 80), &[], None, new_flag()) {
         Err(err @ PtyError::InvalidProgram(_)) => {
             assert!(err.to_string().contains("NUL"), "{err}");
         }
@@ -162,15 +163,15 @@ fn spawn_rejects_nul_in_arg_with_invalid_program() {
 /// Uses `sleep 0` (exits immediately with code 0).
 #[tokio::test]
 async fn detects_child_exit() {
-    let mut pty =
-        Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), &[], None, new_flag(), || {})
-            .expect("failed to spawn PTY");
+    let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), &[], None, new_flag())
+        .expect("failed to spawn PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     // Collect events until we get an Exit.
     let mut got_exit = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
 
         match event {
             Ok(Some(PtyEvent::Exit(result))) => {
@@ -181,6 +182,7 @@ async fn detects_child_exit() {
                 break;
             }
             Ok(Some(PtyEvent::Output(_))) => continue,
+            Ok(Some(PtyEvent::Flush)) => continue,
             Ok(None) => break, // channel closed
             Err(_) => break,   // timeout
         }
@@ -191,9 +193,10 @@ async fn detects_child_exit() {
 /// Test sync write.
 #[tokio::test]
 async fn sync_write_works() {
-    let pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
+    let pty = Pty::spawn("/bin/cat", (24, 80)).expect("failed to spawn PTY");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    pty.write_sync(b"test\n").expect("sync write failed");
+    let writer = pty.writer();
+    writer.write_sync(b"test\n").expect("sync write failed");
 }
 
 /// Ctrl+C must remain a PTY byte for raw-mode consumers such as SSH and
@@ -207,22 +210,15 @@ async fn interrupt_delivers_exactly_one_etx_to_raw_mode() {
         "byte=$(/bin/dd bs=1 count=1 2>/dev/null | /usr/bin/od -An -tu1); ",
         "printf 'BYTE:%s\\r\\n' \"$byte\""
     );
-    let mut pty = Pty::spawn_with_args(
-        "/bin/sh",
-        &["-c", script],
-        (24, 80),
-        &[],
-        None,
-        new_flag(),
-        || {},
-    )
-    .expect("failed to spawn raw-mode PTY fixture");
+    let mut pty = Pty::spawn_with_args("/bin/sh", &["-c", script], (24, 80), &[], None, new_flag())
+        .expect("failed to spawn raw-mode PTY fixture");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     let mut output = String::new();
     let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while !output.contains("READY") && tokio::time::Instant::now() < ready_deadline {
         if let Ok(Some(PtyEvent::Output(bytes))) =
-            tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
         {
             output.push_str(&String::from_utf8_lossy(&bytes));
         }
@@ -231,14 +227,16 @@ async fn interrupt_delivers_exactly_one_etx_to_raw_mode() {
         output.contains("READY"),
         "raw fixture did not become ready: {output:?}"
     );
-    assert!(pty.send_interrupt(), "ETX write should succeed");
+    let writer = pty.writer();
+    assert!(writer.send_interrupt(), "ETX write should succeed");
 
     let exit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while tokio::time::Instant::now() < exit_deadline {
-        match tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
             Ok(Some(PtyEvent::Output(bytes))) => {
                 output.push_str(&String::from_utf8_lossy(&bytes));
             }
+            Ok(Some(PtyEvent::Flush)) => {}
             Ok(Some(PtyEvent::Exit(result))) => {
                 assert_eq!(result, Ok(0));
                 break;
@@ -274,15 +272,16 @@ async fn extra_env_reaches_child() {
         &[("WEFT_TEST_OVERRIDE", "sentinel-12345")],
         None,
         new_flag(),
-        || {},
     )
     .expect("failed to spawn PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     let mut buf = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
             Ok(Some(PtyEvent::Output(data))) => buf.extend_from_slice(&data),
+            Ok(Some(PtyEvent::Flush)) => {}
             Ok(Some(PtyEvent::Exit(_))) => break,
             Ok(None) => break,
             Err(_) => break,
@@ -317,15 +316,16 @@ fn error_display() {
 #[tokio::test]
 #[ignore]
 async fn spawn_unknown_command_child_exits() {
-    let mut pty = Pty::spawn("/no/such/binary/xyzzy", (24, 80), || {})
+    let mut pty = Pty::spawn("/no/such/binary/xyzzy", (24, 80))
         .expect("forkpty itself should succeed even if the program doesn't exist");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     // The child's exec will fail → it exits with code 127. Collect
     // events until we see the Exit.
     let mut got_exit = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
         match event {
             Ok(Some(PtyEvent::Exit(result))) => {
                 // exec failure → child exits with 127.
@@ -338,6 +338,7 @@ async fn spawn_unknown_command_child_exits() {
                 break;
             }
             Ok(Some(PtyEvent::Output(_))) => continue,
+            Ok(Some(PtyEvent::Flush)) => continue,
             Ok(None) => break,
             Err(_) => break,
         }
@@ -551,9 +552,10 @@ fn write_all_nonblocking_times_out_against_real_full_pipe() {
 async fn write_sync_large_write_into_saturated_child_reports_ok() {
     // `/bin/sleep` never reads stdin, so the child's input queue is
     // permanently saturated; the kernel discards the overflow.
-    let pty = Pty::spawn("/bin/sleep", (24, 80), || {}).expect("failed to spawn PTY");
+    let pty = Pty::spawn("/bin/sleep", (24, 80)).expect("failed to spawn PTY");
     let payload = vec![0x55u8; 1024 * 1024];
-    let result = pty.write_sync(&payload);
+    let writer = pty.writer();
+    let result = writer.write_sync(&payload);
     assert!(
         result.is_ok(),
         "write_sync must stay Ok() into a saturated child, got {result:?}"
@@ -614,9 +616,10 @@ fn map_write_outcome_reports_written_bytes_honestly() {
 /// `write_sync_reported` must report the exact byte count.
 #[tokio::test]
 async fn write_sync_reported_returns_full_len_into_saturated_child() {
-    let pty = Pty::spawn("/bin/sleep", (24, 80), || {}).expect("failed to spawn PTY");
+    let pty = Pty::spawn("/bin/sleep", (24, 80)).expect("failed to spawn PTY");
     let payload = vec![0x41u8; 64 * 1024];
-    let reported = pty
+    let writer = pty.writer();
+    let reported = writer
         .write_sync_reported(&payload)
         .expect("reported write must stay Ok into a saturated child");
     assert_eq!(
@@ -625,7 +628,7 @@ async fn write_sync_reported_returns_full_len_into_saturated_child() {
         "master writes must report full len"
     );
     assert!(
-        matches!(pty.write_sync_reported(b""), Ok(0)),
+        matches!(writer.write_sync_reported(b""), Ok(0)),
         "empty write reports 0"
     );
 }
@@ -651,15 +654,15 @@ async fn pty_write_large_payload_is_fully_delivered() {
             &[],
             None,
             new_flag(),
-            || {},
         )
         .expect("failed to spawn PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
     // Wait for the child to be in raw mode before writing.
     let mut output = Vec::new();
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !contains_subslice(&output, b"READY") && tokio::time::Instant::now() < ready_deadline {
         if let Ok(Some(PtyEvent::Output(data))) =
-            tokio::time::timeout(Duration::from_millis(200), pty.recv()).await
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
         {
             output.extend_from_slice(&data);
         }
@@ -669,15 +672,18 @@ async fn pty_write_large_payload_is_fully_delivered() {
     // Printable bytes only; the kernel FIFO preserves order, so dd
     // consuming exactly the payload length proves full delivery.
     let payload: Vec<u8> = (0..256 * 1024u32).map(|i| b'A' + (i % 26) as u8).collect();
-    pty.write(&payload)
+    let writer = pty.writer();
+    writer
+        .write(&payload)
         .await
         .expect("large write must loop until fully accepted");
     // Drain until the child's DONE marker (it cannot fire early: dd only
     // finishes after exactly payload.len() one-byte reads).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while !contains_subslice(&output, b"DONE") && tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), pty.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(PtyEvent::Output(data))) => output.extend_from_slice(&data),
+            Ok(Some(PtyEvent::Flush)) => {}
             Ok(Some(PtyEvent::Exit(_))) | Ok(None) => break,
             Err(_) => {}
         }
@@ -712,7 +718,6 @@ async fn read_loop_sets_suppress_flag_on_mouse_disable_bytes() {
         &[],
         None,
         flag.clone(),
-        || {},
     )
     .expect("failed to spawn PTY");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -732,22 +737,16 @@ async fn read_loop_sets_suppress_flag_on_mouse_disable_bytes() {
 async fn read_loop_sets_suppress_flag_on_child_exit() {
     let flag = new_flag();
     assert!(!crate::input::is_suppressed(&flag));
-    let mut pty = Pty::spawn_with_args(
-        "/bin/sleep",
-        &["0"],
-        (24, 80),
-        &[],
-        None,
-        flag.clone(),
-        || {},
-    )
-    .expect("failed to spawn PTY");
+    let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), &[], None, flag.clone())
+        .expect("failed to spawn PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), pty.recv()).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
         match event {
             Ok(Some(PtyEvent::Exit(_))) => break,
             Ok(Some(PtyEvent::Output(_))) => {}
+            Ok(Some(PtyEvent::Flush)) => {}
             Ok(None) | Err(_) => break,
         }
         if tokio::time::Instant::now() >= deadline {
@@ -773,14 +772,15 @@ async fn receiver_drop_during_flood_reaps_child() {
     // send arm when we drop the Pty. `yes` is spawned directly (not via
     // `sh -c`) so SIGHUP kills the child itself rather than leaving a
     // grandchild holding the PTY open.
-    let mut pty = Pty::spawn_with_args("/usr/bin/yes", &[], (24, 80), &[], None, new_flag(), || {})
+    let mut pty = Pty::spawn_with_args("/usr/bin/yes", &[], (24, 80), &[], None, new_flag())
         .expect("failed to spawn flooding PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     // Pump a few events so the read loop is running and the channel
     // is live, then capture the pid and drop the whole Pty — this
     // drops the receiver, which makes the next `tx.send()` fail.
     for _ in 0..5 {
-        let _ = tokio::time::timeout(Duration::from_millis(500), pty.recv()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
     }
     let pid = pty.child_pid();
     drop(pty);
@@ -816,19 +816,12 @@ async fn receiver_drop_sets_mouse_suppressed() {
     let flag = new_flag();
     assert!(!crate::input::is_suppressed(&flag));
 
-    let mut pty = Pty::spawn_with_args(
-        "/usr/bin/yes",
-        &[],
-        (24, 80),
-        &[],
-        None,
-        flag.clone(),
-        || {},
-    )
-    .expect("failed to spawn flooding PTY");
+    let mut pty = Pty::spawn_with_args("/usr/bin/yes", &[], (24, 80), &[], None, flag.clone())
+        .expect("failed to spawn flooding PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     for _ in 0..5 {
-        let _ = tokio::time::timeout(Duration::from_millis(500), pty.recv()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
     }
     drop(pty);
 
@@ -842,6 +835,69 @@ async fn receiver_drop_sets_mouse_suppressed() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+// ── v1.13.6 T10 P2 (D2): the Flush marker protocol ──────────────────
+// Both arms of the `try_send` injection are pinned WITHOUT a real PTY:
+// `inject_flush_marker` takes the fd and the sender separately, so a
+// /dev/null fd (tcflush fails silently there — ignored by design) and a
+// plain bounded channel drive both arms deterministically.
+
+fn marker_test_fd() -> OwnedFd {
+    let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+    // SAFETY: from_raw_fd takes ownership of a fd we just opened.
+    unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) }
+}
+
+/// Arm 1 — channel has room: the marker is queued and a receiver observes
+/// `PtyEvent::Flush` (the worker's discard order).
+#[test]
+fn flush_marker_is_injected_when_the_channel_has_room() {
+    let (tx, mut rx) = mpsc::channel(PTY_CHANNEL_CAP);
+    inject_flush_marker(&marker_test_fd(), &tx);
+    assert!(
+        matches!(rx.try_recv(), Ok(PtyEvent::Flush)),
+        "the Flush marker must reach the receiver"
+    );
+}
+
+/// Arm 2 — bounded channel full (flood-phase norm): `try_send` fails, the
+/// injection degrades to tcflush-only and must neither block nor queue the
+/// marker behind the backlog.
+#[test]
+fn flush_marker_is_skipped_when_the_channel_is_full() {
+    let (tx, mut rx) = mpsc::channel(2);
+    tx.try_send(PtyEvent::Output(vec![b'x'; 8])).unwrap();
+    tx.try_send(PtyEvent::Output(vec![b'y'; 8])).unwrap();
+    assert!(tx.capacity() == 0, "precondition: channel saturated");
+    inject_flush_marker(&marker_test_fd(), &tx);
+    // Drain: only the pre-existing backlog comes out — no Flush anywhere.
+    let drained: Vec<PtyEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(drained.len(), 2, "the saturated backlog is untouched");
+    assert!(
+        drained.iter().all(|e| matches!(e, PtyEvent::Output(_))),
+        "a full channel must skip the marker, not block or reorder"
+    );
+}
+
+/// The `Pty::flush_input` wrapper keeps behaving like the free fn: tcflush
+/// plus the marker, against a real spawned PTY (cat stays alive so the
+/// channel has room). Also pins the one-shot nature of the receiver split.
+#[tokio::test]
+async fn flush_input_injects_the_marker_into_a_live_pty() {
+    let mut pty = Pty::spawn("/bin/cat", (24, 80)).expect("failed to spawn PTY");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
+    pty.flush_input();
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for the Flush marker")
+        .expect("channel closed");
+    assert!(
+        matches!(event, PtyEvent::Flush),
+        "expected Flush, got {event:?}"
+    );
+    // A second take is None — the split is one-shot.
+    assert!(pty.take_event_rx().is_none());
 }
 
 // T8 tests (read_batch stop conditions, wake table, flood integrity)

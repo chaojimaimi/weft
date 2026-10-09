@@ -452,6 +452,13 @@ impl App {
                     return;
                 };
                 target
+                // [P2 TOCTOU 登记·评审裁定本轮不修] the metrics lock above
+                // and the set_block_scroll apply lock below are separate
+                // (the scroll call re-enters the terminal lock, D9 rule 5);
+                // the parse worker can reflow between them, so the jump
+                // target can be one batch stale — the pre-worker pump had
+                // the identical window between its read phase and the
+                // scroll. Accepted for P2.
             };
             if let Some(tab) = self.sessions.active_mut() {
                 tab.set_block_scroll(target);

@@ -148,7 +148,6 @@ fn snapshot_tree_conversion_pairs_leaves_in_dfs_order() {
 fn empty_tab_starts_without_transient_pending_state() {
     let tab = Tab::empty();
     assert!(tab.pending_pty_resize.is_none());
-    assert!(tab.pending_pty_output.is_none());
     assert!(tab.ime_preedit.is_empty());
 }
 
@@ -340,9 +339,8 @@ fn to_snapshot_keeps_pty_dead_pane_serializable_with_cwd_fallback_only() {
 fn queued_alt_screen_teardown_output_is_preserved() {
     let mut tab = tab_with_terminal();
     tab.lock_terminal().unwrap().process(b"\x1b[?1049h");
-    tab.msg_tx
-        .send(AppMsg::PtyOutput(b"\x1b[?1049lresume hint".to_vec()))
-        .unwrap();
+    // T10 P2: output is injected through the worker-shaped test seam.
+    tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[?1049lresume hint");
 
     let (_, _, need_redraw, _) = tab.process_messages();
 
@@ -369,12 +367,10 @@ fn queued_primary_tui_teardown_becomes_a_screen_snapshot() {
     // process_messages re-locks this pane's terminal.
     drop(terminal);
 
-    tab.msg_tx
-        .send(AppMsg::PtyOutput(
-            b"\x1b[2J\x1b[HResume this session with:\x1b[2;1Hscreen-app --resume abc\x1b]133;D;130\x07\x1b]133;A\x07"
-                .to_vec(),
-        ))
-        .unwrap();
+    tab.feed_pty_output_for_test(
+        tab.active_pane_id(),
+        b"\x1b[2J\x1b[HResume this session with:\x1b[2;1Hscreen-app --resume abc\x1b]133;D;130\x07\x1b]133;A\x07",
+    );
 
     let (_, blocks, need_redraw, _) = tab.process_messages();
 
@@ -406,9 +402,7 @@ fn failed_interrupt_does_not_drop_queued_output_or_reset_shell_phase() {
     );
     // T10 P1 (D9 rule 2): release the guard before interrupt_pty/process_messages.
     drop(terminal);
-    tab.msg_tx
-        .send(AppMsg::PtyOutput(b"still-running-tail".to_vec()))
-        .unwrap();
+    tab.feed_pty_output_for_test(tab.active_pane_id(), b"still-running-tail");
 
     assert!(
         !tab.interrupt_pty(),
@@ -467,13 +461,11 @@ fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
     // T10 P1 (D9 rule 2): release the guard before process_messages re-locks.
     drop(terminal);
 
-    tab.msg_tx
-        .send(AppMsg::PtyOutput(
-            b"\x1b]133;D;130\x07\x1b]133;A\x07\x1b[2J\x1b[HPress Ctrl-C again to exit\x1b[2;1HResume this session with:\x1b[3;1Hscreen-app --resume late"
-                .to_vec(),
-        ))
-        .unwrap();
-    tab.msg_tx.send(AppMsg::PtyExit(Ok(130))).unwrap();
+    tab.feed_pty_output_for_test(
+        tab.active_pane_id(),
+        b"\x1b]133;D;130\x07\x1b]133;A\x07\x1b[2J\x1b[HPress Ctrl-C again to exit\x1b[2;1HResume this session with:\x1b[3;1Hscreen-app --resume late",
+    );
+    tab.msg_tx.send(AppMsg::PtyExited(Ok(130))).unwrap();
 
     let (alive, blocks, need_redraw, _) = tab.process_messages();
 
@@ -487,9 +479,10 @@ fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
     );
 }
 
-/// v1.11.4 (PLAN_v1114 §1.3/§4.8): AppMsg::PtyExit (the main-message-pump
-/// hook in tab.rs) clears BOTH kitty keyboard stacks — a dead shell must
-/// never leave negotiated flags behind for whatever respawns.
+/// v1.11.4 (PLAN_v1114 §1.3/§4.8): AppMsg::PtyExited (the worker→main
+/// control event consumed by Tab::process_messages) clears BOTH kitty
+/// keyboard stacks — a dead shell must never leave negotiated flags behind
+/// for whatever respawns.
 #[test]
 fn pty_exit_resets_kitty_keyboard_flags() {
     let mut tab = tab_with_terminal();
@@ -499,9 +492,9 @@ fn pty_exit_resets_kitty_keyboard_flags() {
     // T10 P1 (D9 rule 2): release the guard before process_messages re-locks.
     drop(terminal);
 
-    tab.msg_tx.send(AppMsg::PtyExit(Ok(0))).unwrap();
+    tab.msg_tx.send(AppMsg::PtyExited(Ok(0))).unwrap();
     let (alive, _, _, _) = tab.process_messages();
-    assert!(!alive, "PtyExit must be processed");
+    assert!(!alive, "PtyExited must be processed");
     let mut terminal = tab.lock_terminal().unwrap();
     assert_eq!(terminal.keyboard_protocol_flags(), 0, "main stack cleared");
     terminal.process(b"\x1b[?1049l");
@@ -512,9 +505,9 @@ fn pty_exit_resets_kitty_keyboard_flags() {
     );
 }
 
-/// v1.11.4 (PLAN_v1114 §1.3): the close-tail path (drain_bounded_close_tail,
-/// lifecycle.rs — AppMsg::PtyExit while a primary-screen tail is pending)
-/// applies the same kitty reset a dying shell triggers while a tab closes.
+/// v1.11.4 (PLAN_v1114 §1.3): the close contract (T10 P2: the PtyExited arm
+/// in pane_pump — a dying shell while a tab closes) applies the same kitty
+/// reset a natural shell exit triggers.
 #[test]
 fn close_tail_pty_exit_resets_kitty_keyboard_flags() {
     let mut tab = tab_with_terminal();
@@ -532,45 +525,17 @@ fn close_tail_pty_exit_resets_kitty_keyboard_flags() {
     // T10 P1 (D9 rule 2): release the guard before finish_pending_blocks.
     drop(terminal);
 
-    tab.msg_tx.send(AppMsg::PtyExit(Ok(0))).unwrap();
-    tab.finish_pending_blocks();
+    // T10 P2 (D2): the close contract is async — the PtyExited ARM owns the
+    // close-tail kitty reset now (the synchronous channel drain that used to
+    // do it is retired with the main-thread byte pump).
+    tab.msg_tx.send(AppMsg::PtyExited(Ok(0))).unwrap();
+    tab.process_messages();
     let terminal = tab.lock_terminal().unwrap();
     assert_eq!(
         terminal.keyboard_protocol_flags(),
         0,
-        "close-tail PtyExit must clear kitty flags"
+        "close-tail PtyExited must clear kitty flags"
     );
-}
-
-#[test]
-fn oversized_output_remainder_stays_ahead_of_queued_pty_exit() {
-    let mut tab = tab_with_terminal();
-    let mut terminal = tab.lock_terminal().unwrap();
-    terminal.process(b"\x1b]133;A\x07");
-    terminal.editor_mut().buffer.set_text("screen-app");
-    terminal.submit_command();
-    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H");
-    // T10 P1 (D9 rule 2): release the guard before process_messages re-locks.
-    drop(terminal);
-
-    let mut output = vec![b'x'; 256 * 1024 + 1];
-    output.extend_from_slice(
-        b"\x1b]133;D;130\x07\x1b]133;A\x07\x1b[2J\x1b[HResume this session with:\x1b[2;1Hscreen-app --resume ordered",
-    );
-    tab.msg_tx.send(AppMsg::PtyOutput(output)).unwrap();
-    tab.msg_tx.send(AppMsg::PtyExit(Ok(130))).unwrap();
-
-    let (alive, blocks, _, _) = tab.process_messages();
-    assert!(alive);
-    assert!(blocks.is_empty());
-    assert!(tab.pending_pty_output.is_some());
-
-    let (alive, blocks, _, _) = tab.process_messages();
-    assert!(!alive);
-    assert_eq!(blocks.len(), 1);
-    assert!(blocks[0]
-        .output
-        .ends_with("Resume this session with:\nscreen-app --resume ordered"));
 }
 
 #[test]
@@ -585,9 +550,10 @@ fn closing_a_tab_force_settles_its_pending_primary_tui_block() {
     assert!(terminal.primary_screen_exit_pending());
     // T10 P1 (D9 rule 2): release the guard before finish_pending_blocks.
     drop(terminal);
-    tab.msg_tx
-        .send(AppMsg::PtyOutput(b"\x1b[2J\x1b[Hlate close tail".to_vec()))
-        .unwrap();
+    // T10 P2 (D2): the late tail is parsed by the worker (test seam here)
+    // BEFORE the close finishes it — the async contract keeps it in the
+    // block.
+    tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2J\x1b[Hlate close tail");
 
     let blocks = tab.finish_pending_blocks();
 
@@ -598,43 +564,13 @@ fn closing_a_tab_force_settles_its_pending_primary_tui_block() {
 }
 
 #[test]
-fn closing_a_primary_tui_does_not_chase_an_unbounded_output_producer() {
-    let mut tab = tab_with_terminal();
-    let mut terminal = tab.lock_terminal().unwrap();
-    terminal.process(b"\x1b]133;A\x07");
-    terminal.editor_mut().buffer.set_text("screen-app");
-    terminal.submit_command();
-    terminal
-        .process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H\x1b]133;D;0\x07\x1b]133;A\x07");
-    assert!(terminal.primary_screen_exit_pending());
-    // T10 P1 (D9 rule 2): release the guard before finish_pending_blocks.
-    drop(terminal);
-    for _ in 0..=super::lifecycle::MAX_CLOSE_TAIL_EVENTS {
-        tab.msg_tx.send(AppMsg::PtyOutput(b"x".to_vec())).unwrap();
-    }
-
-    let blocks = tab.finish_pending_blocks();
-
-    assert_eq!(blocks.len(), 1);
-    assert_eq!(
-        tab.msg_rx.len(),
-        1,
-        "close must process a fixed queue snapshot"
-    );
-}
-
-#[test]
 fn synchronized_output_suppresses_partial_frame_until_commit() {
     let mut tab = tab_with_terminal();
-    tab.msg_tx
-        .send(AppMsg::PtyOutput(b"\x1b[?2026hpartial".to_vec()))
-        .unwrap();
+    tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[?2026hpartial");
     let (_, _, partial_redraw, _) = tab.process_messages();
     assert!(!partial_redraw);
 
-    tab.msg_tx
-        .send(AppMsg::PtyOutput(b" frame\x1b[?2026l".to_vec()))
-        .unwrap();
+    tab.feed_pty_output_for_test(tab.active_pane_id(), b" frame\x1b[?2026l");
     let (_, _, committed_redraw, _) = tab.process_messages();
     assert!(committed_redraw);
     assert!(tab

@@ -16,9 +16,15 @@ pub(crate) mod effect_dispatch;
 pub(crate) mod focus;
 pub(crate) mod helpers;
 pub(crate) mod keyboard;
+// v1.13.6 T10 P2 (PLAN_v1136 §1 D2): the per-pane parse worker — one
+// `weft-parse-<session_id>` thread feeding the pane's FairMutex terminal
+// directly; the main thread keeps only control events + the post pass.
+pub(crate) mod parse_worker;
 // v1.12.25 (3-B-2 P2-01): per-frame session I/O core (`spawn_pty` /
 // `pump_pty` / `process_messages` / `request_redraw`) moved verbatim out of
 // `main.rs`; bodies zero-rewritten, visibility `pub(crate)`.
+// v1.13.6 T10 P2 (D6): `pump_pty` is retired — the parse worker owns the
+// byte path; `process_messages` drains control events only.
 pub(crate) mod session_pump;
 // v1.11.5 (PLAN_v1115 §M2): UI-event dispatch table + Dock badge debounce.
 pub(crate) mod ui_events;

@@ -19,6 +19,7 @@ mod alt_peek;
 // v1.10.21: alt-screen wheel dispatch (route() wiring; controller stays lean).
 mod alt_wheel_controller;
 mod app;
+mod app_msg;
 mod app_runtime;
 mod app_state;
 mod block_actions;
@@ -167,10 +168,7 @@ pub(crate) use context_menu_component::CONTEXT_MENU_ITEMS;
 
 // ── Messages between threads ─────────────────────────────────────────
 
-pub(crate) enum AppMsg {
-    PtyOutput(Vec<u8>),
-    PtyExit(Result<i32, String>),
-}
+pub(crate) use app_msg::AppMsg;
 
 /// Cross-thread wake-up for the winit event loop.
 ///

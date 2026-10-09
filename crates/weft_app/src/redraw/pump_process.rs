@@ -16,7 +16,8 @@ impl crate::App {
     /// `process_messages` and is only meaningful with [`PhaseOutcome::Continue`]
     /// (on `Abort` the caller returns immediately and never reads it).
     pub(crate) fn redraw_pump_phase(&mut self) -> (PhaseOutcome, bool) {
-        self.pump_pty();
+        // v1.13.6 T10 P2 (D6): no main-thread byte pump — the parse workers
+        // own it; process_messages below drains their control events only.
         // v1.11.15 review P2: tabs may ALREADY be empty here — emptied by a
         // previous event's process_messages while a drag gesture stayed
         // armed. pump_selection_autoscroll derefs the active tab through

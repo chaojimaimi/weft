@@ -16,11 +16,17 @@ use weft_core::shell::Integration;
 use weft_core::vt::Terminal;
 
 /// Drain PTY output until the child exits or the deadline passes.
-async fn collect(pty: &mut Pty, deadline: tokio::time::Instant) -> Vec<u8> {
+/// v1.13.6 T10 P2: the receive half is taken off the `Pty` (D2 split) —
+/// assertion semantics unchanged.
+async fn collect(
+    rx: &mut tokio::sync::mpsc::Receiver<PtyEvent>,
+    deadline: tokio::time::Instant,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), pty.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
             Ok(Some(PtyEvent::Output(d))) => buf.extend_from_slice(&d),
+            Ok(Some(PtyEvent::Flush)) => {}
             Ok(Some(PtyEvent::Exit(_))) => break,
             Ok(None) => break,
             Err(_) => {} // keep draining until deadline/exit
@@ -61,7 +67,6 @@ fn spawn_sandboxed_zsh() -> (Pty, std::path::PathBuf) {
         &env_refs,
         None,
         weft_core::input::new_flag(),
-        || {},
     )
     .expect("failed to spawn zsh");
     (pty, sandbox)
@@ -75,14 +80,16 @@ async fn zsh_emits_osc133_markers_without_echoing_hook() {
     }
 
     let (mut pty, sandbox) = spawn_sandboxed_zsh();
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     // Let the first prompt render, then run a command and exit.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    pty.write(b"echo weft_marker_probe\n").await.unwrap();
-    pty.write(b"exit\n").await.unwrap();
+    let writer = pty.writer();
+    writer.write(b"echo weft_marker_probe\n").await.unwrap();
+    writer.write(b"exit\n").await.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let out = collect(&mut pty, deadline).await;
+    let out = collect(&mut rx, deadline).await;
     let _ = std::fs::remove_dir_all(&sandbox);
 
     let s = String::from_utf8_lossy(&out);
@@ -137,12 +144,14 @@ async fn zsh_output_becomes_block() {
     }
 
     let (mut pty, sandbox) = spawn_sandboxed_zsh();
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    pty.write(b"echo weft_block_probe\n").await.unwrap();
-    pty.write(b"exit\n").await.unwrap();
+    let writer = pty.writer();
+    writer.write(b"echo weft_block_probe\n").await.unwrap();
+    writer.write(b"exit\n").await.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let out = collect(&mut pty, deadline).await;
+    let out = collect(&mut rx, deadline).await;
     let _ = std::fs::remove_dir_all(&sandbox);
 
     let mut term = Terminal::new(24, 80);

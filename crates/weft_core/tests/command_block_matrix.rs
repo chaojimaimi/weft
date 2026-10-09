@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use weft_core::blocks::{Block, ANSI_ATTRIBUTE_MASK};
 use weft_core::grid::{CellColor, CellFlags};
-use weft_core::pty::{Pty, PtyEvent};
+use weft_core::pty::{Pty, PtyEvent, PtyWriter};
 use weft_core::shell::Integration;
 use weft_core::vt::Terminal;
 
@@ -35,7 +35,13 @@ const COLS: u16 = 100;
 /// Drop removes the sandbox dir, and the `Pty`'s Drop SIGHUPs the child, so
 /// no process or temp state leaks between tests.
 struct IntegratedSession {
-    pty: Pty,
+    /// Kept for its Drop side effect (SIGHUP to the child) — the fd itself
+    /// is only touched through the halves below since the T10 P2 split.
+    _pty: Pty,
+    /// v1.13.6 T10 P2 (D2): the receive half split off the Pty.
+    rx: tokio::sync::mpsc::Receiver<PtyEvent>,
+    /// The shared write half (D4).
+    writer: std::sync::Arc<PtyWriter>,
     term: Terminal,
     /// Everything zsh wrote, kept for failure-message diagnostics.
     raw: Vec<u8>,
@@ -76,18 +82,22 @@ impl IntegratedSession {
         env.push(("HOME", fake_home_str));
         let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let pty = Pty::spawn_with_args(
+        let mut pty = Pty::spawn_with_args(
             "/bin/zsh",
             &[],
             (ROWS, COLS),
             &env_refs,
             None,
             weft_core::input::new_flag(),
-            || {},
         )
         .expect("failed to spawn zsh");
+        // v1.13.6 T10 P2 (D2): receiver split + writer handle.
+        let rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
+        let writer = pty.writer();
         Some(Self {
-            pty,
+            _pty: pty,
+            rx,
+            writer,
             term: Terminal::new(ROWS as usize, COLS as usize),
             raw: Vec::new(),
             exited: false,
@@ -100,7 +110,7 @@ impl IntegratedSession {
     async fn send_line(&self, line: &str) {
         let mut bytes = line.as_bytes().to_vec();
         bytes.push(b'\n');
-        self.pty.write(&bytes).await.expect("write to zsh pty");
+        self.writer.write(&bytes).await.expect("write to zsh pty");
     }
 
     /// Drain PTY output into the Terminal until the deadline, the child
@@ -108,11 +118,12 @@ impl IntegratedSession {
     /// feeding the live parser instead of only an accumulating buffer.
     async fn pump_until(&mut self, deadline: tokio::time::Instant) {
         while tokio::time::Instant::now() < deadline && !self.exited {
-            match tokio::time::timeout(Duration::from_millis(200), self.pty.recv()).await {
+            match tokio::time::timeout(Duration::from_millis(200), self.rx.recv()).await {
                 Ok(Some(PtyEvent::Output(bytes))) => {
                     self.raw.extend_from_slice(&bytes);
                     self.term.process(&bytes);
                 }
+                Ok(Some(PtyEvent::Flush)) => {}
                 Ok(Some(PtyEvent::Exit(_))) | Ok(None) => {
                     self.exited = true;
                 }

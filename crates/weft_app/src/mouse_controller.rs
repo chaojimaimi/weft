@@ -691,7 +691,8 @@ impl App {
         y: f64,
     ) {
         // v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): the per-event
-        // `pump_pty + process_messages` (v0.9 alt-screen-entry fix) was
+        // `process_messages` (v0.9 alt-screen-entry fix; the retired
+        // main-thread `pump_pty` half is now the parse worker) was
         // removed — the redraw path (`handle_redraw_requested`) pumps the
         // PTY on every frame, so a wheel event sees terminal state at most
         // one frame stale (a single event during the CSI ?1049h transition
@@ -842,9 +843,8 @@ impl App {
         let up = rows > 0;
         let lines = rows.unsigned_abs() as usize;
 
-        // Short-lived immutable borrow to read the mode flags up-front —
-        // avoids holding a long-lived mutable borrow of `terminal` across
-        // later accesses to `block_scroll_offset`, `renderer`, etc.
+        // Short-lived LOCK (T10 accessors) to read the mode flags up-front;
+        // the encode path and pane-field writes below run lock-free.
         let tui_starting = self
             .sessions
             .active_mut()
@@ -1092,12 +1092,20 @@ impl App {
                 tab.scroll_down_by(lines);
             }
         } else {
-            // Grid view scroll — needs mutable terminal.
+            // Grid view scroll — needs the terminal lock.
             // v1.10.20 改动 4 (drift guard): a grid selection is
             // viewport-relative; scrolling would silently drift its anchor
             // (L2). No migration path exists here (non-TUI grid), so clear
             // the selection instead of corrupting the copy range. Only when
             // the offset actually moves — offset 0 + scroll-down is a no-op.
+            //
+            // [P2 TOCTOU 登记·评审裁定本轮不修] probe→clear→scroll is a
+            // three-step sequence over two locks; the parse worker can grow
+            // the scrollback between the probe lock and the scroll lock, so
+            // the "offset will change" verdict can be one batch stale. The
+            // failure mode (selection cleared without an actual scroll, or
+            // vice versa one batch later) is the same single-batch
+            // staleness the pre-worker pump produced; accepted for P2.
             let (had_selection, offset_will_change) = {
                 let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal());
                 match terminal {

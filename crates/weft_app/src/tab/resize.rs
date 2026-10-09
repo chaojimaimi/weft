@@ -193,9 +193,19 @@ impl Tab {
     /// longer discard pane A's accumulated record, so A's burst signature
     /// survives and "different panes' storms never freeze each other"
     /// holds by construction.
-    pub(crate) fn record_alt_flip_instants(&mut self, pane_id: PaneId, batch_flips: u64) {
+    // v1.13.6 T10 P2: `at` is the WORKER-side stamp captured at the diff
+    // point (the `AltFlipped` control-event payload) — stamping at
+    // main-thread consumption time would drift the storm/debounce windows
+    // by up to a frame (P2 review). The pre-worker behavior (stamp = now at
+    // recording time) is unchanged when the caller stamps inline.
+    pub(crate) fn record_alt_flip_instants(
+        &mut self,
+        pane_id: PaneId,
+        batch_flips: u64,
+        at: std::time::Instant,
+    ) {
         debug_assert!(batch_flips > 0);
-        let now = std::time::Instant::now();
+        let now = at;
         if batch_flips >= 2 {
             // A single batch with ≥2 toggles lands both storm instants at
             // `now` — a sub-µs double flip, the tightest possible storm.

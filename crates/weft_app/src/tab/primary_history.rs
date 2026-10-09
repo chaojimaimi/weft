@@ -147,7 +147,6 @@ impl Pane {
 mod tests {
     use super::*;
     use crate::pane::Pane;
-    use crate::AppMsg;
 
     fn primary_tui_tab() -> Tab {
         // v1.3: build a pane with a live Terminal (no PTY), wrap in a single-pane
@@ -209,9 +208,9 @@ mod tests {
         tab.scroll_up_by(1);
         assert!(tab.lock_terminal().unwrap().primary_history_view());
 
-        tab.msg_tx
-            .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gfresh".to_vec()))
-            .unwrap();
+        // T10 P2: the PtyOutput channel variant is gone — output is injected
+        // through the worker-shaped test seam (parse + AltFlipped + flag).
+        tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2K\x1b[1Gfresh");
         tab.process_messages();
         assert_eq!(
             tab.lock_terminal()
@@ -233,9 +232,7 @@ mod tests {
         // rate-limit stamp, so it succeeds immediately; the SECOND output
         // (within the 50ms window) schedules the wake.
         tab.snap_to_bottom();
-        tab.msg_tx
-            .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gtail".to_vec()))
-            .unwrap();
+        tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2K\x1b[1Gtail");
         tab.process_messages();
         assert_eq!(
             tab.lock_terminal()
@@ -247,9 +244,7 @@ mod tests {
             "tail",
             "following the tail must refresh the live snapshot again"
         );
-        tab.msg_tx
-            .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gtail2".to_vec()))
-            .unwrap();
+        tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2K\x1b[1Gtail2");
         tab.process_messages();
         assert!(
             !tab.take_primary_history_refresh_wake_delays().is_empty(),
@@ -261,14 +256,10 @@ mod tests {
     fn quiet_tail_refresh_survives_leave_and_reenter_before_old_deadline() {
         let mut tab = primary_tui_tab();
         // First output: no rate-limit stamp yet → refresh succeeds directly.
-        tab.msg_tx
-            .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gfirst".to_vec()))
-            .unwrap();
+        tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2K\x1b[1Gfirst");
         tab.process_messages();
         // Second output inside the 50ms window → rate-limited → deadline set.
-        tab.msg_tx
-            .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gsecond".to_vec()))
-            .unwrap();
+        tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2K\x1b[1Gsecond");
         tab.process_messages();
         assert!(!tab.take_primary_history_refresh_wake_delays().is_empty());
 
@@ -277,13 +268,9 @@ mod tests {
         // generation that can claim its own deadline.
         tab.scroll_up_by(1);
         tab.snap_to_bottom();
-        tab.msg_tx
-            .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gfinal".to_vec()))
-            .unwrap();
+        tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2K\x1b[1Gfinal");
         tab.process_messages();
-        tab.msg_tx
-            .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gfinal2".to_vec()))
-            .unwrap();
+        tab.feed_pty_output_for_test(tab.active_pane_id(), b"\x1b[2K\x1b[1Gfinal2");
         tab.process_messages();
         let delay = tab
             .take_primary_history_refresh_wake_delays()

@@ -232,9 +232,9 @@ async fn flood_read_batches_preserve_byte_stream() {
         &[],
         None,
         new_flag(),
-        || {},
     )
     .expect("failed to spawn flood fixture");
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
 
     // FNV-1a 64-bit — dependency-free, deterministic.
     let fnv_init: u64 = 0xcbf2_9ce4_8422_2325;
@@ -250,19 +250,22 @@ async fn flood_read_batches_preserve_byte_stream() {
             tokio::time::Instant::now() < deadline,
             "flood fixture did not finish in time"
         );
-        let event = tokio::time::timeout(Duration::from_secs(10), pty.recv())
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("recv stalled for 10s");
         match event {
             Some(PtyEvent::Output(data)) => {
                 max_event = max_event.max(data.len());
-                max_queue_depth = max_queue_depth.max(pty.queued_event_count());
+                // v1.13.6 T10 P2: the receiver moved to the test — `len()` is the
+                // same queue-depth snapshot `queued_event_count` used to report.
+                max_queue_depth = max_queue_depth.max(rx.len());
                 for &byte in &data {
                     received_hash ^= byte as u64;
                     received_hash = received_hash.wrapping_mul(fnv_prime);
                 }
                 total += data.len();
             }
+            Some(PtyEvent::Flush) => continue,
             Some(PtyEvent::Exit(result)) => {
                 assert_eq!(result, Ok(0), "flood child must exit cleanly");
                 break;
@@ -327,10 +330,10 @@ async fn slow_stream_hold_preserves_all_bytes_in_order() {
         &[],
         None,
         new_flag(),
-        || {},
     )
     .expect("failed to spawn slow-stream fixture");
 
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
     let mut received: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -338,11 +341,12 @@ async fn slow_stream_hold_preserves_all_bytes_in_order() {
             tokio::time::Instant::now() < deadline,
             "slow-stream fixture did not finish in time"
         );
-        let event = tokio::time::timeout(Duration::from_secs(5), pty.recv())
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("recv stalled for 5s");
         match event {
             Some(PtyEvent::Output(data)) => received.extend_from_slice(&data),
+            Some(PtyEvent::Flush) => continue,
             Some(PtyEvent::Exit(result)) => {
                 assert_eq!(result, Ok(0), "slow-stream child must exit cleanly");
                 break;

@@ -590,7 +590,7 @@ impl App {
         for tab in self.sessions.tabs_mut() {
             if let Some(pane) = tab.pane_mut(pane_id) {
                 match &pane.pty {
-                    Some(pty) => match pty.write_sync(&reply) {
+                    Some(pty) => match pty.writer().write_sync(&reply) {
                         Ok(()) => {
                             info!(
                                 seq,

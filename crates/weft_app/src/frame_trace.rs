@@ -31,8 +31,10 @@ use std::time::Instant;
 /// so the recorder classifies from observable state at frame start.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FrameReason {
-    /// PTY output arrived and the view follows it.
-    PtyOutput,
+    /// PTY output arrived and the view follows it. (Renamed from
+    /// `PtyOutput`: this classifies an *observed* frame — the `AppMsg`
+    /// variant of the same name was removed in v1.13.6 T10 P2.)
+    PtyParsed,
     /// Blinking cursor or spinner animation tick.
     Animation,
     /// Mouse hover / scroll / selection dragging. Not yet produced by
@@ -50,7 +52,7 @@ pub(crate) enum FrameReason {
 impl FrameReason {
     fn as_str(self) -> &'static str {
         match self {
-            FrameReason::PtyOutput => "pty",
+            FrameReason::PtyParsed => "pty",
             FrameReason::Animation => "anim",
             FrameReason::Hover => "hover",
             FrameReason::Resize => "resize",
@@ -505,7 +507,7 @@ pub(crate) fn classify_reason(
     // PTY output is the dominant redraw driver and the one we most want to
     // attribute; check it first.
     if had_pty_output {
-        return FrameReason::PtyOutput;
+        return FrameReason::PtyParsed;
     }
     if cursor_anim_active || spinner_anim_active {
         return FrameReason::Animation;
@@ -535,7 +537,7 @@ mod tests {
 
     #[test]
     fn segments_accumulate_microseconds() {
-        let mut r = FrameTraceRecorder::begin(true, 42, FrameReason::PtyOutput);
+        let mut r = FrameTraceRecorder::begin(true, 42, FrameReason::PtyParsed);
         r.layout_start();
         // layout segment
         std::thread::sleep(Duration::from_micros(50));
@@ -617,7 +619,7 @@ mod tests {
     fn classify_prefers_pty_then_animation_then_resize() {
         assert_eq!(
             classify_reason(true, true, false, true),
-            FrameReason::PtyOutput
+            FrameReason::PtyParsed
         );
         assert_eq!(
             classify_reason(false, true, false, true),

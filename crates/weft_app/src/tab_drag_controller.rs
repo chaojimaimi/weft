@@ -34,6 +34,23 @@ impl App {
         if !self.confirm_background_tab_close(idx) {
             return;
         }
+        // v1.13.6 T10 P2 (D2): async close contract (see close_tab) — a tab
+        // with PTY-backed panes finishes on its workers' PtyExited events.
+        let async_pending = self
+            .sessions
+            .tab_mut(idx)
+            .map(crate::tab::Tab::begin_close)
+            .unwrap_or(false);
+        if async_pending {
+            // P1-1b: arm the close watchdog (see close_tab) — background
+            // closes are equally exposed to SIGHUP-immune children.
+            self.schedule_close_watchdog_wake();
+            tracing::info!(
+                tab = idx,
+                "background tab close: PTY teardown initiated; finishing on PtyExited"
+            );
+            return;
+        }
         let blocks = self
             .sessions
             .tab_mut(idx)

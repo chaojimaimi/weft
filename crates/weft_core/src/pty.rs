@@ -2,13 +2,20 @@
 //!
 //! Spawns a shell subprocess via `forkpty`, provides async read/write,
 //! and handles window resize via `TIOCSWINSZ`.
+//!
+//! v1.13.6 T10 P2 (PLAN_v1136 §1 D2–D5): `Pty` no longer owns the receive
+//! half of its event channel. `take_event_rx` hands it to the per-pane
+//! parse worker (weft_app); `Pty` keeps the main-thread concerns — master
+//! fd (resize ioctl / tcflush / drop-SIGHUP), child pid, the write half
+//! ([`PtyWriter`], shared with the worker via `Arc` clones), and the
+//! `event_tx` clone that implements the [`PtyEvent::Flush`] marker of the
+//! flush protocol (D2).
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::time::{Duration, Instant};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Instant;
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{self, Pid};
@@ -41,11 +48,31 @@ pub enum PtyError {
 /// Result type for PTY operations.
 pub type Result<T> = std::result::Result<T, PtyError>;
 
-/// Events emitted by the PTY read loop.
+/// Events emitted by the PTY read loop (and, for [`PtyEvent::Flush`], by the
+/// main-thread flush protocol).
 #[derive(Debug)]
 pub enum PtyEvent {
     /// Raw bytes received from the child process.
     Output(Vec<u8>),
+    /// v1.13.6 T10 P2 (D2): flush marker injected by `Pty::flush_input`.
+    /// Precise semantics (review P2-1 — do NOT gloss this as equivalent to
+    /// the retired synchronous drain):
+    /// - BACKLOG BEFORE the marker (FIFO): already parsed into the terminal
+    ///   by the time the worker consumes the marker — NOT dropped. Today's
+    ///   Ctrl+C dropped all of it instantly; keeping it is a deliberate
+    ///   change (the interrupt-capture/rollback on the main thread handles
+    ///   the stale tail).
+    /// - What IS dropped: every `Output` still queued in the sweep executed
+    ///   at marker-consumption time (i.e. queued BEHIND the marker).
+    /// - Channel full (flood): the `try_send` marker is SKIPPED — degraded
+    ///   to tcflush only, and up to the channel's ~8 MiB backlog keeps
+    ///   parsing (the retired main-thread drain dropped it instantly, so
+    ///   this arm is a WEAKENING; worst-case Ctrl+C truncation delay is
+    ///   bounded by channel capacity ÷ parse rate — tracked in the plan's
+    ///   P3 probe list).
+    /// - The v1.11.15 guarantee that output around Ctrl+C is retained for
+    ///   resume tails is correspondingly WEAKENED in the full-channel arm.
+    Flush,
     /// Child process exited.
     Exit(std::result::Result<i32, String>),
 }
@@ -54,20 +81,24 @@ pub enum PtyEvent {
 ///
 /// Usage:
 /// 1. `Pty::spawn("/bin/zsh", (24, 80))` → creates PTY + child
-/// 2. `pty.write(data)` → send keyboard input to shell
-/// 3. `pty.recv()` → receive output events from shell
+/// 2. `pty.write_sync(data)` / `pty.writer()` → send keyboard input
+/// 3. `pty.take_event_rx()` → hand the receive half to the parse worker
 /// 4. `pty.resize(rows, cols)` → update terminal dimensions
 pub struct Pty {
-    /// Master side of the PTY (owned file descriptor).
+    /// Master side of the PTY (owned file descriptor). Kept on the main
+    /// thread for the resize ioctl, `tcflush`, and the Drop SIGHUP.
     master: OwnedFd,
     /// PID of the child shell process.
     child_pid: Pid,
-    /// Channel to receive PTY output events.
-    /// v1.11.2 X2: bounded (`PTY_CHANNEL_CAP`) instead of unbounded — see
-    /// the const's doc comment for the backpressure contract.
-    event_rx: mpsc::Receiver<PtyEvent>,
-    /// Sender cloned for the read loop.
-    _event_tx: mpsc::Sender<PtyEvent>,
+    /// Sender cloned for the read loop — retained on the main thread ONLY
+    /// for the `flush_input` Flush-marker injection (D2).
+    event_tx: mpsc::Sender<PtyEvent>,
+    /// Receive half — `Some` until [`Pty::take_event_rx`] hands it to the
+    /// parse worker (D2).
+    event_rx: Option<mpsc::Receiver<PtyEvent>>,
+    /// The write half (D4): shared with the worker via `Arc` clones; the
+    /// write mutex lives inside it.
+    writer: std::sync::Arc<crate::pty::writer::PtyWriter>,
 }
 
 impl Pty {
@@ -77,8 +108,13 @@ impl Pty {
     /// and starts an async read loop that forwards output via a channel.
     ///
     /// `args` are passed as additional arguments to the program.
-    pub fn spawn<W: Fn() + Send + 'static>(shell: &str, size: (u16, u16), wake: W) -> Result<Self> {
-        Self::spawn_with_args(shell, &[], size, &[], None, new_flag(), wake)
+    ///
+    /// v1.13.6 T10 P2 (D3): the `wake` closure parameter is GONE — UI wake
+    /// ownership moved from the reader to the parse worker (see
+    /// `weft_app::app::parse_worker`, which reuses the exported
+    /// [`pty_wake_due`] throttle).
+    pub fn spawn(shell: &str, size: (u16, u16)) -> Result<Self> {
+        Self::spawn_with_args(shell, &[], size, &[], None, new_flag())
     }
 
     /// Spawn a process inside a PTY with additional arguments and env overrides.
@@ -100,14 +136,13 @@ impl Pty {
     /// whose TUI is (or may be) gone before the main thread parses those
     /// bytes. The flag's authoritative undo is the main-thread vte parser
     /// (`Terminal::handle_dec_private_mode`).
-    pub fn spawn_with_args<W: Fn() + Send + 'static>(
+    pub fn spawn_with_args(
         program: &str,
         args: &[&str],
         size: (u16, u16),
         extra_env: &[(&str, &str)],
         cwd: Option<&str>,
         mouse_suppress: MouseSuppressFlag,
-        wake: W,
     ) -> Result<Self> {
         let winsize = Winsize {
             ws_row: size.0,
@@ -200,6 +235,18 @@ impl Pty {
                     OwnedFd::from_raw_fd(new_fd)
                 };
 
+                // The writer's fd is ANOTHER independent dup: dropping `Pty`
+                // (pane close) closes the master while the parse worker's
+                // writer clone can still drain its in-flight reply.
+                // SAFETY: dup returns a new fd that we wrap in OwnedFd.
+                let writer_fd = unsafe {
+                    let new_fd = nix::libc::dup(master.as_raw_fd());
+                    if new_fd < 0 {
+                        return Err(PtyError::Read(io::Error::last_os_error()));
+                    }
+                    OwnedFd::from_raw_fd(new_fd)
+                };
+
                 let child_pid = child;
                 let read_child_pid = child;
 
@@ -215,7 +262,6 @@ impl Pty {
                         read_child_pid,
                         reader,
                         mouse_suppress,
-                        wake,
                     ));
                     if let Err(join_err) = handle.await {
                         let msg = if join_err.is_panic() {
@@ -237,8 +283,9 @@ impl Pty {
                 Ok(Self {
                     master,
                     child_pid,
-                    event_rx,
-                    _event_tx: event_tx,
+                    event_tx,
+                    event_rx: Some(event_rx),
+                    writer: std::sync::Arc::new(writer::PtyWriter::new(writer_fd)),
                 })
             }
         }
@@ -258,171 +305,40 @@ impl Pty {
         resize_ioctl_result(result)
     }
 
-    /// Write bytes to the PTY (keyboard input → shell).
+    /// v1.0 fix: flush the PTY's kernel-side read buffer; v1.13.6 T10 P2
+    /// (D2): the app-side half became the Flush MARKER protocol.
     ///
-    /// NOTE: the production input path does not go through here — it uses
-    /// the synchronous [`Self::write_sync_reported`] (tab.rs). This async
-    /// variant survives as the test-injection seam.
-    ///
-    /// v1.11.15 (FIX E): the loop advances by the number of bytes actually
-    /// accepted instead of treating ANY successful write as completion — a
-    /// partial write (kernel input queue full, reader slow) used to drop the
-    /// tail silently while reporting success. A zero-progress write fails
-    /// fast (std `write_all` contract) instead of spinning.
-    pub async fn write(&self, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        // We need a mutable reference for AsyncWrite, so create a temporary handle.
-        // SAFETY: dup the fd so we can get an async writer.
-        let duped = unsafe {
-            let new_fd = nix::libc::dup(self.master.as_raw_fd());
-            if new_fd < 0 {
-                return Err(PtyError::Write(io::Error::last_os_error()));
-            }
-            OwnedFd::from_raw_fd(new_fd)
-        };
-        let writer =
-            tokio::io::unix::AsyncFd::new(duped).expect("failed to create async fd for write");
-        // Use the AsyncFd to perform a non-blocking write.
-        let mut written = 0usize;
-        loop {
-            let mut guard = writer.writable().await.map_err(PtyError::Write)?;
-            match guard
-                .try_io(|fd| nix::unistd::write(fd, &data[written..]).map_err(io::Error::from))
-            {
-                Ok(Ok(n)) => {
-                    written += n;
-                    if written >= data.len() {
-                        return Ok(());
-                    }
-                    if n == 0 {
-                        // Zero bytes with data remaining can never make
-                        // progress — mirror write_all_nonblocking's contract.
-                        return Err(PtyError::Write(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "pty write returned 0 with data remaining",
-                        )));
-                    }
-                }
-                Ok(Err(e)) => return Err(PtyError::Write(e)),
-                Err(_would_block) => continue,
-            }
-        }
+    /// Full contract on the [`PtyEvent::Flush`] doc — the short form here:
+    /// `tcflush` + a best-effort non-blocking marker to the parse worker.
+    /// BACKLOG QUEUED AHEAD of the marker was already parsed into the
+    /// terminal (NOT dropped — today's Ctrl+C dropped it instantly); the
+    /// sweep at marker-consumption time drops only what is still queued
+    /// BEHIND it. A full channel SKIPS the marker (tcflush-only degradation,
+    /// review P2-1): up to the ~8 MiB backlog keeps parsing, so the
+    /// v1.11.15 "output around Ctrl+C is retained" guarantee weakens in
+    /// that arm. Called from the Ctrl+C path (`Pane::interrupt_pty`) —
+    /// retaining output around the ETX is intentional there (v1.11.15
+    /// resume tails); the old "flood-recovery only" warning described the
+    /// retired channel-draining implementation.
+    pub fn flush_input(&self) {
+        // P3 (review): the tcflush lives in `inject_flush_marker` — the
+        // public semantics have exactly one implementation point.
+        inject_flush_marker(&self.master, &self.event_tx);
     }
 
-    /// Write bytes synchronously (for use before tokio runtime or in tests).
-    ///
-    /// FIX_TERMINAL_CAPABILITY_HARDENING: bounded retry on EAGAIN. The PTY
-    /// master fd is non-blocking (set in `spawn_with_args`), so a full kernel
-    /// write buffer surfaces as EAGAIN instead of blocking. The v1.0 behavior
-    /// dropped the data silently at debug level the moment the buffer filled —
-    /// a heavy-output command with an undrained read side loses keystrokes
-    /// with no trace. Now `write_all_nonblocking` polls `POLLOUT` and retries
-    /// within a ~50ms budget: long enough to ride out a transient full buffer,
-    /// short enough that the UI thread never freezes (the v1.0 reason for not
-    /// retrying was a 1s blocking retry). If the budget is exhausted the
-    /// remaining bytes are dropped, but loudly — warn! reports the dropped
-    /// count. The caller keeps deciding on fallbacks (e.g. `send_interrupt`
-    /// for Ctrl+C).
-    ///
-    /// v1.11.15 (FIX E): now a thin wrapper over [`Self::write_sync_reported`]
-    /// — the drop warn lives there, and this signature stays `Ok(())` so
-    /// every existing caller is undisturbed.
-    pub fn write_sync(&self, data: &[u8]) -> Result<()> {
-        self.write_sync_reported(data).map(|_| ())
+    /// Hand the receive half to this pane's parse worker (T10 P2 D2, the
+    /// `into_parts()`-style split). After this call `Pty` keeps only the
+    /// write half (`event_tx` for the Flush marker + the [`PtyWriter`] Arc).
+    /// Returns `None` if the receiver was already handed off (a fresh `Pty`
+    /// always holds it — callers may `expect`).
+    pub fn take_event_rx(&mut self) -> Option<mpsc::Receiver<PtyEvent>> {
+        self.event_rx.take()
     }
 
-    /// v1.11.15 (FIX E, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §5): honest
-    /// synchronous write — returns the number of bytes that actually left
-    /// when the retry budget expires (`Ok(written)`) instead of masking a
-    /// partial write as `Ok(())`. On production macOS the `TimedOut` arm is
-    /// unreachable (the n_tty line discipline silently discards input
-    /// overflow, so the master always writes the full count — see the
-    /// saturated-child anchor test below); the honest mapping exists for
-    /// ssh/remote ptys and future platforms. The warn is kept here so both
-    /// wrappers surface the drop exactly once.
-    pub fn write_sync_reported(&self, data: &[u8]) -> Result<usize> {
-        if data.is_empty() {
-            return Ok(0);
-        }
-        let fd = self.master.as_raw_fd();
-        let mut write_one =
-            |buf: &[u8]| nix::unistd::write(&self.master, buf).map_err(io::Error::from);
-        let outcome = write_all_nonblocking(&mut write_one, fd, data, WRITE_RETRY_BUDGET);
-        map_write_outcome(outcome, data.len())
-    }
-
-    /// Deliver one Ctrl+C interrupt to the foreground process.
-    ///
-    /// Write ETX (`0x03`) through the PTY so line discipline, remote sessions
-    /// and raw interactive programs observe exactly the same event as a native
-    /// terminal. We deliberately do not replace this with a direct SIGINT:
-    /// doing so would interrupt a local `ssh` transport instead of forwarding
-    /// Ctrl+C to its remote foreground process.
-    ///
-    /// Returns true if the interrupt was delivered successfully.
-    pub fn send_interrupt(&self) -> bool {
-        match nix::unistd::write(&self.master, &[0x03]) {
-            Ok(1) => {
-                tracing::debug!(delivery = "pty-etx", "Ctrl+C delivered once");
-                true
-            }
-            Ok(_) => {
-                tracing::warn!("short Ctrl+C PTY write; interrupt not delivered");
-                false
-            }
-            Err(nix::errno::Errno::EAGAIN) => {
-                tracing::warn!("Ctrl+C PTY write would block; interrupt not delivered");
-                false
-            }
-            Err(error) => {
-                tracing::warn!(%error, "Ctrl+C PTY write failed; interrupt not delivered");
-                false
-            }
-        }
-    }
-
-    /// v1.0 fix: Flush the PTY's kernel-side read buffer and drain queued
-    /// output events from the internal channel.
-    ///
-    /// Draining the channel also discards any queued [`PtyEvent::Exit`], so
-    /// this must only be used on the flood-recovery path — never during
-    /// normal teardown, where losing the exit status matters.
-    ///
-    /// Reserved for explicit flood-recovery actions. Ctrl+C itself must never
-    /// call this after writing ETX: `tcflush(TCIFLUSH)` can discard the ETX
-    /// before the slave line discipline consumes it.
-    pub fn flush_input(&mut self) {
-        // Flush kernel PTY read buffer (slave→master direction).
-        // SAFETY: tcflush is a safe ioctl that discards pending data.
-        unsafe {
-            nix::libc::tcflush(self.master.as_raw_fd(), nix::libc::TCIFLUSH);
-        }
-        // Drain queued output events from the internal channel.
-        while self.event_rx.try_recv().is_ok() {}
-    }
-
-    /// Receive the next PTY event (output or exit).
-    pub async fn recv(&mut self) -> Option<PtyEvent> {
-        self.event_rx.recv().await
-    }
-
-    /// Try to receive the next PTY event without blocking.
-    /// Returns `Err` if no event is available.
-    pub fn try_recv(&mut self) -> Result<PtyEvent> {
-        self.event_rx.try_recv().map_err(|_| {
-            PtyError::Read(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "no data available",
-            ))
-        })
-    }
-
-    /// Number of events queued at this instant. Close-time draining snapshots
-    /// this value so a producer cannot keep the UI thread chasing new output.
-    pub fn queued_event_count(&self) -> usize {
-        self.event_rx.len()
+    /// Clone of the shared write half (D4/D5): the main thread and the parse
+    /// worker each hold one; the write mutex lives inside [`PtyWriter`].
+    pub fn writer(&self) -> std::sync::Arc<crate::pty::writer::PtyWriter> {
+        self.writer.clone()
     }
 
     /// Get the child process PID.
@@ -436,129 +352,83 @@ impl Pty {
     }
 }
 
-/// Total time a non-blocking synchronous write may spend poll-waiting and
-/// retrying after EAGAIN before giving up (FIX_TERMINAL_CAPABILITY_HARDENING).
-const WRITE_RETRY_BUDGET: Duration = Duration::from_millis(50);
-
-/// Outcome of a bounded non-blocking write loop, observable by callers and
-/// unit tests (FIX_TERMINAL_CAPABILITY_HARDENING).
-#[derive(Debug)]
-#[must_use]
-pub(crate) enum WriteOutcome {
-    /// All bytes reached the fd.
-    WrittenAll,
-    /// Budget exhausted before everything was written; `written` bytes made
-    /// it out, the rest were dropped (caller should warn with the count).
-    TimedOut { written: usize },
-    /// A non-EAGAIN write/poll error.
-    Error(io::Error),
+/// The flush marker injection, split from [`Pty::flush_input`] so both arms
+/// of the `try_send` contract are unit-testable without a real PTY (D2):
+/// with channel room the marker is queued; with a full bounded channel it is
+/// skipped (degrade to tcflush-only) instead of blocking the UI thread.
+/// `tcflush` on a non-tty fd (the tests pass /dev/null) fails silently — the
+/// result is deliberately ignored there too.
+fn inject_flush_marker(master: &OwnedFd, event_tx: &mpsc::Sender<PtyEvent>) {
+    // Flush kernel PTY read buffer (slave→master direction).
+    // SAFETY: tcflush is a safe ioctl that discards pending data.
+    unsafe {
+        nix::libc::tcflush(master.as_raw_fd(), nix::libc::TCIFLUSH);
+    }
+    let _ = event_tx.try_send(PtyEvent::Flush);
 }
 
-/// Bounded EAGAIN/EWOULDBLOCK retry for a non-blocking writer.
+/// Monotonic milliseconds since process start (v1.11.2 X2 wake throttle).
+/// rust-reviewer Minor-3: deliberately NOT wall-clock `SystemTime` — NTP
+/// steps or a manual clock change can move it backwards, which would
+/// suppress wakes until real time caught up with the stale stamp while the
+/// queue is non-empty. `Instant` only ever moves forward.
 ///
-/// Calls `write_fn` with the unsent remainder; on EAGAIN/EWOULDBLOCK waits
-/// on `poll(fd, POLLOUT)` for the remaining `budget` before retrying, so a
-/// transient full kernel buffer is ridden out while a permanently-full
-/// buffer can never stall the caller beyond `budget`. EINTR is retried like
-/// EWOULDBLOCK (a signal interrupted the syscall — mirrors the poll loop's
-/// own EINTR handling). Partial writes advance (the remainder is re-issued
-/// in the same loop); `Ok(0)` with data remaining fails fast with `WriteZero`
-/// (std `write_all` contract). Any other error is returned as
-/// `WriteOutcome::Error`.
+/// v1.13.6 T10 P2 (D3): `pub` — the parse worker stamps its wake throttle
+/// with it (the reader no longer wakes the UI).
+pub fn monotonic_millis() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Tracks when the last UI wake was stamped (v1.11.2 X2). v1.13.6 T10 P2
+/// (D3): `pub` — definition deliberately STAYS in weft_core (the decision
+/// table tests pin it here) while ownership of the wake moved to the
+/// weft_app parse worker.
+#[derive(Debug, Default)]
+pub struct WakeThrottle {
+    last_ms: u64,
+}
+
+impl WakeThrottle {
+    pub fn last(&self) -> u64 {
+        self.last_ms
+    }
+
+    pub fn stamp(&mut self, now_ms: u64) {
+        self.last_ms = now_ms;
+    }
+}
+
+/// Backlog-state wake interval (T8, PLAN_v11217 §3.4): 2 ms. The previous
+/// 16 ms (~60 Hz, Warp-precedent) capped cat throughput at 60 Hz × ≤32
+/// channel events × kernel read granularity ≈ 5.8 MB/s — exactly the
+/// measured T0 baseline. A caught-up consumer (empty queue) wakes
+/// immediately regardless (unchanged), and Exit always bypasses the
+/// throttle.
+const FLOOD_WAKE_INTERVAL_MS: u64 = 2;
+
+/// Pure wake decision (v1.11.2 X2, PLAN_v1112 §2; revised by T8
+/// PLAN_v11217 §3.4): during an output backlog the UI is nudged at most
+/// once per `FLOOD_WAKE_INTERVAL_MS`, but a caught-up consumer (empty
+/// queue) always wakes immediately so fresh output is pumped without
+/// latency, and Exit always bypasses the throttle so the UI learns of a
+/// dead child instantly.
 ///
-/// The fd and the writer are injected separately so unit tests can fake a
-/// writer that would-block N times (success path) or forever (timeout
-/// path) against a real always-writable fd.
-pub(crate) fn write_all_nonblocking<W>(
-    mut write_fn: W,
-    fd: RawFd,
-    data: &[u8],
-    budget: Duration,
-) -> WriteOutcome
-where
-    W: FnMut(&[u8]) -> io::Result<usize>,
-{
-    let deadline = Instant::now() + budget;
-    let mut written = 0;
-    let mut rest = data;
-    loop {
-        match write_fn(rest) {
-            Ok(n) => {
-                written += n;
-                rest = &rest[n..];
-                if rest.is_empty() {
-                    return WriteOutcome::WrittenAll;
-                }
-                if n == 0 {
-                    // std `write_all` contract: zero bytes with data
-                    // remaining can never make progress — fail fast
-                    // instead of spinning the budget away.
-                    return WriteOutcome::Error(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write returned 0 with data remaining",
-                    ));
-                }
-            }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::Interrupted =>
-            {
-                // EWOULDBLOCK (buffer full → poll for writability below) and
-                // EINTR (signal interrupted the syscall → retry, mirroring
-                // the poll loop's own EINTR continue) are both retried.
-            }
-            Err(e) => return WriteOutcome::Error(e),
-        }
-        // Wait for writability with whatever budget remains; never wait
-        // past `deadline`.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return WriteOutcome::TimedOut { written };
-        }
-        // SAFETY: `fd` outlives this call (callers pass their own live fd,
-        // held for the duration), so borrowing it for the poll is sound.
-        let mut fds = [PollFd::new(
-            unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) },
-            PollFlags::POLLOUT,
-        )];
-        let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::ZERO);
-        match poll(&mut fds, timeout) {
-            Ok(0) => return WriteOutcome::TimedOut { written },
-            // Ready (or POLLERR/POLLNVAL) — retry; the write itself
-            // surfaces the real error.
-            Ok(_) => {}
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => return WriteOutcome::Error(io::Error::from(e)),
-        }
+/// Safety of ~500 wakes/s (fourth-round review P3): the guarantee is
+/// SELF-LIMITATION, not "each wake is cheap" — wake generation rate ≤
+/// batch flush rate ≤ kernel data-availability rate, and a full channel
+/// suspends the reader in `send().await` before it can produce another
+/// wake, so there is no feedback amplification.
+///
+/// v1.13.6 T10 P2 (D3): `pub` — consumed by the weft_app parse worker
+/// (the reader no longer wakes). Definition and decision-table tests stay
+/// in weft_core, untouched.
+pub fn pty_wake_due(is_exit: bool, consumer_caught_up: bool, last_ms: u64, now_ms: u64) -> bool {
+    if is_exit {
+        return true;
     }
-}
-
-/// v1.11.15 (FIX E): the pure `WriteOutcome → honest report` mapping shared
-/// by `write_sync_reported`. Extracted so the TimedOut-reports-written
-/// contract is unit-testable without a real PTY (the partial-write arm is
-/// unreachable against a real macOS master — see the module's saturated
-/// child anchor). A budget timeout warns with the dropped count and reports
-/// the bytes that made it out; a full write reports the total.
-fn map_write_outcome(outcome: WriteOutcome, total: usize) -> Result<usize> {
-    match outcome {
-        WriteOutcome::WrittenAll => Ok(total),
-        WriteOutcome::TimedOut { written } => {
-            tracing::warn!(
-                dropped = total - written,
-                "pty write budget exhausted — dropping remaining bytes"
-            );
-            Ok(written)
-        }
-        WriteOutcome::Error(e) => Err(PtyError::Write(e)),
-    }
-}
-
-fn resize_ioctl_result(result: nix::libc::c_int) -> Result<()> {
-    if result == -1 {
-        Err(PtyError::Resize(nix::errno::Errno::last()))
-    } else {
-        Ok(())
-    }
+    consumer_caught_up || now_ms.saturating_sub(last_ms) >= FLOOD_WAKE_INTERVAL_MS
 }
 
 /// v1.13.2 (WP-A): the reader-task panic wrapper's payload downcast, extracted
@@ -649,65 +519,10 @@ fn strip_inherited_debug_env(
 
 /// v1.11.2 X2 (PLAN_v1112 §2): capacity of the bounded PTY event channel.
 /// 32 × 256 KiB chunks = an 8 MiB ceiling on in-flight output between the
-/// read task and the UI pump. When full, `send().await` suspends the read
-/// task, which backpressures into the kernel PTY buffer and ultimately
+/// read task and the parse worker. When full, `send().await` suspends the
+/// read task, which backpressures into the kernel PTY buffer and ultimately
 /// blocks the child's writes — bytes are never dropped by Weft.
 const PTY_CHANNEL_CAP: usize = 32;
-
-/// Monotonic milliseconds since process start (v1.11.2 X2 wake throttle).
-/// rust-reviewer Minor-3: deliberately NOT wall-clock `SystemTime` — NTP
-/// steps or a manual clock change can move it backwards, which would
-/// suppress wakes until real time caught up with the stale stamp while the
-/// queue is non-empty. `Instant` only ever moves forward.
-fn monotonic_millis() -> u64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
-}
-
-/// Tracks when the read loop last woke the UI (v1.11.2 X2).
-#[derive(Debug, Default)]
-struct WakeThrottle {
-    last_ms: u64,
-}
-
-impl WakeThrottle {
-    fn last(&self) -> u64 {
-        self.last_ms
-    }
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.last_ms = now_ms;
-    }
-}
-
-/// Backlog-state wake interval (T8, PLAN_v11217 §3.4): 2 ms. The previous
-/// 16 ms (~60 Hz, Warp-precedent) capped cat throughput at 60 Hz × ≤32
-/// channel events × kernel read granularity ≈ 5.8 MB/s — exactly the
-/// measured T0 baseline. A caught-up consumer (empty queue) wakes
-/// immediately regardless (unchanged), and Exit always bypasses the
-/// throttle.
-const FLOOD_WAKE_INTERVAL_MS: u64 = 2;
-
-/// Pure wake decision (v1.11.2 X2, PLAN_v1112 §2; revised by T8
-/// PLAN_v11217 §3.4): during an output backlog the UI is nudged at most
-/// once per `FLOOD_WAKE_INTERVAL_MS`, but a caught-up consumer (empty
-/// queue) always wakes immediately so fresh output is pumped without
-/// latency, and Exit always bypasses the throttle so the UI learns of a
-/// dead child instantly.
-///
-/// Safety of ~500 wakes/s (fourth-round review P3): the guarantee is
-/// SELF-LIMITATION, not "each wake is cheap" — wake generation rate ≤
-/// batch flush rate ≤ kernel data-availability rate, and a full channel
-/// suspends the reader in `send().await` before it can produce another
-/// wake, so there is no feedback amplification.
-fn pty_wake_due(is_exit: bool, consumer_caught_up: bool, last_ms: u64, now_ms: u64) -> bool {
-    if is_exit {
-        return true;
-    }
-    consumer_caught_up || now_ms.saturating_sub(last_ms) >= FLOOD_WAKE_INTERVAL_MS
-}
 
 // Reader task moved to `pty/read_loop.rs` (T8, PLAN_v11217 §3.4; standard
 // `pty.rs` + `pty/` directory layout) so this file stays within its
@@ -716,6 +531,22 @@ fn pty_wake_due(is_exit: bool, consumer_caught_up: bool, last_ms: u64, now_ms: u
 // re-exports it.
 mod read_loop;
 pub use read_loop::EVENT_CAP;
+
+// The write half (v1.13.6 T10 P2, D4/D5): `pty/pty.rs` + `pty/writer.rs`
+// layout. The bounded-retry machinery is re-exported pub(crate) so the
+// test module's `use super::*` keeps reaching it.
+mod writer;
+pub use writer::PtyWriter;
+#[allow(unused_imports)] // consumed by the test module via `use super::*`
+pub(crate) use writer::{map_write_outcome, write_all_nonblocking, WriteOutcome};
+
+fn resize_ioctl_result(result: nix::libc::c_int) -> Result<()> {
+    if result == -1 {
+        Err(PtyError::Resize(nix::errno::Errno::last()))
+    } else {
+        Ok(())
+    }
+}
 
 // Tests extracted to `pty/tests.rs` (repo convention) to keep the
 // production file within the architecture gate.

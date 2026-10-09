@@ -17,13 +17,6 @@ fn empty_tab_has_no_terminal() {
 }
 
 #[test]
-fn empty_tab_pump_pty_is_noop() {
-    let mut t = Tab::empty();
-    // Should not panic — just returns early since pty is None.
-    t.pump_pty();
-}
-
-#[test]
 fn empty_tab_process_messages_returns_empty() {
     let mut t = Tab::empty();
     let (alive, drained, need_redraw, _) = t.process_messages();
@@ -394,6 +387,21 @@ fn close_last_pane_signals_tab_empty() {
     let is_empty = t.close_active_pane().expect("close succeeds");
     assert!(is_empty);
     assert_eq!(t.pane_count(), 0);
+}
+
+#[test]
+fn begin_close_teardown_stamps_the_watchdog_deadline() {
+    // Review P1-1a wiring: any close initiator that tears down a PTY-backed
+    // pane must route through `begin_close_teardown` — the watchdog pump
+    // check keys on `close_deadline`, so a direct `release_pty` call would
+    // leave a hung pane unwatched. (The arming half — `App::
+    // schedule_close_watchdog_wake` at the three async_pending sites — is
+    // one-line wiring verified by review; it needs an EventLoopProxy.)
+    let mut pane = crate::pane::Pane::with_terminal_only(100);
+    assert!(pane.close_deadline.is_none());
+    pane.begin_close_teardown();
+    assert!(pane.close_deadline.is_some());
+    assert!(!pane.close_settled, "stamp must not pre-settle the pane");
 }
 
 #[test]
