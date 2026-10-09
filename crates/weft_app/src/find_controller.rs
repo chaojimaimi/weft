@@ -170,10 +170,10 @@ impl App {
                 .unwrap_or(false);
             if need_expand {
                 if let Some(bm) = self.find.block_matches.get(self.find.block_index) {
-                    if let Some(term) = self
+                    if let Some(mut term) = self
                         .sessions
                         .active_mut()
-                        .and_then(|tab| tab.terminal.as_mut())
+                        .and_then(|tab| tab.lock_terminal())
                     {
                         let block = term
                             .block_tracker()
@@ -231,7 +231,7 @@ impl App {
         let Some(term) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_ref())
+            .and_then(|tab| tab.lock_terminal())
         else {
             return;
         };
@@ -264,6 +264,7 @@ impl App {
         // block view. This is fast (String scanning) and the matches are
         // needed immediately for the FindUI count.
         // v0.9 U-P2: pass is_regex so regex mode works in block view too.
+        let mut need_block_scroll = false;
         if term.show_block_view() {
             let blocks = term.block_tracker().session_blocks();
             let mut block_matches = match weft_core::find::find_in_blocks(
@@ -301,7 +302,7 @@ impl App {
             if !self.find.block_matches.is_empty() {
                 self.find.block_index =
                     self.find.block_index.min(self.find.block_matches.len() - 1);
-                self.scroll_to_current_find_match();
+                need_block_scroll = true;
             } else {
                 self.find.block_index = 0;
             }
@@ -309,6 +310,12 @@ impl App {
             self.find.block_matches.clear();
             self.find.block_truncated = false;
             self.find.block_index = 0;
+        }
+        drop(term);
+        // T10 P1 (D9 rule 2): the scroll helper re-locks the active pane's
+        // terminal, so it runs only after the guard above is dropped.
+        if need_block_scroll {
+            self.scroll_to_current_find_match();
         }
 
         self.request_redraw();
@@ -395,48 +402,56 @@ impl App {
         if self.block_view_active() && !self.find.block_matches.is_empty() {
             let bm = self.find.block_matches.get(self.find.block_index).cloned();
             let Some(bm) = bm else { return };
-            let Some(term) = self
-                .sessions
-                .active_mut()
-                .and_then(|tab| tab.terminal.as_ref())
-            else {
-                return;
-            };
-            let blocks = term.block_tracker().session_blocks();
-            // Bring it to roughly the upper-middle of the viewport so the
-            // user sees context below and above the match.
-            let Some(renderer) = self.renderer.as_ref() else {
-                return;
-            };
-            let cwd_header = crate::layout::block_cwd_header_active(
-                term.effective_input_mode() == weft_core::input::InputMode::Editor,
-                term.cwd().is_some(),
-            );
-            let visible = renderer
-                .block_visible_rows(crate::block_component::block_prompt_lines(term), cwd_header);
-            // Scroll so the matching row lands at ~2/3 from the bottom of the
-            // viewport (upper-middle). block_scroll_offset is "rows scrolled
-            // up from the bottom", so target = rows_from_bottom - visible*2/3.
-            let cols = term.grid().num_cols;
-            let cache = renderer.block_layout_cache.borrow();
-            let (total, _) = block_content_metrics_with_cache(
-                term,
-                cols,
-                renderer.block_header_rows(),
-                Some(&*cache),
-                None,
-            );
-            let max_scroll = total.saturating_sub(visible);
-            let Some(target) = block_find_scroll_target(
-                blocks,
-                &bm,
-                renderer.block_header_rows(),
-                cols,
-                term.grid().num_rows,
-                visible,
-                max_scroll,
-            ) else {
-                return;
+            // T10 P1 (D9 rule 2): the guard covers only the read/layout
+            // phase; `set_block_scroll` below re-locks, so `target` is
+            // computed inside this scope and applied after it drops.
+            let target = {
+                let Some(term) = self
+                    .sessions
+                    .active_mut()
+                    .and_then(|tab| tab.lock_terminal())
+                else {
+                    return;
+                };
+                let blocks = term.block_tracker().session_blocks();
+                // Bring it to roughly the upper-middle of the viewport so the
+                // user sees context below and above the match.
+                let Some(renderer) = self.renderer.as_ref() else {
+                    return;
+                };
+                let cwd_header = crate::layout::block_cwd_header_active(
+                    term.effective_input_mode() == weft_core::input::InputMode::Editor,
+                    term.cwd().is_some(),
+                );
+                let visible = renderer.block_visible_rows(
+                    crate::block_component::block_prompt_lines(&term),
+                    cwd_header,
+                );
+                // Scroll so the matching row lands at ~2/3 from the bottom of the
+                // viewport (upper-middle). block_scroll_offset is "rows scrolled
+                // up from the bottom", so target = rows_from_bottom - visible*2/3.
+                let cols = term.grid().num_cols;
+                let cache = renderer.block_layout_cache.borrow();
+                let (total, _) = block_content_metrics_with_cache(
+                    &term,
+                    cols,
+                    renderer.block_header_rows(),
+                    Some(&*cache),
+                    None,
+                );
+                let max_scroll = total.saturating_sub(visible);
+                let Some(target) = block_find_scroll_target(
+                    blocks,
+                    &bm,
+                    renderer.block_header_rows(),
+                    cols,
+                    term.grid().num_rows,
+                    visible,
+                    max_scroll,
+                ) else {
+                    return;
+                };
+                target
             };
             if let Some(tab) = self.sessions.active_mut() {
                 tab.set_block_scroll(target);
@@ -448,10 +463,10 @@ impl App {
         let Some(m) = self.find.matches.get(self.find.index).copied() else {
             return;
         };
-        let Some(term) = self
+        let Some(mut term) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         else {
             return;
         };

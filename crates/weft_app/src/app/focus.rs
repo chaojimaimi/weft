@@ -69,8 +69,7 @@ impl crate::App {
             /* editor_active */ true,
             self.sessions
                 .tab(active_tab)
-                .and_then(|tab| tab.terminal.as_ref())
-                .map(|t| t.editor().is_completing())
+                .and_then(|tab| tab.with_terminal(|t| t.editor().is_completing()))
                 .unwrap_or(false),
             active_tab,
         )

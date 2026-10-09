@@ -228,10 +228,10 @@ impl crate::App {
                         // Nested `if let` keeps the disjoint-field borrows
                         // (`self.sessions` mut, `self.renderer` imm) visible
                         // to the borrow checker.
-                        if let Some(t) = self
+                        if let Some(mut t) = self
                             .sessions
                             .active_mut()
-                            .and_then(|tab| tab.terminal.as_mut())
+                            .and_then(|tab| tab.lock_terminal())
                         {
                             if let Some(r) = self.renderer.as_ref() {
                                 t.set_palette(r.theme().palette);

@@ -131,9 +131,7 @@ impl PaneTreeRebuild for WorkspacePaneNode {
         if let Some(pane) = tab.pane_mut(pane_id) {
             pane.set_restored_cwd_fallback(Some(cwd.to_string_lossy().into_owned()));
             if !draft.is_empty() {
-                if let Some(terminal) = pane.terminal.as_mut() {
-                    terminal.editor_mut().buffer.set_text(draft);
-                }
+                pane.with_terminal(|terminal| terminal.editor_mut().buffer.set_text(draft));
             }
         }
     }
@@ -199,8 +197,8 @@ impl PaneTreeRebuild for SnapshotPaneNode {
             block_ids: block_ids.clone(),
             panes: None,
         });
-        if let (Some(terminal), Some(buf)) = (pane.terminal.as_mut(), decoded) {
-            terminal.editor_mut().buffer = buf;
+        if let Some(buf) = decoded {
+            pane.with_terminal(|terminal| terminal.editor_mut().buffer = buf);
         }
     }
 }

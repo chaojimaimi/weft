@@ -66,7 +66,7 @@ impl crate::App {
                 let cell_w = base_layout.cell_width as f32;
                 let cell_h = base_layout.cell_height as f32;
                 for (tab_index, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
-                    if tab.terminal.is_some() {
+                    if tab.has_terminal() {
                         tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
 
                         // `block_scroll_offset` is measured from the
@@ -79,14 +79,16 @@ impl crate::App {
                         // snapshot now, before SIGWINCH causes the TUI
                         // to repaint asynchronously.
                         let previous = tab.block_scroll();
-                        let reconciliation = tab.terminal.as_ref().and_then(|terminal| {
-                            crate::block_component::reconciled_terminal_block_scroll(
-                                terminal,
-                                &layout_ctx,
-                                header_rows,
-                                previous,
-                            )
-                        });
+                        let reconciliation = tab
+                            .with_terminal(|terminal| {
+                                crate::block_component::reconciled_terminal_block_scroll(
+                                    terminal,
+                                    &layout_ctx,
+                                    header_rows,
+                                    previous,
+                                )
+                            })
+                            .flatten();
                         if let Some((reconciled, total, visible)) = reconciliation {
                             if previous != reconciled {
                                 info!(

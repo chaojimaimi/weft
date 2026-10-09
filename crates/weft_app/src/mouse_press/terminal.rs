@@ -67,9 +67,7 @@ impl App {
                         if let Some(anchor) = self.pixel_to_block_view_pos(x, y) {
                             if let Some(pane) = self.sessions.active_mut() {
                                 let fingerprint = pane
-                                    .terminal
-                                    .as_ref()
-                                    .map(|t| {
+                                    .with_terminal(|t| {
                                         crate::selection::block_selection_fingerprint(
                                             t.block_tracker().session_blocks(),
                                             t.screen_head_lines(),
@@ -159,9 +157,7 @@ impl App {
                                 let has_selection =
                                     pane.selection_handler.block_view_selection.is_some();
                                 let fingerprint = pane
-                                    .terminal
-                                    .as_ref()
-                                    .map(|t| {
+                                    .with_terminal(|t| {
                                         crate::selection::block_selection_fingerprint(
                                             t.block_tracker().session_blocks(),
                                             t.screen_head_lines(),

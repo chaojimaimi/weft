@@ -30,12 +30,8 @@ impl App {
                 .unwrap_or(false);
             if in_prompt {
                 if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                    if let Some(t) = self
-                        .sessions
-                        .active_mut()
-                        .and_then(|tab| tab.terminal.as_mut())
-                    {
-                        t.editor_mut().buffer.start_selection(pos);
+                    if let Some(tab) = self.sessions.active_mut() {
+                        tab.with_terminal(|t| t.editor_mut().buffer.start_selection(pos));
                     }
                     self.interaction.prompt_dragging = true;
                     // Clear any block/grid selection so Cmd+C targets the editor.
@@ -49,13 +45,16 @@ impl App {
                     self.request_redraw();
                 }
                 return PressOutcome::Consumed;
-            } else if let Some(t) = self
-                .sessions
-                .active_mut()
-                .and_then(|tab| tab.terminal.as_mut())
-            {
-                if t.editor().buffer.has_selection() {
-                    t.editor_mut().buffer.clear_selection();
+            } else if let Some(tab) = self.sessions.active_mut() {
+                let cleared = tab.with_terminal(|t| {
+                    if t.editor().buffer.has_selection() {
+                        t.editor_mut().buffer.clear_selection();
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if cleared.unwrap_or(false) {
                     self.request_redraw();
                 }
             }

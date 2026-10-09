@@ -2,7 +2,7 @@ use super::{AltFlipHistory, Tab};
 use crate::effect::PendingPaneResize;
 use std::time::{Duration, Instant};
 use weft_core::pane_layout::PaneId;
-use weft_core::vt::{Terminal, TuiColsKind};
+use weft_core::vt::TuiColsKind;
 
 /// v1.10.19: How long a repeated alt-screen toggle delays the pending
 /// rescale recompute. Tuned above the observed SIGWINCH feedback-loop period
@@ -154,7 +154,7 @@ impl Tab {
         let Some(terminal) = self
             .panes
             .get(&pane_id)
-            .and_then(|pane| pane.terminal.as_ref())
+            .and_then(|pane| pane.lock_terminal())
         else {
             // No live terminal — fall back to the Content-width mapping (prior
             // behaviour) so a phantom pane still reports a sane target.
@@ -247,13 +247,11 @@ impl Tab {
         for (id, pane) in &self.panes {
             if let Some(dim) = pane.pending_pty_resize {
                 let synchronized = pane
-                    .terminal
-                    .as_ref()
-                    .is_some_and(Terminal::synchronized_output);
+                    .with_terminal(|t| t.synchronized_output())
+                    .unwrap_or(false);
                 let alt_active = pane
-                    .terminal
-                    .as_ref()
-                    .is_some_and(Terminal::is_alt_screen_active);
+                    .with_terminal(|t| t.is_alt_screen_active())
+                    .unwrap_or(false);
                 out.push(PendingPaneResize::new(
                     *id,
                     dim,
@@ -268,9 +266,8 @@ impl Tab {
 
     pub(crate) fn any_synchronized_output(&self) -> bool {
         self.panes.values().any(|pane| {
-            pane.terminal
-                .as_ref()
-                .is_some_and(Terminal::synchronized_output)
+            pane.with_terminal(|t| t.synchronized_output())
+                .unwrap_or(false)
         })
     }
 }

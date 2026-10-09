@@ -48,18 +48,18 @@ impl crate::App {
         }
 
         // Find the block in the active terminal's session blocks.
-        let Some(block) = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .and_then(|t| {
+        let Some(block) = self.sessions.active().and_then(|tab| {
+            // T10 P1: the found block borrows the terminal, so it is
+            // cloned inside the guard scope (same .cloned() as before).
+            tab.with_terminal(|t| {
                 t.block_tracker()
                     .session_blocks()
                     .iter()
                     .find(|b| b.id == block_id)
+                    .cloned()
             })
-            .cloned()
-        else {
+            .flatten()
+        }) else {
             tracing::warn!(?block_id, "block not found for diagnose");
             return;
         };

@@ -94,18 +94,23 @@ impl App {
         }
         self.sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| t.grid().num_rows)
+            .and_then(|tab| tab.with_terminal(|t| t.grid().num_rows))
             .unwrap_or(0)
     }
 
     /// F3-4: Total count of blocks matching the panel query (no truncation).
     /// Used to clamp `scroll_offset` so the list can't scroll past the end.
     pub(super) fn panel_total_filtered(&self) -> usize {
-        let Some(terminal) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
-            return 0;
-        };
-        panel_filtered_count(terminal.block_tracker().blocks(), &self.panel.query)
+        let total = self
+            .sessions
+            .active()
+            .and_then(|tab| {
+                tab.with_terminal(|t| {
+                    panel_filtered_count(t.block_tracker().blocks(), &self.panel.query)
+                })
+            })
+            .unwrap_or(0);
+        total
     }
 
     /// F3-4: Clamp `panel.scroll_offset` to `[0, max(0, total - visible)]`.
@@ -119,7 +124,7 @@ impl App {
     /// Count of blocks visible in the current panel window (after
     /// `scroll_offset` skip, newest-first, query-filtered).
     pub(super) fn panel_visible_count(&self) -> usize {
-        let Some(terminal) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
+        let Some(terminal) = self.sessions.active().and_then(|tab| tab.lock_terminal()) else {
             return 0;
         };
         let blocks = terminal.block_tracker().blocks();
@@ -145,10 +150,7 @@ impl App {
 
     /// The [`BlockId`] of the currently selected panel row, if any.
     pub(super) fn panel_selected_block_id(&self) -> Option<BlockId> {
-        let terminal = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())?;
+        let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
         let visible = self.panel_max_visible();
         terminal
             .block_tracker()
@@ -175,7 +177,7 @@ impl App {
         // Borrow the terminal immutably to find the command, then release
         // before mutating the editor.
         let cmd: Option<String> = {
-            let Some(t) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
+            let Some(t) = self.sessions.active().and_then(|tab| tab.lock_terminal()) else {
                 return;
             };
             if t.effective_input_mode() != weft_core::input::InputMode::Editor {
@@ -189,10 +191,10 @@ impl App {
         };
         if let Some(cmd) = cmd {
             if !cmd.is_empty() {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.set_text(&cmd);
                     // v0.9: select all so Cmd+C copies the command without
@@ -224,48 +226,54 @@ impl App {
         if !self.block_view_active() {
             return;
         }
-        let Some(term) = self
-            .sessions
-            .active_mut()
-            .and_then(|tab| tab.terminal.as_ref())
-        else {
-            return;
-        };
-        let cwd_header_active = crate::layout::block_cwd_header_active(
-            term.effective_input_mode() == weft_core::input::InputMode::Editor,
-            term.cwd().is_some(),
-        );
-        let prompt_lines = crate::block_component::block_prompt_lines(term);
-        let blocks = term.block_tracker().session_blocks();
-        let viewport_rows = term.grid().num_rows;
-        let cols = term.grid().num_cols;
-        let block_idx = blocks.iter().position(|b| b.id == block_id);
-        let Some(block_idx) = block_idx else { return };
+        // T10 P1 (D9 rule 2): `set_block_scroll` below re-enters the
+        // terminal lock (→ sync_primary_history_view), so this guard covers
+        // only the read/layout phase and is dropped before the scroll.
+        let target = {
+            let Some(term) = self
+                .sessions
+                .active_mut()
+                .and_then(|tab| tab.lock_terminal())
+            else {
+                return;
+            };
+            let cwd_header_active = crate::layout::block_cwd_header_active(
+                term.effective_input_mode() == weft_core::input::InputMode::Editor,
+                term.cwd().is_some(),
+            );
+            let prompt_lines = crate::block_component::block_prompt_lines(&term);
+            let blocks = term.block_tracker().session_blocks();
+            let viewport_rows = term.grid().num_rows;
+            let cols = term.grid().num_cols;
+            let block_idx = blocks.iter().position(|b| b.id == block_id);
+            let Some(block_idx) = block_idx else { return };
 
-        // Count rows from the bottom up to the target block's command line.
-        // Layout (bottom→top): Output[N-1] at row 0, …, Output[0] at row
-        // N-1, Command at row N, then the accessible Header band and gap.
-        // For each block BELOW the target (i.e. with higher index), add its
-        // full height using the renderer's current Header row span.
-        let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
-        let mut rows_from_bottom = 0usize;
-        for (i, b) in blocks.iter().enumerate().rev() {
-            if i == block_idx {
-                break;
+            // Count rows from the bottom up to the target block's command line.
+            // Layout (bottom→top): Output[N-1] at row 0, …, Output[0] at row
+            // N-1, Command at row N, then the accessible Header band and gap.
+            // For each block BELOW the target (i.e. with higher index), add its
+            // full height using the renderer's current Header row span.
+            let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
+            let mut rows_from_bottom = 0usize;
+            for (i, b) in blocks.iter().enumerate().rev() {
+                if i == block_idx {
+                    break;
+                }
+                rows_from_bottom +=
+                    completed_block_layout_rows(b, cols, header_rows, viewport_rows);
             }
-            rows_from_bottom += completed_block_layout_rows(b, cols, header_rows, viewport_rows);
-        }
-        rows_from_bottom += completed_block_output_rows(&blocks[block_idx], cols);
-        // Position the block's command line at ~1/3 from the bottom of the
-        // viewport so the user sees the command + most of its output above.
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
+            rows_from_bottom += completed_block_output_rows(&blocks[block_idx], cols);
+            // Position the block's command line at ~1/3 from the bottom of the
+            // viewport so the user sees the command + most of its output above.
+            let Some(renderer) = self.renderer.as_ref() else {
+                return;
+            };
+            let visible = renderer.block_visible_rows(prompt_lines, cwd_header_active);
+            // v1.11.16: `saturating_sub` already floors at 0 — the trailing
+            // `.max(0)` was dead (clippy::unnecessary_min_or_max under CI's
+            // `-D warnings`).
+            rows_from_bottom.saturating_sub(visible / 3)
         };
-        let visible = renderer.block_visible_rows(prompt_lines, cwd_header_active);
-        // v1.11.16: `saturating_sub` already floors at 0 — the trailing
-        // `.max(0)` was dead (clippy::unnecessary_min_or_max under CI's
-        // `-D warnings`).
-        let target = rows_from_bottom.saturating_sub(visible / 3);
         if let Some(tab) = self.sessions.active_mut() {
             tab.set_block_scroll(target);
         }
@@ -285,16 +293,15 @@ impl App {
             .enumerate()
             .find_map(|(tab_index, tab)| {
                 tab.panes().find_map(|(pane_id, pane)| {
-                    pane.terminal
-                        .as_ref()
-                        .is_some_and(|terminal| {
-                            terminal
-                                .block_tracker()
-                                .session_blocks()
-                                .iter()
-                                .any(|block| block.id == block_id)
-                        })
-                        .then_some((tab_index, pane_id))
+                    pane.with_terminal(|terminal| {
+                        terminal
+                            .block_tracker()
+                            .session_blocks()
+                            .iter()
+                            .any(|block| block.id == block_id)
+                    })
+                    .unwrap_or(false)
+                    .then_some((tab_index, pane_id))
                 })
             });
         let Some((tab_index, pane_id)) = target else {
@@ -328,39 +335,50 @@ impl App {
         ) {
             tab.enter_primary_history_if_active();
         }
-        let Some(terminal) = &mut tab.terminal else {
-            return;
+        // T10 P1 (D9 rule 2): the block-branch scroll calls re-enter the
+        // terminal lock (set_block_scroll → sync_primary_history_view), so the
+        // guard below only covers the read/metrics phase and is released
+        // before the match.
+        let (rows, _cols, block_view, max_scroll) = {
+            let Some(terminal) = tab.lock_terminal() else {
+                return;
+            };
+            let rows = terminal.grid().num_rows;
+            let cols = terminal.grid().num_cols;
+            // Block view uses a dedicated scroll offset.
+            let block_view = terminal.show_block_view();
+            let max_scroll = if block_view {
+                let cache = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.block_layout_cache.borrow());
+                let (total, _) = block_content_metrics_with_cache(
+                    &terminal,
+                    cols,
+                    header_rows,
+                    cache.as_deref(),
+                    None,
+                );
+                // Compute visible rows from the renderer's actual geometry.
+                let prompt_lines = crate::block_component::block_prompt_lines(&terminal);
+                let visible = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| {
+                        let cwd_header = crate::layout::block_cwd_header_active(
+                            terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
+                            terminal.cwd().is_some(),
+                        );
+                        r.block_visible_rows(prompt_lines, cwd_header)
+                    })
+                    .unwrap_or(rows);
+                total.saturating_sub(visible)
+            } else {
+                0
+            };
+            (rows, cols, block_view, max_scroll)
         };
-        let rows = terminal.grid().num_rows;
-        let cols = terminal.grid().num_cols;
-        // Block view uses a dedicated scroll offset.
-        let block_view = terminal.show_block_view();
         if block_view {
-            let cache = self
-                .renderer
-                .as_ref()
-                .map(|r| r.block_layout_cache.borrow());
-            let (total, _) = block_content_metrics_with_cache(
-                terminal,
-                cols,
-                header_rows,
-                cache.as_deref(),
-                None,
-            );
-            // Compute visible rows from the renderer's actual geometry.
-            let prompt_lines = crate::block_component::block_prompt_lines(terminal);
-            let visible = self
-                .renderer
-                .as_ref()
-                .map(|r| {
-                    let cwd_header = crate::layout::block_cwd_header_active(
-                        terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
-                        terminal.cwd().is_some(),
-                    );
-                    r.block_visible_rows(prompt_lines, cwd_header)
-                })
-                .unwrap_or(rows);
-            let max_scroll = total.saturating_sub(visible);
             match action {
                 Action::ScrollPageUp => {
                     tab.scroll_up_by(rows);
@@ -383,6 +401,9 @@ impl App {
                 _ => {}
             }
         } else {
+            let Some(mut terminal) = tab.lock_terminal() else {
+                return;
+            };
             let grid = terminal.grid_mut();
             match action {
                 Action::ScrollPageUp => grid.scroll_up_history(rows),

@@ -7,20 +7,40 @@
 //! `session_id` for tab-bar / context-menu ownership) stay on `Tab`.
 //!
 //! `Tab` implements `Deref<Target=Pane>` / `DerefMut` so existing call
-//! sites that read `tab.terminal` / `tab.pty` / `tab.input_handler` /
+//! sites that read `tab.pty` / `tab.input_handler` /
 //! `tab.selection_handler` / `tab.ime_preedit` / … keep compiling
 //! unchanged: the field access auto-dereferences to the active pane. New
 //! code that needs to operate on a non-active pane should go through
 //! `tab.pane(id)` / `tab.pane_mut(id)`.
+//!
+//! v1.13.6 T10 P1 (PLAN_v1136 §1 D1/D9): the VT `Terminal` moved behind a
+//! fair mutex (`Option<Arc<FairMutex<Terminal>>>`) as the parse-thread
+//! shared model. The field is **private** (D9 rule 1); access goes through
+//! the controlled accessors [`Pane::lock_terminal`] (owned guard for
+//! multi-statement scopes such as a full draw frame) and
+//! [`Pane::with_terminal`] (short closure reads/writes). The guard is the
+//! *owned* `ArcMutexGuard` (`lock_arc`) — it holds an `Arc` clone instead of
+//! borrowing the pane, so pre-existing disjoint-field-borrow sites (e.g.
+//! `(&terminal, &mut pane.selection_handler)` in the draw path, or
+//! `terminal ∥ pty` in `interrupt_pty`) keep compiling unchanged.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
+use parking_lot::{ArcMutexGuard, FairMutex, RawFairMutex};
 use weft_core::input::{new_flag, InputHandler, MouseSuppressFlag};
 use weft_core::persistence::TabSnapshot;
 use weft_core::pty::{Pty, PtyError, PtyEvent};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
+
+/// Owned terminal lock guard (v1.13.6 T10 P1). `lock_arc` keeps an `Arc`
+/// clone inside the guard, so it carries no borrow of the `Pane` — callers
+/// may mutate sibling pane fields while holding it. Still bound by D9
+/// rules 2–4: never nested, never held across channel send/recv, fd writes,
+/// or file IO.
+pub(crate) type TerminalGuard = ArcMutexGuard<RawFairMutex, Terminal>;
 
 use crate::tab::{BlockScrollAnchor, PendingTuiScroll, PrimaryHistoryRefresh, TuiScrollResolution};
 use crate::{AppEvent, AppMsg};
@@ -50,7 +70,11 @@ pub struct Pane {
     /// dispatch traces so a single log line answers "which physical key
     /// press produced this Effect".
     pub input_seq: u64,
-    pub terminal: Option<Terminal>,
+    /// v1.13.6 T10 P1 (D9 rule 1): private — access only via
+    /// [`Pane::lock_terminal`] / [`Pane::with_terminal`]. `Arc<FairMutex>`
+    /// is the T10 shared-ownership model: the P2 parse worker will clone
+    /// the Arc; the main thread short-scope locks.
+    terminal: Option<Arc<FairMutex<Terminal>>>,
     pub pty: Option<Pty>,
     /// v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §1.2): reader-side
     /// mouse-suppression flag — shared with this pane's PTY read loop and
@@ -182,6 +206,7 @@ impl Pane {
         tracing::info!(rows, cols, "initial terminal size");
 
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
+        let terminal = Arc::new(FairMutex::new(terminal));
         Self {
             pane_session_id: NEXT_PANE_SESSION.fetch_add(1, Ordering::Relaxed),
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
@@ -254,7 +279,11 @@ impl Pane {
         Self {
             pane_session_id: NEXT_PANE_SESSION.fetch_add(1, Ordering::Relaxed),
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
-            terminal: Some(Terminal::with_scrollback(24, 80, scrollback_lines)),
+            terminal: Some(Arc::new(FairMutex::new(Terminal::with_scrollback(
+                24,
+                80,
+                scrollback_lines,
+            )))),
             pty: None,
             mouse_suppress: new_flag(),
             msg_rx,
@@ -280,6 +309,40 @@ impl Pane {
         }
     }
 
+    // ── v1.13.6 T10 P1: controlled terminal accessors (D9) ───────────────
+
+    /// Lock this pane's terminal for a multi-statement scope (full draw
+    /// frame, post-processing pass, resize commit, `write_user_input`, …).
+    /// The returned guard is *owned* (`lock_arc` — holds an `Arc` clone), so
+    /// sibling pane fields stay mutable while it is held. D9 discipline:
+    /// never re-lock the same pane inside the guard scope; never hold it
+    /// across channel send/recv, fd writes, or file IO.
+    pub(crate) fn lock_terminal(&self) -> Option<TerminalGuard> {
+        self.terminal.as_ref().map(|t| t.lock_arc())
+    }
+
+    /// Short-scope terminal access for point reads/writes (mode state, cwd,
+    /// dims, editor text, …). Returns `None` when the pane has no terminal.
+    /// The closure must not itself call `with_terminal`/`lock_terminal` on
+    /// the same pane (no nested locks — D9 rule 2) and must not perform
+    /// blocking operations (D9 rule 4).
+    pub(crate) fn with_terminal<R>(&self, f: impl FnOnce(&mut Terminal) -> R) -> Option<R> {
+        let mut guard = self.lock_terminal()?;
+        Some(f(&mut guard))
+    }
+
+    /// Whether this pane has a live terminal (PTY-spawned or test-built).
+    pub(crate) fn has_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    /// Test-only terminal injection for the former `pane.terminal = Some(…)`
+    /// direct-field assignments.
+    #[cfg(test)]
+    pub(crate) fn set_terminal_for_test(&mut self, terminal: Terminal) {
+        self.terminal = Some(Arc::new(FairMutex::new(terminal)));
+    }
+
     /// Bump and return the next per-pane input-event sequence number.
     /// Currently called at the keyboard-encode chokepoint only. IME commit,
     /// mouse gestures, and paste are not yet wired — extending coverage to
@@ -296,9 +359,7 @@ impl Pane {
     /// config to this pane's terminal. Called by every tab/pane creation
     /// site that already reads config (same chokepoints as scrollback).
     pub(crate) fn set_blocks_retained_limit(&mut self, limit: usize) {
-        if let Some(t) = self.terminal.as_mut() {
-            t.set_blocks_retained_limit(limit);
-        }
+        self.with_terminal(|t| t.set_blocks_retained_limit(limit));
     }
 
     /// PLAN_v11217 §3.5 (T4): apply the `[blocks] output_cap_mib` config to
@@ -306,9 +367,7 @@ impl Pane {
     /// creation-site chokepoints. `cap_bytes` arrives pre-converted (and
     /// clamped) from the config_controller helper.
     pub(crate) fn set_blocks_output_cap(&mut self, cap_bytes: usize) {
-        if let Some(t) = self.terminal.as_mut() {
-            t.set_block_output_cap(cap_bytes);
-        }
+        self.with_terminal(|t| t.set_block_output_cap(cap_bytes));
     }
 
     /// v1.11.7 (PLAN_v1117 §三 M1.2, P2-3): inject the user's
@@ -317,9 +376,7 @@ impl Pane {
     /// Classic so weft_core tests keep the v1.11.6 baseline). Mirror of
     /// `set_blocks_retained_limit` — same chokepoints.
     pub(crate) fn set_tui_render_mode(&mut self, mode: weft_core::vt::TuiRenderMode) {
-        if let Some(t) = self.terminal.as_mut() {
-            t.set_tui_render_mode(mode);
-        }
+        self.with_terminal(|t| t.set_tui_render_mode(mode));
     }
 
     /// Queue a geometry transaction without resizing the Grid ahead of its PTY.
@@ -327,12 +384,11 @@ impl Pane {
     /// dispatcher applies `TIOCSWINSZ` first and only then commits the Grid,
     /// preventing old-width progress output from wrapping in a new-width Grid.
     pub(crate) fn resize_terminal_and_queue(&mut self, rows: usize, cols: usize) -> bool {
-        let Some(terminal) = &self.terminal else {
+        let current = self.with_terminal(|t| (t.grid().num_rows, t.grid().num_cols));
+        if current == Some((rows, cols)) && self.pending_pty_resize.is_none() {
             return false;
-        };
-        if (terminal.grid().num_rows, terminal.grid().num_cols) == (rows, cols)
-            && self.pending_pty_resize.is_none()
-        {
+        }
+        if current.is_none() {
             return false;
         }
         self.pending_pty_resize = Some((rows, cols));
@@ -468,23 +524,18 @@ impl Pane {
     /// interactive tools write confirmation/resume tails after the first or
     /// second Ctrl+C, and a post-write `tcflush` can race away the ETX itself.
     pub fn interrupt_pty(&mut self) -> bool {
-        if let Some(terminal) = &mut self.terminal {
-            terminal.begin_primary_screen_interrupt_capture();
-        }
+        self.with_terminal(|t| t.begin_primary_screen_interrupt_capture());
         // `send_interrupt` only needs `&self`, but `flush_input` needs `&mut`,
         // so take a single `&mut` borrow of the pty field and keep it alive
-        // across both calls. `self.terminal` is a disjoint field, so the
-        // borrow checker permits the `&mut self.terminal` accesses below.
+        // across both calls. The terminal guard above is a scoped
+        // with_terminal closure (T10 P1), so the disjoint `&mut self.pty`
+        // borrow below is uncontended.
         let Some(pty) = self.pty.as_mut() else {
-            if let Some(terminal) = &mut self.terminal {
-                terminal.cancel_primary_screen_interrupt_capture();
-            }
+            self.with_terminal(|t| t.cancel_primary_screen_interrupt_capture());
             return false;
         };
         if !pty.send_interrupt() {
-            if let Some(terminal) = &mut self.terminal {
-                terminal.cancel_primary_screen_interrupt_capture();
-            }
+            self.with_terminal(|t| t.cancel_primary_screen_interrupt_capture());
             return false;
         }
         // Best-effort flush of pending input so a half-typed line doesn't

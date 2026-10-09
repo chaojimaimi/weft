@@ -87,10 +87,10 @@ pub(super) fn apply_palette_to_all_panes(
 ) {
     for tab in tabs.iter_mut() {
         for pane in tab.panes_mut() {
-            if let Some(t) = pane.terminal.as_mut() {
+            pane.with_terminal(|t| {
                 t.set_palette(palette);
                 t.set_background_color(background);
-            }
+            });
         }
     }
 }
@@ -102,9 +102,7 @@ pub(super) fn apply_palette_to_all_panes(
 pub(super) fn apply_kitty_protocol_to_all_panes(tabs: &mut [Tab], enabled: bool) {
     for tab in tabs.iter_mut() {
         for pane in tab.panes_mut() {
-            if let Some(t) = pane.terminal.as_mut() {
-                t.set_kitty_protocol_enabled(enabled);
-            }
+            pane.with_terminal(|t| t.set_kitty_protocol_enabled(enabled));
         }
     }
 }
@@ -122,9 +120,7 @@ pub(super) fn apply_scrollback_to_all_panes(tabs: &mut [Tab], max_lines: usize) 
     );
     for tab in tabs.iter_mut() {
         for pane in tab.panes_mut() {
-            if let Some(t) = pane.terminal.as_mut() {
-                t.set_scrollback_max_lines(max_lines);
-            }
+            pane.with_terminal(|t| t.set_scrollback_max_lines(max_lines));
         }
     }
 }
@@ -150,9 +146,7 @@ pub(super) fn apply_blocks_output_cap_to_all_panes(tabs: &mut [Tab], cap_mib: us
     let cap_bytes = output_cap_bytes(cap_mib);
     for tab in tabs.iter_mut() {
         for pane in tab.panes_mut() {
-            if let Some(t) = pane.terminal.as_mut() {
-                t.set_block_output_cap(cap_bytes);
-            }
+            pane.with_terminal(|t| t.set_block_output_cap(cap_bytes));
         }
     }
 }

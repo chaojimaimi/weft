@@ -109,8 +109,8 @@ impl App {
                 let cwd = self
                     .sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .and_then(|t| t.cwd().map(|s| s.to_string()));
+                    .and_then(|tab| tab.with_terminal(|t| t.cwd().map(str::to_owned)))
+                    .flatten();
                 let gen = worker.submit(&self.palette.query, &[], cwd.as_deref(), 50);
                 self.palette.search_generation = gen;
                 self.palette.search_pending = true;

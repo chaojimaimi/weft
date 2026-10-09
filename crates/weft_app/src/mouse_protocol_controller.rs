@@ -72,7 +72,7 @@ impl App {
             let Some(session) = self.sessions.tab(tab) else {
                 return false;
             };
-            let Some(terminal) = session.terminal.as_ref() else {
+            let Some(terminal) = session.lock_terminal() else {
                 return false;
             };
             // v1.11.15 (FIX A): the PTY reader saw this session's

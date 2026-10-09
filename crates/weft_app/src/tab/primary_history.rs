@@ -84,7 +84,7 @@ impl Pane {
             return false;
         }
 
-        let Some(terminal) = self.terminal.as_mut() else {
+        let Some(mut terminal) = self.lock_terminal() else {
             self.primary_history_refresh = PrimaryHistoryRefresh::default();
             return false;
         };
@@ -153,9 +153,8 @@ mod tests {
         // v1.3: build a pane with a live Terminal (no PTY), wrap in a single-pane
         // tab, then drive the OSC 133 prompt/command sequence so the block tracker
         // enters CommandExecuting — the precondition for primary-history snapshots.
-        let mut pane = Pane::with_terminal_only(100);
-        pane.terminal
-            .as_mut()
+        let pane = Pane::with_terminal_only(100);
+        pane.lock_terminal()
             .unwrap()
             .process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b[6G\x1b[13G");
         Tab::with_single_pane(pane)
@@ -185,7 +184,7 @@ mod tests {
         // "scrolled back to the tail, then keypress" flicker case.
         let mut tab = primary_tui_tab();
         assert!(
-            !tab.terminal.as_ref().unwrap().primary_history_view(),
+            !tab.with_terminal(|t| t.primary_history_view()).unwrap(),
             "precondition: following the live tail"
         );
         // No PTY in this test pane — `write_user_input` returns Err AFTER
@@ -208,15 +207,14 @@ mod tests {
     fn detached_browsing_freezes_snapshot_until_tail() {
         let mut tab = primary_tui_tab();
         tab.scroll_up_by(1);
-        assert!(tab.terminal.as_ref().unwrap().primary_history_view());
+        assert!(tab.lock_terminal().unwrap().primary_history_view());
 
         tab.msg_tx
             .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gfresh".to_vec()))
             .unwrap();
         tab.process_messages();
         assert_eq!(
-            tab.terminal
-                .as_ref()
+            tab.lock_terminal()
                 .unwrap()
                 .block_tracker()
                 .in_flight()
@@ -240,8 +238,7 @@ mod tests {
             .unwrap();
         tab.process_messages();
         assert_eq!(
-            tab.terminal
-                .as_ref()
+            tab.lock_terminal()
                 .unwrap()
                 .block_tracker()
                 .in_flight()
@@ -298,8 +295,7 @@ mod tests {
         let (_, _, need_redraw, _) = tab.process_messages();
         assert!(need_redraw);
         assert_eq!(
-            tab.terminal
-                .as_ref()
+            tab.lock_terminal()
                 .unwrap()
                 .block_tracker()
                 .in_flight()
@@ -318,18 +314,18 @@ mod tests {
         // a fallback (no preedit, imprecise caret).
         let mut tab = primary_tui_tab();
         tab.scroll_up_by(1);
-        assert!(tab.terminal.as_ref().unwrap().primary_history_view());
+        assert!(tab.lock_terminal().unwrap().primary_history_view());
 
         tab.scroll_down_by(1);
         assert_eq!(tab.block_scroll(), 0);
         assert!(
-            !tab.terminal.as_ref().unwrap().primary_history_view(),
+            !tab.lock_terminal().unwrap().primary_history_view(),
             "scrolling to the tail must exit history browsing (return to live grid)"
         );
 
         tab.scroll_up_by(2);
-        assert!(tab.terminal.as_ref().unwrap().primary_history_view());
+        assert!(tab.lock_terminal().unwrap().primary_history_view());
         tab.snap_to_bottom();
-        assert!(!tab.terminal.as_ref().unwrap().primary_history_view());
+        assert!(!tab.lock_terminal().unwrap().primary_history_view());
     }
 }

@@ -638,15 +638,14 @@ impl App {
                 let cwd = self
                     .sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .and_then(|t| t.cwd().map(|s| s.to_string()))
+                    .and_then(|tab| tab.with_terminal(|t| t.cwd().map(str::to_owned)))
+                    .flatten()
                     .unwrap_or_default();
                 // Gather recent history (most-recent first, capped).
                 let recent_history: Vec<String> = self
                     .sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .map(|t| t.editor().history().to_vec())
+                    .and_then(|tab| tab.with_terminal(|t| t.editor().history().to_vec()))
                     .unwrap_or_default()
                     .into_iter()
                     .rev()

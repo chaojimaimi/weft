@@ -215,13 +215,11 @@ impl App {
                             None => None, // no block store — unchanged silent no-op
                         };
                         if let Some(command) = command {
-                            if let Some(terminal) = self
-                                .sessions
-                                .active_mut()
-                                .and_then(|tab| tab.terminal.as_mut())
-                            {
-                                terminal.editor_mut().buffer.set_text(&command);
-                                terminal.editor_mut().buffer.select_all();
+                            if let Some(tab) = self.sessions.active_mut() {
+                                tab.with_terminal(|terminal| {
+                                    terminal.editor_mut().buffer.set_text(&command);
+                                    terminal.editor_mut().buffer.select_all();
+                                });
                             }
                             self.close_palette();
                         }
@@ -247,13 +245,11 @@ impl App {
                 self.request_redraw();
             }
             PaletteEntry::Runbook(entry) => {
-                if let Some(terminal) = self
-                    .sessions
-                    .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
-                {
-                    terminal.editor_mut().buffer.set_text(&entry.command);
-                    terminal.editor_mut().buffer.select_all();
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.with_terminal(|terminal| {
+                        terminal.editor_mut().buffer.set_text(&entry.command);
+                        terminal.editor_mut().buffer.select_all();
+                    });
                 }
                 self.close_palette();
                 self.request_redraw();
@@ -261,13 +257,11 @@ impl App {
             // v1.8.1: Insert the AI-generated command into the editor.
             // No auto-execution — the user reviews and presses Enter.
             PaletteEntry::AiSuggestion { command, risk: _ } => {
-                if let Some(terminal) = self
-                    .sessions
-                    .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
-                {
-                    terminal.editor_mut().buffer.set_text(&command);
-                    terminal.editor_mut().buffer.select_all();
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.with_terminal(|terminal| {
+                        terminal.editor_mut().buffer.set_text(&command);
+                        terminal.editor_mut().buffer.select_all();
+                    });
                 }
                 self.close_palette();
                 self.request_redraw();
@@ -328,10 +322,14 @@ impl App {
             Ok(commands) => {
                 for cmd in &commands {
                     if let Some(tab) = self.sessions.active_mut() {
-                        if let Some(terminal) = &mut tab.terminal {
-                            // Set the command text and submit via the editor path.
+                        // Set the command text and submit via the editor path.
+                        // The with_terminal scope ends before the PTY write
+                        // (D9 rule 4: no fd write inside the guard).
+                        let bytes = tab.with_terminal(|terminal| {
                             terminal.editor_mut().buffer.set_text(cmd);
-                            let bytes = terminal.submit_command();
+                            terminal.submit_command()
+                        });
+                        if let Some(bytes) = bytes {
                             if !bytes.is_empty() && tab.write_user_input(&bytes).is_err() {
                                 warn!("failed to write workflow command to PTY");
                             }

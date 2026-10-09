@@ -7,11 +7,12 @@
 //! lifecycle (split / focus / close / hit-test).
 
 use super::*;
+use weft_core::vt::Terminal;
 
 #[test]
 fn empty_tab_has_no_terminal() {
     let t = Tab::empty();
-    assert!(t.terminal.is_none());
+    assert!(!t.has_terminal());
     assert!(t.pty.is_none());
 }
 
@@ -44,7 +45,7 @@ fn queued_scroll_replays_after_alt_screen_entry() {
     assert!(t.queue_tui_scroll(-2, 5, 10, weft_core::input::Modifiers::empty()));
     assert!(t.resolve_pending_tui_scroll().is_none());
 
-    t.terminal.as_mut().unwrap().process(b"\x1b[?1049h");
+    t.lock_terminal().unwrap().process(b"\x1b[?1049h");
     assert!(t.resolve_pending_tui_scroll().is_none());
     expire_pending_scroll(&mut t);
     let Some(TuiScrollResolution::PtyBytes(bytes)) = t.resolve_pending_tui_scroll() else {
@@ -59,7 +60,7 @@ fn queued_scroll_falls_back_to_local_rows_for_normal_command() {
     let mut t = tab_with_terminal(100);
     t.arm_tui_scroll_window();
     assert!(t.queue_tui_scroll(3, 5, 10, weft_core::input::Modifiers::empty()));
-    t.terminal.as_mut().unwrap().process(b"\x1b]133;A\x07");
+    t.lock_terminal().unwrap().process(b"\x1b]133;A\x07");
     expire_pending_scroll(&mut t);
 
     let Some(TuiScrollResolution::LocalRows(rows)) = t.resolve_pending_tui_scroll() else {
@@ -89,8 +90,7 @@ fn queued_scroll_uses_mouse_protocol_when_tui_enables_it() {
     let mut t = tab_with_terminal(100);
     t.arm_tui_scroll_window();
     assert!(t.queue_tui_scroll(-1, 5, 10, weft_core::input::Modifiers::empty()));
-    t.terminal
-        .as_mut()
+    t.lock_terminal()
         .unwrap()
         .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
     expire_pending_scroll(&mut t);
@@ -107,12 +107,11 @@ fn queued_scroll_waits_for_mouse_mode_in_next_pty_chunk() {
     t.arm_tui_scroll_window();
     assert!(t.queue_tui_scroll(-1, 5, 10, weft_core::input::Modifiers::empty()));
 
-    t.terminal.as_mut().unwrap().process(b"\x1b[?1049h");
+    t.lock_terminal().unwrap().process(b"\x1b[?1049h");
     assert!(t.resolve_pending_tui_scroll().is_none());
     assert!(t.resolve_pending_tui_scroll().is_none());
 
-    t.terminal
-        .as_mut()
+    t.lock_terminal()
         .unwrap()
         .process(b"\x1b[?1000h\x1b[?1006h");
     expire_pending_scroll(&mut t);
@@ -127,7 +126,7 @@ fn queued_arrow_scroll_preserves_shift_modifier() {
     let mut t = tab_with_terminal(100);
     t.arm_tui_scroll_window();
     assert!(t.queue_tui_scroll(-1, 5, 10, weft_core::input::Modifiers::SHIFT));
-    t.terminal.as_mut().unwrap().process(b"\x1b[?1049h");
+    t.lock_terminal().unwrap().process(b"\x1b[?1049h");
     expire_pending_scroll(&mut t);
 
     let Some(TuiScrollResolution::PtyBytes(bytes)) = t.resolve_pending_tui_scroll() else {
@@ -164,8 +163,7 @@ fn snapshot_is_none_when_no_terminal() {
 fn snapshot_roundtrip_preserves_scroll_offset_and_editor() {
     let mut t = tab_with_terminal(1000);
     t.set_block_scroll(7);
-    t.terminal
-        .as_mut()
+    t.lock_terminal()
         .unwrap()
         .editor_mut()
         .buffer
@@ -181,7 +179,7 @@ fn snapshot_roundtrip_preserves_scroll_offset_and_editor() {
     let mut restored = tab_with_terminal(1000);
     assert!(restored.restore_from_snapshot(&snap));
     assert_eq!(restored.block_scroll(), 7);
-    let editor_text = restored.terminal.as_ref().unwrap().editor().buffer.text();
+    let editor_text = restored.lock_terminal().unwrap().editor().buffer.text();
     assert_eq!(editor_text, "echo hi");
 }
 
@@ -218,7 +216,7 @@ fn restore_from_invalid_editor_buffer_keeps_empty() {
     assert!(!t.restore_from_snapshot(&snap));
     // scroll offset still applied even if editor restore failed.
     assert_eq!(t.block_scroll(), 3);
-    let editor_text = t.terminal.as_ref().unwrap().editor().buffer.text();
+    let editor_text = t.lock_terminal().unwrap().editor().buffer.text();
     assert!(editor_text.is_empty());
 }
 
@@ -273,8 +271,13 @@ fn active_pane_views_backgrounds_exclude_active_terminal() {
     let original_session = original_pane.pane_session_id;
     let original_scroll = original_pane.block_scroll_anchor.offset_value() as f32
         + original_pane.block_scroll_fraction;
-    let original_terminal: *const weft_core::vt::Terminal =
-        original_pane.terminal.as_ref().expect("original terminal");
+    // T10 P1: the terminal lives inside the pane's `Arc<FairMutex<…>>`, so
+    // the data address taken through a short-owned guard is the same stable
+    // heap address the old field reference compared.
+    let original_terminal: *const weft_core::vt::Terminal = {
+        let guard = original_pane.lock_terminal().expect("original terminal");
+        &*guard
+    };
     let active_session = t.pane(new_id).expect("active pane present").pane_session_id;
 
     let views = t.active_pane_views();
@@ -286,9 +289,11 @@ fn active_pane_views_backgrounds_exclude_active_terminal() {
     assert_eq!(bg.block_scroll, original_scroll);
     // Address comparison: the background reference points at the ORIGINAL
     // pane's terminal, never at the active pane's.
-    let active_terminal: *const weft_core::vt::Terminal =
-        views.active.terminal.as_ref().expect("active terminal") as *const _;
-    let bg_terminal: *const weft_core::vt::Terminal = bg.terminal;
+    let active_terminal: *const weft_core::vt::Terminal = {
+        let guard = views.active.lock_terminal().expect("active terminal");
+        &*guard
+    };
+    let bg_terminal: *const weft_core::vt::Terminal = &*bg.terminal;
     assert!(!std::ptr::eq(bg_terminal, active_terminal));
     assert!(std::ptr::eq(bg_terminal, original_terminal));
 }
@@ -428,17 +433,17 @@ fn split_inherits_active_pane_terminal_size() {
     // plumbing; the renderer / PTY resize to split-tree rects lands
     // in Batch 5/6.)
     let mut pane = Pane::with_terminal_only(100);
-    pane.terminal = Some(Terminal::with_scrollback(30, 90, 100));
+    pane.set_terminal_for_test(Terminal::with_scrollback(30, 90, 100));
     let mut t = Tab::with_single_pane(pane);
-    let original_rows = t.active().terminal.as_ref().unwrap().grid().num_rows;
-    let original_cols = t.active().terminal.as_ref().unwrap().grid().num_cols;
+    let original_rows = t.active().lock_terminal().unwrap().grid().num_rows;
+    let original_cols = t.active().lock_terminal().unwrap().grid().num_cols;
     assert_eq!((original_rows, original_cols), (30, 90));
 
     let new_id = t
         .split_active_pane_test(SplitDirection::Vertical, 0.5, 100)
         .unwrap();
     let new_pane = t.pane(new_id).unwrap();
-    let new_terminal = new_pane.terminal.as_ref().unwrap();
+    let new_terminal = new_pane.lock_terminal().unwrap();
     // with_terminal_only uses Terminal::with_scrollback(24, 80, ...) —
     // it does NOT inherit the original pane's size (that only happens
     // in the production split_active_pane path). The test documents
@@ -553,7 +558,7 @@ const TUI_CELL_H: f32 = 20.0;
 fn drive_primary_tui(tab: &mut Tab) {
     tab.process_pty_output(b"\x1b]133;A\x07\x1b]133;B\x07omp\x1b]133;C\x07");
     tab.process_pty_output(b"\x1b[3A\x1b[1G\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l");
-    let terminal = tab.terminal.as_ref().unwrap();
+    let terminal = tab.lock_terminal().unwrap();
     assert!(
         terminal.primary_screen_app_active(),
         "precondition: the pane owns a primary-screen TUI"
@@ -588,11 +593,10 @@ fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
     let queued = tab.active_mut().pending_pty_resize.take().unwrap();
     assert_eq!(queued, (rows, pty_cols), "both mirror sites agree");
     tab.active_mut()
-        .terminal
-        .as_mut()
+        .lock_terminal()
         .unwrap()
         .resize(rows, pty_cols);
-    let grid_cols = tab.terminal.as_ref().unwrap().grid().num_cols;
+    let grid_cols = tab.lock_terminal().unwrap().grid().num_cols;
     assert_eq!(grid_cols, pty_cols, "grid render cols == PTY target cols");
 
     // (3) Block wrap cols at the same pane geometry.
@@ -613,12 +617,11 @@ fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
         .unwrap();
     assert_eq!(alt_cols, 80, "alt-screen TUI target is the full width");
     tab.active_mut()
-        .terminal
-        .as_mut()
+        .lock_terminal()
         .unwrap()
         .resize(rows, alt_cols);
     assert_eq!(
-        tab.terminal.as_ref().unwrap().grid().num_cols,
+        tab.lock_terminal().unwrap().grid().num_cols,
         alt_cols,
         "grid render cols always mirror the PTY target (edge-to-edge here)"
     );
@@ -663,8 +666,7 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
     // Calculate the expected Full width for this pane geometry.
     let full_cols = 80; // TUI_PANE_RECT (800.0) / TUI_CELL_W (10.0) = 80 cols
     tab.active_mut()
-        .terminal
-        .as_mut()
+        .lock_terminal()
         .unwrap()
         .resize(rows, content_cols);
     let mut last_sent: Option<(usize, usize)> = Some((rows, content_cols));
@@ -711,11 +713,7 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
         if Pane::should_send_winsize_ioctl(last_sent, (rows, cols)) {
             last_sent = Some((rows, cols));
             emitted_ioctls += 1;
-            tab.active_mut()
-                .terminal
-                .as_mut()
-                .unwrap()
-                .resize(rows, cols);
+            tab.active_mut().lock_terminal().unwrap().resize(rows, cols);
         }
 
         tab.process_pty_output(b"\x1b[?1049l");
@@ -730,8 +728,7 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
             last_sent = Some((rows, primary_cols));
             emitted_ioctls += 1;
             tab.active_mut()
-                .terminal
-                .as_mut()
+                .lock_terminal()
                 .unwrap()
                 .resize(rows, primary_cols);
         }
@@ -802,8 +799,7 @@ fn apply_measured_target(
         ioctls.push(target);
     }
     tab.active_mut()
-        .terminal
-        .as_mut()
+        .lock_terminal()
         .unwrap()
         .resize(target.0, target.1);
 }
@@ -837,8 +833,7 @@ fn resize_followed_by_toggle_pair_emits_exactly_two_ioctls_no_intermediate() {
         .unwrap();
     assert_eq!(old_full_cols, 80, "old geometry maps to full 80 cols");
     tab.active_mut()
-        .terminal
-        .as_mut()
+        .lock_terminal()
         .unwrap()
         .resize(rows, old_full_cols);
     let mut last_sent: Option<(usize, usize)> = Some((rows, old_full_cols));
@@ -929,9 +924,9 @@ fn resize_followed_by_toggle_pair_emits_exactly_two_ioctls_no_intermediate() {
 fn batch_internal_h_l_pair_counts_two_flips_and_refreshes_history() {
     let mut tab = tab_with_terminal(100);
     drive_primary_tui(&mut tab);
-    assert!(!tab.terminal.as_ref().unwrap().is_alt_screen_active());
+    assert!(!tab.lock_terminal().unwrap().is_alt_screen_active());
     assert_eq!(
-        tab.terminal.as_ref().unwrap().alt_flip_count(),
+        tab.lock_terminal().unwrap().alt_flip_count(),
         0,
         "precondition: no flips yet"
     );
@@ -939,7 +934,7 @@ fn batch_internal_h_l_pair_counts_two_flips_and_refreshes_history() {
     // One batch with an h→l pair: phase is net-zero (still primary).
     tab.process_pty_output(b"\x1b[?1049h\x1b[?1049l");
 
-    let terminal = tab.terminal.as_ref().unwrap();
+    let terminal = tab.lock_terminal().unwrap();
     assert_eq!(
         terminal.alt_flip_count(),
         2,
@@ -984,7 +979,7 @@ fn single_alt_toggle_converges_to_full_once_resident() {
     // this mis-fired: any fresh flip held the 150ms Content lock, flashing
     // the wrong width on a real vim/less launch.
     tab.process_pty_output(b"\x1b[?1049h");
-    assert!(tab.terminal.as_ref().unwrap().is_alt_screen_active());
+    assert!(tab.lock_terminal().unwrap().is_alt_screen_active());
     let_sustained_alt_residency_elapse();
     let (_, fresh_cols) = tab
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
@@ -996,8 +991,7 @@ fn single_alt_toggle_converges_to_full_once_resident() {
     // Commit the grid to the alt Full width (production: ioctl → grid commit)
     // so the freeze reads current == last_sent.
     tab.active_mut()
-        .terminal
-        .as_mut()
+        .lock_terminal()
         .unwrap()
         .resize(rows, fresh_cols);
 
@@ -1031,8 +1025,7 @@ fn live_split_stream_drains_heads_and_compensates_anchor() {
     tab.process_pty_output(b"\x1b]133;A\x07\x1b]133;B\x07stream\x1b]133;C\x07");
     tab.process_pty_output(b"\x1b[H\x1b[2;1H");
     assert!(
-        tab.terminal
-            .as_ref()
+        tab.lock_terminal()
             .unwrap()
             .block_tracker()
             .screen_document_start()
@@ -1058,36 +1051,21 @@ fn live_split_stream_drains_heads_and_compensates_anchor() {
 
     // First 1MiB crossing: the manual refresh splits the composed document;
     // the heads land in finished blocks synchronously.
-    let heads_before = tab
-        .terminal
-        .as_ref()
-        .unwrap()
-        .block_tracker()
-        .blocks()
-        .len();
+    let heads_before = tab.lock_terminal().unwrap().block_tracker().blocks().len();
     assert!(
-        tab.terminal
-            .as_mut()
+        tab.lock_terminal()
             .unwrap()
             .refresh_primary_history_snapshot_now(),
         "manual refresh must run regardless of the 50ms throttle"
     );
-    let heads_1 = tab
-        .terminal
-        .as_ref()
-        .unwrap()
-        .block_tracker()
-        .blocks()
-        .len()
-        - heads_before;
+    let heads_1 = tab.lock_terminal().unwrap().block_tracker().blocks().len() - heads_before;
     assert!(heads_1 >= 1, "first flood must settle >= 1 split head");
 
     // The tab drain consumes the pending head count (the anchor compensation
     // runs after the terminal borrow ends, tab.rs B-D3).
     tab.process_messages();
     assert!(
-        tab.terminal
-            .as_mut()
+        tab.lock_terminal()
             .unwrap()
             .take_pending_screen_split_heads()
             .is_none(),
@@ -1101,28 +1079,14 @@ fn live_split_stream_drains_heads_and_compensates_anchor() {
     for _ in 0..6 {
         tab.process_pty_output(&flood);
     }
-    let heads_before = tab
-        .terminal
-        .as_ref()
-        .unwrap()
-        .block_tracker()
-        .blocks()
-        .len();
+    let heads_before = tab.lock_terminal().unwrap().block_tracker().blocks().len();
     assert!(
-        tab.terminal
-            .as_mut()
+        tab.lock_terminal()
             .unwrap()
             .refresh_primary_history_snapshot_now(),
         "second manual refresh must split the grown document"
     );
-    let heads_2 = tab
-        .terminal
-        .as_ref()
-        .unwrap()
-        .block_tracker()
-        .blocks()
-        .len()
-        - heads_before;
+    let heads_2 = tab.lock_terminal().unwrap().block_tracker().blocks().len() - heads_before;
     assert!(heads_2 >= 1, "second flood must settle >= 1 split head");
     tab.process_messages();
 
@@ -1139,8 +1103,11 @@ fn live_split_stream_drains_heads_and_compensates_anchor() {
     // head blocks keep the stream's head text and the final block keeps the
     // stream-tail text — the shared transcript stays complete.
     tab.process_pty_output(b"\x1b]133;D;0\x07");
-    tab.terminal.as_mut().unwrap().settle_primary_screen_exit();
-    let blocks = tab.terminal.as_ref().unwrap().block_tracker().blocks();
+    tab.lock_terminal().unwrap().settle_primary_screen_exit();
+    let blocks = {
+        let guard = tab.lock_terminal().unwrap();
+        guard.block_tracker().blocks().to_vec()
+    };
     assert!(
         blocks.len() >= 2,
         "splits + settle leave >= 2 finished blocks"
@@ -1167,8 +1134,7 @@ fn sync_mouse_modes_copies_terminal_mouse_trio_into_input_handler() {
     let mut t = tab_with_terminal(100);
     // Negotiate AnyEvent + SGR + DECCKM on the terminal; the input handler
     // stays at its fresh defaults until the sync.
-    t.terminal
-        .as_mut()
+    t.lock_terminal()
         .unwrap()
         .process(b"\x1b[?1003h\x1b[?1006h\x1b[?1h");
     assert_eq!(t.input_handler.mouse_protocol, MouseProtocol::Off);
@@ -1216,8 +1182,7 @@ fn suppressed_pending_tui_scroll_is_consumed_without_pty_bytes() {
     assert!(t.queue_tui_scroll(-2, 5, 10, weft_core::input::Modifiers::empty()));
     // The TUI's full startup handshake arrives while the gesture is parked;
     // without suppression this resolution would be SGR wheel bytes.
-    t.terminal
-        .as_mut()
+    t.lock_terminal()
         .unwrap()
         .process(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
     // …but the session's disable arrives first (the leak scenario): the

@@ -297,9 +297,8 @@ impl ApplicationHandler<AppEvent> for App {
                     self.poll_ai_results();
                     schedule_primary_history_refresh_wakes(self.sessions.tabs_mut(), &self.proxy);
                     if self.sessions.tabs().iter().any(|tab| {
-                        tab.terminal
-                            .as_ref()
-                            .is_some_and(Terminal::primary_screen_exit_pending)
+                        tab.with_terminal(|t| t.primary_screen_exit_pending())
+                            .unwrap_or(false)
                     }) {
                         let proxy = self.proxy.clone();
                         schedule_synchronized_output_watchdog(
@@ -313,8 +312,8 @@ impl ApplicationHandler<AppEvent> for App {
                     let active_synchronized = self
                         .sessions
                         .active()
-                        .and_then(|tab| tab.terminal.as_ref())
-                        .is_some_and(Terminal::synchronized_output);
+                        .and_then(|tab| tab.with_terminal(|t| t.synchronized_output()))
+                        .unwrap_or(false);
                     let any_synchronized = self
                         .sessions
                         .tabs()
@@ -898,9 +897,11 @@ impl App {
                 }
             };
             let mut committed = false;
-            if let Some(terminal) = &mut pane.terminal {
+            // T10 P1: the guard is owned (`lock_arc`) so the disjoint
+            // `pending_pty_resize` field stays mutable under the lock.
+            if let Some(mut terminal) = pane.lock_terminal() {
                 committed = commit_pty_resize_result(
-                    terminal,
+                    &mut terminal,
                     &mut pane.pending_pty_resize,
                     (rows, cols),
                     resize_succeeded,
@@ -975,14 +976,14 @@ impl App {
                     .as_ref()
                     .map(|snap| snap.block_ids.clone())
                     .unwrap_or_default();
-                if let Some(terminal) = pane.terminal.as_mut() {
+                pane.with_terminal(|terminal| {
                     hydrate_persisted_history(
                         terminal,
                         &persisted_history,
                         &pane_block_ids,
                         block_id_allocator.clone(),
                     );
-                }
+                });
             }
         }
     }
@@ -1227,7 +1228,7 @@ mod tests {
     #[test]
     fn cwd_fallback_then_attach_hydrates_tracker_from_injected_block_ids() {
         let mut tab = crate::tab::Tab::empty();
-        tab.terminal = Some(Terminal::with_scrollback(24, 80, 1000));
+        tab.set_terminal_for_test(Terminal::with_scrollback(24, 80, 1000));
 
         // Workspace restore: cwd fallback only — no stub snapshot.
         tab.set_restored_cwd_fallback(Some("/saved".into()));
@@ -1267,19 +1268,12 @@ mod tests {
             30,
             30 + 4096,
         ));
-        hydrate_persisted_history(
-            tab.terminal.as_mut().unwrap(),
-            &newest_first,
-            &tab_block_ids,
-            allocator,
-        );
+        let mut guard = tab.lock_terminal().unwrap();
+        hydrate_persisted_history(&mut guard, &newest_first, &tab_block_ids, allocator);
+        // T10 P1 (D9 rule 2): release the guard before the re-locking assert.
+        drop(guard);
         assert_eq!(
-            tab.terminal
-                .as_ref()
-                .unwrap()
-                .block_tracker()
-                .blocks()
-                .len(),
+            tab.lock_terminal().unwrap().block_tracker().blocks().len(),
             2,
             "injected block_ids must hydrate the tracker (v1.8.9 chain)"
         );

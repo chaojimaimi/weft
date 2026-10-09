@@ -17,7 +17,7 @@ impl App {
         if let Some(t) = self
             .sessions
             .tab(self.sessions.active_idx())
-            .and_then(|tab| tab.terminal.as_ref())
+            .and_then(|tab| tab.lock_terminal())
         {
             let grid = t.grid();
             return (grid.num_rows, grid.num_cols);
@@ -43,11 +43,7 @@ impl App {
         // Finder-launched apps commonly have `/` as their process cwd. A new
         // terminal tab should instead inherit the active shell's live OSC 7
         // cwd (or its restored fallback) so Cmd+T preserves user context.
-        let inherited_cwd = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.launch_cwd())
-            .map(str::to_owned);
+        let inherited_cwd = self.sessions.active().and_then(|tab| tab.launch_cwd());
         let idx = self.sessions.open_tab(
             rows,
             cols,
@@ -56,10 +52,10 @@ impl App {
             inherited_cwd.as_deref(),
         );
         if let Some(block_id_allocator) = block_id_allocator {
-            if let Some(terminal) = self
+            if let Some(mut terminal) = self
                 .sessions
                 .tab_mut(idx)
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             {
                 terminal
                     .block_tracker_mut()
@@ -79,10 +75,10 @@ impl App {
                 self.config_state.config.experimental.tui_render_mode,
             );
         }
-        if let Some(t) = self
+        if let Some(mut t) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         {
             t.set_blocks_retained_limit(self.config_state.config.blocks.retained_limit);
             t.set_block_output_cap(crate::config_controller::output_cap_bytes(
@@ -313,11 +309,9 @@ impl App {
             .enumerate()
             .map(|(i, tab)| {
                 let command = tab
-                    .terminal
-                    .as_ref()
-                    .and_then(|t| t.block_tracker().in_flight())
-                    .map(|flight| flight.command);
-                crate::paint::tab_bar::tab_title(i, tab.launch_cwd(), command)
+                    .with_terminal(|t| t.block_tracker().in_flight().map(|f| f.command.to_string()))
+                    .flatten();
+                crate::paint::tab_bar::tab_title(i, tab.launch_cwd().as_deref(), command.as_deref())
             })
             .collect();
         let labels = titles.iter().map(|title| title.compact.clone()).collect();
@@ -394,10 +388,10 @@ impl App {
         // Reseed ALL tabs' palettes, not just the active one — otherwise
         // switching tabs shows the old theme's ANSI colors.
         for tab in self.sessions.tabs_mut() {
-            if let Some(t) = &mut tab.terminal {
+            tab.with_terminal(|t| {
                 t.set_palette(theme.palette);
                 t.set_background_color(theme.background);
-            }
+            });
         }
         info!(dark = self.config_state.theme_is_dark, name, "theme cycled");
         self.request_redraw();
@@ -412,13 +406,11 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
-        if let Some(t) = self
-            .sessions
-            .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
-        {
-            t.set_palette(theme.palette);
-            t.set_background_color(theme.background);
+        if let Some(tab) = self.sessions.active_mut() {
+            tab.with_terminal(|t| {
+                t.set_palette(theme.palette);
+                t.set_background_color(theme.background);
+            });
         }
         self.config_state.theme_is_dark = dark;
         // v1.0: sync config.theme.name + preferred_dark_theme so Settings

@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod targets;
+
 /// Action triggered by clicking a button in the find popup. Produced by
 /// `App::find_button_at` (this controller — the hit-test lives here) from
 /// the find scene's hit-test rects.
@@ -27,7 +29,7 @@ impl App {
         let ctx = renderer.layout_ctx?;
         // v1.12.25 (audit 3-B, P1-01): empty-tabs transient reads as None.
         let tab = self.sessions.active()?;
-        let terminal = tab.terminal.as_ref()?;
+        let terminal = tab.lock_terminal()?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -44,88 +46,6 @@ impl App {
             max_scroll,
             tab.block_scroll(),
         )
-    }
-    pub(super) fn palette_scene(
-        &self,
-    ) -> Option<crate::scene::Scene<crate::palette_component::PaletteTarget>> {
-        if !self.palette.open {
-            return None;
-        }
-        let ctx = self.renderer.as_ref()?.layout_ctx?;
-        let labels: Vec<String> = match &self.palette.submode {
-            PaletteSubMode::SelectTheme { buffer, themes } => {
-                let query = buffer.to_lowercase();
-                themes
-                    .iter()
-                    .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
-                    .cloned()
-                    .collect()
-            }
-            _ => self
-                .palette
-                .results
-                .iter()
-                .map(|entry| match entry {
-                    PaletteEntry::Workflow(workflow) => workflow.name.clone(),
-                    PaletteEntry::Builtin(command) => command.label().to_string(),
-                    // v1.5.1: Profile entries render as "Switch Profile: <name>".
-                    PaletteEntry::Profile { name, .. } => {
-                        format!("Switch Profile: {name}")
-                    }
-                    // v1.7.1: Search hits use the document title as label.
-                    PaletteEntry::SearchHit(hit) => hit.doc.title.clone(),
-                    PaletteEntry::Runbook(entry) => entry.command.clone(),
-                    // v1.8.1: AI suggestions use the generated command as label.
-                    PaletteEntry::AiSuggestion { command, .. } => command.clone(),
-                })
-                .collect(),
-        };
-        let layout = crate::palette_component::derive_palette_layout(
-            &ctx,
-            labels.len(),
-            self.palette.selection,
-            self.palette.form.as_ref().map(|form| form.var_names.len()),
-            self.interaction.popup_max_rows,
-            self.interaction.popup_width_scale,
-        );
-        Some(crate::palette_component::build_palette_scene(
-            layout, &labels, ctx.cell_h,
-        ))
-    }
-
-    pub(super) fn completion_scene(
-        &self,
-    ) -> Option<crate::scene::Scene<crate::completion_component::CompletionTarget>> {
-        let renderer = self.renderer.as_ref()?;
-        let ctx = renderer.layout_ctx?;
-        let terminal = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())?;
-        if terminal.effective_input_mode() != weft_core::input::InputMode::Editor
-            || terminal.editor().search_view().is_some()
-        {
-            return None;
-        }
-        let editor = terminal.editor();
-        let (matches, selected) = editor.completion_view()?;
-        let (visual, _, _) = crate::paint::prompt::prompt_layout_for_buffer(
-            &ctx,
-            &editor.buffer.lines,
-            editor.buffer.cursor,
-        );
-        let layout = crate::completion_component::derive_completion_layout(
-            &ctx,
-            matches,
-            selected,
-            visual.rows.len(),
-            (visual.cursor_row, visual.cursor_display_col),
-            self.interaction.popup_max_rows,
-            self.interaction.popup_width_scale,
-        )?;
-        Some(crate::completion_component::build_completion_scene(
-            layout, matches, ctx.cell_h,
-        ))
     }
 
     /// Build the one shared terminal layout used by PTY sizing, rendering and
@@ -235,7 +155,7 @@ impl App {
         let cell_w = base_layout.cell_width as f32;
         let cell_h = base_layout.cell_height as f32;
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
-            if tab.terminal.is_some() {
+            if tab.has_terminal() {
                 let resized = tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
                 if resized {
                     // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): a terminal
@@ -282,14 +202,16 @@ impl App {
                     })
                     .unwrap_or(layout_ctx);
                 let previous = tab.block_scroll();
-                let reconciliation = tab.terminal.as_ref().and_then(|terminal| {
-                    crate::block_component::reconciled_terminal_block_scroll(
-                        terminal,
-                        &pane_layout_ctx,
-                        header_rows,
-                        previous,
-                    )
-                });
+                let reconciliation = tab
+                    .with_terminal(|terminal| {
+                        crate::block_component::reconciled_terminal_block_scroll(
+                            terminal,
+                            &pane_layout_ctx,
+                            header_rows,
+                            previous,
+                        )
+                    })
+                    .flatten();
                 if let Some((reconciled, total, visible)) = reconciliation {
                     if previous != reconciled {
                         info!(
@@ -326,8 +248,7 @@ impl App {
         let (num_rows, num_cols) = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| (t.grid().num_rows, t.grid().num_cols))
+            .and_then(|tab| tab.with_terminal(|t| (t.grid().num_rows, t.grid().num_cols)))
             .unwrap_or((1, 1));
 
         // v1.3 Batch 6: adjust (x, y) by the active pane's origin offset.
@@ -344,8 +265,12 @@ impl App {
         let inset_block_gutter = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .is_some_and(|t| !t.is_alt_screen_active() && t.primary_screen_owns_live_view());
+            .and_then(|tab| {
+                tab.with_terminal(|t| {
+                    !t.is_alt_screen_active() && t.primary_screen_owns_live_view()
+                })
+            })
+            .unwrap_or(false);
         let (adj_x, adj_y, gutter_delta) = if layout.contains_content(x, y) {
             let content_rect: weft_core::pane_layout::Rect = [
                 layout.content.left as f32,
@@ -398,14 +323,14 @@ impl App {
         if self.block_view_active() {
             return self.block_view_hyperlink_at_pixel(x, y);
         }
-        let terminal = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())?;
+        // T10 P1 (D9 rule 2): `terminal_content_contains` / `pixel_to_grid`
+        // lock the active pane's terminal internally, so both run BEFORE the
+        // guard below is taken (zero behavior change — both are pure reads).
         if !self.terminal_content_contains(x, y) {
             return None;
         }
         let pos = self.pixel_to_grid(x, y);
+        let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
         // v1.6.1: resolve via RowExtras (scroll-aware) → registry URL lookup.
         let id = terminal.grid().hyperlink_id_at(pos.row, pos.col)?;
         terminal.hyperlinks().url(id).map(str::to_string)
@@ -438,10 +363,7 @@ impl App {
                 self.renderer.as_ref()?.cell_width() as f64,
                 row.indent_cols,
             );
-        let terminal = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())?;
+        let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
         let tracker = terminal.block_tracker();
         // Resolve the StyledLine from either a finalized block or the live
         // in-flight block (block_id is None for live rows).
@@ -534,10 +456,7 @@ impl App {
         if cw <= 0.0 || ch <= 0.0 {
             return None;
         }
-        let terminal = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())?;
+        let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
         if terminal.effective_input_mode() != weft_core::input::InputMode::Editor {
             return None;
         }
@@ -592,10 +511,7 @@ impl App {
     pub(super) fn prompt_box_rect(&self) -> Option<[f32; 4]> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
-        let terminal = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())?;
+        let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -615,12 +531,21 @@ impl App {
     pub(super) fn compute_block_view_rows(
         &self,
     ) -> Option<(Vec<weft_core::selection::BlockViewRow>, f32, f32)> {
-        let renderer = self.renderer.as_ref()?;
-        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient reads as None;
-        // the tab binding below also serves the two active() reads in the
-        // BlockViewParams literal.
         let tab = self.sessions.active()?;
-        let terminal = tab.terminal.as_ref()?;
+        let terminal = tab.lock_terminal()?;
+        self.compute_block_view_rows_for(tab, &terminal)
+    }
+
+    /// Guard-carrying variant of [`Self::compute_block_view_rows`] (T10 P1):
+    /// callers that already hold the active pane's terminal guard (e.g. the
+    /// accessibility text walk) must use this — calling the locking wrapper
+    /// inside a guard scope would self-deadlock (D9 rule 2).
+    pub(super) fn compute_block_view_rows_for(
+        &self,
+        tab: &Tab,
+        terminal: &Terminal,
+    ) -> Option<(Vec<weft_core::selection::BlockViewRow>, f32, f32)> {
+        let renderer = self.renderer.as_ref()?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -679,35 +604,8 @@ impl App {
     pub(super) fn block_view_active(&self) -> bool {
         self.sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| t.show_block_view())
+            .and_then(|tab| tab.with_terminal(|t| t.show_block_view()))
             .unwrap_or(false)
-    }
-
-    /// F3-3: Check whether a physical-pixel point `(x, y)` lands on the
-    /// sidebar's right-edge resize handle. Returns `true` only when:
-    ///   - the history panel is open,
-    ///   - the window is NOT Compact (sidebar is push mode, not overlay),
-    ///   - the point is within `tolerance` px of the sidebar's right edge,
-    ///   - the point is within the viewport's vertical extent.
-    ///
-    /// `tolerance` is in physical pixels (≈4 px each side of the edge). The
-    /// pure geometry lives in `ui_tokens::sidebar_edge_hit` (unit-tested
-    /// independently of the renderer/App state).
-    pub(super) fn sidebar_resize_hit(&self, x: f32, y: f32, tolerance: f32) -> bool {
-        if !self.panel.open {
-            return false;
-        }
-        let Some(renderer) = &self.renderer else {
-            return false;
-        };
-        // Compact windows don't support sidebar resize (overlay drawer).
-        if renderer.sidebar_push_width() == 0.0 {
-            return false;
-        }
-        let edge = renderer.sidebar_width();
-        let vp_h = renderer.viewport().1;
-        crate::ui_tokens::sidebar_edge_hit(x, edge, tolerance, vp_h, y)
     }
 
     /// True when the foreground program has grabbed the mouse (mouse reporting
@@ -721,8 +619,7 @@ impl App {
         }
         self.sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| t.mouse_protocol() != MouseProtocol::Off)
+            .and_then(|tab| tab.with_terminal(|t| t.mouse_protocol() != MouseProtocol::Off))
             .unwrap_or(false)
     }
 
@@ -751,151 +648,5 @@ impl App {
             }
         }
         None
-    }
-
-    /// Hit-test the find popup's clickable buttons. Returns the action the
-    /// click should trigger, or `None` when the click landed outside any
-    /// button (or the find popup isn't open). Layout, hit testing and semantic
-    /// bounds are produced by the same Find Scene component.
-    pub(super) fn find_button_at(&self, x: f32, y: f32) -> Option<FindButtonAction> {
-        let renderer = self.renderer.as_ref()?;
-        let ctx = renderer.layout_ctx?;
-        let total = if self.block_view_active() {
-            self.find.block_matches.len()
-        } else {
-            self.find.matches.len()
-        };
-        let scene =
-            crate::find_component::build_find_scene(crate::layout::layout_find(&ctx, total));
-        crate::find_component::find_target_at(&scene, x, y).map(|target| match target {
-            crate::find_component::FindTarget::Previous => FindButtonAction::Prev,
-            crate::find_component::FindTarget::Next => FindButtonAction::Next,
-            crate::find_component::FindTarget::ToggleCase => FindButtonAction::ToggleCase,
-            crate::find_component::FindTarget::ToggleRegex => FindButtonAction::ToggleRegex,
-        })
-    }
-
-    /// v0.9: map a physical-pixel click to a palette results-list row
-    /// index. Returns `Some(idx)` when the click lands inside a visible
-    /// results row, `None` otherwise (outside the popup, on the query/banner
-    /// row, in workflow form mode, or below the last visible row). Border-drag
-    /// clicks are handled earlier by `check_popup_border_drag`, so they never
-    /// reach here.
-    ///
-    /// Geometry and hit targets come from the shared Palette Scene.
-    pub(super) fn palette_row_at(&self, x: f64, y: f64) -> Option<usize> {
-        let scene = self.palette_scene()?;
-        match crate::palette_component::palette_target_at(&scene, x as f32, y as f32) {
-            Some(crate::palette_component::PaletteTarget::Item(index)) => Some(index),
-            _ => None,
-        }
-    }
-
-    /// Resolve a physical-pixel point in the tab bar to the topmost target.
-    /// Rebuilds the tab-strip layout from the current renderer geometry +
-    /// `TabBarState.scroll_offset`, then queries the shared TabBar Scene.
-    /// Returns `None` when the renderer is absent or the point is outside the
-    /// bar.
-    pub(super) fn tab_bar_target_at(
-        &self,
-        x: f32,
-        y: f32,
-    ) -> Option<crate::tab_bar_component::TabBarTarget> {
-        let renderer = self.renderer.as_ref()?;
-        if y > renderer.tab_bar_height() {
-            return None;
-        }
-        let chrome_left = self.tab_bar_chrome_left();
-        let strip = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
-            viewport_width: self.tab_bar_layout_right(),
-            bar_height: renderer.tab_bar_height(),
-            cell_width: renderer.cell_width() as f32,
-            padding_x: renderer.padding_x(),
-            chrome_left,
-            traffic_lights_width: renderer.traffic_lights_width(),
-            tab_count: self.sessions.len(),
-            requested_scroll_offset: self.tab_bar.scroll_offset,
-        });
-        let scene = crate::tab_bar_component::build_tab_bar_scene(
-            strip,
-            self.sessions.len(),
-            renderer.cell_width() as f32,
-            renderer.cell_height() as f32,
-        );
-        crate::tab_bar_component::tab_bar_target_at(&scene, x, y)
-    }
-
-    /// Resolve a physical-pixel point in the history panel to a target.
-    /// Rebuilds the panel layout from renderer geometry (single source of
-    /// truth — no duplicated magic numbers). Returns `None` when the panel
-    /// is closed, the renderer is absent, or the point misses every target.
-    pub(super) fn panel_target_at(
-        &self,
-        x: f32,
-        y: f32,
-    ) -> Option<crate::panel_component::PanelTarget> {
-        if !self.panel.open {
-            return None;
-        }
-        let renderer = self.renderer.as_ref()?;
-        let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
-        let layout = crate::layout::layout_panel(
-            chrome_top,
-            renderer.cell_width() as f32,
-            renderer.cell_height() as f32,
-            renderer.sidebar_width(),
-            renderer.viewport().1,
-        );
-        let max_rows = crate::paint::ui_helpers::visible_panel_rows(
-            renderer.viewport().1,
-            renderer.cell_height(),
-        );
-        // v1.11.2 X4: the footer button exists only when this tab has blocks.
-        let footer = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .filter(|t| !t.block_tracker().blocks().is_empty())
-            .map(|_| layout.footer_rect);
-        let scene = crate::panel_component::build_panel_scene(
-            layout.panel_rect,
-            layout.search_field_rect,
-            layout.list_top,
-            layout.row_height,
-            max_rows,
-            footer,
-        );
-        crate::panel_component::panel_target_at(&scene, x, y)
-    }
-
-    pub(super) fn active_panel_scrollbar_layout(
-        &self,
-    ) -> Option<crate::panel_scrollbar::PanelScrollbarLayout> {
-        if !self.panel.open {
-            return None;
-        }
-        let renderer = self.renderer.as_ref()?;
-        // Batch 5 Step 2: read cached metrics from the last draw() instead of
-        // re-running panel_filtered_count (O(n) over all blocks) on every
-        // mouse move. The cache is written at the end of build_panel_vertices;
-        // mouse events read the previous frame's metrics (1-frame lag is
-        // imperceptible for scrollbar hit-testing).
-        let (total, visible, _max_scroll) = renderer.cached_panel_scroll_metrics.get()?;
-        let chrome_top = renderer.layout_ctx.map(|ctx| ctx.chrome_top).unwrap_or(0.0);
-        let layout = crate::layout::layout_panel(
-            chrome_top,
-            renderer.cell_width() as f32,
-            renderer.cell_height() as f32,
-            renderer.sidebar_width(),
-            renderer.viewport().1,
-        );
-        crate::panel_scrollbar::panel_scrollbar_layout(
-            layout.panel_rect,
-            layout.list_top,
-            total,
-            visible,
-            self.panel.scroll_offset,
-            renderer.cell_height() as f32 * 0.8,
-        )
     }
 }

@@ -7,9 +7,10 @@
 //! here.
 //!
 //! `Tab` implements `Deref<Target=Pane>` / `DerefMut` so existing call sites
-//! that read `tab.terminal` / `tab.pty` / `tab.input_handler` / … keep
-//! compiling unchanged: the field access auto-dereferences to the active
-//! pane. New code that needs to operate on a non-active pane should go
+//! that read `tab.pty` / `tab.input_handler` / … keep compiling unchanged:
+//! the field access auto-dereferences to the active pane. The terminal is
+//! reached through the `Pane` accessors (`with_terminal` / `lock_terminal` —
+//! T10 P1). New code that needs to operate on a non-active pane should go
 //! through `tab.pane(id)` / `tab.pane_mut(id)`.
 
 use std::collections::HashMap;
@@ -18,7 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use weft_core::pane_layout::{PaneId, PaneTree, SplitDirection, SplitError, SplitTree};
 use weft_core::persistence::{PaneTreeSnapshot, SnapshotPaneNode, TabSnapshot};
 use weft_core::pty::PtyError;
-use weft_core::vt::Terminal;
 
 use crate::pane::Pane;
 use crate::AppEvent;
@@ -89,7 +89,8 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// The active pane is the one that receives keyboard input and renders the
 /// cursor. `Deref` / `DerefMut` forward to it so the existing single-pane
-/// call sites (`tab.terminal`, `tab.pty`, …) keep working without change.
+/// call sites (`tab.pty`, `tab.input_handler`, …) keep working without
+/// change; the terminal goes through the `Pane` lock accessors (T10 P1).
 pub struct Tab {
     /// Stable tab-level identifier. Stays constant for the tab's lifetime
     /// regardless of how many panes are open or which is active.
@@ -159,12 +160,13 @@ pub struct Tab {
 /// non-active pane, derived under the [`Tab::active_pane_views`] invariants.
 /// The rect is NOT carried here — layout is the caller's concern; pair
 /// `pane_id` against `split_tree().layout(content_rect)` at the call site.
-pub(crate) struct BackgroundPaneView<'a> {
+pub(crate) struct BackgroundPaneView {
     /// Pane the view came from — the pairing key for the caller's rects.
     pub pane_id: PaneId,
-    /// Shared terminal reference. Background panes' terminals are only read
-    /// during draw (invariant 4 of `active_pane_views`).
-    pub terminal: &'a Terminal,
+    /// Owned terminal lock guard (T10 P1). Background panes' terminals are
+    /// only read during draw; the guard is `lock_arc`-owned, so the view
+    /// carries no borrow of the `Tab`.
+    pub terminal: crate::pane::TerminalGuard,
     /// Block-scroll snapshot (`offset_value + fraction`) taken at derivation
     /// time, so the draw path needs no second borrow of the pane.
     pub block_scroll: f32,
@@ -178,7 +180,7 @@ pub(crate) struct BackgroundPaneView<'a> {
 /// Terminal` pointer bridge in redraw_controller.
 pub(crate) struct PaneViewSet<'a> {
     pub active: &'a mut Pane,
-    pub backgrounds: Vec<BackgroundPaneView<'a>>,
+    pub backgrounds: Vec<BackgroundPaneView>,
 }
 
 impl std::ops::Deref for Tab {
@@ -232,11 +234,11 @@ impl Tab {
     pub(crate) fn active_pane_views(&mut self) -> PaneViewSet<'_> {
         let active_id = self.active_pane_id();
         let mut active: Option<&mut Pane> = None;
-        let mut backgrounds: Vec<BackgroundPaneView<'_>> = Vec::new();
+        let mut backgrounds: Vec<BackgroundPaneView> = Vec::new();
         for (id, pane) in self.panes.iter_mut() {
             if *id == active_id {
                 active = Some(pane);
-            } else if let Some(terminal) = pane.terminal.as_ref() {
+            } else if let Some(terminal) = pane.lock_terminal() {
                 // Same snapshot the raw-pointer bridge took: offset + the
                 // transient trackpad fraction, read once per frame.
                 backgrounds.push(BackgroundPaneView {
@@ -276,9 +278,7 @@ impl Tab {
             if *id == active_id {
                 continue;
             }
-            if let Some(t) = pane.terminal.as_mut() {
-                t.grid_mut().clear_all_dirty();
-            }
+            pane.with_terminal(|t| t.grid_mut().clear_all_dirty());
         }
     }
 
@@ -340,7 +340,7 @@ impl Tab {
         proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
         geo: PaneSplitGeometry,
     ) -> Result<PaneId, SplitError> {
-        let cwd = self.launch_cwd().map(str::to_owned);
+        let cwd = self.launch_cwd();
         let active_id = self.active_pane;
         // Try to compute the new pane's intended (rows, cols) from the
         // post-split rect. Falls back to the active pane's current size
@@ -380,10 +380,7 @@ impl Tab {
             None
         };
         let (rows, cols) = new_pane_dims.unwrap_or_else(|| {
-            self.active()
-                .terminal
-                .as_ref()
-                .map(|t| (t.grid().num_rows, t.grid().num_cols))
+            self.with_terminal(|t| (t.grid().num_rows, t.grid().num_cols))
                 .unwrap_or((24, 80))
         });
         let new_pane = Pane::spawn(rows, cols, scrollback_lines, proxy, cwd.as_deref());
@@ -750,12 +747,15 @@ impl Tab {
     /// shortcut, non-active owner tabs) — it reads the TARGET tab.
     /// Borrow-split precedent: mouse_controller.rs's sync.
     pub fn sync_mouse_modes(&mut self) {
-        let Some(terminal) = self.terminal.as_ref() else {
+        // T10 P1: the guard is owned (`lock_arc`) so the `input_handler`
+        // writes below don't conflict with the terminal reads above.
+        let Some(terminal) = self.lock_terminal() else {
             return;
         };
         let mouse_protocol = terminal.mouse_protocol();
         let sgr_mouse = terminal.sgr_mouse();
         let app_cursor_keys = terminal.app_cursor_keys();
+        drop(terminal);
         self.input_handler.app_cursor_keys = app_cursor_keys;
         self.input_handler.mouse_protocol = mouse_protocol;
         self.input_handler.sgr_mouse = sgr_mouse;
@@ -799,15 +799,16 @@ impl Tab {
         // grid mid-interaction — the openclaw "jump to top" symptom. The
         // redraw_controller's follow logic already snaps on fresh output when
         // appropriate, so this snap is redundant during execution anyway.
-        let executing = self.terminal.as_ref().is_some_and(|t| {
-            t.block_tracker().phase() == weft_core::blocks::ShellPhase::CommandExecuting
-        });
+        let executing = self
+            .with_terminal(|t| {
+                t.block_tracker().phase() == weft_core::blocks::ShellPhase::CommandExecuting
+            })
+            .unwrap_or(false);
         if !executing {
             self.snap_to_bottom();
         } else if self
-            .terminal
-            .as_ref()
-            .is_some_and(weft_core::vt::Terminal::is_alt_screen_active)
+            .with_terminal(|t| t.is_alt_screen_active())
+            .unwrap_or(false)
         {
             // Round 4 review (LOW-1): inside an alternate-screen child
             // (vim/less) the BlockView is not rendered — a snapshot bypass
@@ -837,16 +838,14 @@ impl Tab {
             // cursor_snapshot_line stays None until the force window is
             // consumed, and the caret/preedit fall back to the imprecise
             // formula (which lands on the wrong row).
-            if let Some(terminal) = self.terminal.as_mut() {
+            self.with_terminal(|terminal| {
                 if terminal.show_block_view() {
                     terminal.snapshot_primary_screen_output_for_caret();
                 }
-            }
+            });
         }
         let pane = self.active_mut();
-        if let Some(terminal) = &mut pane.terminal {
-            terminal.cancel_primary_screen_interrupt_capture();
-        }
+        pane.with_terminal(|t| t.cancel_primary_screen_interrupt_capture());
         let pty = pane.pty.as_ref().ok_or_else(|| {
             PtyError::Write(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -858,11 +857,10 @@ impl Tab {
 
     /// Directory inherited by a newly-created sibling tab. Prefer live OSC 7
     /// state, retaining a restored cwd until the shell reports one.
-    pub fn launch_cwd(&self) -> Option<&str> {
-        self.terminal
-            .as_ref()
-            .and_then(Terminal::cwd)
-            .or_else(|| self.restored_cwd_fallback())
+    pub fn launch_cwd(&self) -> Option<String> {
+        self.with_terminal(|t| t.cwd().map(str::to_owned))
+            .flatten()
+            .or_else(|| self.restored_cwd_fallback().map(str::to_owned))
     }
 
     /// v1.12.28 (P1-02 ②): serialize one leaf pane for the split-tree
@@ -880,27 +878,30 @@ impl Tab {
                 block_ids: Vec::new(),
             };
         };
-        let Some(terminal) = pane.terminal.as_ref() else {
-            if let Some(saved) = pane.restored_snapshot.as_ref() {
-                return SnapshotPaneNode::Pane {
-                    cwd: saved.cwd.clone(),
-                    editor_buffer: saved.editor_buffer.clone(),
-                    block_ids: saved.block_ids.clone(),
-                };
-            }
-            return SnapshotPaneNode::Pane {
-                cwd: pane.restored_cwd.clone(),
-                editor_buffer: String::new(),
-                block_ids: Vec::new(),
-            };
-        };
-        SnapshotPaneNode::Pane {
+        // T10 P1: the live serialization runs inside the guard scope and only
+        // the owned node escapes; the PTY-dead fallbacks below are unchanged.
+        let live = pane.with_terminal(|terminal| SnapshotPaneNode::Pane {
             cwd: terminal
                 .cwd()
                 .map(str::to_owned)
                 .or_else(|| pane.restored_cwd_fallback().map(str::to_owned)),
             editor_buffer: TabSnapshot::encode_editor_buffer(&terminal.editor().buffer),
             block_ids: terminal.block_tracker().lineage_block_ids(),
+        });
+        if let Some(node) = live {
+            return node;
+        }
+        if let Some(saved) = pane.restored_snapshot.as_ref() {
+            return SnapshotPaneNode::Pane {
+                cwd: saved.cwd.clone(),
+                editor_buffer: saved.editor_buffer.clone(),
+                block_ids: saved.block_ids.clone(),
+            };
+        }
+        SnapshotPaneNode::Pane {
+            cwd: pane.restored_cwd.clone(),
+            editor_buffer: String::new(),
+            block_ids: Vec::new(),
         }
     }
 
@@ -915,7 +916,25 @@ impl Tab {
     /// v1.12.28 (P1-02 ②): multi-pane tabs additionally persist the split
     /// tree (`panes`) — see the branch below.
     pub fn to_snapshot(&self, position: usize, active: bool) -> Option<TabSnapshot> {
-        let Some(terminal) = self.terminal.as_ref() else {
+        // T10 P1 (D9 rule 2): the terminal state is read under ONE short
+        // guard; the multi-pane fold below re-locks per leaf
+        // (`pane_leaf_snapshot`), so no guard may be held across it.
+        let live = self.with_terminal(|terminal| {
+            let shell_phase = match terminal.block_tracker().phase() {
+                weft_core::blocks::ShellPhase::NotIntegrated => "NotIntegrated",
+                weft_core::blocks::ShellPhase::AtPrompt => "AtPrompt",
+                weft_core::blocks::ShellPhase::CommandExecuting => "CommandExecuting",
+            };
+            (
+                terminal.cwd().map(str::to_owned),
+                weft_core::persistence::TabSnapshot::encode_editor_buffer(
+                    &terminal.editor().buffer,
+                ),
+                shell_phase,
+                terminal.block_tracker().lineage_block_ids(),
+            )
+        });
+        let Some((live_cwd, editor_buffer, shell_phase, block_ids)) = live else {
             // PTY-dead pane: keep the recovery state serializable. A fresh
             // empty tab with no recovery state still returns `None`
             // (unchanged); a pane with the real attached snapshot or only
@@ -946,6 +965,7 @@ impl Tab {
             snapshot.block_scroll_offset = self.block_scroll();
             return Some(snapshot);
         };
+        let cwd = live_cwd.or_else(|| self.restored_cwd_fallback().map(str::to_owned));
         // v1.12.28 (P1-02 ②): multi-pane branch FIRST. `pane_count()` is the
         // structural accessor (zoom-safe) — `split_tree().panes()` collapses
         // to `[zoomed]` and `Tab::panes()` iterates a HashMap, so neither may
@@ -964,19 +984,6 @@ impl Tab {
                     snapshot_node_from_tree(exported, active_id, &mut index, &mut active_leaf)
                 });
             let panes = tree.map(|tree| PaneTreeSnapshot { tree, active_leaf });
-            let cwd = terminal
-                .cwd()
-                .map(str::to_owned)
-                .or_else(|| self.restored_cwd_fallback().map(str::to_owned));
-            let editor_buffer = weft_core::persistence::TabSnapshot::encode_editor_buffer(
-                &terminal.editor().buffer,
-            );
-            let shell_phase = match terminal.block_tracker().phase() {
-                weft_core::blocks::ShellPhase::NotIntegrated => "NotIntegrated",
-                weft_core::blocks::ShellPhase::AtPrompt => "AtPrompt",
-                weft_core::blocks::ShellPhase::CommandExecuting => "CommandExecuting",
-            };
-            let block_ids = terminal.block_tracker().lineage_block_ids();
             return Some(TabSnapshot {
                 position,
                 active,
@@ -988,24 +995,14 @@ impl Tab {
                 panes,
             });
         }
-        let cwd = terminal
-            .cwd()
-            .map(str::to_owned)
-            .or_else(|| self.restored_cwd_fallback().map(str::to_owned));
-        let editor_buffer =
-            weft_core::persistence::TabSnapshot::encode_editor_buffer(&terminal.editor().buffer);
-        let shell_phase = match terminal.block_tracker().phase() {
-            weft_core::blocks::ShellPhase::NotIntegrated => "NotIntegrated",
-            weft_core::blocks::ShellPhase::AtPrompt => "AtPrompt",
-            weft_core::blocks::ShellPhase::CommandExecuting => "CommandExecuting",
-        };
         // v1.7.6: persist per-tab block ownership so each tab can restore
         // only its own history on next launch (per-tab isolation).
         // v1.12.24 (N-3): use the full lineage (session-produced UNION
         // loaded-from-previous-restore) — the v1.7.6 session-only design
         // dropped the previous generation's recall on every restart-restore
         // cycle, so each ↑ history shrunk by one generation per restart.
-        let block_ids = terminal.block_tracker().lineage_block_ids();
+        // (cwd / editor_buffer / shell_phase / block_ids were captured under
+        // the single short guard at the top of this function.)
         // v1.12.28 (P1-02 ②): single-pane tabs never write the `panes`
         // field — the current path is unchanged apart from the new field.
         Some(TabSnapshot {
@@ -1030,14 +1027,10 @@ impl Tab {
     pub fn restore_from_snapshot(&mut self, snap: &TabSnapshot) -> bool {
         self.restored_snapshot = Some(snap.clone());
         self.set_block_scroll(snap.block_scroll_offset);
-        let Some(terminal) = self.terminal.as_mut() else {
-            return false;
-        };
         match weft_core::persistence::TabSnapshot::decode_editor_buffer(&snap.editor_buffer) {
-            Some(buf) => {
-                terminal.editor_mut().buffer = buf;
-                true
-            }
+            Some(buf) => self
+                .with_terminal(|terminal| terminal.editor_mut().buffer = buf)
+                .is_some(),
             None => {
                 tracing::warn!("failed to deserialize editor buffer; using empty");
                 false

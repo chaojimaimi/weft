@@ -138,12 +138,10 @@ impl App {
                             && yf < row.y_bottom
                         {
                             if let Some(bid) = row.block_id {
-                                if let Some(term) = self
-                                    .sessions
-                                    .active_mut()
-                                    .and_then(|tab| tab.terminal.as_mut())
-                                {
-                                    term.block_tracker_mut().toggle_collapse(bid);
+                                if let Some(tab) = self.sessions.active_mut() {
+                                    tab.with_terminal(|term| {
+                                        term.block_tracker_mut().toggle_collapse(bid)
+                                    });
                                     // M5-b P2-2: no invalidate — collapsed mismatch
                                     // takes the WidthOnly rebuild path (L1 kept).
                                     self.request_redraw();

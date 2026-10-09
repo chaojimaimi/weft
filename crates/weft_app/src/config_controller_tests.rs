@@ -21,17 +21,17 @@ fn tab_with_terminal(scrollback_lines: usize) -> Tab {
 fn kitty_protocol_walk_touches_every_pane() {
     let mut tabs = vec![tab_with_terminal(100), tab_with_terminal(100)];
     for tab in tabs.iter_mut() {
-        tab.terminal.as_mut().unwrap().process(b"\x1b[>27u");
+        tab.lock_terminal().unwrap().process(b"\x1b[>27u");
     }
     apply_kitty_protocol_to_all_panes(&mut tabs, false);
     for tab in tabs.iter_mut() {
-        let t = tab.terminal.as_mut().unwrap();
+        let mut t = tab.lock_terminal().unwrap();
         assert_eq!(t.keyboard_protocol_flags(), 0, "disabled ⇒ flags 0");
         t.process(b"\x1b[?u");
         assert_eq!(t.take_response(), b"", "disabled ⇒ ops swallowed");
     }
     apply_kitty_protocol_to_all_panes(&mut tabs, true);
-    let t = tabs[0].terminal.as_mut().unwrap();
+    let mut t = tabs[0].lock_terminal().unwrap();
     t.process(b"\x1b[?u");
     assert_eq!(
         t.take_response(),
@@ -50,7 +50,7 @@ fn output_cap_walk_touches_every_pane_of_every_tab() {
     let mut tabs = vec![tab_with_terminal(100), tab_with_terminal(100)];
     apply_blocks_output_cap_to_all_panes(&mut tabs, 4);
     for tab in &tabs {
-        let cap = tab.terminal.as_ref().unwrap().block_tracker().output_cap();
+        let cap = tab.lock_terminal().unwrap().block_tracker().output_cap();
         assert_eq!(cap, 4 * 1024 * 1024, "configured 4 MiB reaches the tracker");
     }
 }
@@ -64,8 +64,7 @@ fn output_cap_walk_clamps_out_of_range_mib() {
     apply_blocks_output_cap_to_all_panes(&mut tabs, 0);
     assert_eq!(
         tabs[0]
-            .terminal
-            .as_ref()
+            .lock_terminal()
             .unwrap()
             .block_tracker()
             .output_cap(),
@@ -76,8 +75,7 @@ fn output_cap_walk_clamps_out_of_range_mib() {
     apply_blocks_output_cap_to_all_panes(&mut tabs, 65);
     assert_eq!(
         tabs[0]
-            .terminal
-            .as_ref()
+            .lock_terminal()
             .unwrap()
             .block_tracker()
             .output_cap(),
@@ -93,19 +91,18 @@ fn per_tab_output_cap_apply_matches_the_all_tab_walk() {
     let mut tab = tab_with_terminal(100);
     apply_blocks_output_cap(&mut tab, 8);
     assert_eq!(
-        tab.terminal.as_ref().unwrap().block_tracker().output_cap(),
+        tab.lock_terminal().unwrap().block_tracker().output_cap(),
         8 * 1024 * 1024
     );
     let mut tabs = vec![tab_with_terminal(100)];
     apply_blocks_output_cap_to_all_panes(&mut tabs, 8);
     assert_eq!(
         tabs[0]
-            .terminal
-            .as_ref()
+            .lock_terminal()
             .unwrap()
             .block_tracker()
             .output_cap(),
-        tab.terminal.as_ref().unwrap().block_tracker().output_cap()
+        tab.lock_terminal().unwrap().block_tracker().output_cap()
     );
 }
 
@@ -119,8 +116,7 @@ fn retained_limit_walk_touches_every_pane_of_every_tab() {
     apply_blocks_retained_limit_to_all_panes(&mut tabs, 750);
     for tab in &tabs {
         assert_eq!(
-            tab.terminal
-                .as_ref()
+            tab.lock_terminal()
                 .unwrap()
                 .block_tracker()
                 .retained_limit(),
@@ -133,8 +129,7 @@ fn retained_limit_walk_touches_every_pane_of_every_tab() {
     apply_blocks_retained_limit_to_all_panes(&mut tabs, 0);
     assert_eq!(
         tabs[0]
-            .terminal
-            .as_ref()
+            .lock_terminal()
             .unwrap()
             .block_tracker()
             .retained_limit(),
@@ -350,7 +345,7 @@ fn profile_switch_updates_every_tab_and_pane_palette() {
     // tab's pane.
     let tab0 = tab_with_terminal(100);
     let tab1 = tab_with_terminal(100);
-    let original_palette = *tab0.terminal.as_ref().unwrap().palette();
+    let original_palette = *tab0.lock_terminal().unwrap().palette();
 
     // Build a distinctly different palette.
     let mut new_palette = original_palette;
@@ -366,7 +361,8 @@ fn profile_switch_updates_every_tab_and_pane_palette() {
 
     // Both tabs' panes must have the new palette.
     for (i, tab) in tabs.iter().enumerate() {
-        let pal = tab.terminal.as_ref().unwrap().palette();
+        let guard = tab.lock_terminal().unwrap();
+        let pal = guard.palette();
         assert_eq!(pal[0], new_palette[0], "tab {i} palette not updated");
         assert_ne!(pal[0], original_palette[0], "tab {i} palette unchanged");
     }
@@ -404,7 +400,7 @@ fn profile_switch_updates_every_pane_scrollback_limit() {
 
     // Both tabs' panes must have the new scrollback capacity.
     for (i, tab) in tabs.iter().enumerate() {
-        let t = tab.terminal.as_ref().unwrap();
+        let t = tab.lock_terminal().unwrap();
         let grid = t.grid();
         assert_eq!(
             grid.scrollback.max_lines(),
@@ -425,7 +421,7 @@ fn profile_switch_updates_two_tabs_with_four_panes_each() {
         assert_eq!(tab.pane_count(), 4);
     }
 
-    let mut palette = *tabs[0].terminal.as_ref().unwrap().palette();
+    let mut palette = *tabs[0].lock_terminal().unwrap().palette();
     palette[7] = Color {
         r: 0x12,
         g: 0x34,
@@ -439,7 +435,7 @@ fn profile_switch_updates_two_tabs_with_four_panes_each() {
         let panes: Vec<_> = tab.panes_mut().collect();
         assert_eq!(panes.len(), 4);
         for (pane_index, pane) in panes.into_iter().enumerate() {
-            let terminal = pane.terminal.as_ref().unwrap();
+            let terminal = pane.lock_terminal().unwrap();
             assert_eq!(
                 terminal.palette()[7],
                 palette[7],

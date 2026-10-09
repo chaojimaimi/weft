@@ -67,6 +67,12 @@ rustybuzz = "0.20"
 pathfinder_geometry = "0.5"
 
 # Common
+# v1.13.6 T10 P1 (PLAN_v1136 §1/D1): `Pane.terminal` becomes
+# `Option<Arc<FairMutex<Terminal>>>` — the fair mutex is the T10 parse-thread
+# shared model (Warp-verified route). Already in Cargo.lock as a transitive
+# dep; `FairMutex`'s FIFO fairness guarantees the waiting main thread wins
+# against a saturated parse worker (P2).
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 bitflags = { version = "2", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"

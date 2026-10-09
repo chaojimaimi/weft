@@ -133,9 +133,7 @@ impl crate::App {
                         if let Some(session) = self.sessions.tab_mut(tab) {
                             let input_seq = session.input_seq();
                             let (screen_owner, settle_state, history_snapshot_due) = session
-                                .terminal
-                                .as_ref()
-                                .map(|t| {
+                                .with_terminal(|t| {
                                     (t.screen_owner(), t.settle_state(), t.history_snapshot_due())
                                 })
                                 .unwrap_or((
@@ -171,9 +169,7 @@ impl crate::App {
                         if let Some(session) = self.sessions.tab_mut(tab) {
                             let input_seq = session.input_seq();
                             let (screen_owner, settle_state, history_snapshot_due) = session
-                                .terminal
-                                .as_ref()
-                                .map(|t| {
+                                .with_terminal(|t| {
                                     (t.screen_owner(), t.settle_state(), t.history_snapshot_due())
                                 })
                                 .unwrap_or((
@@ -301,9 +297,10 @@ impl crate::App {
         let oldest_started_ms = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .and_then(|t| t.block_tracker().blocks().first())
-            .map(|b| b.started_at)
+            .and_then(|tab| {
+                tab.with_terminal(|t| t.block_tracker().blocks().first().map(|b| b.started_at))
+            })
+            .flatten()
             .map(|started| {
                 started
                     .duration_since(std::time::UNIX_EPOCH)
@@ -325,10 +322,10 @@ impl crate::App {
             }
             Ok(blocks) => {
                 let loaded = blocks.len();
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.block_tracker_mut().load_older_to_front(blocks);
                 }
@@ -579,8 +576,9 @@ impl crate::App {
                 .iter()
                 .map(|tab| {
                     tab.panes()
-                        .filter_map(|(_, pane)| pane.terminal.as_ref())
-                        .map(|t| t.block_tracker().blocks().len())
+                        .filter_map(|(_, pane)| {
+                            pane.with_terminal(|t| t.block_tracker().blocks().len())
+                        })
                         .sum::<usize>()
                 })
                 .sum();
@@ -686,8 +684,10 @@ impl crate::App {
         let editor_mode = self
             .sessions
             .tab(tab)
-            .and_then(|t| t.terminal.as_ref())
-            .is_some_and(|t| t.effective_input_mode() == weft_core::input::InputMode::Editor);
+            .and_then(|t| {
+                t.with_terminal(|t| t.effective_input_mode() == weft_core::input::InputMode::Editor)
+            })
+            .unwrap_or(false);
         self.apply_paste_text(tab, text);
         if paste_toast_eligible(text.len(), text.chars().count(), threshold_kib, editor_mode) {
             if let Some(renderer) = self.renderer.as_mut() {
@@ -707,17 +707,16 @@ impl crate::App {
         let mode = self
             .sessions
             .tab(tab)
-            .and_then(|t| t.terminal.as_ref())
-            .map(|t| t.effective_input_mode())
+            .and_then(|t| t.with_terminal(|t| t.effective_input_mode()))
             .unwrap_or(weft_core::input::InputMode::Passthrough);
 
         if mode == weft_core::input::InputMode::Editor {
             // Preserve pasted newlines explicitly because insert_char rejects
             // controls; drop CR to normalize external CRLF text.
-            if let Some(t) = self
+            if let Some(mut t) = self
                 .sessions
                 .tab_mut(tab)
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             {
                 let buf = &mut t.editor_mut().buffer;
                 for c in text.chars() {
@@ -734,8 +733,7 @@ impl crate::App {
             let bracketed = self
                 .sessions
                 .tab(tab)
-                .and_then(|t| t.terminal.as_ref())
-                .map(|t| t.bracketed_paste)
+                .and_then(|t| t.with_terminal(|t| t.bracketed_paste))
                 .unwrap_or(false);
             let bytes = encode_paste(text, bracketed);
             if let Some(session) = self.sessions.tab_mut(tab) {
@@ -744,9 +742,7 @@ impl crate::App {
                 // noninteractive render tier falls back to the classic
                 // takeover for the pasted-into TUI. Only the passthrough
                 // branch marks: editor-insert pastes are never forwarded.
-                if let Some(t) = session.terminal.as_mut() {
-                    t.note_interactive_stdin();
-                }
+                session.with_terminal(|t| t.note_interactive_stdin());
                 // v1.11.15 (FIX E): a partial write surfaces a truncation
                 // toast — defensive only on production macOS (n_tty silently
                 // discards input overflow; the master always reports full
@@ -785,9 +781,10 @@ impl crate::App {
             let Some(tab) = self.sessions.active() else {
                 return;
             };
-            let Some(terminal) = tab.terminal.as_ref() else {
+            let Some(terminal) = tab.lock_terminal() else {
                 return;
             };
+            let terminal = &*terminal;
             // Editor drag-selection takes priority over block/grid selection.
             terminal
                 .editor()

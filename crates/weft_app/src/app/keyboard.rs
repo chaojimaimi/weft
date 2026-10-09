@@ -66,8 +66,7 @@ impl crate::App {
         let has_sessions = !self.sessions.is_empty();
         let kitty_flags = self
             .tab()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| t.keyboard_protocol_flags())
+            .and_then(|tab| tab.with_terminal(|t| t.keyboard_protocol_flags()))
             .unwrap_or(0);
         if kind == weft_core::input::KittyEventKind::Release {
             if (kitty_flags & weft_core::input::kitty::FLAG_REPORT_EVENT_TYPES) == 0 {
@@ -78,10 +77,12 @@ impl crate::App {
             // Empty tabs (`None`) read as "not passthrough" and return here.
             if !self
                 .tab()
-                .and_then(|tab| tab.terminal.as_ref())
-                .is_some_and(|t| {
-                    t.effective_input_mode() == weft_core::input::InputMode::Passthrough
+                .and_then(|tab| {
+                    tab.with_terminal(|t| {
+                        t.effective_input_mode() == weft_core::input::InputMode::Passthrough
+                    })
                 })
+                .unwrap_or(false)
             {
                 return;
             }
@@ -108,7 +109,7 @@ impl crate::App {
         let has_terminal = self
             .sessions
             .tab(self.sessions.active_idx())
-            .is_some_and(|tab| tab.terminal.is_some());
+            .is_some_and(|tab| tab.has_terminal());
         match crate::input_router::route_keyboard_entry(has_sessions, has_terminal, bound_action) {
             crate::input_router::KeyboardEntryRoute::Action(action) => {
                 self.execute_action(action);
@@ -208,20 +209,17 @@ impl crate::App {
         // passthrough automatically in alt-screen / command-running / SSH.
         let input_mode = self
             .tab()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| t.effective_input_mode())
+            .and_then(|tab| tab.with_terminal(|t| t.effective_input_mode()))
             .unwrap_or(weft_core::input::InputMode::Passthrough);
         if input_mode == weft_core::input::InputMode::Editor {
             let prev_lines = self
                 .tab()
-                .and_then(|tab| tab.terminal.as_ref())
-                .map(|t| t.editor().line_count())
+                .and_then(|tab| tab.with_terminal(|t| t.editor().line_count()))
                 .unwrap_or(1);
             let consumed = self.handle_editor_key(key, m, text);
             let new_lines = self
                 .tab()
-                .and_then(|tab| tab.terminal.as_ref())
-                .map(|t| t.editor().line_count())
+                .and_then(|tab| tab.with_terminal(|t| t.editor().line_count()))
                 .unwrap_or(1);
             if new_lines != prev_lines {
                 self.recompute_layout();
@@ -272,11 +270,7 @@ impl crate::App {
             tracing::debug!("key forward ignored: no sessions");
             return;
         };
-        let app_cursor_keys = tab
-            .terminal
-            .as_ref()
-            .map(|t| t.app_cursor_keys())
-            .unwrap_or(false);
+        let app_cursor_keys = tab.with_terminal(|t| t.app_cursor_keys()).unwrap_or(false);
         {
             let ih = &mut tab.input_handler;
             ih.app_cursor_keys = app_cursor_keys;
@@ -310,9 +304,7 @@ impl crate::App {
         // flag. Empty encodings (e.g. modifier-only presses) forward nothing
         // and must not count.
         if !bytes.is_empty() {
-            if let Some(t) = tab.terminal.as_mut() {
-                t.note_interactive_stdin();
-            }
+            tab.with_terminal(|t| t.note_interactive_stdin());
         }
         // v1.11.11 (M-B): the Effect family targets the stable session id. The
         // active tab exists for the whole handler, so forwarding semantics

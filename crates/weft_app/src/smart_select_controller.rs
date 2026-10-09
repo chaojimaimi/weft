@@ -85,10 +85,7 @@ impl App {
             return None;
         }
         let pos = self.pixel_to_grid(x, y);
-        let terminal = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())?;
+        let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
         let (text, click_col, segments) = grid_logical_line(terminal.grid(), pos);
         let target = match_display_at(&text, click_col)?;
         let start = grid_pos_at_display_col(&segments, target.start_display_col)?;
@@ -121,9 +118,7 @@ impl App {
                     return;
                 };
                 let fingerprint = pane
-                    .terminal
-                    .as_ref()
-                    .map(|t| {
+                    .with_terminal(|t| {
                         crate::selection::block_selection_fingerprint(
                             t.block_tracker().session_blocks(),
                             t.screen_head_lines(),
@@ -148,9 +143,10 @@ impl App {
                 let cwd = self
                     .sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .and_then(Terminal::cwd)
-                    .map(Path::new);
+                    .and_then(|tab| tab.with_terminal(|t| t.cwd().map(str::to_owned)))
+                    .flatten()
+                    .map(PathBuf::from);
+                let cwd = cwd.as_deref();
                 let home = std::env::var_os("HOME").map(PathBuf::from);
                 let path = resolve_local_target(text, cwd, home.as_deref())?;
                 reveal_path_in_finder(&path).map_err(|error| error.to_string())

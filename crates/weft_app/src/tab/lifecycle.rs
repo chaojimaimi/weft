@@ -19,15 +19,17 @@ impl Tab {
     }
 
     pub fn finish_pending_blocks(&mut self) -> Vec<weft_core::blocks::Block> {
-        let preserve_screen_tail = self.terminal.as_ref().is_some_and(|terminal| {
-            terminal.primary_screen_app_active() || terminal.primary_screen_exit_pending()
-        });
+        let preserve_screen_tail = self
+            .with_terminal(|terminal| {
+                terminal.primary_screen_app_active() || terminal.primary_screen_exit_pending()
+            })
+            .unwrap_or(false);
         if preserve_screen_tail {
             self.drain_bounded_close_tail();
         }
         let split_heads;
         let blocks = {
-            let Some(terminal) = &mut self.terminal else {
+            let Some(mut terminal) = self.lock_terminal() else {
                 return Vec::new();
             };
             terminal.settle_primary_screen_exit();
@@ -68,9 +70,7 @@ impl Tab {
                     tracing::info!(?code, "shell exited while closing tab");
                     // v1.11.4 (PLAN_v1114 §1.3): close-tail reset — a dying
                     // shell must not leave negotiated kitty flags behind.
-                    if let Some(t) = &mut self.terminal {
-                        t.kitty_reset();
-                    }
+                    self.with_terminal(|t| t.kitty_reset());
                     exited = true;
                     break;
                 }
@@ -100,9 +100,7 @@ impl Tab {
                     tracing::info!(?code, "shell exited while closing tab");
                     // v1.11.4 (PLAN_v1114 §1.3): close-tail reset (PtyEvent
                     // side — same contract as AppMsg::PtyExit above).
-                    if let Some(t) = &mut self.terminal {
-                        t.kitty_reset();
-                    }
+                    self.with_terminal(|t| t.kitty_reset());
                     break;
                 }
             }

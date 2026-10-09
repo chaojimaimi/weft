@@ -38,10 +38,10 @@ impl App {
         // v0.9: any non-Cmd editor key clears the mouse-drag selection so
         // typing replaces the selection. Cmd+C is handled above (returns
         // false) so it won't clear the selection — copy still works.
-        if let Some(t) = self
+        if let Some(mut t) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         {
             if t.editor().buffer.has_selection() {
                 t.editor_mut().buffer.clear_selection();
@@ -52,10 +52,10 @@ impl App {
 
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
         if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) && key != Enter {
-            let consumed = if let Some(t) = self
+            let consumed = if let Some(mut t) = self
                 .sessions
                 .active_mut()
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             {
                 let e = t.editor_mut();
                 match key {
@@ -99,14 +99,13 @@ impl App {
         let searching = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| t.editor().is_searching())
+            .and_then(|tab| tab.with_terminal(|t| t.editor().is_searching()))
             .unwrap_or(false);
         if searching {
-            if let Some(t) = self
+            if let Some(mut t) = self
                 .sessions
                 .active_mut()
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             {
                 let e = t.editor_mut();
                 match key {
@@ -146,8 +145,7 @@ impl App {
         let completing = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| t.editor().is_completing())
+            .and_then(|tab| tab.with_terminal(|t| t.editor().is_completing()))
             .unwrap_or(false);
         if completing {
             use crate::paint::command_surface::CommandSurfaceKeyAction;
@@ -209,20 +207,20 @@ impl App {
                 );
                 if do_submit {
                     self.editor_submit();
-                } else if let Some(t) = self
+                } else if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.split_newline();
                 }
                 true
             }
             Char(c) => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut()
                         .buffer
@@ -231,70 +229,70 @@ impl App {
                 true
             }
             Backspace => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.delete_backspace();
                 }
                 true
             }
             Delete => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.delete_forward();
                 }
                 true
             }
             Left => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.move_left();
                 }
                 true
             }
             Right => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.move_right();
                 }
                 true
             }
             Home => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.move_line_home();
                 }
                 true
             }
             End => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.move_line_end();
                 }
                 true
             }
             Up => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     let e = t.editor_mut();
                     if e.buffer.cursor.0 == 0 {
@@ -308,10 +306,10 @@ impl App {
                 true
             }
             Down => {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     let e = t.editor_mut();
                     let last = e.buffer.line_count() - 1;
@@ -340,15 +338,18 @@ impl App {
             return;
         };
         let pane_session_id = tab.pane_session_id;
-        let (line_owned, col, cwd, history) = match tab.terminal.as_ref() {
-            Some(t) => {
-                let line_idx = t.editor().buffer.cursor.0;
-                let col = t.editor().buffer.cursor.1;
-                let line = t.editor().buffer.lines.get(line_idx).cloned();
-                let cwd = t.cwd().unwrap_or("").to_string();
-                let history = t.editor().history().to_vec();
-                (line, col, cwd, history)
-            }
+        // T10 P1: the context tuple is owned, so it can escape the guard
+        // scope; the `None` (no terminal) early return is preserved.
+        let context = tab.with_terminal(|t| {
+            let line_idx = t.editor().buffer.cursor.0;
+            let col = t.editor().buffer.cursor.1;
+            let line = t.editor().buffer.lines.get(line_idx).cloned();
+            let cwd = t.cwd().unwrap_or("").to_string();
+            let history = t.editor().history().to_vec();
+            (line, col, cwd, history)
+        });
+        let (line_owned, col, cwd, history) = match context {
+            Some(context) => context,
             None => return,
         };
         let Some(line_str) = line_owned.as_deref() else {
@@ -456,10 +457,10 @@ impl App {
             {
                 continue;
             }
-            let Some(terminal) = self
+            let Some(mut terminal) = self
                 .sessions
                 .active_mut()
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             else {
                 continue;
             };
@@ -645,41 +646,46 @@ impl App {
     }
 
     pub(super) fn editor_completion_next(&mut self) {
-        if let Some(t) = self
+        if let Some(mut t) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         {
             t.editor_mut().completion_next();
         }
     }
 
     pub(super) fn editor_completion_prev(&mut self) {
-        if let Some(t) = self
+        if let Some(mut t) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         {
             t.editor_mut().completion_prev();
         }
     }
 
     fn editor_completion_page(&mut self, forward: bool) {
-        let Some((selected, target)) = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .and_then(|terminal| terminal.editor().completion_view())
-            .map(|(matches, selected)| {
-                let target = crate::paint::command_surface::apply_page_selection(
-                    selected,
-                    matches.len(),
-                    self.interaction.popup_max_rows,
-                    forward,
-                );
-                (selected, target)
+        // T10 P1: `completion_view` lends the terminal's match list, so the
+        // page-selection math runs inside the guard scope and only the owned
+        // (selected, target) pair escapes.
+        let Some((selected, target)) = self.sessions.active().and_then(|tab| {
+            tab.with_terminal(|terminal| {
+                terminal
+                    .editor()
+                    .completion_view()
+                    .map(|(matches, selected)| {
+                        let target = crate::paint::command_surface::apply_page_selection(
+                            selected,
+                            matches.len(),
+                            self.interaction.popup_max_rows,
+                            forward,
+                        );
+                        (selected, target)
+                    })
             })
-        else {
+            .flatten()
+        }) else {
             return;
         };
         if target >= selected {
@@ -694,20 +700,20 @@ impl App {
     }
 
     pub(super) fn editor_completion_accept(&mut self) {
-        if let Some(t) = self
+        if let Some(mut t) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         {
             t.editor_mut().completion_accept();
         }
     }
 
     pub(super) fn editor_completion_cancel(&mut self) {
-        if let Some(t) = self
+        if let Some(mut t) = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         {
             t.editor_mut().completion_cancel();
         }
@@ -729,8 +735,7 @@ impl App {
         let bytes = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
-            .map(|t| t.submit_command())
+            .and_then(|tab| tab.with_terminal(|t| t.submit_command()))
             .unwrap_or_default();
         if !bytes.is_empty() {
             if let Some(Err(error)) = self
@@ -744,8 +749,7 @@ impl App {
         let resp = self
             .sessions
             .active_mut()
-            .and_then(|tab| tab.terminal.as_mut())
-            .map(|t| t.take_response())
+            .and_then(|tab| tab.with_terminal(|t| t.take_response()))
             .unwrap_or_default();
         if !resp.is_empty() {
             if let Some(pty) = self.sessions.active_mut().and_then(|tab| tab.pty.as_ref()) {

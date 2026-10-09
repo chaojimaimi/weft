@@ -102,17 +102,20 @@ impl Tab {
         // Does not touch block_scroll_anchor — only flips primary_history_view
         // so the renderer switches to the history snapshot. The anchor stays
         // whatever the user last set (FollowBottom until they scroll).
+        // T10 P1: two sequential short locks (mode probe, then the flip) —
+        // the pane's terminal cannot disappear between them on the single
+        // main thread, so the former `.expect` degenerates to `unwrap_or`.
         let active = self
-            .terminal
-            .as_ref()
-            .is_some_and(weft_core::vt::Terminal::primary_screen_app_active);
+            .with_terminal(|t| t.primary_screen_app_active())
+            .unwrap_or(false);
         if active {
-            let terminal = self
-                .terminal
-                .as_mut()
-                .expect("active primary screen has a terminal");
-            let entering = !terminal.primary_history_view();
-            terminal.set_primary_history_view(true);
+            let entering = self
+                .with_terminal(|t| {
+                    let entering = !t.primary_history_view();
+                    t.set_primary_history_view(true);
+                    entering
+                })
+                .unwrap_or(false);
             if entering {
                 self.reset_primary_history_refresh();
             }
@@ -218,12 +221,10 @@ impl Tab {
         // entry gate (sibling Tab field) can be armed afterwards — see
         // snap_to_bottom for the DerefMut borrow constraint.
         let peek_was_active = self
-            .active()
-            .terminal
-            .as_ref()
-            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+            .with_terminal(|t| t.is_alt_screen_history_peek())
+            .unwrap_or(false);
         let pane = self.active_mut();
-        let changed = if let Some(terminal) = &mut pane.terminal {
+        let changed = if let Some(mut terminal) = pane.lock_terminal() {
             // v1.10.6: history browsing is ACTIVE ONLY while the user is
             // detached (anchor != FollowBottom). The previous
             // `(detached || primary_history_view)` kept history browsing
@@ -305,16 +306,17 @@ impl Pane {
         // borrow — the entry gate is a sibling field and the closure
         // below can't touch it while `self.terminal` is borrowed.
         let peek_was_active = self
-            .terminal
-            .as_ref()
-            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
-        let changed = self.terminal.as_mut().is_some_and(|terminal| {
-            let changed = terminal.primary_history_view();
-            terminal.set_primary_history_view(false);
-            // v1.10.12: also leave any alt-screen history peek.
-            terminal.set_alt_screen_history_peek(false);
-            changed
-        });
+            .with_terminal(|t| t.is_alt_screen_history_peek())
+            .unwrap_or(false);
+        let changed = self
+            .with_terminal(|terminal| {
+                let changed = terminal.primary_history_view();
+                terminal.set_primary_history_view(false);
+                // v1.10.12: also leave any alt-screen history peek.
+                terminal.set_alt_screen_history_peek(false);
+                changed
+            })
+            .unwrap_or(false);
         // v1.10.21: arm the re-entry lockout only on a REAL exit (the flag
         // was set) — an unconditional note_exit would lock out peek entry
         // after every keystroke/snap, even with no peek.
@@ -566,7 +568,7 @@ mod tests {
             "the cwd fallback must no longer write a stub snapshot"
         );
         assert_eq!(
-            tab.launch_cwd(),
+            tab.launch_cwd().as_deref(),
             Some("/saved"),
             "the fallback must stay visible to launch_cwd"
         );

@@ -138,9 +138,9 @@ impl App {
                 Some(session_id) => self.sessions.tab_index_by_session_id(session_id),
                 None => Some(self.sessions.active_idx()),
             };
-            if let Some(t) = release_tab
+            if let Some(mut t) = release_tab
                 .and_then(|tab| self.sessions.tab_mut(tab))
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             {
                 if !t.editor().buffer.has_selection() {
                     // has_selection returns false when anchor==cursor, so
@@ -220,8 +220,7 @@ impl App {
         let modes = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| (t.mouse_protocol(), t.sgr_mouse()));
+            .and_then(|tab| tab.with_terminal(|t| (t.mouse_protocol(), t.sgr_mouse())));
         if let Some((mp, sgr)) = modes {
             if let Some(tab) = self.sessions.active_mut() {
                 tab.input_handler.mouse_protocol = mp;
@@ -359,10 +358,10 @@ impl App {
         // v0.9: extend editor drag-selection inside the prompt box.
         if self.interaction.prompt_dragging {
             if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                if let Some(t) = self
+                if let Some(mut t) = self
                     .sessions
                     .active_mut()
-                    .and_then(|tab| tab.terminal.as_mut())
+                    .and_then(|tab| tab.lock_terminal())
                 {
                     t.editor_mut().buffer.extend_selection(pos);
                     self.request_redraw();
@@ -559,10 +558,10 @@ impl App {
         // store can be accessed without a borrow conflict.
         let mut export_block_data: Option<weft_core::blocks::Block> = None;
         {
-            let Some(terminal) = self
+            let Some(mut terminal) = self
                 .sessions
                 .active_mut()
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             else {
                 // Annotation-only actions (toggle_bookmark / add_note) don't
                 // need the terminal — fall through to the post-borrow block.
@@ -773,8 +772,8 @@ impl App {
         let block_view = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .is_some_and(Terminal::show_block_view);
+            .and_then(|tab| tab.with_terminal(|t| t.show_block_view()))
+            .unwrap_or(false);
         if block_view {
             if let winit::event::MouseScrollDelta::PixelDelta(pos) = delta {
                 if phase == winit::event::TouchPhase::Cancelled {
@@ -788,8 +787,8 @@ impl App {
                 let peeking = self
                     .sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+                    .and_then(|tab| tab.with_terminal(|t| t.is_alt_screen_history_peek()))
+                    .unwrap_or(false);
                 if peeking && !self.interaction.mods.state().shift_key() {
                     // snap_to_bottom clears the flag and arms the gate's
                     // re-entry lockout (exit edge detected inside).
@@ -811,9 +810,9 @@ impl App {
                     .as_ref()
                     .and_then(|renderer| {
                         let tab = self.sessions.active()?;
-                        let terminal = tab.terminal.as_ref()?;
+                        let terminal = tab.lock_terminal()?;
                         let (_total, _visible, max) =
-                            renderer.block_scroll_metrics(terminal, tab.pane_session_id);
+                            renderer.block_scroll_metrics(&terminal, tab.pane_session_id);
                         Some(max)
                     })
                     .unwrap_or(0);
@@ -851,7 +850,7 @@ impl App {
             .active_mut()
             .is_some_and(|tab| tab.tui_scroll_window_active());
         let (mouse_protocol_active, alt_screen_active, app_cursor_keys, mouse_protocol, sgr_mouse) = {
-            let Some(t) = self.sessions.active().and_then(|tab| tab.terminal.as_ref()) else {
+            let Some(t) = self.sessions.active().and_then(|tab| tab.lock_terminal()) else {
                 return;
             };
             // v1.0 fix: capture mouse_protocol here and sync it into the
@@ -1029,9 +1028,8 @@ impl App {
                     Some(tab) => (
                         tab.selection_handler.selecting,
                         tab.selection_handler.selection.is_some(),
-                        tab.terminal
-                            .as_ref()
-                            .is_some_and(weft_core::vt::Terminal::primary_screen_app_active),
+                        tab.with_terminal(|t| t.primary_screen_app_active())
+                            .unwrap_or(false),
                     ),
                     None => (false, false, false),
                 }
@@ -1058,8 +1056,8 @@ impl App {
         let block_view = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .is_some_and(Terminal::show_block_view);
+            .and_then(|tab| tab.with_terminal(|t| t.show_block_view()))
+            .unwrap_or(false);
         if block_view {
             // A1: compute max_scroll LIVE from the layout cache. The per-frame
             // cached value is None during grid-mode execution (primary-screen TUI),
@@ -1072,9 +1070,9 @@ impl App {
                 .as_ref()
                 .and_then(|renderer| {
                     let tab = self.sessions.active()?;
-                    let terminal = tab.terminal.as_ref()?;
+                    let terminal = tab.lock_terminal()?;
                     let (_total, _visible, max) =
-                        renderer.block_scroll_metrics(terminal, tab.pane_session_id);
+                        renderer.block_scroll_metrics(&terminal, tab.pane_session_id);
                     Some(max)
                 })
                 .unwrap_or(0);
@@ -1101,7 +1099,7 @@ impl App {
             // the selection instead of corrupting the copy range. Only when
             // the offset actually moves — offset 0 + scroll-down is a no-op.
             let (had_selection, offset_will_change) = {
-                let terminal = self.sessions.active().and_then(|tab| tab.terminal.as_ref());
+                let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal());
                 match terminal {
                     Some(t) => {
                         let grid = t.grid();
@@ -1128,10 +1126,10 @@ impl App {
                     tab.selection_handler.clear();
                 }
             }
-            if let Some(terminal) = self
+            if let Some(mut terminal) = self
                 .sessions
                 .active_mut()
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             {
                 let grid = &mut terminal.grid_mut();
                 if up {
@@ -1176,10 +1174,12 @@ impl App {
             let snapshot_context = self
                 .sessions
                 .active()
-                .and_then(|tab| tab.terminal.as_ref())
-                .is_some_and(|terminal| {
-                    terminal.primary_history_view() || terminal.is_alt_screen_history_peek()
-                });
+                .and_then(|tab| {
+                    tab.with_terminal(|terminal| {
+                        terminal.primary_history_view() || terminal.is_alt_screen_history_peek()
+                    })
+                })
+                .unwrap_or(false);
             let down_threshold = down_autoscroll_threshold(bottom, ch, snapshot_context);
             if (y as f32) < top - ch {
                 Some((AutoscrollDir::Up, (top - ch) - y as f32))
@@ -1194,8 +1194,8 @@ impl App {
             let tui_active = self
                 .sessions
                 .active()
-                .and_then(|tab| tab.terminal.as_ref())
-                .is_some_and(Terminal::primary_screen_app_active);
+                .and_then(|tab| tab.with_terminal(|t| t.primary_screen_app_active()))
+                .unwrap_or(false);
             if !tui_active {
                 return None;
             }
@@ -1285,10 +1285,10 @@ impl App {
             .as_ref()
             .and_then(|renderer| {
                 let tab = self.sessions.active()?;
-                let terminal = tab.terminal.as_ref()?;
+                let terminal = tab.lock_terminal()?;
                 Some(
                     renderer
-                        .block_scroll_metrics(terminal, tab.pane_session_id)
+                        .block_scroll_metrics(&terminal, tab.pane_session_id)
                         .2,
                 )
             })

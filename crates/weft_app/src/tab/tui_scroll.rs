@@ -103,7 +103,7 @@ impl Tab {
         // `if let` block so the immutable terminal borrow releases before we
         // mutate `input_handler` / `tui_scroll_deadline` (which both deref
         // through the active pane and would otherwise conflict).
-        let terminal_state = self.terminal.as_ref()?;
+        let terminal_state = self.lock_terminal()?;
         let is_alt_screen = terminal_state.is_alt_screen_active();
         if !is_alt_screen {
             // The first ambiguous gesture has now been classified as ordinary
@@ -121,9 +121,9 @@ impl Tab {
         // legacy bytes, and an L4+ app gets its arrow rows.
         let kitty_flags = terminal_state.keyboard_protocol_flags();
         let mouse_protocol_off = mouse_protocol == weft_core::input::MouseProtocol::Off;
-        // NLL releases the immutable `pane.terminal` borrow at the end of the
-        // last expression above, so the mutations below are free to take a
-        // fresh `&mut` through `DerefMut`.
+        // T10 P1: the `terminal_state` guard above is owned (`lock_arc`) and
+        // carries no borrow of the pane, so the `input_handler` mutations
+        // below are uncontended.
 
         self.input_handler.app_cursor_keys = app_cursor_keys;
         self.input_handler.mouse_protocol = mouse_protocol;

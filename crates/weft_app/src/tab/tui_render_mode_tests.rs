@@ -8,6 +8,7 @@
 //! Terminal level is the repo's established headless harness (`tab_with_terminal`).
 
 use super::*;
+use weft_core::vt::Terminal;
 use weft_core::vt::TuiRenderMode;
 
 fn tab_with_terminal_ni(scrollback_lines: usize) -> Tab {
@@ -32,9 +33,9 @@ fn uv_class_byte_stream_keeps_block_view_with_block_head() {
     // M2.3 scenario 1: a noninteractive-tier progress command runs entirely
     // as a block — the block head (command string) stays intact and the
     // view never flips to the live grid mid-session.
-    let mut tab = tab_with_terminal_ni(1000);
-    let terminal = tab.terminal.as_mut().unwrap();
-    uv_progress_bytes(terminal);
+    let tab = tab_with_terminal_ni(1000);
+    let mut terminal = tab.lock_terminal().unwrap();
+    uv_progress_bytes(&mut terminal);
     assert!(
         terminal.show_block_view(),
         "screen-owned progress session must keep the block view (noninteractive)"
@@ -60,7 +61,7 @@ fn typed_key_while_screen_owned_returns_to_grid_view() {
     // exactly like `App::forward_key_to_pty` does.
     let mut tab = tab_with_terminal_ni(1000);
     {
-        let terminal = tab.terminal.as_mut().unwrap();
+        let mut terminal = tab.lock_terminal().unwrap();
         terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
         terminal.process("\x1b[999D\x1b[915A\x1b[1A".as_bytes());
         assert!(
@@ -75,19 +76,18 @@ fn typed_key_while_screen_owned_returns_to_grid_view() {
     // The keystroke (any non-empty encoding — the pane-level call that
     // `App::forward_key_to_pty` makes).
     tab.active_mut()
-        .terminal
-        .as_mut()
+        .lock_terminal()
         .unwrap()
         .note_interactive_stdin();
     assert!(
-        !tab.terminal.as_ref().unwrap().show_block_view(),
+        !tab.lock_terminal().unwrap().show_block_view(),
         "first keystroke returns the TUI to the classic live-grid takeover"
     );
     // The flag lives only for this command; the next command starts clean.
-    tab.terminal.as_mut().unwrap().process(b"\x1b]133;D;0\x07");
-    tab.terminal.as_mut().unwrap().settle_primary_screen_exit();
+    tab.lock_terminal().unwrap().process(b"\x1b]133;D;0\x07");
+    tab.lock_terminal().unwrap().settle_primary_screen_exit();
     assert!(
-        !tab.terminal.as_ref().unwrap().interactive_stdin_seen(),
+        !tab.lock_terminal().unwrap().interactive_stdin_seen(),
         "command boundary clears the interactive-stdin flag"
     );
 }
@@ -98,8 +98,8 @@ fn mouse_protocol_enabled_uses_classic_takeover_without_stdin() {
     // declaration — a screen-owned session with DEC 1002 armed goes straight
     // to the classic takeover even with zero stdin bytes (the block view
     // would swallow wheel events meant for the TUI).
-    let mut tab = tab_with_terminal_ni(1000);
-    let terminal = tab.terminal.as_mut().unwrap();
+    let tab = tab_with_terminal_ni(1000);
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07claude\x1b]133;C\x07");
     terminal.process(b"\x1b[H\x1b[2;1H");
     assert!(
@@ -127,9 +127,9 @@ fn history_scroll_into_and_back_keeps_block_view_semantics() {
     // bottom keeps the block view in both states (history browsing always
     // shows blocks; back at the live bottom the screen-owned session resumes
     // its block view under the noninteractive tier).
-    let mut tab = tab_with_terminal_ni(1000);
-    let terminal = tab.terminal.as_mut().unwrap();
-    uv_progress_bytes(terminal);
+    let tab = tab_with_terminal_ni(1000);
+    let mut terminal = tab.lock_terminal().unwrap();
+    uv_progress_bytes(&mut terminal);
     assert!(terminal.show_block_view());
     terminal.set_primary_history_view(true);
     assert!(
@@ -173,6 +173,6 @@ fn terminal_defaults_to_classic_without_config_injection() {
     // depend on it. The noninteractive tier only exists after the config
     // chokepoint injects it.
     let tab = Tab::with_single_pane(Pane::with_terminal_only(1000));
-    let terminal = tab.terminal.as_ref().unwrap();
+    let terminal = tab.lock_terminal().unwrap();
     assert_eq!(terminal.tui_render_mode(), TuiRenderMode::Classic);
 }

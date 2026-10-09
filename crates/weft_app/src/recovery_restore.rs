@@ -52,7 +52,7 @@ impl App {
                                 &self.proxy,
                                 cwd_to_apply.as_deref(),
                             );
-                            if let Some(t) = &mut tab.terminal {
+                            if let Some(mut t) = tab.lock_terminal() {
                                 t.set_blocks_retained_limit(blocks_limit);
                                 t.set_block_output_cap(crate::config_controller::output_cap_bytes(
                                     self.config_state.config.blocks.output_cap_mib,
@@ -78,7 +78,7 @@ impl App {
                             cwd_to_apply.as_deref(),
                         );
                         tab.restore_from_snapshot(snap);
-                        if let Some(t) = &mut tab.terminal {
+                        if let Some(mut t) = tab.lock_terminal() {
                             t.set_blocks_retained_limit(blocks_limit);
                             t.set_block_output_cap(crate::config_controller::output_cap_bytes(
                                 self.config_state.config.blocks.output_cap_mib,
@@ -143,7 +143,7 @@ impl App {
             &self.proxy,
             root_spawn_cwd.as_deref(),
         );
-        if let Some(t) = &mut tab.terminal {
+        if let Some(mut t) = tab.lock_terminal() {
             t.set_blocks_retained_limit(blocks_limit);
             t.set_block_output_cap(crate::config_controller::output_cap_bytes(output_cap_mib));
             // v1.11.7 (P2-3): inject the user's TUI tier.
@@ -160,9 +160,9 @@ impl App {
             .block_store()
             .map(weft_core::persistence::BlockStore::block_id_allocator)
         {
-            if let Some(t) = tab.terminal.as_mut() {
+            tab.with_terminal(|t| {
                 t.block_tracker_mut().use_shared_id_allocator(allocator);
-            }
+            });
         }
 
         let initial_pane_id = tab.active_pane_id();

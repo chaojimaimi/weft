@@ -46,8 +46,7 @@ impl App {
                 self.sessions.active_idx(),
                 self.sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .map(|terminal| terminal.effective_input_mode())
+                    .and_then(|tab| tab.with_terminal(|t| t.effective_input_mode()))
                     .unwrap_or(weft_core::input::InputMode::Passthrough),
             )
         };
@@ -242,15 +241,13 @@ impl App {
                             self.request_redraw();
                         }
                         event_replay::ImeCommitTarget::Editor { tab } => {
-                            if let Some(terminal) = self
-                                .sessions
-                                .tab_mut(tab)
-                                .and_then(|session| session.terminal.as_mut())
-                            {
-                                for c in text.chars() {
-                                    terminal.editor_mut().buffer.insert_char(c);
-                                }
-                                terminal.editor_mut().buffer.clear_selection();
+                            if let Some(session) = self.sessions.tab_mut(tab) {
+                                session.with_terminal(|terminal| {
+                                    for c in text.chars() {
+                                        terminal.editor_mut().buffer.insert_char(c);
+                                    }
+                                    terminal.editor_mut().buffer.clear_selection();
+                                });
                             }
                             self.interaction.prompt_dragging = false;
                             self.request_redraw();
@@ -273,12 +270,8 @@ impl App {
                             // exemption exactly like a forwarded key, so CJK
                             // input into pi/claude gets the classic takeover
                             // instead of lingering in the block view.
-                            if let Some(terminal) = self
-                                .sessions
-                                .tab_mut(tab)
-                                .and_then(|session| session.terminal.as_mut())
-                            {
-                                terminal.note_interactive_stdin();
+                            if let Some(session) = self.sessions.tab_mut(tab) {
+                                session.with_terminal(|terminal| terminal.note_interactive_stdin());
                             }
                             // v1.11.11 (M-B): Effects carry the stable session
                             // id; the commit target's index still routes the

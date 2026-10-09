@@ -8,7 +8,6 @@
 
 use crate::effect;
 use crate::redraw::PhaseOutcome;
-use weft_core::vt::Terminal;
 
 impl crate::App {
     /// Former `run_redraw` :55-76 — PTY pump + post-drain empty-tabs guard.
@@ -60,8 +59,8 @@ impl crate::App {
             forced,
             self.sessions
                 .active()
-                .and_then(|tab| tab.terminal.as_ref())
-                .is_some_and(Terminal::synchronized_output),
+                .and_then(|tab| tab.with_terminal(|t| t.synchronized_output()))
+                .unwrap_or(false),
             crate::input_router::route_session_input(!self.sessions.is_empty()),
         ) {
             // WHY (v1.11.10 M-B/D-j): synchronized output deliberately
@@ -111,12 +110,13 @@ impl crate::App {
             let snap_to_bottom = self
                 .sessions
                 .active()
-                .and_then(|tab| tab.terminal.as_ref())
-                .map(|t| {
-                    crate::block_component::should_follow_running_output(
-                        t.block_tracker().phase(),
-                        t.primary_history_view(),
-                    )
+                .and_then(|tab| {
+                    tab.with_terminal(|t| {
+                        crate::block_component::should_follow_running_output(
+                            t.block_tracker().phase(),
+                            t.primary_history_view(),
+                        )
+                    })
                 })
                 .unwrap_or(false)
                 && matches!(
@@ -153,8 +153,7 @@ impl crate::App {
         let current = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| (t.grid().num_rows, t.grid().num_cols))
+            .and_then(|tab| tab.with_terminal(|t| (t.grid().num_rows, t.grid().num_cols)))
             .unwrap_or((0, 0));
         if desired.0 != 0 && desired.1 != 0 && desired != current {
             self.recompute_layout();

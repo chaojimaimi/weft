@@ -80,7 +80,7 @@ fn exit_then_request_wake<E>(exit: impl FnOnce(), wake: impl FnOnce() -> Result<
 }
 
 fn pane_running_command(pane: &crate::pane::Pane) -> Option<String> {
-    let terminal = pane.terminal.as_ref()?;
+    let terminal = pane.lock_terminal()?;
     let shell_pid = pane.pty.as_ref().map(|pty| pty.child_pid().as_raw());
     let foreground_pgid = pane
         .pty

@@ -304,7 +304,7 @@ impl App {
             if sel.mode != SelectionMode::Simple {
                 return false;
             }
-            let Some(terminal) = tab.terminal.as_ref() else {
+            let Some(terminal) = tab.lock_terminal() else {
                 return false;
             };
             if !terminal.primary_screen_app_active() {
@@ -330,8 +330,7 @@ impl App {
         // Step 2 (read-only): the anchor grid row's cells → source char
         // offset within its snapshot line.
         let source_char = {
-            let Some(terminal) = self.sessions.active().and_then(|tab| tab.terminal.as_ref())
-            else {
+            let Some(terminal) = self.sessions.active().and_then(|tab| tab.lock_terminal()) else {
                 return false;
             };
             let Some(row) = terminal.grid().viewport.get(anchor.start.row) else {
@@ -359,9 +358,7 @@ impl App {
             return false;
         };
         let fingerprint = pane
-            .terminal
-            .as_ref()
-            .map(|terminal| {
+            .with_terminal(|terminal| {
                 block_selection_fingerprint(
                     terminal.block_tracker().session_blocks(),
                     terminal.screen_head_lines(),

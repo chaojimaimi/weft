@@ -210,10 +210,10 @@ impl Tab {
                 continue;
             }
             // v1.11.4: kitty negotiated flags die with the shell.
-            if let Some(t) = self
+            if let Some(mut t) = self
                 .panes
                 .get_mut(&pane_id)
-                .and_then(|pane| pane.terminal.as_mut())
+                .and_then(|pane| pane.lock_terminal())
             {
                 t.kitty_reset();
             }
@@ -248,13 +248,12 @@ impl Tab {
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 // v1.10.4: keypress bypass window — publish now (gated).
                 need_redraw |= if pane_processed && pane.primary_history_refresh.take_force() {
-                    pane.terminal
-                        .as_mut()
-                        .is_some_and(weft_core::vt::Terminal::refresh_primary_history_snapshot_now)
+                    pane.with_terminal(|t| t.refresh_primary_history_snapshot_now())
+                        .unwrap_or(false)
                 } else {
                     pane.refresh_primary_history_snapshot(pane_processed)
                 };
-                if let Some(terminal) = pane.terminal.as_mut() {
+                if let Some(mut terminal) = pane.lock_terminal() {
                     let settled = if !pane_exited {
                         terminal.settle_primary_screen_exit_if_idle(now)
                     } else {
@@ -274,7 +273,7 @@ impl Tab {
                     split_heads = terminal.take_pending_screen_split_heads().unwrap_or(0);
                     // v1.10.21: don't yank THIS pane's active history peek.
                     reset_scroll =
-                        crate::tab::scroll::block_completion_should_snap(terminal, &pane_drained);
+                        crate::tab::scroll::block_completion_should_snap(&terminal, &pane_drained);
                 } else {
                     terminal_gone = true;
                 }
@@ -400,7 +399,7 @@ impl Tab {
         ui_events: &mut Vec<(PaneId, weft_core::vt::UiEvent)>,
     ) {
         if let Some(pane) = self.panes.get_mut(&pane_id) {
-            if let Some(terminal) = pane.terminal.as_mut() {
+            if let Some(mut terminal) = pane.lock_terminal() {
                 // A shell that died mid-command still finalizes its in-flight
                 // block before the pane drops.
                 terminal.settle_primary_screen_exit();
@@ -465,13 +464,13 @@ impl Tab {
         let was_peeking = self
             .panes
             .get(&pane_id)
-            .and_then(|pane| pane.terminal.as_ref())
-            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+            .and_then(|pane| pane.with_terminal(|t| t.is_alt_screen_history_peek()))
+            .unwrap_or(false);
         let (response, alt_flips, still_peeking) = {
             let Some(pane) = self.panes.get_mut(&pane_id) else {
                 return false;
             };
-            let Some(terminal) = pane.terminal.as_mut() else {
+            let Some(mut terminal) = pane.lock_terminal() else {
                 return false;
             };
             let before = terminal.alt_flip_count();
@@ -559,8 +558,7 @@ mod tests {
 
     fn row_text(tab: &Tab, pane_id: PaneId, row: usize) -> String {
         tab.pane(pane_id)
-            .and_then(|pane| pane.terminal.as_ref())
-            .map(|t| t.grid().row_text(row))
+            .and_then(|pane| pane.with_terminal(|t| t.grid().row_text(row)))
             .unwrap_or_default()
     }
 

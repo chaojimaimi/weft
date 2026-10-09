@@ -1,10 +1,11 @@
 use super::*;
 use weft_core::editor::EditorBuffer;
 use weft_core::persistence::TabSnapshot;
+use weft_core::vt::Terminal;
 
 fn tab_with_terminal() -> Tab {
     let mut tab = Tab::empty();
-    tab.terminal = Some(Terminal::with_scrollback(24, 80, 1000));
+    tab.set_terminal_for_test(Terminal::with_scrollback(24, 80, 1000));
     tab
 }
 
@@ -158,10 +159,10 @@ fn terminal_resize_queues_latest_size_without_desynchronizing_grid() {
 
     assert!(tab.active_mut().resize_terminal_and_queue(22, 78));
     assert_eq!(tab.pending_pty_resize, Some((22, 78)));
-    let grid = tab.terminal.as_ref().unwrap().grid();
+    let grid_dims = tab.with_terminal(|t| (t.grid().num_rows, t.grid().num_cols));
     assert_eq!(
-        (grid.num_rows, grid.num_cols),
-        (24, 80),
+        grid_dims,
+        Some((24, 80)),
         "Grid geometry must stay paired with the old PTY until ResizePty commits"
     );
 }
@@ -170,10 +171,7 @@ fn terminal_resize_queues_latest_size_without_desynchronizing_grid() {
 fn pending_resize_reports_each_panes_synchronized_frame_state() {
     let mut tab = tab_with_terminal();
     tab.pending_pty_resize = Some((30, 100));
-    tab.terminal
-        .as_mut()
-        .unwrap()
-        .process(b"\x1b[?2026hpartial");
+    tab.lock_terminal().unwrap().process(b"\x1b[?2026hpartial");
 
     assert!(tab.any_synchronized_output());
     let pending = tab.pending_pane_resizes();
@@ -181,7 +179,7 @@ fn pending_resize_reports_each_panes_synchronized_frame_state() {
     assert_eq!(pending[0].dimensions(), (30, 100));
     assert!(pending[0].is_synchronized());
 
-    tab.terminal.as_mut().unwrap().process(b" frame\x1b[?2026l");
+    tab.lock_terminal().unwrap().process(b" frame\x1b[?2026l");
     assert!(!tab.any_synchronized_output());
     assert!(!tab.pending_pane_resizes()[0].is_synchronized());
 }
@@ -208,8 +206,8 @@ fn to_snapshot_block_ids_carry_full_lineage_across_generations() {
     use std::time::{Duration, SystemTime};
     use weft_core::blocks::{Block, BlockId};
 
-    let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let tab = tab_with_terminal();
+    let mut terminal = tab.lock_terminal().unwrap();
     let mk = |id: u64, cmd: &str| Block {
         id: BlockId(id),
         command: cmd.to_string(),
@@ -231,6 +229,8 @@ fn to_snapshot_block_ids_carry_full_lineage_across_generations() {
     tracker.on_prompt_start();
     tracker.on_command_start("four".to_string());
     tracker.on_command_end(0);
+    // T10 P1 (D9 rule 2): release the guard before to_snapshot re-locks.
+    drop(terminal);
 
     let snap = tab.to_snapshot(0, true).unwrap();
     assert_eq!(snap.block_ids, vec![1, 2, 3, 4]);
@@ -242,7 +242,7 @@ fn restored_cwd_survives_until_terminal_reports_authoritative_cwd() {
     let restored = snapshot("/restored/project", &EditorBuffer::new());
 
     assert!(tab.restore_from_snapshot(&restored));
-    assert_eq!(tab.terminal.as_ref().unwrap().cwd(), None);
+    assert_eq!(tab.lock_terminal().unwrap().cwd(), None);
     assert_eq!(
         tab.to_snapshot(0, true).unwrap().cwd.as_deref(),
         Some("/restored/project")
@@ -276,8 +276,7 @@ fn live_osc7_cwd_overrides_restored_fallback() {
     let restored = snapshot("/restored/project", &EditorBuffer::new());
 
     assert!(tab.restore_from_snapshot(&restored));
-    tab.terminal
-        .as_mut()
+    tab.lock_terminal()
         .unwrap()
         .process(b"\x1b]7;file://localhost/live/project\x1b\\");
 
@@ -292,13 +291,12 @@ fn new_tab_launch_cwd_prefers_live_then_restored_state() {
     let mut tab = tab_with_terminal();
     let restored = snapshot("/restored/project", &EditorBuffer::new());
     assert!(tab.restore_from_snapshot(&restored));
-    assert_eq!(tab.launch_cwd(), Some("/restored/project"));
+    assert_eq!(tab.launch_cwd().as_deref(), Some("/restored/project"));
 
-    tab.terminal
-        .as_mut()
+    tab.lock_terminal()
         .unwrap()
         .process(b"\x1b]7;file://localhost/live/project\x1b\\");
-    assert_eq!(tab.launch_cwd(), Some("/live/project"));
+    assert_eq!(tab.launch_cwd().as_deref(), Some("/live/project"));
 }
 
 /// v1.10.24 B1: the workspace-restore cwd fallback (`restored_cwd`) drives
@@ -309,16 +307,15 @@ fn launch_cwd_uses_restored_cwd_fallback_before_osc7() {
     let mut tab = tab_with_terminal();
     tab.set_restored_cwd_fallback(Some("/restored/project".into()));
     assert_eq!(
-        tab.launch_cwd(),
+        tab.launch_cwd().as_deref(),
         Some("/restored/project"),
         "fallback cwd must drive launch_cwd before OSC 7"
     );
 
-    tab.terminal
-        .as_mut()
+    tab.lock_terminal()
         .unwrap()
         .process(b"\x1b]7;file://localhost/live/project\x1b\\");
-    assert_eq!(tab.launch_cwd(), Some("/live/project"));
+    assert_eq!(tab.launch_cwd().as_deref(), Some("/live/project"));
 }
 
 /// v1.10.24 B1: a PTY-dead workspace-restored pane (terminal None, no real
@@ -342,7 +339,7 @@ fn to_snapshot_keeps_pty_dead_pane_serializable_with_cwd_fallback_only() {
 #[test]
 fn queued_alt_screen_teardown_output_is_preserved() {
     let mut tab = tab_with_terminal();
-    tab.terminal.as_mut().unwrap().process(b"\x1b[?1049h");
+    tab.lock_terminal().unwrap().process(b"\x1b[?1049h");
     tab.msg_tx
         .send(AppMsg::PtyOutput(b"\x1b[?1049lresume hint".to_vec()))
         .unwrap();
@@ -350,10 +347,9 @@ fn queued_alt_screen_teardown_output_is_preserved() {
     let (_, _, need_redraw, _) = tab.process_messages();
 
     assert!(need_redraw);
-    assert!(!tab.terminal.as_ref().unwrap().is_alt_screen_active());
+    assert!(!tab.lock_terminal().unwrap().is_alt_screen_active());
     assert!(tab
-        .terminal
-        .as_ref()
+        .lock_terminal()
         .unwrap()
         .grid()
         .row_text(0)
@@ -363,12 +359,15 @@ fn queued_alt_screen_teardown_output_is_preserved() {
 #[test]
 fn queued_primary_tui_teardown_becomes_a_screen_snapshot() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07");
     terminal.editor_mut().buffer.set_text("screen-app");
     terminal.submit_command();
     terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07old linear output\x1b[2;1H\x1b[3;1H");
     assert!(terminal.primary_screen_app_active());
+    // T10 P1 (D9 rule 2): release the guard before the tab-level pump —
+    // process_messages re-locks this pane's terminal.
+    drop(terminal);
 
     tab.msg_tx
         .send(AppMsg::PtyOutput(
@@ -384,8 +383,8 @@ fn queued_primary_tui_teardown_becomes_a_screen_snapshot() {
         blocks.is_empty(),
         "the screen tail must settle before freezing"
     );
-    assert!(tab.terminal.as_ref().unwrap().primary_screen_exit_pending());
-    tab.terminal.as_mut().unwrap().settle_primary_screen_exit();
+    assert!(tab.lock_terminal().unwrap().primary_screen_exit_pending());
+    tab.lock_terminal().unwrap().settle_primary_screen_exit();
     let (_, blocks, _, _) = tab.process_messages();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].command, "screen-app");
@@ -399,12 +398,14 @@ fn queued_primary_tui_teardown_becomes_a_screen_snapshot() {
 #[test]
 fn failed_interrupt_does_not_drop_queued_output_or_reset_shell_phase() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
     assert_eq!(
         terminal.block_tracker().phase(),
         weft_core::blocks::ShellPhase::CommandExecuting
     );
+    // T10 P1 (D9 rule 2): release the guard before interrupt_pty/process_messages.
+    drop(terminal);
     tab.msg_tx
         .send(AppMsg::PtyOutput(b"still-running-tail".to_vec()))
         .unwrap();
@@ -417,12 +418,11 @@ fn failed_interrupt_does_not_drop_queued_output_or_reset_shell_phase() {
 
     assert!(need_redraw);
     assert_eq!(
-        tab.terminal.as_ref().unwrap().block_tracker().phase(),
+        tab.lock_terminal().unwrap().block_tracker().phase(),
         weft_core::blocks::ShellPhase::CommandExecuting
     );
     assert!(tab
-        .terminal
-        .as_ref()
+        .lock_terminal()
         .unwrap()
         .block_tracker()
         .in_flight()
@@ -432,12 +432,14 @@ fn failed_interrupt_does_not_drop_queued_output_or_reset_shell_phase() {
 #[test]
 fn failed_interrupt_rolls_back_primary_screen_freeze() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H");
     terminal.process(b"old frame before failed interrupt");
+    // T10 P1 (D9 rule 2): release the guard before interrupt_pty re-locks.
+    drop(terminal);
 
     assert!(!tab.interrupt_pty(), "tab intentionally has no PTY");
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew frame after failed interrupt\x1b[?2026l");
     terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
     terminal.settle_primary_screen_exit();
@@ -456,12 +458,14 @@ fn failed_interrupt_rolls_back_primary_screen_freeze() {
 #[test]
 fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07");
     terminal.editor_mut().buffer.set_text("screen-app");
     terminal.submit_command();
     terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H");
     assert!(terminal.primary_screen_app_active());
+    // T10 P1 (D9 rule 2): release the guard before process_messages re-locks.
+    drop(terminal);
 
     tab.msg_tx
         .send(AppMsg::PtyOutput(
@@ -489,14 +493,16 @@ fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
 #[test]
 fn pty_exit_resets_kitty_keyboard_flags() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b[>1u\x1b[?1049h\x1b[>11u"); // main=1, alt=11→masked 3
     assert_eq!(terminal.keyboard_protocol_flags(), 3);
+    // T10 P1 (D9 rule 2): release the guard before process_messages re-locks.
+    drop(terminal);
 
     tab.msg_tx.send(AppMsg::PtyExit(Ok(0))).unwrap();
     let (alive, _, _, _) = tab.process_messages();
     assert!(!alive, "PtyExit must be processed");
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     assert_eq!(terminal.keyboard_protocol_flags(), 0, "main stack cleared");
     terminal.process(b"\x1b[?1049l");
     assert_eq!(
@@ -512,7 +518,7 @@ fn pty_exit_resets_kitty_keyboard_flags() {
 #[test]
 fn close_tail_pty_exit_resets_kitty_keyboard_flags() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07");
     terminal.editor_mut().buffer.set_text("screen-app");
     terminal.submit_command();
@@ -523,10 +529,12 @@ fn close_tail_pty_exit_resets_kitty_keyboard_flags() {
     );
     terminal.process(b"\x1b[>27u");
     assert_eq!(terminal.keyboard_protocol_flags(), 27 & 0b1_0011);
+    // T10 P1 (D9 rule 2): release the guard before finish_pending_blocks.
+    drop(terminal);
 
     tab.msg_tx.send(AppMsg::PtyExit(Ok(0))).unwrap();
     tab.finish_pending_blocks();
-    let terminal = tab.terminal.as_ref().unwrap();
+    let terminal = tab.lock_terminal().unwrap();
     assert_eq!(
         terminal.keyboard_protocol_flags(),
         0,
@@ -537,11 +545,13 @@ fn close_tail_pty_exit_resets_kitty_keyboard_flags() {
 #[test]
 fn oversized_output_remainder_stays_ahead_of_queued_pty_exit() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07");
     terminal.editor_mut().buffer.set_text("screen-app");
     terminal.submit_command();
     terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H");
+    // T10 P1 (D9 rule 2): release the guard before process_messages re-locks.
+    drop(terminal);
 
     let mut output = vec![b'x'; 256 * 1024 + 1];
     output.extend_from_slice(
@@ -566,13 +576,15 @@ fn oversized_output_remainder_stays_ahead_of_queued_pty_exit() {
 #[test]
 fn closing_a_tab_force_settles_its_pending_primary_tui_block() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07");
     terminal.editor_mut().buffer.set_text("screen-app");
     terminal.submit_command();
     terminal
         .process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H\x1b]133;D;0\x07\x1b]133;A\x07");
     assert!(terminal.primary_screen_exit_pending());
+    // T10 P1 (D9 rule 2): release the guard before finish_pending_blocks.
+    drop(terminal);
     tab.msg_tx
         .send(AppMsg::PtyOutput(b"\x1b[2J\x1b[Hlate close tail".to_vec()))
         .unwrap();
@@ -582,19 +594,21 @@ fn closing_a_tab_force_settles_its_pending_primary_tui_block() {
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].command, "screen-app");
     assert_eq!(blocks[0].output.as_ref(), "late close tail");
-    assert!(!tab.terminal.as_ref().unwrap().primary_screen_exit_pending());
+    assert!(!tab.lock_terminal().unwrap().primary_screen_exit_pending());
 }
 
 #[test]
 fn closing_a_primary_tui_does_not_chase_an_unbounded_output_producer() {
     let mut tab = tab_with_terminal();
-    let terminal = tab.terminal.as_mut().unwrap();
+    let mut terminal = tab.lock_terminal().unwrap();
     terminal.process(b"\x1b]133;A\x07");
     terminal.editor_mut().buffer.set_text("screen-app");
     terminal.submit_command();
     terminal
         .process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H\x1b]133;D;0\x07\x1b]133;A\x07");
     assert!(terminal.primary_screen_exit_pending());
+    // T10 P1 (D9 rule 2): release the guard before finish_pending_blocks.
+    drop(terminal);
     for _ in 0..=super::lifecycle::MAX_CLOSE_TAIL_EVENTS {
         tab.msg_tx.send(AppMsg::PtyOutput(b"x".to_vec())).unwrap();
     }
@@ -624,8 +638,7 @@ fn synchronized_output_suppresses_partial_frame_until_commit() {
     let (_, _, committed_redraw, _) = tab.process_messages();
     assert!(committed_redraw);
     assert!(tab
-        .terminal
-        .as_ref()
+        .lock_terminal()
         .unwrap()
         .grid()
         .row_text(0)

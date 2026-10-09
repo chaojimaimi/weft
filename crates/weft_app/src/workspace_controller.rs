@@ -152,15 +152,12 @@ impl App {
             };
         };
         let cwd = pane
-            .terminal
-            .as_ref()
-            .and_then(|t| t.cwd())
-            .or_else(|| pane.restored_cwd_fallback())
+            .with_terminal(|t| t.cwd().map(str::to_owned))
+            .flatten()
+            .or_else(|| pane.restored_cwd_fallback().map(str::to_owned))
             .map(PathBuf::from);
         let draft = pane
-            .terminal
-            .as_ref()
-            .map(|t| t.editor().text())
+            .with_terminal(|t| t.editor().text())
             .unwrap_or_default();
         PanePayload { cwd, draft }
     }
@@ -344,20 +341,20 @@ impl App {
             .block_store()
             .map(weft_core::persistence::BlockStore::block_id_allocator)
         {
-            if let Some(terminal) = self
+            if let Some(mut terminal) = self
                 .sessions
                 .tab_mut(tab_idx)
-                .and_then(|tab| tab.terminal.as_mut())
+                .and_then(|tab| tab.lock_terminal())
             {
                 terminal
                     .block_tracker_mut()
                     .use_shared_id_allocator(block_id_allocator);
             }
         }
-        if let Some(t) = self
+        if let Some(mut t) = self
             .sessions
             .tab_mut(tab_idx)
-            .and_then(|tab| tab.terminal.as_mut())
+            .and_then(|tab| tab.lock_terminal())
         {
             if let Some(r) = &self.renderer {
                 t.set_palette(r.theme().palette);
@@ -367,12 +364,8 @@ impl App {
 
         // Set the root leaf's editor draft.
         if !root_draft.is_empty() {
-            if let Some(terminal) = self
-                .sessions
-                .tab_mut(tab_idx)
-                .and_then(|tab| tab.terminal.as_mut())
-            {
-                terminal.editor_mut().buffer.set_text(&root_draft);
+            if let Some(tab) = self.sessions.tab_mut(tab_idx) {
+                tab.with_terminal(|terminal| terminal.editor_mut().buffer.set_text(&root_draft));
             }
         }
 
@@ -788,7 +781,7 @@ mod tests {
         assert_eq!(panes.len(), 2);
         // The second pane (new) should have the draft.
         let second_pane = tab.pane(panes[1]).unwrap();
-        let terminal = second_pane.terminal.as_ref().unwrap();
+        let terminal = second_pane.lock_terminal().unwrap();
         assert_eq!(terminal.editor().text(), "build");
     }
 
@@ -833,11 +826,11 @@ mod tests {
         // build_subtree. Skip checking it here.
         // Pane 1 is B — draft "build".
         let pane_b = tab.pane(panes[1]).unwrap();
-        assert_eq!(pane_b.terminal.as_ref().unwrap().editor().text(), "build");
+        assert_eq!(pane_b.lock_terminal().unwrap().editor().text(), "build");
         assert_eq!(pane_b.restored_cwd.as_deref(), Some("/b"));
         // Pane 2 is C — draft "test".
         let pane_c = tab.pane(panes[2]).unwrap();
-        assert_eq!(pane_c.terminal.as_ref().unwrap().editor().text(), "test");
+        assert_eq!(pane_c.lock_terminal().unwrap().editor().text(), "test");
         assert_eq!(pane_c.restored_cwd.as_deref(), Some("/c"));
     }
 
@@ -883,9 +876,9 @@ mod tests {
         assert_eq!(panes.len(), 3);
         // Pane 0 is A (root), Pane 1 is B, Pane 2 is C.
         let pane_b = tab.pane(panes[1]).unwrap();
-        assert_eq!(pane_b.terminal.as_ref().unwrap().editor().text(), "build");
+        assert_eq!(pane_b.lock_terminal().unwrap().editor().text(), "build");
         let pane_c = tab.pane(panes[2]).unwrap();
-        assert_eq!(pane_c.terminal.as_ref().unwrap().editor().text(), "test");
+        assert_eq!(pane_c.lock_terminal().unwrap().editor().text(), "test");
     }
 
     #[test]

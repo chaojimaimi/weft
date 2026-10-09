@@ -137,8 +137,7 @@ impl App {
         let modes = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .map(|t| (t.mouse_protocol(), t.sgr_mouse()));
+            .and_then(|tab| tab.with_terminal(|t| (t.mouse_protocol(), t.sgr_mouse())));
         if let Some((mp, sgr)) = modes {
             if let Some(tab) = self.sessions.active_mut() {
                 tab.input_handler.mouse_protocol = mp;

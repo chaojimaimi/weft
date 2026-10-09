@@ -22,8 +22,8 @@ impl App {
         let peeking = self
             .sessions
             .active()
-            .and_then(|tab| tab.terminal.as_ref())
-            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+            .and_then(|tab| tab.with_terminal(|t| t.is_alt_screen_history_peek()))
+            .unwrap_or(false);
         // Feed the gate only Shift gestures' signed rows (up = positive):
         // entry requires Shift anyway, so plain-wheel travel must not
         // accumulate toward the threshold across separate gestures (a
@@ -51,8 +51,7 @@ impl App {
                 let kitty_flags = self
                     .sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .map(|t| t.keyboard_protocol_flags())
+                    .and_then(|tab| tab.with_terminal(|t| t.keyboard_protocol_flags()))
                     .unwrap_or(0);
                 let key = if up { KeyCode::Up } else { KeyCode::Down };
                 let single = self
@@ -86,15 +85,11 @@ impl App {
                 let bootstrap = self
                     .sessions
                     .active()
-                    .and_then(|tab| tab.terminal.as_ref())
-                    .is_some_and(|t| t.block_tracker().bootstrap_ready());
+                    .and_then(|tab| tab.with_terminal(|t| t.block_tracker().bootstrap_ready()))
+                    .unwrap_or(false);
                 if bootstrap {
-                    if let Some(t) = self
-                        .sessions
-                        .active_mut()
-                        .and_then(|tab| tab.terminal.as_mut())
-                    {
-                        t.set_alt_screen_history_peek(true);
+                    if let Some(tab) = self.sessions.active_mut() {
+                        tab.with_terminal(|t| t.set_alt_screen_history_peek(true));
                     }
                     self.scroll_local_view(rows);
                 }
