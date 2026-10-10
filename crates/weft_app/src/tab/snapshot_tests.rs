@@ -1,5 +1,7 @@
+use super::snapshot::snapshot_node_from_tree;
 use super::*;
 use weft_core::editor::EditorBuffer;
+use weft_core::pane_layout::{PaneTree, SplitDirection};
 use weft_core::persistence::TabSnapshot;
 use weft_core::vt::Terminal;
 

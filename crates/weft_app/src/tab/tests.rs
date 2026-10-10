@@ -7,6 +7,7 @@
 //! lifecycle (split / focus / close / hit-test).
 
 use super::*;
+use weft_core::pane_layout::{SplitDirection, SplitError};
 use weft_core::vt::Terminal;
 
 #[test]
