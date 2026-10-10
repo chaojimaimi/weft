@@ -2,6 +2,14 @@
 //!
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
+// v1.13.8 S2 (zero-behavior file-budget split): `vte::Perform` trait impl
+// stays a single block in perform.rs; the osc/csi dispatch bodies and the
+// DEC-mode / SGR / print method families live in child modules as `impl
+// Terminal` cross-file blocks (screen_exit / kitty_keyboard precedent).
+mod actions_csi;
+mod actions_osc;
+mod actions_print;
+mod actions_sgr;
 mod attrs;
 mod capability;
 mod capture_cursor;
@@ -11,6 +19,7 @@ mod capture_cursor;
 mod capture_diff;
 mod grapheme;
 pub(crate) mod kitty_keyboard;
+mod modes;
 mod osc;
 mod osc_guard;
 mod perform;
@@ -42,9 +51,9 @@ pub use osc::osc52_read_reply;
 #[cfg(test)]
 pub(crate) use screen_exit::{sustained_alt_cols_kind, SUSTAINED_ALT_COLS_MS};
 
-use crate::blocks::{BlockTracker, CapturedStyle, OutputCapture, ShellPhase};
+use crate::blocks::{BlockTracker, CapturedStyle, OutputCapture};
 use crate::editor::Editor;
-use crate::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
+use crate::grid::{Color, Cursor, CursorStyle, Grid};
 use crate::hyperlink::HyperlinkRegistry;
 use crate::input::{
     build_submit_bytes, effective_mode, InputMode, MouseProtocol, MouseSuppressFlag,
@@ -234,30 +243,6 @@ impl Terminal {
 
     pub fn grid_mut(&mut self) -> &mut Grid {
         &mut self.grid
-    }
-
-    /// v1.11.16 (Fix B2): shared deferred-wrap newline. Clears `wrap_pending`,
-    /// moves to the next row (scrolling at the region bottom), and marks the
-    /// previous row `wrapped` ONLY when the cursor actually advanced or a
-    /// scroll occurred. At the last physical row outside the scroll region
-    /// (DECSTBM status-line layout) neither arm fires — the cursor stays put
-    /// and NO row may be marked (the old code mismarked `row-1` as a
-    /// continuation of unrelated content).
-    fn deferred_wrap_newline(&mut self) {
-        self.grid.cursor.wrap_pending = false;
-        self.grid.cursor.col = 0;
-        let (_, bottom) = self.grid.scroll_region();
-        let mut advanced = false;
-        if self.grid.cursor.row == bottom {
-            self.scroll_grid_up(1);
-            advanced = true; // content moved up; cursor.row-1 is the overflowed row
-        } else if self.grid.cursor.row < self.grid.num_rows - 1 {
-            self.grid.cursor.row += 1;
-            advanced = true;
-        }
-        if advanced && self.grid.cursor.row > 0 {
-            self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
-        }
     }
 
     /// The 256-color palette. Seeded from the theme, mutable by OSC 4/104.
@@ -462,80 +447,6 @@ impl Terminal {
             .history_snapshot_due(std::time::Instant::now())
     }
 
-    /// Swap the primary and alternate screen buffers (DEC 1049/47).
-    ///
-    /// `save_cursor_and_clear` distinguishes the two modes:
-    /// - `true` (1049): save the primary cursor, clear the alt screen on
-    ///   entry, restore the cursor on exit.
-    /// - `false` (47): plain swap, no cursor save/restore, no clear.
-    ///
-    /// Modelled on Alacritty's `swap_alt` (O(1) `mem::swap`) with the
-    /// parameterised clear/restore semantics from Warp's `SwapScreen` mode.
-    fn swap_alt(&mut self, save_cursor_and_clear: bool) {
-        if !self.capabilities.alt_active {
-            if save_cursor_and_clear {
-                self.saved_cursor = Some(self.grid.cursor.clone());
-                self.alt_grid.clear();
-            }
-            // Alternate screen starts fresh with the cursor at home (0,0).
-            self.alt_grid.cursor = Cursor::default();
-            std::mem::swap(&mut self.grid, &mut self.alt_grid);
-            self.capabilities.alt_active = true;
-            // v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): stamp the entry instant so
-            // tui_cols_kind() can apply the sustained-alt hysteresis (continuous
-            // residency >= 250ms before reporting Full).
-            self.capabilities.alt_active_since = Some(std::time::Instant::now());
-            // OSC 8 state is viewport-relative — entering the alt screen
-            // invalidates any cell_map entries from the primary grid.
-            self.hyperlinks.clear_cell_map();
-            self.active_hyperlink_id = None;
-            // FIX_ORPHAN_PARSE_ERROR_OUTPUT: a TUI taking the alt screen
-            // invalidates the staged pre-exec line bytes — drop them so no
-            // later orphan `133;D` can synthesize a block from dead context.
-            self.preexec_staging.clear();
-        } else {
-            std::mem::swap(&mut self.grid, &mut self.alt_grid);
-            if save_cursor_and_clear {
-                if let Some(c) = self.saved_cursor.take() {
-                    self.grid.cursor = c;
-                }
-            }
-            self.capabilities.alt_active = false;
-            // v1.10.30 (FIX_LESS_ALT_COLS_JUMP): record the exit instant so
-            // subsequent re-entries can distinguish isolated vs burst entry.
-            self.capabilities.alt_last_exit = Some(std::time::Instant::now());
-            // v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): leaving the alt screen
-            // clears the sustained-residency stamp; the primary screen has no
-            // Full-width entitlement.
-            self.capabilities.alt_active_since = None;
-            // v1.10.12: leaving the alt screen ends any in-progress history
-            // peek so show_block_view() reverts to the primary-screen rules
-            // and the renderer shows the restored primary grid, not a stale
-            // BlockView overlay.
-            //
-            // v1.10.19: kept unconditional — the resize feedback loop that
-            // used to hammer this path (primary-screen TUI SIGWINCH repaints
-            // toggling DEC 1049 every ~130ms, each toggle clearing the peek
-            // and yanking a scrolled-up history back to the grid) is broken
-            // at the source (stable cols + winsize dedup + rescale debounce),
-            // so the only alt exits here are real ones, where clearing the
-            // peek is correct (see alt_screen_exit_clears_history_peek).
-            self.capabilities.alt_screen_history_peek = false;
-            // Restoring the primary grid — alt-screen hyperlinks are gone.
-            self.hyperlinks.clear_cell_map();
-            self.active_hyperlink_id = None;
-        }
-        tracing::info!(
-            active = self.capabilities.alt_active,
-            rows = self.grid.num_rows,
-            cols = self.grid.num_cols,
-            "alt-screen toggled"
-        );
-        // v1.10.26 Batch D (D-2): count every real flip for the app-layer
-        // batch-diff detection and burst-storm signature.
-        self.alt_flip_count = self.alt_flip_count.wrapping_add(1);
-    }
-
     pub fn attrs(&self) -> &Attrs {
         &self.attrs
     }
@@ -643,203 +554,6 @@ impl Terminal {
             return true;
         }
         osc_guard::observe(&mut self.osc_watch, &mut self.osc_watch_prev_esc, b)
-    }
-
-    /// v1.0 perf: Bulk-write a run of printable ASCII bytes (0x20..=0x7E)
-    /// directly to the grid, bypassing vte's per-byte state machine.
-    ///
-    /// v1.0 P1.5-C2: Rewritten to process one row at a time instead of
-    /// per-char, eliminating several sources of per-char overhead:
-    /// - **Hyperlink check**: skipped entirely when no active hyperlink AND
-    ///   the cell_map is empty (99.9% of output). Old code called
-    ///   `unlink_cell` (HashMap::remove) for every char.
-    /// - **Dirty marking**: once per row segment, not per cell.
-    /// - **Bounds check**: computed once per row (`remaining_in_row`), not
-    ///   checked per char.
-    /// - **Block capture**: batched via `on_print_ascii_run` (one
-    ///   `push_str` instead of N `push` calls).
-    /// - **Cursor access**: `cursor.col` updated once per row, not per char.
-    fn print_ascii_run(&mut self, bytes: &[u8]) {
-        debug_assert!(!bytes.is_empty());
-        let phase = self.block_tracker.phase();
-        // Snap back to live viewport for new content — same gate as print().
-        // Skipped while the user is browsing primary-screen TUI history so a
-        // redraw cannot yank the viewport back to the live bottom.
-        if phase != ShellPhase::AtPrompt && !self.primary_history_view() {
-            self.grid.set_scroll_offset(0);
-        }
-        let num_cols = self.grid.num_cols;
-        let fg = self.attrs.fg;
-        let bg = self.attrs.bg;
-        let base_flags = self.attrs.flags | CellFlags::DIRTY;
-
-        // v1.0 P1.5-C2: Determine hyperlink handling mode once.
-        // - `has_hyperlink`: active OSC 8 → every cell gets linked.
-        // - `need_unlink_check`: no active link, but old cells might have
-        //   HYPERLINK flag → need to check + unlink (rare).
-        // - Neither: skip ALL hyperlink logic (fast path, 99.9% of output).
-        let has_hyperlink = self.active_hyperlink_id.is_some();
-        let need_unlink_check = !has_hyperlink && !self.hyperlinks.cell_map_is_empty();
-
-        let mut offset = 0;
-        while offset < bytes.len() {
-            // Handle deferred wrap (same as print()) — once per row boundary.
-            if self.grid.cursor.wrap_pending {
-                self.deferred_wrap_newline();
-            }
-
-            let col = self.grid.cursor.col;
-
-            // v1.0 P1.5-C2: resize race — cursor.col may be >= num_cols after
-            // a narrowing resize. Reset to col 0 and advance row (same as the
-            // old per-char bounds check, but done once per row boundary).
-            let col = if col >= num_cols {
-                self.deferred_wrap_newline();
-                self.grid.cursor.col
-            } else {
-                col
-            };
-            // Read row AFTER the col adjustment (cursor.row may have changed).
-            let row = self.grid.cursor.row;
-            self.prepare_primary_screen_exit_row_overwrite();
-            self.include_primary_screen_viewport_row(row);
-
-            // How many bytes fit in the current row? No per-char bounds check.
-            let remaining_in_row = num_cols - col;
-            let remaining_bytes = bytes.len() - offset;
-            let count = remaining_in_row.min(remaining_bytes);
-            let chunk = &bytes[offset..offset + count];
-
-            // Batch capture to the active sink — one push instead of N pushes.
-            // v1.7.0-A: capture the current VT SGR attrs for the whole ASCII
-            // run — all bytes share one style since the fast path only fires
-            // when no SGR change occurred mid-run.
-            // FIX_ORPHAN_PARSE_ERROR_OUTPUT: sink selection lives in
-            // staging.rs — in-flight capture while CommandExecuting, preexec
-            // staging between editor submit and 133;B.
-            {
-                let style = self.capture_style();
-                self.capture_print_ascii_run(chunk, style);
-            }
-            {
-                let style = self.capture_style();
-                self.capture_primary_screen_interrupt_ascii(chunk, style);
-            }
-
-            // The contiguous ASCII overwrite can only split a pre-existing
-            // wide glyph at its two boundaries. Pairs fully inside the range
-            // are overwritten together, so repairing the first and last cell
-            // preserves the row invariant without adding per-cell overhead.
-            self.grid.viewport[row].clear_wide_pair_at(col);
-            self.grid.viewport[row].clear_wide_pair_at(col + count - 1);
-
-            // Write cells — tight inner loop, no per-cell wrap/bounds check.
-            {
-                let cells = &mut self.grid.viewport[row].cells;
-                if has_hyperlink {
-                    let id = self.active_hyperlink_id.unwrap();
-                    let link_flags = base_flags | CellFlags::HYPERLINK;
-                    for (i, &b) in chunk.iter().enumerate() {
-                        let c = col + i;
-                        cells[c].character = b as char;
-                        cells[c].fg = fg;
-                        cells[c].bg = bg;
-                        cells[c].flags = link_flags;
-                        cells[c].width = CellWidth::Half;
-                        // v1.11.3 (PLAN_v1113 §1.1): carry underline
-                        // style/color (cells are field-assigned, not
-                        // default-constructed — stale values would survive).
-                        cells[c].underline_style = self.attrs.underline_style;
-                        cells[c].underline_color = self.attrs.underline_color;
-                    }
-                    // Batch-link all cells at once (borrow released).
-                    for i in 0..count {
-                        self.hyperlinks.link_cell(row, col + i, id);
-                    }
-                    // v1.6.1: also write to RowExtras for persistence/scrollback.
-                    // Hyperlinks are rare (OSC 8 active), so per-cell BTreeMap
-                    // insert is acceptable here — the hot ASCII fast path below
-                    // never touches extras.
-                    // v1.6.0 review C1: also clear orphaned grapheme extras for
-                    // the overwritten range (ASCII overwrites don't extend clusters).
-                    {
-                        let extras = &mut self.grid.viewport[row].extras;
-                        extras.clear_grapheme_range(col, col + count);
-                        for i in 0..count {
-                            extras.set_hyperlink(col + i, Some(id));
-                        }
-                    }
-                } else if need_unlink_check {
-                    // Slow path: some cells might have old hyperlinks to clean.
-                    // Collect positions first, then unlink after writing.
-                    let mut to_unlink: [usize; 128] = [0; 128];
-                    let mut unlink_n = 0;
-                    for (i, &b) in chunk.iter().enumerate() {
-                        let c = col + i;
-                        if cells[c].flags.contains(CellFlags::HYPERLINK) {
-                            to_unlink[unlink_n] = c;
-                            unlink_n += 1;
-                        }
-                        cells[c].character = b as char;
-                        cells[c].fg = fg;
-                        cells[c].bg = bg;
-                        cells[c].flags = base_flags;
-                        cells[c].width = CellWidth::Half;
-                        // v1.11.3 (PLAN_v1113 §1.1): carry underline
-                        // style/color (see hyperlink path).
-                        cells[c].underline_style = self.attrs.underline_style;
-                        cells[c].underline_color = self.attrs.underline_color;
-                    }
-                    for &c in to_unlink.iter().take(unlink_n) {
-                        self.hyperlinks.unlink_cell(row, c);
-                    }
-                    // v1.6.1: clear extras for unlinked cells too.
-                    // v1.6.0 review C1: also clear orphaned grapheme extras
-                    // for the full overwritten range (not just unlinked cells).
-                    {
-                        let extras = &mut self.grid.viewport[row].extras;
-                        for &c in to_unlink.iter().take(unlink_n) {
-                            extras.set_hyperlink(c, None);
-                        }
-                        extras.clear_grapheme_range(col, col + count);
-                    }
-                } else {
-                    // Fast path: no hyperlink logic at all.
-                    for (i, &b) in chunk.iter().enumerate() {
-                        let c = col + i;
-                        cells[c].character = b as char;
-                        cells[c].fg = fg;
-                        cells[c].bg = bg;
-                        cells[c].flags = base_flags;
-                        cells[c].width = CellWidth::Half;
-                        // v1.11.3 (PLAN_v1113 §1.1): carry underline
-                        // style/color (see hyperlink path).
-                        cells[c].underline_style = self.attrs.underline_style;
-                        cells[c].underline_color = self.attrs.underline_color;
-                    }
-                    // v1.6.0 review C1: clear orphaned grapheme extras for the
-                    // overwritten range. Common case: extras is empty (no
-                    // multi-scalar clusters on this row) → single is_empty()
-                    // check, zero per-cell cost.
-                    let extras = &mut self.grid.viewport[row].extras;
-                    if !extras.is_empty() {
-                        extras.clear_grapheme_range(col, col + count);
-                    }
-                }
-            }
-
-            // Mark dirty once for the whole row segment — was per-cell.
-            self.grid.viewport[row].mark_dirty(col + count - 1);
-
-            self.grid.cursor.col += count;
-            offset += count;
-
-            // Handle end-of-row wrap.
-            if self.grid.cursor.col >= num_cols {
-                self.grid.cursor.wrap_pending = true;
-                self.grid.cursor.col = num_cols - 1;
-            }
-        }
     }
 
     /// Queue bytes to write back to the PTY (terminal query responses).
@@ -997,155 +711,6 @@ impl Terminal {
             self.attrs.underline_style,
             self.attrs.underline_color,
         )
-    }
-
-    /// Handle SGR (Select Graphic Rendition) — CSI m.
-    ///
-    /// vte parses `CSI 38;5;196m` as three separate param groups:
-    ///   iter → [38], [5], [196]
-    /// We flatten all sub-param first-values into a `Vec<u16>`, then walk it
-    /// with an index so we can consume 1–4 values for color sequences.
-    ///
-    /// v1.11.3 (PLAN_v1113 §2.1): colon groups (`4:x`, `58:x`) are dispatched
-    /// whole BEFORE flattening (handlers in `sgr_underline.rs`). Probe
-    /// verdict (PLAN_v1113 step 1): vte materializes an empty `:` tail as
-    /// an explicit `0` subparam — `4:` ≡ `4:0` ≡ clear underline; there is
-    /// no "missing subparam" shape.
-    fn handle_sgr(&mut self, params: &vte::Params) {
-        if params.is_empty() {
-            self.attrs = Attrs::default();
-            return;
-        }
-
-        // v1.0 perf: Use a stack-allocated array instead of Vec<u16>.
-        // SGR sequences rarely exceed 16 params (truecolor: 38;2;R;G;B = 5).
-        // The old `Vec<u16>::collect()` allocated on every SGR dispatch —
-        // a hot path for colored output (e.g. `ls --color`, `rg`).
-        const MAX_SGR_PARAMS: usize = 32;
-        let mut buf = [0u16; MAX_SGR_PARAMS];
-        let mut len = 0usize;
-        for sub in params.iter() {
-            if len >= MAX_SGR_PARAMS {
-                break;
-            }
-            // v1.11.3: whole-group semantics so `4:3` never misparses as
-            // `4` + DIM(`3`); handlers live in sgr_underline.rs.
-            if sub.len() > 1 && sub[0] == 4 {
-                sgr_underline::handle_underline_group(&mut self.attrs, sub);
-                continue;
-            }
-            if sub.len() > 1 && sub[0] == 58 {
-                sgr_underline::handle_underline_color_group(&mut self.attrs, sub);
-                continue;
-            }
-            buf[len] = sub.first().copied().unwrap_or(0);
-            len += 1;
-        }
-        let vals: &[u16] = &buf[..len];
-
-        // v1.11.3: the flat walk (38/48/58 colors, attribute arms) lives in
-        // sgr_underline.rs with the colon-group handlers — one SGR home,
-        // and this facade stays within its architecture-gate budget.
-        sgr_underline::apply_flat_sgr(&mut self.attrs, vals);
-    }
-
-    /// Handle DEC private mode set/reset (CSI ? <n> h/l).
-    ///
-    /// v1.11.15 (FIX A): this parse is the AUTHORITATIVE undo of the
-    /// reader scanner's set — the pre-clear runs UNCONDITIONALLY (h and l
-    /// both clear; the set_mouse_protocol change guard must not gate it).
-    fn handle_dec_private_mode(&mut self, mode: u16, set: bool) {
-        if crate::input::mouse_suppress::MOUSE_SUPPRESS_CLEAR_MODES.contains(&mode) {
-            if let Some(flag) = &self.mouse_suppress {
-                flag.store(false, std::sync::atomic::Ordering::Release);
-            }
-        }
-        match mode {
-            1 => self.capabilities.app_cursor_keys = set, // DECCKM
-            6 => {
-                // DECOM: CUP is relative to the scroll region.
-                self.origin_mode = set;
-                tracing::debug!(set, "DECOM origin mode toggled");
-            }
-            7 => { /* DECAWM — auto wrap mode, always on */ }
-            25 => {
-                self.cursor_visible = set; // DECTCEM — cursor show/hide
-            }
-            47 | 1049 => {
-                // Swap only on a real state change.
-                if set != self.capabilities.alt_active {
-                    self.swap_alt(mode == 1049);
-                }
-                if !set {
-                    self.synchronized_output_started = None;
-                }
-            }
-            2004 => self.bracketed_paste = set, // Bracketed paste
-            2026 => {
-                if set {
-                    self.begin_primary_screen_synchronized_frame();
-                    self.synchronized_output_started
-                        .get_or_insert_with(std::time::Instant::now);
-                } else {
-                    self.finish_primary_screen_synchronized_frame();
-                    self.synchronized_output_started = None;
-                }
-                tracing::debug!(set, "DEC synchronized output toggled");
-            }
-            9 => {
-                let new = if set {
-                    MouseProtocol::X10
-                } else {
-                    MouseProtocol::Off
-                };
-                self.set_mouse_protocol(new, 9);
-            }
-            1000 => {
-                let new = if set {
-                    MouseProtocol::Normal
-                } else {
-                    MouseProtocol::Off
-                };
-                self.set_mouse_protocol(new, 1000);
-            }
-            1002 => {
-                let new = if set {
-                    MouseProtocol::ButtonEvent
-                } else {
-                    MouseProtocol::Off
-                };
-                self.set_mouse_protocol(new, 1002);
-            }
-            1003 => {
-                let new = if set {
-                    MouseProtocol::AnyEvent
-                } else {
-                    MouseProtocol::Off
-                };
-                self.set_mouse_protocol(new, 1003);
-            }
-            // v1.0 fix: SGR-1006 mouse ENCODING (selects the format of mouse
-            // reports, independent of whether reporting is on). vim/tmux/htop
-            // enable this together with 1000/1002/1003. Previously ignored →
-            // we always emitted SGR format, corrupting apps that expected
-            // legacy encoding and leaking bytes as visible text (vim `~@k`).
-            1006 => self.capabilities.sgr_mouse = set,
-            // SGR pixel-mode (1015) and urxvt-mode (1015): not implemented;
-            // apps that request them fall back to our default (SGR-1006 when
-            // sgr_mouse, legacy otherwise).
-            _ => tracing::trace!(mode, set, "unhandled DEC private mode"),
-        }
-    }
-
-    /// v1.11.8 (PLAN_v1118 M-B): single write point for the mouse-protocol
-    /// DEC modes (9/1000/1002/1003) with a change guard — TUIs re-assert
-    /// their DECSET modes on every repaint, so an unconditional log would
-    /// spam per prompt/frame. Logs only on an actual protocol transition.
-    fn set_mouse_protocol(&mut self, new: MouseProtocol, decset_mode: u16) {
-        if new != self.capabilities.mouse_protocol {
-            self.capabilities.mouse_protocol = new;
-            tracing::info!(?new, decset_mode, "DECSET mouse protocol negotiated");
-        }
     }
 }
 

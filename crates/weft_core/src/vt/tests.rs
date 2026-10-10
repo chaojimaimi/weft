@@ -1,6 +1,6 @@
 use super::*;
 use crate::blocks::{ShellPhase, DEFAULT_OUTPUT_CAP};
-use crate::grid::{CellColor, UnderlineStyle};
+use crate::grid::{CellColor, CellFlags, CellWidth, UnderlineStyle};
 use std::time::{Duration, Instant};
 
 fn term() -> Terminal {
@@ -3803,6 +3803,7 @@ fn passthrough_133b_uses_grid_snapshot() {
 #[cfg(test)]
 mod reflow_cjk_tests {
     use super::super::*;
+    use super::CellFlags;
 
     /// v1.0 fix: verify CJK characters render correctly after ASCII fast path.
     /// Regression test: `ls -l` with Chinese filenames showed `????` because
