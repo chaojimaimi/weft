@@ -530,6 +530,7 @@ const PTY_CHANNEL_CAP: usize = 32;
 // per-message size ceiling — the app crate's oversize-split threshold
 // re-exports it.
 mod read_loop;
+mod read_loop_stats;
 pub use read_loop::EVENT_CAP;
 
 // The write half (v1.13.6 T10 P2, D4/D5): `pty/pty.rs` + `pty/writer.rs`

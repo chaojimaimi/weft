@@ -328,9 +328,13 @@ pub(super) async fn read_loop(
     // `last_data_ms` feeds the stream-activity window. Any path that sends
     // or exits flushes `pending` first, so no byte can strand.
     let mut pending: Option<(Vec<u8>, u64)> = None;
+    // F2-prework (PLAN_v1138): reader drain telemetry — locate the GUI
+    // co-residency tax (read granularity / WouldBlock rate / batch sizes).
+    let mut stats = crate::pty::read_loop_stats::ReadLoopStats::default();
     let mut last_data_ms: Option<u64> = None;
 
     loop {
+        stats.emit_if_due(std::time::Instant::now());
         // T5' change point 3: while a batch is held, race readiness against
         // a `HOLD_MAX_MS` timer anchored at the held batch's FIRST byte, so
         // a trickle (seq's line-by-line writes) can never strand bytes past
@@ -373,6 +377,7 @@ pub(super) async fn read_loop(
                     // drop back to the plain loop top — held bytes never
                     // wait on data that may never come.
                     let (held, _) = pending.take().expect("pending held across the timer arm");
+                    stats.record_flush(held.len(), std::time::Instant::now());
                     if !flush_output(&tx, child_pid, held).await {
                         break;
                     }
@@ -401,6 +406,7 @@ pub(super) async fn read_loop(
                 Ok(result) => result?,
                 Err(_would_block) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
             };
+            stats.record_read(n, std::time::Instant::now());
             let data = &dst[..n];
             // v1.11.15 (FIX A): scan before queueing so the flag flips as
             // early as the bytes exist. A hit here is always followed by
@@ -430,6 +436,9 @@ pub(super) async fn read_loop(
 
         // Classify the stop. `terminal` also means: flush the batch below
         // BEFORE breaking into the shared exit tail (T8 hard requirement).
+        if matches!(stop, BatchStop::WouldBlock) {
+            stats.record_wouldblock(std::time::Instant::now());
+        }
         let terminal = match &stop {
             BatchStop::SoftTarget | BatchStop::WouldBlock => None,
             BatchStop::Eof => {
@@ -471,6 +480,7 @@ pub(super) async fn read_loop(
             continue;
         }
 
+        stats.record_flush(data.len(), std::time::Instant::now());
         // T5' change point 2: every read that returned data marks the
         // stream active. The activity DECISION below uses the pre-batch
         // value on purpose — the first small batch after an idle period
@@ -500,6 +510,7 @@ pub(super) async fn read_loop(
                 .is_some_and(|(held, _)| held.len() + data.len() >= EVENT_CAP);
             if cap_hit {
                 let (held, _) = pending.take().expect("cap_hit implies pending");
+                stats.record_flush(held.len(), std::time::Instant::now());
                 if !flush_output(&tx, child_pid, held).await {
                     break;
                 }
@@ -523,10 +534,12 @@ pub(super) async fn read_loop(
         // Output can exceed EVENT_CAP; a failed first send short-circuits
         // the second (helper returns false → break).
         if let Some((held, _)) = pending.take() {
+            stats.record_flush(held.len(), std::time::Instant::now());
             if !flush_output(&tx, child_pid, held).await {
                 break;
             }
         }
+        stats.record_flush(data.len(), std::time::Instant::now());
         if !flush_output(&tx, child_pid, data).await {
             break;
         }
