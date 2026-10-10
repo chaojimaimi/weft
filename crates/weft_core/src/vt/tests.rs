@@ -793,6 +793,113 @@ fn ownership_mask_reads_stay_tail_aligned_under_trim_batch() {
 fn ownership_document_text(terminal: &Terminal) -> String {
     terminal.primary_screen_document_snapshot(0).0
 }
+
+#[test]
+fn reflow_pre_flags_survives_trim_excess() {
+    // PLAN_v1138 §3 (v1.13.7 review P3): the tail-aligned `pre_flags`
+    // clone in `reflow_primary_screen_candidate` (ownership.rs
+    // TRIM_BATCH comment) had no resize-path driver. Same excess
+    // construction as `ownership_mask_reads_stay_tail_aligned_under_trim_batch`,
+    // but here the excess must survive through the REAL reflow route
+    // (`Terminal::resize` -> `reflow_primary_screen_candidate` ->
+    // `from_row_map`) and land bit-identical to the canonical (no
+    // excess) run. A raw prefix-aligned `pre_flags` read shifts every
+    // flag one old-row down (the owned row's flag moves onto its
+    // unowned predecessor's range) — verified to turn the equality
+    // below red.
+    //
+    // Entry conditions (review-pinned): the reflow route only runs while
+    // phase == CommandExecuting && primary_screen_cursor_ops == 0 &&
+    // screen_document_start() == None (vt/mod.rs resize routing), so the
+    // scene sends 133;A + 133;B and NO 133;C — the candidate window
+    // before any cursor addressing could take layout ownership. 133;B
+    // resets the ownership masks (freeze), so the owned output must be
+    // printed AFTER the markers.
+    let build = || {
+        let mut terminal = Terminal::new(3, 24);
+        // Pre-command row prints BEFORE the markers: the viewport
+        // ownership mask does not exist yet, so the row stays unowned.
+        terminal.process(b"row zero\r\n");
+        terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07");
+        // Owned output; the two trailing LFs fire at the bottom row, so
+        // the scrolls push "row zero" (unowned) and then "owned one"
+        // (owned) into scrollback — a MIXED scrollback mask, the shape a
+        // stale front entry can corrupt.
+        terminal.process(b"owned one\r\nowned two\r\n\r\n");
+        terminal
+    };
+
+    let mut canonical = build();
+    assert_eq!(
+        canonical.block_tracker().phase(),
+        ShellPhase::CommandExecuting,
+        "reflow entry: candidate phase"
+    );
+    assert_eq!(
+        canonical.capabilities.primary_screen_cursor_ops, 0,
+        "reflow entry: no cursor ops"
+    );
+    assert!(
+        canonical.block_tracker().screen_document_start().is_none(),
+        "reflow entry: no screen document"
+    );
+    assert_eq!(
+        canonical.capabilities.primary_screen_ownership.scrollback,
+        vec![false, true],
+        "pre-resize shape: unowned then owned scrollback row"
+    );
+
+    canonical.resize(2, 12);
+    let expected_scrollback = canonical
+        .capabilities
+        .primary_screen_ownership
+        .scrollback
+        .clone();
+    let expected_viewport = canonical
+        .capabilities
+        .primary_screen_ownership
+        .viewport
+        .clone();
+    assert_eq!(
+        expected_scrollback.len(),
+        canonical.grid().scrollback.len(),
+        "ownership and grid must retain the same reflow suffix"
+    );
+    assert!(
+        expected_scrollback.iter().any(|&owned| owned)
+            || expected_viewport
+                .as_ref()
+                .is_some_and(|viewport| { viewport.iter().any(|&owned| owned) }),
+        "ownership evidence must survive the reflow (else the equality below is vacuous)"
+    );
+
+    let mut with_excess = build();
+    // Simulate a pending trim: one stale front entry, physical length one
+    // past the scrollback.
+    with_excess
+        .capabilities
+        .primary_screen_ownership
+        .scrollback
+        .insert(0, false);
+    assert_eq!(
+        with_excess
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .len(),
+        with_excess.grid().scrollback.len() + 1
+    );
+    with_excess.resize(2, 12);
+    assert_eq!(
+        with_excess.capabilities.primary_screen_ownership.scrollback, expected_scrollback,
+        "tail-aligned pre_flags must reproduce the canonical ownership bits"
+    );
+    assert_eq!(
+        with_excess.capabilities.primary_screen_ownership.viewport, expected_viewport,
+        "viewport ownership must match the canonical run too"
+    );
+}
+
 #[test]
 fn primary_screen_ownership_resizes_with_dimension_only_primary_grid() {
     let mut terminal = Terminal::new(3, 32);

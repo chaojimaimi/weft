@@ -97,7 +97,17 @@ pub(crate) fn spawn(
     let thread_name = format!("weft-parse-{pane_session_id}");
     let spawned = std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || run(event_rx, &terminal, &writer, &ctrl_tx, &had_output, &wake));
+        .spawn(move || {
+            run(
+                pane_session_id,
+                event_rx,
+                &terminal,
+                &writer,
+                &ctrl_tx,
+                &had_output,
+                &wake,
+            )
+        });
     if let Err(error) = spawned {
         // Only reachable under resource exhaustion; the pane degrades to
         // the pre-P2 symptom (no parsing) with a loud trace instead of a
@@ -215,7 +225,12 @@ fn report_parse_panic(ctrl_tx: &crossbeam_channel::Sender<AppMsg>, wake: &WakeFn
 /// The worker's main loop. All three exit paths (channel closed, Exit
 /// event, parse panic) leave the thread — none leaves the pane without a
 /// control event the main thread can act on.
+///
+/// `pane_session_id` feeds the drain telemetry's `pane` field (PLAN_v1138
+/// §2.2): with multiple panes the `parse-worker drain window` lines must be
+/// attributable to their worker.
 fn run(
+    pane_session_id: u64,
     mut rx: mpsc::Receiver<PtyEvent>,
     terminal: &Arc<FairMutex<Terminal>>,
     writer: &Arc<PtyWriter>,
@@ -224,7 +239,7 @@ fn run(
     wake: &WakeFn,
 ) {
     let mut throttle = WakeThrottle::default();
-    let mut stats = ParseWorkerStats::default();
+    let mut stats = ParseWorkerStats::with_pane(pane_session_id);
     loop {
         // D2 step 1: block until the reader delivers a batch (or the pane
         // dies → channel closed → thread ends).
@@ -545,7 +560,7 @@ mod tests {
         let wake: WakeFn = Box::new(|| {});
         let handle = std::thread::Builder::new()
             .name("weft-parse-test-close".to_string())
-            .spawn(move || run(rx, &terminal, &writer, &ctrl_tx, &had_output, &wake))
+            .spawn(move || run(7, rx, &terminal, &writer, &ctrl_tx, &had_output, &wake))
             .unwrap();
         drop(h.rx_tx);
         handle

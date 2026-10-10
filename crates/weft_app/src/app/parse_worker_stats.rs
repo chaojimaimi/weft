@@ -23,9 +23,23 @@ pub(crate) struct ParseWorkerStats {
     bytes: u64,
     lock_wait_ns: u64,
     parse_ns: u64,
+    /// Owning pane's session id (PLAN_v1138 §2.2 multi-pane lock_wait
+    /// attribution). `Default` keeps 0 for the stats unit tests; the
+    /// production worker constructs through [`Self::with_pane`].
+    pane: u64,
 }
 
 impl ParseWorkerStats {
+    /// Production constructor: tag every emitted line with the pane that
+    /// owns this worker (the spawn's `pane_session_id`, previously used
+    /// only for the thread name).
+    pub(crate) fn with_pane(pane_session_id: u64) -> Self {
+        Self {
+            pane: pane_session_id,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn record(
         &mut self,
         lock_wait: Duration,
@@ -55,6 +69,7 @@ impl ParseWorkerStats {
         }
         if trace_enabled && self.batches > 0 {
             tracing::info!(
+                pane = self.pane,
                 batches = self.batches,
                 bytes = self.bytes,
                 avg_bytes = self.bytes / self.batches,
@@ -64,7 +79,11 @@ impl ParseWorkerStats {
                 "parse-worker drain window",
             );
         }
-        *self = Self::default();
+        // Preserve the pane identity across the window reset — pane 0 is a
+        // VALID session id, so `Self::default()` would silently re-attribute
+        // every window after the first to pane 0 (rust-reviewer P1).
+        let pane = self.pane;
+        *self = Self::with_pane(pane);
         true
     }
 }
@@ -89,7 +108,7 @@ mod tests {
     #[test]
     fn record_accumulates_and_emit_resets_the_window() {
         let t0 = Instant::now();
-        let mut stats = ParseWorkerStats::default();
+        let mut stats = ParseWorkerStats::with_pane(7);
         stats.record(Duration::from_millis(3), Duration::from_millis(10), 256, t0);
         stats.record(Duration::from_millis(1), Duration::from_millis(20), 512, t0);
         // Not due yet: nothing emitted, values retained.
@@ -97,6 +116,9 @@ mod tests {
         // Due + enabled: emits and resets.
         assert!(stats.emit_if_due(t0 + Duration::from_millis(600), true));
         assert_eq!(stats.batches, 0);
+        // The pane identity must survive the window reset (P1: pane 0 is a
+        // valid id — a wiped field mis-attributes later windows).
+        assert_eq!(stats.pane, 7, "pane identity survives emit reset");
         // Due but disabled: resets silently (no window growth).
         stats.record(
             Duration::from_millis(1),
