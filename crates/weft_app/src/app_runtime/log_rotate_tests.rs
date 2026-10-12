@@ -2,10 +2,12 @@
 //!
 //! Own file per the repo test-module convention (see `retention_tests.rs`):
 //! keeps `app_runtime.rs` at its architecture-gate ceiling while the
-//! plan-mandated `rotate_log_if_huge` coverage still ships. Child-module
-//! privacy reaches the private fn via `super::*`.
+//! plan-mandated `rotate_log_if_huge` coverage still ships. The rotation
+//! fns moved to the `diagnostics` child module in the v1.13.9 file-budget
+//! split (verbatim), so the tests import them directly (tab/tests.rs
+//! import-adjustment precedent).
 
-use super::*;
+use super::diagnostics::{remove_stale_rotated_log, rotate_log_if_huge, rotated_log_is_stale};
 
 fn temp_log_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(

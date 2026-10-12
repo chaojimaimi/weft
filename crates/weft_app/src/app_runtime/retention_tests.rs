@@ -1,9 +1,11 @@
 //! Retention × hydration round-trip coverage (v1.11.2 X4, PLAN_v1112 §7.1).
 //!
 //! Extracted from `app_runtime.rs`'s inline test module to keep that file
-//! under its architecture-gate ceiling; child-module privacy still reaches
-//! `hydrate_persisted_history` via `super::*`.
+//! under its architecture-gate ceiling. `hydrate_persisted_history` moved to
+//! the `hydrate` child module in the v1.13.9 file-budget split (verbatim),
+//! so the tests import it directly (tab/tests.rs import-adjustment precedent).
 
+use super::hydrate::hydrate_persisted_history;
 use super::*;
 
 /// v1.11.2 X4 round-trip (PLAN_v1112 §7.1 / §8 top risk): save snapshot →
