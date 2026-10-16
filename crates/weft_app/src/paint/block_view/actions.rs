@@ -74,7 +74,7 @@ fn block_header_action_geometry(
     }
 }
 
-pub(super) fn block_header_band_height(pitch: f32, scale: f64) -> f32 {
+pub(crate) fn block_header_band_height(pitch: f32, scale: f64) -> f32 {
     crate::ui_tokens::compact_control_row_span(pitch, scale) as f32 * pitch
 }
 

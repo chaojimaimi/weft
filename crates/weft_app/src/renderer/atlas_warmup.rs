@@ -1,11 +1,18 @@
 //! Per-frame glyph-atlas warm-up: collect all on-screen characters not yet
 //! rasterized and add them to the atlas before vertex building runs.
+//!
+//! v1.13.11 (PLAN_v1.13.11): the block-view scan moved from warm_atlas's
+//! `.rev().take(64)` × 200-line sweep to [`MetalRenderer::
+//! warm_block_view_glyphs`] — a visible-window, once-ever, identity-keyed
+//! scan with a per-frame byte budget. warm_atlas keeps the grid/panel/
+//! overlay warmup plus the block-view cwd/branch/diagnose strings.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::glyph::GlyphAtlas;
 use crate::overlay::{OverlayContent, OverlayWarmup, PaletteDrawParams, SettingsDrawParams};
+use crate::paint::block_view::layout_pass::bounds::{lower_bound_height, upper_bound_height};
 use crate::paint::overlays::{FindDrawState, NoteEditorDrawState};
 use crate::paint::panel::PanelDrawParams;
 use crate::paint::preedit::TuiPreeditDrawParams;
@@ -13,81 +20,168 @@ use crate::paint::prompt::PromptDrawParams;
 use crate::paint::tab_bar::TabBarDrawState;
 use crate::paint::ui_helpers::{block_duration_str, panel_display, visible_panel_rows};
 use crate::renderer::MetalRenderer;
-use weft_core::blocks::BlockId;
+use unicode_segmentation::UnicodeSegmentation;
+use weft_core::blocks::{Block, BlockId};
 use weft_core::complete::Match;
 use weft_core::grid::Grid;
 use weft_core::vt::Terminal;
 
-/// v1.12.2 B3-3 (PLAN_S2_render): per-frame cap on block output lines fed to
-/// the warmup scan — the pre-B3-3 hardcoded `take(200)` per block, kept as a
-/// named constant for the watermark math (both the finished-block scan and
-/// the in-flight scan used 200).
-const BLOCK_OUTPUT_SCAN_LIMIT: usize = 200;
+/// v1.13.11 N1.5: per-pane, per-frame scan-byte budget for the block-view
+/// warmup. Block capture caps at 1 MiB (blocks.rs `DEFAULT_OUTPUT_CAP`
+/// territory), so an unbounded first sweep costs milliseconds of HashSet
+/// inserts in one frame; this splits a max-size block's first scan across
+/// ≤ 8 frames, each well under 1 ms. The budget stops at line boundaries
+/// and every windowed block always scans ≥ 1 line (progress guarantee).
+pub(crate) const BLOCK_WARM_BUDGET_BYTES: usize = 128 * 1024;
+
+/// v1.13.11 N1.2: the newest K blocks are ALWAYS part of the warm window.
+/// Streaming output and finalize-created blocks land at the newest end, and
+/// the previous frame's prefix sum / live-height bound can be stale — this
+/// constant union keeps the window a superset where it matters (plan N1.2
+/// 兜底).
+pub(crate) const BLOCK_WARM_NEWEST_BLOCKS: usize = 16;
+
+/// v1.13.11 N1.2: rows of extra margin (as pixels: rows × pitch) around the
+/// binary-searched visible band. Absorbs the live segment's header/
+/// separator chrome (~4 rows) and f32 wobble; over-scanning is amortized by
+/// once-ever.
+pub(crate) const BLOCK_WARM_MARGIN_ROWS: usize = 64;
+
+/// v1.13.11 N1.2: extra blocks included on each side of the searched band
+/// (layout_pass keeps 1 for the sticky header; the warm window adds 2).
+pub(crate) const BLOCK_WARM_OVERSCAN_BLOCKS: usize = 2;
 
 /// v1.12.2 B3-3: the in-flight block has no stable [`BlockId`] of its own —
 /// there is at most one per terminal, so a per-namespace sentinel key carries
 /// its watermark.
+///
+/// v1.13.11 P1-1 (rust-reviewer): the sentinel's scan identity is the
+/// tracker's per-command generation (`BlockTracker::command_generation`),
+/// not a constant — chained commands (`a; b`) can cross the D→A/B boundary
+/// inside one PTY batch with no intervening frame, so the
+/// forget-when-idle path alone cannot stop command 2 inheriting command 1's
+/// watermark. A generation mismatch restarts the live scan at 0.
 const IN_FLIGHT_KEY: BlockId = BlockId(u64::MAX);
 
+/// v1.13.11 P2-1 (rust-reviewer): output identity = (ptr, len) folded into
+/// one `usize` — a bare `Arc::as_ptr` is ABA-vulnerable: a continuation
+/// merge frees the old Arc and a fresh allocation can land on the same
+/// address, silently matching the stale watermark. Folding `len` (rotated
+/// into the high half, disjoint from macOS's low-half heap pointers) makes
+/// any merge that changes the byte length a mismatch. Residual 备案 (plan
+/// 风险表): a same-address AND equal-length replacement still aliases —
+/// accepted, since the replacement content then spans the same extent the
+/// watermark already covers.
+fn output_identity(output: &str) -> usize {
+    output.as_ptr() as usize ^ output.len().rotate_left(32)
+}
+
 /// v1.12.2 B3-3 (PLAN_S2_render): per-namespace, per-block output-line
-/// watermarks for the drag-time incremental atlas warmup. Namespaces are
+/// watermarks for the incremental block-view warmup. Namespaces are
 /// per-pane session ids — BlockIds are allocated per-Terminal, so a shared
 /// constant namespace would leak watermarks across tab/focus switches.
 ///
-/// The warmup scans block outputs (finished + in-flight) every frame; with
-/// 64 blocks × up to 200 lines each this dominates the drag frame budget.
-/// During a live resize the scan starts at the per-block watermark (how many
-/// lines were already scanned) instead of line 0. Block output is
-/// append-only (finished blocks are immutable, in-flight output grows at the
-/// tail), so lines below the watermark cannot produce new glyphs.
+/// v1.13.11 (N1.3): once-ever semantics for BOTH drag and idle frames —
+/// a block's output lines are scanned at most once per (namespace, output
+/// identity). Block output is append-only (finished blocks are immutable,
+/// in-flight output grows at the tail), so lines below the watermark cannot
+/// produce new glyphs. The watermark entry carries the block's output
+/// identity (`output_identity`: (ptr, len) of `block.output`, P2-1 ABA
+/// hardening): a continuation merge replaces a block's output while KEEPING
+/// its BlockId (continuation.rs finalize), so an identity mismatch
+/// invalidates the entry and the next frame rescans from line 0 — merged-in
+/// lines are never skipped.
 ///
 /// **Invalidation**: cleared by `update_scale` and `rebuild_atlas` — both
 /// swap in a fresh empty atlas, and stale "already scanned" marks would then
 /// skip glyphs the new atlas still needs (the fragmented-output bug class).
 #[derive(Default)]
 pub(crate) struct BlockScanWatermarks {
-    scanned_lines: HashMap<(u64, BlockId), usize>,
+    /// (namespace, BlockId) → (scanned output lines, output identity at
+    /// scan time).
+    scanned_lines: HashMap<(u64, BlockId), (usize, usize)>,
+    /// (namespace, BlockId) → (output line count, output identity).
+    /// Identity-matched counts are permanently valid (finished output is
+    /// immutable); caching them keeps every frame from re-walking a giant
+    /// block just to bound the scan range. The in-flight scan skips this
+    /// cache (no stable identity — it scans to EOF under the budget).
+    line_counts: HashMap<(u64, BlockId), (usize, usize)>,
 }
 
 impl BlockScanWatermarks {
-    /// Range `[start, end)` of output lines to scan this frame for one
-    /// block. `line_count` is the block's current output line count and
-    /// `limit` the per-frame cap (see [`BLOCK_OUTPUT_SCAN_LIMIT`]).
-    ///
-    /// Non-live frames always scan from 0 — outside a drag the full scan is
-    /// the pre-B3-3 behavior and its cost is irrelevant next to the frame
-    /// budget. Pure function (unit-tested, no device needed).
-    pub(crate) fn output_scan_range(
-        &self,
+    /// Output line count for `(namespace, id)`, counted from `output` on
+    /// first sight of a given identity. An identity mismatch (continuation
+    /// merge replaced the output) forces a recount. P1-2a: the expanded
+    /// scan no longer needs a total (it walks to EOF under the budget), so
+    /// this remains only as the collapsed "{n} lines" fallback.
+    pub(crate) fn line_count(
+        &mut self,
         namespace: u64,
         id: BlockId,
-        live_resize: bool,
-        line_count: usize,
-        limit: usize,
-    ) -> (usize, usize) {
-        let end = line_count.min(limit);
-        if !live_resize {
-            return (0, end);
+        identity: usize,
+        output: &str,
+    ) -> usize {
+        match self.line_counts.get(&(namespace, id)) {
+            Some((count, idty)) if *idty == identity => *count,
+            _ => {
+                let count = output.lines().count();
+                self.line_counts.insert((namespace, id), (count, identity));
+                count
+            }
         }
-        let start = self
-            .scanned_lines
-            .get(&(namespace, id))
-            .copied()
-            .unwrap_or(0)
-            .min(end);
-        (start, end)
+    }
+
+    /// Range `[start, end)` of output lines to scan this frame for one
+    /// finished block: `[watermark, line_count)`. The per-frame byte budget
+    /// caps the span at the call site. A recorded watermark whose output
+    /// identity no longer matches is invalidated (continuation merge)
+    /// → restart at 0. Pure resume semantics (unit-tested, no device).
+    /// P1-2a: callers that scan to EOF under the budget (no up-front total
+    /// walk) pass `usize::MAX` — the end clamp degenerates to the watermark
+    /// alone and the budget bounds the span.
+    pub(crate) fn output_scan_range(
+        &mut self,
+        namespace: u64,
+        id: BlockId,
+        identity: usize,
+        line_count: usize,
+    ) -> (usize, usize) {
+        let start = match self.scanned_lines.get(&(namespace, id)) {
+            Some((lines, idty)) if *idty == identity => (*lines).min(line_count),
+            _ => {
+                // First sight or identity mismatch → rescan from line 0.
+                self.scanned_lines.remove(&(namespace, id));
+                0
+            }
+        };
+        (start, line_count)
     }
 
     /// Record that `lines_total` output lines of this block have been scanned
     /// (monotonic — an append-only contract makes the count a high-water
-    /// mark; `max` also guards against a transient count regression).
-    pub(crate) fn record_scanned(&mut self, namespace: u64, id: BlockId, lines_total: usize) {
-        let slot = self.scanned_lines.entry((namespace, id)).or_default();
-        *slot = (*slot).max(lines_total);
+    /// mark; `max` also guards against a transient count regression). The
+    /// entry is stamped with the output identity the scan saw.
+    pub(crate) fn record_scanned(
+        &mut self,
+        namespace: u64,
+        id: BlockId,
+        lines_total: usize,
+        identity: usize,
+    ) {
+        let slot = self
+            .scanned_lines
+            .entry((namespace, id))
+            .or_insert((0, identity));
+        slot.0 = slot.0.max(lines_total);
+        slot.1 = identity;
     }
 
-    /// Atlas rebuild invalidation: every watermark is dropped so the next
-    /// frame re-scans everything the fresh, empty atlas needs.
+    /// Atlas rebuild/scale-change invalidation: every scanned-line watermark
+    /// is dropped so the next frame re-scans everything the fresh, empty
+    /// atlas needs. P1-2b (rust-reviewer): line_counts SURVIVE — they are
+    /// identity-keyed, a block's output is immutable per identity, and a
+    /// line count has nothing to do with atlas contents; dropping them here
+    /// would re-walk every windowed block's full output for nothing.
     pub(crate) fn clear(&mut self) {
         self.scanned_lines.clear();
     }
@@ -96,9 +190,10 @@ impl BlockScanWatermarks {
     /// sentinel key ([`IN_FLIGHT_KEY`]) is REUSED across commands — without
     /// forgetting it when no block is in flight, the next command's early
     /// output lines would inherit the previous command's watermark and be
-    /// skipped during a drag (missing glyphs until the drag ends).
+    /// skipped (missing glyphs until the next full rescan).
     pub(crate) fn forget(&mut self, namespace: u64, id: BlockId) {
         self.scanned_lines.remove(&(namespace, id));
+        self.line_counts.remove(&(namespace, id));
     }
 }
 
@@ -112,16 +207,14 @@ impl MetalRenderer {
     /// for the whole frame. Taking `&mut self` here would conflict with
     /// that borrow.
     ///
-    /// v1.12.2 B3-3 (PLAN_S2_render): the block-output scan is incremental
-    /// while a live resize is running — each block scans only the output
-    /// lines after its per-block watermark (see [`BlockScanWatermarks`]).
-    /// Outside a drag the full scan runs unchanged. Returns the number of
-    /// block output lines actually scanned this frame (test observability).
+    /// v1.13.11: the block-output scan moved to
+    /// [`MetalRenderer::warm_block_view_glyphs`] (visible-window, once-ever,
+    /// byte-budgeted). This function keeps the grid cells, panel, prompt,
+    /// overlays and the block-view cwd/branch/diagnose strings.
     ///
     /// Draw-path contract (unchanged): this is a *warmup* — the paint path
     /// itself stays lookup-only (a missing glyph paints as blank/space), so
-    /// skipping the warmup would resurrect the fragmented-output bug class;
-    /// that is why B3-3 narrows the scan instead of gating it.
+    /// skipping the warmup would resurrect the fragmented-output bug class.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn warm_atlas(
         atlas: &mut GlyphAtlas,
@@ -138,10 +231,7 @@ impl MetalRenderer {
         settings: Option<&SettingsDrawParams<'_>>,
         tab_bar: &TabBarDrawState,
         diagnose_texts: &[&str],
-        live_resize: bool,
-        watermarks: &RefCell<BlockScanWatermarks>,
-        warm_namespace: u64,
-    ) -> u64 {
+    ) {
         // Collect unique on-screen GRID + panel characters not yet in the
         // atlas, then rasterize each exactly once.
         let mut missing = HashSet::new();
@@ -223,75 +313,16 @@ impl MetalRenderer {
                 missing.extend(m.label.chars());
             }
         }
-        // Block-view (Editor mode + CommandExecuting overlay): commands,
-        // outputs, durations. Session blocks only — hydrated history stays
-        // in the panel.
-        //
-        // v1.12.2 B3-3: output lines scan from the per-block watermark during
-        // a live resize (finished blocks are immutable, in-flight output is
-        // append-only — lines below the watermark cannot produce new glyphs).
-        // Command + duration strings stay scanned every frame (one short
-        // line each — the watermark targets the dominant per-line cost).
-        let mut scanned_output_lines: u64 = 0;
+        // Block-view shared header strings (cwd / git branch) — block outputs
+        // themselves are warmed by [`MetalRenderer::warm_block_view_glyphs`]
+        // (v1.13.11 visible-window scan).
         if terminal.show_block_view() {
-            let mut wm = watermarks.borrow_mut();
             if let Some(cwd) = terminal.cwd() {
                 missing.extend(cwd.chars());
             }
             if let Some(branch) = terminal.git_branch() {
                 missing.extend(" git:()".chars());
                 missing.extend(branch.chars());
-            }
-            for b in terminal
-                .block_tracker()
-                .session_blocks()
-                .iter()
-                .rev()
-                .take(64)
-            {
-                missing.extend("❯ ".chars());
-                missing.extend(b.command.chars());
-                missing.extend(block_duration_str(b).chars());
-                // P1-2 fix (rust-reviewer): count only up to the per-frame
-                // scan limit — a full `lines().count()` iterates up to ~1MB
-                // of output per block per non-live frame (the old `.take(200)`
-                // iterated exactly 200 lines). min(line_count, LIMIT) is all
-                // `output_scan_range` consumes.
-                let line_count = b.output.lines().take(BLOCK_OUTPUT_SCAN_LIMIT).count();
-                let (start, end) = wm.output_scan_range(
-                    warm_namespace,
-                    b.id,
-                    live_resize,
-                    line_count,
-                    BLOCK_OUTPUT_SCAN_LIMIT,
-                );
-                for line in b.output.lines().skip(start).take(end - start) {
-                    missing.extend(line.chars());
-                }
-                wm.record_scanned(warm_namespace, b.id, end);
-                scanned_output_lines += (end - start) as u64;
-            }
-            // In-flight (live) block during CommandExecuting.
-            if let Some(live) = terminal.block_tracker().in_flight() {
-                missing.extend("❯ ".chars());
-                missing.extend(live.command.chars());
-                let line_count = live.output.lines().take(BLOCK_OUTPUT_SCAN_LIMIT).count();
-                let (start, end) = wm.output_scan_range(
-                    warm_namespace,
-                    IN_FLIGHT_KEY,
-                    live_resize,
-                    line_count,
-                    BLOCK_OUTPUT_SCAN_LIMIT,
-                );
-                for line in live.output.lines().skip(start).take(end - start) {
-                    missing.extend(line.chars());
-                }
-                wm.record_scanned(warm_namespace, IN_FLIGHT_KEY, end);
-                scanned_output_lines += (end - start) as u64;
-            } else {
-                // P3 fix: the sentinel watermark belongs to the *previous*
-                // command once nothing is in flight.
-                wm.forget(warm_namespace, IN_FLIGHT_KEY);
             }
             // v1.8.9 fix: warm up AI diagnose panel text. The diagnose
             // result is dynamically produced by the local Ollama backend
@@ -380,246 +411,318 @@ impl MetalRenderer {
         for (cluster, base_char, is_wide) in &missing_clusters {
             atlas.get_or_rasterize_cluster(cluster, *base_char, *is_wide);
         }
-        // B3-3: scanned block-output line count — the observability hook the
-        // watermark tests assert on (0 on an incremental frame with no new
-        // lines, >0 only for appended/new lines).
-        scanned_output_lines
+    }
+
+    /// v1.13.11 N1: block-view glyph warmup — the visible-window successor
+    /// of the B3-3 `.rev().take(64)` × 200-line sweep (now deleted).
+    ///
+    /// Window (N1.2): the finished blocks intersecting a conservative
+    /// SUPERSET of the visible band, binary-searched with the LAYOUT side's
+    /// authoritative bound functions (`lower_bound_height` /
+    /// `upper_bound_height`: prefix_sum + header depth + clear spacers),
+    /// widened by [`BLOCK_WARM_MARGIN_ROWS`] and ±
+    /// [`BLOCK_WARM_OVERSCAN_BLOCKS`], and ALWAYS unioned with the newest
+    /// [`BLOCK_WARM_NEWEST_BLOCKS`] blocks. Superset argument (plan N1.2
+    /// 裕量论证):
+    /// - the clip band is approximated by the whole viewport
+    ///   (`threshold_high` uses `viewport_h` ≥ content_bottom_y − clip_top)
+    ///   — only ever larger than the true band;
+    /// - `live_height_px` is the PREVIOUS frame's live total, gated to the
+    ///   pane that owns the live cache (`LiveLayoutCache::pane() == ns`) and
+    ///   to frames with a block in flight — otherwise 0 (the "live ends →
+    ///   window resets" contract). Streaming growth can push genuinely-new
+    ///   bottom blocks out of the shifted band; the constant {newest 16}
+    ///   union covers them (the live block itself has its own watermark
+    ///   path below);
+    /// - the prefix sum is the previous frame's sync (the active pane syncs
+    ///   last in a frame, so the warmup reads its geometry); a stale entry
+    ///   costs at most one frame of lateness under once-ever. A prefix sum
+    ///   that doesn't cover this block set falls back to a full scan
+    ///   (layout_pass.rs:294-295 同款).
+    ///
+    /// Background panes cannot derive per-pane geometry from the global
+    /// block_layout_cache: they pass `visible_override` — the pane's
+    /// previous rebuild's visible set (renderer `bg_visible_blocks`, N1.4) —
+    /// which replaces the geometric window (still unioned with {newest 16}).
+    ///
+    /// Watermarks (N1.3): once-ever, identity-keyed — see
+    /// [`BlockScanWatermarks`]. Collapsed blocks skip output scanning and
+    /// record NO watermark (expanding must look like a first scan); command/
+    /// duration/header strings always scan (the header row still renders
+    /// them). The in-flight block keeps its append-only [`IN_FLIGHT_KEY`]
+    /// watermark with the 200-line cap removed. Scan cost is bounded per
+    /// pane per frame by [`BLOCK_WARM_BUDGET_BYTES`] (N1.5).
+    ///
+    /// Same partial-borrow contract as [`MetalRenderer::warm_atlas`]:
+    /// associated function, `&mut atlas` disjoint from everything else.
+    ///
+    /// Returns the number of output bytes actually scanned this frame (the
+    /// budget's test observability hook).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn warm_block_view_glyphs(
+        atlas: &mut GlyphAtlas,
+        tracker: &weft_core::blocks::BlockTracker,
+        show_block_view: bool,
+        warm_namespace: u64,
+        visible_override: Option<&[BlockId]>,
+        viewport_h: f32,
+        block_scroll: f32,
+        viewport_rows: usize,
+        scale: f64,
+        block_cache: &crate::paint::grid_cache::BlockLayoutCache,
+        live_cache: &crate::paint::live_cache::LiveLayoutCache,
+        watermarks: &RefCell<BlockScanWatermarks>,
+    ) -> u64 {
+        if !show_block_view {
+            return 0;
+        }
+        let blocks = tracker.session_blocks();
+        let n = blocks.len();
+        // Row pitch = the atlas cell height in physical px (layout.pitch ==
+        // ctx.cell_h, layout/terminal.rs:274).
+        let pitch = atlas.cell_height as f32;
+        // Same formula the paint path uses (block_view.rs:94).
+        let header_height = crate::paint::block_view::block_header_band_height(pitch, scale);
+        // N1.2 live gating: only the pane whose live cache this is pays the
+        // live-height band shift.
+        let live_height_px = if tracker.in_flight().is_some() && live_cache.pane() == warm_namespace
+        {
+            // Note: this is the window TOTAL only — the live segment adds
+            // ~4 rows of blank/command/header chrome on top. The shortfall
+            // shifts the band toward older blocks by <5 rows, well inside
+            // BLOCK_WARM_MARGIN_ROWS, and the {newest 16} union covers the
+            // newest end regardless.
+            live_cache.total_display_rows() as f32 * pitch
+        } else {
+            0.0
+        };
+
+        let mut missing: HashSet<char> = HashSet::new();
+        // v1.13.11: block output graphemes — multi-scalar clusters go to the
+        // CoreText cluster atlas (get_or_rasterize_cluster) so an ℹ️/⚠️ in
+        // block history renders like the live grid. Keyed by the cluster
+        // string itself (Borrow<str> lookups avoid per-occurrence allocs).
+        let mut missing_clusters: HashMap<String, (char, bool)> = HashMap::new();
+        let mut wm = watermarks.borrow_mut();
+        let mut budget_left = BLOCK_WARM_BUDGET_BYTES;
+        let mut scanned_bytes = 0u64;
+
+        // Oldest-first selection. Geometric window indices are newest-first
+        // (0 = newest) and convert via `blocks[n - 1 - idx]`
+        // (layout_pass.rs:340 同款).
+        let newest_start = n.saturating_sub(BLOCK_WARM_NEWEST_BLOCKS);
+        let selected: Vec<&Block> = match visible_override {
+            Some(visible) => {
+                let set: HashSet<u64> = visible.iter().map(|id| id.0).collect();
+                blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, b)| *i >= newest_start || set.contains(&b.id.0))
+                    .map(|(_, b)| b)
+                    .collect()
+            }
+            None => {
+                let prefix_sum = block_cache.prefix_sum();
+                let clear_ps = block_cache.clear_prefix_sum();
+                let (win_start, win_end) = block_warm_window(
+                    n,
+                    prefix_sum,
+                    clear_ps,
+                    pitch,
+                    header_height,
+                    viewport_rows as f32 * pitch,
+                    viewport_h,
+                    block_scroll * pitch,
+                    live_height_px,
+                );
+                let start = win_start.min(BLOCK_WARM_NEWEST_BLOCKS).min(n);
+                let end = win_end.max(BLOCK_WARM_NEWEST_BLOCKS.min(n)).min(n);
+                (start..end).map(|idx| &blocks[n - 1 - idx]).collect()
+            }
+        };
+
+        for b in selected {
+            let identity = output_identity(&b.output);
+            // Command + duration strings render on every header, collapsed
+            // or not — always scanned (one short line each).
+            missing.extend("❯ ".chars());
+            missing.extend(b.command.chars());
+            missing.extend(block_duration_str(b).chars());
+            // Per-block header cwd/status (layout_pass.rs:563-571 render
+            // these; before v1.13.11 they were never warmed, so deep-scrolled
+            // old blocks could miss their header glyphs). P1-2a: the
+            // potentially-full line-count walk only feeds the COLLAPSED
+            // "{n} lines" summary (block_component.rs:52-61 — expanded
+            // blocks render the cwd instead), so it lives in this branch
+            // and never bypasses the byte budget on the expanded path.
+            let presentation = if b.collapsed {
+                let header_lines = block_cache
+                    .get_if_cached(b.id.0)
+                    .map(|c| c.content.line_meta.len())
+                    .unwrap_or_else(|| wm.line_count(warm_namespace, b.id, identity, &b.output));
+                crate::block_component::block_presentation(b, header_lines)
+            } else {
+                crate::block_component::block_presentation(b, 0)
+            };
+            missing.extend(presentation.cwd.chars());
+            missing.extend(presentation.status.chars());
+            if b.collapsed {
+                // Collapsed short-circuit: the output region is not
+                // rendered, so its glyphs are not needed — and NO watermark
+                // is recorded, so an expanded block's first frame rescans
+                // from line 0 (评审 P2-2: a full watermark here would make
+                // the expansion permanently blank).
+                continue;
+            }
+            // P1-2a: scan to EOF under the budget — NO full line-count walk
+            // up front. The identity-keyed watermark bounds `start`, and
+            // `usize::MAX` removes the end clamp (same shape as the
+            // in-flight path below).
+            let (start, end) = wm.output_scan_range(warm_namespace, b.id, identity, usize::MAX);
+            let mut scanned_to = start;
+            let mut bytes = 0usize;
+            for line in b.output.lines().skip(start).take(end - start) {
+                // Budget stop at a line boundary. P1-2c: the first-line
+                // progress guarantee only fires while this frame's budget
+                // is UNTOUCHED — once anything was spent this frame, even
+                // a block's first over-budget line defers to the next
+                // frame instead of punching through the budget.
+                let first_line_guarantee = bytes == 0 && budget_left == BLOCK_WARM_BUDGET_BYTES;
+                if bytes + line.len() > budget_left && !first_line_guarantee {
+                    break;
+                }
+                bytes += line.len();
+                scanned_to += 1;
+                collect_line_glyphs(&mut missing, &mut missing_clusters, line);
+            }
+            wm.record_scanned(warm_namespace, b.id, scanned_to, identity);
+            budget_left = budget_left.saturating_sub(bytes);
+            scanned_bytes += bytes as u64;
+        }
+
+        // In-flight (live) block during CommandExecuting. Append-only
+        // watermark, 200-line cap REMOVED (N1.3) — the budget bounds the
+        // per-frame cost instead. No line-count cache: a live output has no
+        // identity Arc; scanning from the watermark to EOF under the budget
+        // needs no total. P1-1: the watermark's identity is the tracker's
+        // COMMAND GENERATION — a chained command that starts inside the
+        // same batch as its predecessor's finalize bumps the generation,
+        // so its live scan restarts at 0 instead of inheriting the
+        // previous command's watermark.
+        if let Some(live) = tracker.in_flight() {
+            missing.extend("❯ ".chars());
+            missing.extend(live.command.chars());
+            let live_identity = tracker.command_generation() as usize;
+            let (start, end) =
+                wm.output_scan_range(warm_namespace, IN_FLIGHT_KEY, live_identity, usize::MAX);
+            let mut scanned_to = start;
+            let mut bytes = 0usize;
+            for line in live.output.lines().skip(start).take(end - start) {
+                // P1-2c: same untouched-budget-only first-line guarantee.
+                let first_line_guarantee = bytes == 0 && budget_left == BLOCK_WARM_BUDGET_BYTES;
+                if bytes + line.len() > budget_left && !first_line_guarantee {
+                    break;
+                }
+                bytes += line.len();
+                scanned_to += 1;
+                collect_line_glyphs(&mut missing, &mut missing_clusters, line);
+            }
+            wm.record_scanned(warm_namespace, IN_FLIGHT_KEY, scanned_to, live_identity);
+            scanned_bytes += bytes as u64;
+        } else {
+            // P3 fix: the sentinel watermark belongs to the *previous*
+            // command once nothing is in flight. The generation key above
+            // is the real invalidation since P1-1; the forget stays as the
+            // table-bounds hygiene.
+            wm.forget(warm_namespace, IN_FLIGHT_KEY);
+        }
+
+        for ch in &missing {
+            atlas.get_or_rasterize(*ch, crate::glyph::GlyphStyle::REGULAR);
+        }
+        for (cluster, (lead, is_wide)) in &missing_clusters {
+            atlas.get_or_rasterize_cluster(cluster, *lead, *is_wide);
+        }
+        scanned_bytes
     }
 }
 
-#[cfg(test)]
-mod watermark_tests {
-    use super::{BlockScanWatermarks, BLOCK_OUTPUT_SCAN_LIMIT, IN_FLIGHT_KEY};
-    use weft_core::blocks::BlockId;
-
-    #[test]
-    fn non_live_frames_always_scan_from_zero() {
-        let wm = BlockScanWatermarks::default();
-        let id = BlockId(7);
-        // Even with a recorded watermark, a non-live frame scans everything.
-        let mut wm = wm;
-        wm.record_scanned(0, id, 50);
-        assert_eq!(
-            wm.output_scan_range(0, id, false, 120, BLOCK_OUTPUT_SCAN_LIMIT),
-            (0, 120),
-            "outside a drag the full scan runs (pre-B3-3 behavior)"
-        );
+/// v1.13.11 N1.2: the warm window's NEWEST-FIRST index range for `n` blocks.
+/// Pure geometry over the shared height formula
+/// `prefix_sum[j]*pitch + j*header_height + clear_ps[j]*clear_pitch` —
+/// reuses the layout side's bound functions instead of re-deriving (the
+/// formula drift risk is the v1 draft's P0). Returns `(0, n)` (full scan)
+/// when the prefix sum doesn't cover the block set. Unit-tested in
+/// `atlas_warmup_tests.rs` (window-superset suite).
+#[allow(clippy::too_many_arguments)] // pure geometry kernel; mirrors layout_pass's bound fns
+fn block_warm_window(
+    n: usize,
+    prefix_sum: &[usize],
+    clear_ps: &[usize],
+    pitch: f32,
+    header_height: f32,
+    clear_pitch: f32,
+    viewport_h: f32,
+    scroll_px: f32,
+    live_height_px: f32,
+) -> (usize, usize) {
+    if n == 0 || prefix_sum.len() != n + 1 {
+        return (0, n);
     }
-
-    #[test]
-    fn live_frames_scan_only_past_the_watermark() {
-        let mut wm = BlockScanWatermarks::default();
-        let id = BlockId(7);
-        // Nothing recorded yet → a live frame still scans from 0.
-        assert_eq!(
-            wm.output_scan_range(0, id, true, 30, BLOCK_OUTPUT_SCAN_LIMIT),
-            (0, 30)
-        );
-        wm.record_scanned(0, id, 30);
-        assert_eq!(
-            wm.output_scan_range(0, id, true, 30, BLOCK_OUTPUT_SCAN_LIMIT),
-            (30, 30),
-            "no new lines → empty range"
-        );
-        // Appended lines only.
-        assert_eq!(
-            wm.output_scan_range(0, id, true, 35, BLOCK_OUTPUT_SCAN_LIMIT),
-            (30, 35)
-        );
-    }
-
-    #[test]
-    fn watermark_is_monotonic_and_namespaced() {
-        let mut wm = BlockScanWatermarks::default();
-        let id = BlockId(1);
-        wm.record_scanned(0, id, 40);
-        wm.record_scanned(0, id, 20); // transient regression → max wins
-        assert_eq!(
-            wm.output_scan_range(0, id, true, 60, BLOCK_OUTPUT_SCAN_LIMIT),
-            (40, 60)
-        );
-        // Namespaces are independent (active pane vs background panes).
-        assert_eq!(
-            wm.output_scan_range(9, id, true, 10, BLOCK_OUTPUT_SCAN_LIMIT),
-            (0, 10)
-        );
-    }
-
-    #[test]
-    fn scan_range_clamps_to_the_per_frame_limit() {
-        let mut wm = BlockScanWatermarks::default();
-        let id = BlockId(2);
-        // 500-line output capped at the 200-line per-frame scan.
-        assert_eq!(
-            wm.output_scan_range(0, id, false, 500, BLOCK_OUTPUT_SCAN_LIMIT),
-            (0, 200)
-        );
-        wm.record_scanned(0, id, 200);
-        assert_eq!(
-            wm.output_scan_range(0, id, true, 500, BLOCK_OUTPUT_SCAN_LIMIT),
-            (200, 200)
-        );
-    }
-
-    #[test]
-    fn in_flight_sentinel_is_forgotten_between_commands() {
-        // P3 fix (rust-reviewer): the sentinel key is reused across commands —
-        // forgetting it when nothing is in flight stops the next command's
-        // early output lines inheriting the previous command's watermark.
-        let mut wm = BlockScanWatermarks::default();
-        wm.record_scanned(0, IN_FLIGHT_KEY, 30);
-        wm.forget(0, IN_FLIGHT_KEY);
-        assert_eq!(
-            wm.output_scan_range(0, IN_FLIGHT_KEY, true, 5, BLOCK_OUTPUT_SCAN_LIMIT),
-            (0, 5),
-            "next command rescans from zero"
-        );
-    }
-
-    #[test]
-    fn atlas_rebuild_clears_all_watermarks_and_in_flight_key_exists() {
-        let mut wm = BlockScanWatermarks::default();
-        assert_ne!(
-            IN_FLIGHT_KEY,
-            BlockId(0),
-            "sentinel must not collide with real ids"
-        );
-        wm.record_scanned(0, IN_FLIGHT_KEY, 12);
-        wm.record_scanned(0, BlockId(3), 44);
-        wm.clear();
-        assert_eq!(
-            wm.output_scan_range(0, IN_FLIGHT_KEY, true, 20, BLOCK_OUTPUT_SCAN_LIMIT),
-            (0, 20),
-            "cleared watermark → live frame rescans from zero"
-        );
-        assert_eq!(
-            wm.output_scan_range(0, BlockId(3), true, 50, BLOCK_OUTPUT_SCAN_LIMIT),
-            (0, 50)
-        );
-    }
+    let margin_px = BLOCK_WARM_MARGIN_ROWS as f32 * pitch;
+    // Same shape as layout_pass.rs:299-301 with conservative clip constants:
+    // content_bottom == clip_bottom makes the low threshold scroll-only, and
+    // the whole viewport stands in for (content_bottom − clip_top).
+    let threshold_low = scroll_px - margin_px - live_height_px;
+    let threshold_high = viewport_h + scroll_px + margin_px - live_height_px;
+    let j_low = lower_bound_height(
+        prefix_sum,
+        clear_ps,
+        pitch,
+        header_height,
+        clear_pitch,
+        threshold_low,
+    );
+    let j_high = upper_bound_height(
+        prefix_sum,
+        clear_ps,
+        pitch,
+        header_height,
+        clear_pitch,
+        threshold_high,
+    );
+    // first_visible −1 (layout) then the warm-side ±2-block overscan.
+    (
+        j_low.saturating_sub(1 + BLOCK_WARM_OVERSCAN_BLOCKS),
+        (j_high + BLOCK_WARM_OVERSCAN_BLOCKS).min(n),
+    )
 }
 
-#[cfg(test)]
-mod warm_atlas_incremental_tests {
-    use super::{BlockScanWatermarks, MetalRenderer};
-    use crate::glyph::GlyphAtlas;
-    use crate::paint::overlays::{FindDrawState, NoteEditorDrawState};
-    use crate::paint::tab_bar::TabBarDrawState;
-    use weft_core::vt::Terminal;
-
-    /// Mirror the golden skip precedent: no Metal device (CI without GPU)
-    /// skips instead of failing (the atlas rasterizer needs a device).
-    fn headless_atlas_or_skip() -> Option<GlyphAtlas> {
-        let device = metal::Device::system_default()?;
-        Some(GlyphAtlas::new(
-            &device,
-            &weft_core::config::FontConfig::default(),
-            2.0,
-        ))
-    }
-
-    fn empty_tab_bar() -> TabBarDrawState {
-        TabBarDrawState {
-            tab_count: 1,
-            active_tab: 0,
-            labels: Vec::new(),
-            tooltips: Vec::new(),
-            hovered_tab: None,
-            scroll_offset: 0.0,
-            plus_hovered: false,
-            arrow_left_hovered: false,
-            arrow_right_hovered: false,
-            chrome_left: 0.0,
-            layout_right: 800.0,
-            drag_index: None,
-            drag_ghost_x: None,
-            drag_insert_index: None,
+/// Collect one output line's glyphs into the warm sets: single-scalar
+/// graphemes as chars, multi-scalar graphemes (ℹ️, ⚠️, combining-mark runs)
+/// as cluster-atlas entries with their lead scalar and width class.
+fn collect_line_glyphs(
+    missing: &mut HashSet<char>,
+    missing_clusters: &mut HashMap<String, (char, bool)>,
+    line: &str,
+) {
+    for grapheme in line.graphemes(true) {
+        let mut chars = grapheme.chars();
+        let lead = chars.next().unwrap_or(' ');
+        if chars.next().is_some() {
+            if !missing_clusters.contains_key(grapheme) {
+                let is_wide = weft_core::grid::terminal_text_width(grapheme) > 1;
+                missing_clusters.insert(grapheme.to_string(), (lead, is_wide));
+            }
+        } else if lead != ' ' {
+            missing.insert(lead);
         }
     }
-
-    /// Warm with every overlay parameter at None — only the grid + block
-    /// scan contribute, so the return value is exactly the block output
-    /// lines scanned.
-    fn warm(
-        terminal: &Terminal,
-        atlas: &mut GlyphAtlas,
-        live_resize: bool,
-        watermarks: &std::cell::RefCell<BlockScanWatermarks>,
-        namespace: u64,
-    ) -> u64 {
-        let no_find: Option<FindDrawState> = None;
-        let no_note: Option<NoteEditorDrawState> = None;
-        let tab_bar = empty_tab_bar();
-        MetalRenderer::warm_atlas(
-            atlas,
-            600.0,
-            &no_find,
-            &no_note,
-            terminal,
-            terminal.grid(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &tab_bar,
-            &[],
-            live_resize,
-            watermarks,
-            namespace,
-        )
-    }
-
-    /// B3-3 acceptance: one finished block (2 output lines) + one in-flight
-    /// block (3 → 4 lines). Non-live scans everything; live frames scan only
-    /// appended lines; a cleared watermark table (atlas rebuild) rescans.
-    #[test]
-    fn warm_atlas_block_scan_is_incremental_under_live_resize() {
-        let Some(mut atlas) = headless_atlas_or_skip() else {
-            eprintln!("skipping warm_atlas incremental test: no Metal device available");
-            return;
-        };
-        let mut terminal = Terminal::new(10, 40);
-        // Finished block: command `ls`, 2 output lines, exited.
-        terminal.process(b"\x1b]133;A\x07ls\x1b]133;B\x07out-1\nout-2\n\x1b]133;C\x07");
-        // In-flight block: 3 lines of live output (OSC 133;B with no C/D).
-        terminal.process(b"\x1b]133;A\x07sleep\x1b]133;B\x07");
-        terminal.process(b"alpha\nbeta\ngamma\n");
-        assert!(
-            terminal.show_block_view(),
-            "shell integration must select block view"
-        );
-        assert_eq!(
-            terminal
-                .block_tracker()
-                .in_flight()
-                .map(|l| l.output.lines().count()),
-            Some(3),
-            "test fixture: in-flight block must carry 3 output lines"
-        );
-
-        let wm = std::cell::RefCell::new(BlockScanWatermarks::default());
-        // Normal frame: full scan (2 finished + 3 in-flight lines).
-        assert_eq!(warm(&terminal, &mut atlas, false, &wm, 0), 5);
-        // Live-resize frame, nothing appended → nothing scanned (the
-        // append-only watermark is the whole point of B3-3).
-        assert_eq!(warm(&terminal, &mut atlas, true, &wm, 0), 0);
-
-        // One appended in-flight line → exactly one new line scanned.
-        terminal.process(b"delta\n");
-        assert_eq!(warm(&terminal, &mut atlas, true, &wm, 0), 1);
-
-        // Non-live frames keep the full scan regardless of watermarks.
-        assert_eq!(warm(&terminal, &mut atlas, false, &wm, 0), 6);
-
-        // Atlas rebuild invalidation (update_scale/rebuild_atlas clear):
-        // the next live frame rescans everything the fresh atlas needs.
-        wm.borrow_mut().clear();
-        assert_eq!(warm(&terminal, &mut atlas, true, &wm, 0), 6);
-
-        // Namespaces are independent (background panes don't inherit the
-        // active pane's watermarks).
-        assert_eq!(warm(&terminal, &mut atlas, true, &wm, 77), 6);
-    }
 }
+
+// v1.13.11: the watermark + warm-mechanism test suites moved to
+// `atlas_warmup_tests.rs` (#[path] companion file) — this file sits close to
+// the 800-line commit gate and N1's rewritten suites are sizeable.
+#[cfg(test)]
+#[path = "atlas_warmup_tests.rs"]
+mod tests;

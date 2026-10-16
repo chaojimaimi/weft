@@ -1,5 +1,7 @@
 //! Per-pane base-content rendering for split tabs.
 
+use std::collections::HashMap;
+
 use crate::glyph::GlyphAtlas;
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::overlays::FindDrawState;
@@ -52,16 +54,24 @@ fn background_prompt<'a>(pane: &'a PaneRenderInfo<'a>) -> Option<PromptDrawParam
 }
 
 impl MetalRenderer {
+    #[allow(clippy::too_many_arguments)] // shared warm inputs; mirrors warm_atlas's arity
     pub(super) fn warm_background_pane_atlases(
         atlas: &mut GlyphAtlas,
         viewport_h: f32,
         panes: &[PaneRenderInfo<'_>],
         tab_bar: &TabBarDrawState,
-        // v1.12.2 B3-3 (PLAN_S2_render): drag-time incremental block scan —
-        // each background pane warms under its own namespace (session id;
-        // P2: namespaces must be per-pane, never a shared constant).
-        live_resize: bool,
+        // v1.12.2 B3-3 (PLAN_S2_render): per-pane namespace block scan —
+        // namespaces must be per-pane, never a shared constant.
         watermarks: &std::cell::RefCell<crate::renderer::atlas_warmup::BlockScanWatermarks>,
+        // v1.13.11 N1/N1.4: the shared layout/live caches + per-pane visible
+        // block sets feed warm_block_view_glyphs (background panes cannot
+        // derive per-pane geometry from the global layout cache).
+        block_cache: &crate::paint::grid_cache::BlockLayoutCache,
+        live_cache: &crate::paint::live_cache::LiveLayoutCache,
+        bg_visible_blocks: &HashMap<u64, Vec<weft_core::blocks::BlockId>>,
+        // v1.13.11: the header-band height needs the renderer's scale (the
+        // associated-fn form keeps the `&mut atlas` partial borrow).
+        scale: f64,
     ) {
         let no_find: Option<FindDrawState> = None;
         let no_note: Option<crate::paint::overlays::NoteEditorDrawState> = None;
@@ -83,9 +93,25 @@ impl MetalRenderer {
                 tab_bar,
                 // Background panes don't render diagnose panels.
                 &[],
-                live_resize,
-                watermarks,
+            );
+            // v1.13.11 N1.4: this pane's block outputs warm from its previous
+            // rebuild's visible set ∪ its newest 16 blocks (the once-ever
+            // watermark machinery makes the fixed window cheap).
+            Self::warm_block_view_glyphs(
+                atlas,
+                pane.terminal.block_tracker(),
+                pane.terminal.show_block_view(),
                 pane.pane_session_id,
+                bg_visible_blocks
+                    .get(&pane.pane_session_id)
+                    .map(|v| v.as_slice()),
+                viewport_h,
+                pane.block_scroll,
+                pane.terminal.grid().num_rows,
+                scale,
+                block_cache,
+                live_cache,
+                watermarks,
             );
         }
     }
@@ -199,6 +225,12 @@ impl MetalRenderer {
                     },
                 );
                 let mut selection = SelectionHandler::new();
+                // v1.13.11 N1.4: arm the visible-block collection sink — the
+                // shared paint loop appends this rebuild's visible output
+                // block ids; drained into `bg_visible_blocks` right after the
+                // build. The active pane never arms the sink.
+                *self.bg_visible_blocks_sink.borrow_mut() =
+                    Some((pane.pane_session_id, Vec::new()));
                 let (mut vertices, _, _) = self.build_block_view_vertices(
                     BlockViewPaintModel {
                         blocks: pane.terminal.block_tracker().session_blocks(),
@@ -228,6 +260,18 @@ impl MetalRenderer {
                     },
                     &mut selection,
                 );
+                // Drain the collection sink into the pane's warm window
+                // (this rebuild's visible block set). P3-2: the sink appends
+                // once per visible OUTPUT row (O(visible rows), one block
+                // spans many rows) — blocks are contiguous in the block-view
+                // layout, so a sort+dedup (order is irrelevant to the
+                // warm-window consumer) keeps the stored window
+                // O(visible blocks) instead of O(visible rows).
+                if let Some((ns, mut ids)) = self.bg_visible_blocks_sink.borrow_mut().take() {
+                    ids.sort_unstable();
+                    ids.dedup();
+                    self.bg_visible_blocks.borrow_mut().insert(ns, ids);
+                }
                 if let Some(prompt) = prompt {
                     vertices.extend(self.build_prompt_vertices(&prompt, 0.0, false));
                 }
@@ -257,6 +301,16 @@ impl MetalRenderer {
     #[cfg(test)]
     pub(super) fn retain_background_block_caches(&self, live_ids: &std::collections::HashSet<u64>) {
         self.background_block_caches
+            .borrow_mut()
+            .retain(|id, _| live_ids.contains(id));
+    }
+
+    /// v1.13.11 N1.4 test/observability hook: prune the per-pane visible
+    /// block windows (the draw() retain runs the same `.retain` inline next
+    /// to `background_block_caches`).
+    #[cfg(test)]
+    pub(super) fn retain_bg_visible_blocks(&self, live_ids: &std::collections::HashSet<u64>) {
+        self.bg_visible_blocks
             .borrow_mut()
             .retain(|id, _| live_ids.contains(id));
     }
@@ -554,6 +608,57 @@ mod tests {
         assert_eq!(renderer.background_block_caches.borrow().len(), 2);
         assert!(renderer.background_block_caches.borrow().contains_key(&2));
         assert!(!renderer.background_block_caches.borrow().contains_key(&1));
+    }
+
+    /// v1.13.11 N1.4 (PLAN_v1.13.11 测试 5): a background block-pane REBUILD
+    /// collects its visible finished-block ids into `bg_visible_blocks`
+    /// (consumed by `warm_background_pane_atlases` as that pane's warm
+    /// window), and the draw()-side retain prunes closed/active panes'
+    /// entries (a closed pane's entry would otherwise pin its last window
+    /// forever). Collection happens only on rebuild — a T16b cache-hit frame
+    /// keeps the previous frame's set, matching the plan's "预热照跑" note.
+    #[test]
+    fn bg_visible_blocks_collected_on_rebuild_and_retained_live_panes_only() {
+        let Some(renderer) = headless_renderer_or_skip() else {
+            eprintln!("skipping bg visible-blocks test: no Metal device available");
+            return;
+        };
+        let mut terminal = weft_core::vt::Terminal::new(6, 40);
+        terminal.process(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07seq 7\nwarm me\nplease\n\x1b]133;D;0;weft-shell\x07",
+        );
+        let pane = PaneRenderInfo {
+            rect: [0.0; 4],
+            terminal: &terminal,
+            block_scroll: 0.0,
+            submit_on_ctrl_enter: true,
+            pane_session_id: 7,
+        };
+        let mut sink: Vec<f32> = Vec::new();
+        assert!(renderer.build_background_pane_content(
+            &pane,
+            &mut sink,
+            &mut Vec::new(),
+            &mut Vec::new()
+        ));
+        let collected = renderer
+            .bg_visible_blocks
+            .borrow()
+            .get(&7)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !collected.is_empty(),
+            "a rebuild with visible output rows must collect finished-block ids"
+        );
+
+        // Pane close/promotion: the live-id retain drops the entry.
+        let live: std::collections::HashSet<u64> = [8u64].into_iter().collect();
+        renderer.retain_bg_visible_blocks(&live);
+        assert!(
+            !renderer.bg_visible_blocks.borrow().contains_key(&7),
+            "a closed pane's visible-block window must be pruned"
+        );
     }
 
     #[test]

@@ -292,6 +292,17 @@ pub struct BlockTracker {
     /// v1.10.23: live-output content version, exposed via
     /// [`in_flight`](Self::in_flight); bumped on every mutation.
     live_output_version: u64,
+    /// v1.13.11 P1-1 (rust-reviewer): per-command generation, bumped at every
+    /// [`on_command_start`](Self::on_command_start). The renderer's in-flight
+    /// warm watermark keys on this — NOT on `InFlightBlock::started_at`,
+    /// which continuation sessions surface from the BASE block and is
+    /// therefore not command-unique. Chained commands (`a; b`) can finish
+    /// command 1 and start command 2 inside one PTY batch with no
+    /// in-between frame; a generation mismatch then forces the sentinel
+    /// warm scan to restart at 0 instead of inheriting command 1's
+    /// watermark (which would leave command 2's first lines forever
+    /// unscanned).
+    command_generation: u64,
     /// Absolute document position where primary-screen output begins.
     screen_document_start: Option<u64>,
     /// Session-local primary-screen blocks eligible for replay continuation.
@@ -387,6 +398,7 @@ impl BlockTracker {
             last_live_styled_publish: None,
             batch_clock: Instant::now(),
             live_output_version: 0,
+            command_generation: 0,
             screen_document_start: None,
             screen_owned_blocks: HashSet::new(),
             continuation_candidate: None,
@@ -539,6 +551,13 @@ impl BlockTracker {
     /// `finish_deferred_screen_command` — the phase already flipped to
     /// AtPrompt at defer time, and without the widened gate the renderer
     /// would flash a naked grid exactly when the handle is closing.
+    /// v1.13.11 P1-1: the current command generation (see the field doc) —
+    /// the snapshot identity the renderer keys the in-flight warm watermark
+    /// on. Monotonic per `133;B`, never reused within a session.
+    pub fn command_generation(&self) -> u64 {
+        self.command_generation
+    }
+
     pub fn in_flight(&self) -> Option<InFlightBlock<'_>> {
         if self.phase != ShellPhase::CommandExecuting && !self.settling {
             return None;
@@ -640,6 +659,11 @@ impl BlockTracker {
         self.last_live_styled_publish = None;
         self.screen_document_start = None;
         self.live_output_version = self.live_output_version.wrapping_add(1);
+        // v1.13.11 P1-1: a new command invalidates the renderer's in-flight
+        // sentinel warm watermark (see the field doc — chained commands can
+        // cross the D→A/B boundary inside one batch with no intervening
+        // frame, so the forget-on-idle path alone is not enough).
+        self.command_generation = self.command_generation.wrapping_add(1);
         self.phase = ShellPhase::CommandExecuting;
     }
 

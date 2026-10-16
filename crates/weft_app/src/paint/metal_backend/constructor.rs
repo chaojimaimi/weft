@@ -338,6 +338,11 @@ impl MetalRenderer {
             block_scan_watermarks: RefCell::new(
                 crate::renderer::atlas_warmup::BlockScanWatermarks::default(),
             ),
+            // v1.13.11 N1.4: per-background-pane visible-block warm windows
+            // + the row-loop collection sink (see the field docs on
+            // MetalRenderer).
+            bg_visible_blocks: RefCell::new(HashMap::new()),
+            bg_visible_blocks_sink: RefCell::new(None),
             scroll_metrics_memo: Cell::new(None),
             cached_scroll_metrics: Cell::new(None),
             cached_panel_scroll_metrics: Cell::new(None),

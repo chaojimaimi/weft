@@ -5,7 +5,11 @@
 /// Smallest j where `prefix_sum[j]*pitch + j*header_height +
 /// clear_ps[j]*clear_pitch >= threshold`; `len` if none. `clear_pitch`
 /// recovers the per-frame clear-block spacer excluded from the prefix sum.
-pub(super) fn lower_bound_height(
+///
+/// v1.13.11: `pub(crate)` — the block-view warmup (renderer/atlas_warmup.rs)
+/// reuses these exact bounds for its visible window so both sides share one
+/// authoritative height formula.
+pub(crate) fn lower_bound_height(
     prefix_sum: &[usize],
     clear_ps: &[usize],
     pitch: f32,
@@ -31,7 +35,7 @@ pub(super) fn lower_bound_height(
 
 /// Smallest j where the height formula is `> threshold` (strict upper
 /// bound); `len` if none.
-pub(super) fn upper_bound_height(
+pub(crate) fn upper_bound_height(
     prefix_sum: &[usize],
     clear_ps: &[usize],
     pitch: f32,

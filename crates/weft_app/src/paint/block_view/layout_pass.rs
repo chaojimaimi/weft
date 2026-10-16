@@ -17,7 +17,9 @@ use crate::paint::grid_cache::{
 #[cfg(test)]
 #[path = "layout_pass/bench.rs"]
 mod bench;
-mod bounds;
+// v1.13.11: `pub(crate)` so the renderer's block-view warmup can reach the
+// shared height bounds (the layout formula's authoritative home).
+pub(crate) mod bounds;
 #[cfg(test)]
 #[path = "layout_pass/window_tests.rs"]
 mod window_tests;

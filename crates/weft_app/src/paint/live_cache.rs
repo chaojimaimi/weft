@@ -199,6 +199,14 @@ impl LiveLayoutCache {
         self.screen_origin = screen_origin;
     }
 
+    /// Pane session id the cache last synced under. v1.13.11 (block-view
+    /// warm window): the warm side reads the previous frame's live total as
+    /// its band shift ONLY when the cached pane is the pane being warmed —
+    /// a stale foreign entry must not shrink another pane's window.
+    pub(crate) fn pane(&self) -> u64 {
+        self.pane_session_id
+    }
+
     /// Total display rows of the tail window. Identical to the pre-cache
     /// formula `lines()[skip..].map(|l| <chunk_count>).sum()` — screen-origin
     /// lines are one row each (clip); ordinary lines count their soft-wrap

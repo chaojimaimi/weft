@@ -1,6 +1,4 @@
-use crate::paint::block_view::actions::{
-    block_header_band_height, push_block_header_actions, BlockHeaderActionPaint,
-};
+use crate::paint::block_view::actions::{push_block_header_actions, BlockHeaderActionPaint};
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::BandSync;
 use crate::paint::primitives::{
@@ -13,7 +11,10 @@ mod actions;
 #[cfg(test)]
 mod bench;
 mod find;
-mod layout_pass;
+// v1.13.11: crate-visible so the renderer's warmup can reuse the shared
+// layout-pass height bounds (the visible-window computation's source of
+// truth). Items inside keep their own visibility.
+pub(crate) mod layout_pass;
 mod output_paint;
 mod row_paint;
 mod rows;
@@ -25,6 +26,9 @@ mod surfaces;
 mod streaming_bench;
 
 pub(crate) use actions::block_header_action_rects;
+// v1.13.11: the warmup computes the same header band height as the paint
+// (block_view.rs:94 同式) so the window's header-depth term cannot drift.
+pub(crate) use actions::block_header_band_height;
 pub(crate) use rows::sticky_block_id;
 
 #[cfg(test)]
@@ -378,8 +382,19 @@ impl MetalRenderer {
             let y = row_top_y;
 
             match &row_data[i] {
-                LaidRow::Output { .. } => {
+                LaidRow::Output { block_id, .. } => {
                     output_paint::paint_output_row(&mut pctx, &row_data[i], y);
+                    // v1.13.11 N1.4: collect the visible finished-block ids
+                    // for the background-pane warm window. The sink is set
+                    // ONLY by `build_background_pane_content` while it
+                    // rebuilds a background block pane — the shared paint
+                    // loop never lets the active pane write into
+                    // `bg_visible_blocks`. Live rows carry block_id None.
+                    if let Some(id) = block_id {
+                        if let Some((_, sink)) = self.bg_visible_blocks_sink.borrow_mut().as_mut() {
+                            sink.push(*id);
+                        }
+                    }
                 }
                 LaidRow::Command {
                     command,

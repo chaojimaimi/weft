@@ -303,6 +303,19 @@ pub struct MetalRenderer {
     /// scanned" marks would skip glyphs the new atlas needs (the
     /// fragmented-output bug class).
     pub(crate) block_scan_watermarks: RefCell<crate::renderer::atlas_warmup::BlockScanWatermarks>,
+    /// v1.13.11 N1.4: per-background-pane VISIBLE block ids from the pane's
+    /// last rebuild frame — the warm window for background panes (the global
+    /// `block_layout_cache` cannot provide per-pane geometry). Written by
+    /// `build_background_pane_content` (via the row-loop sink below) and
+    /// consumed by `warm_background_pane_atlases`; pruned against the live
+    /// pane list each frame (close/promote both prune).
+    pub(crate) bg_visible_blocks: RefCell<HashMap<u64, Vec<weft_core::blocks::BlockId>>>,
+    /// v1.13.11 N1.4 collection sink: `Some((pane, ids))` only while
+    /// `build_background_pane_content` rebuilds a background block pane.
+    /// The shared paint loop in `build_block_view_vertices` appends visible
+    /// `LaidRow::Output` block ids; the active pane never sets the sink, so
+    /// it can never write here.
+    pub(crate) bg_visible_blocks_sink: RefCell<Option<(u64, Vec<weft_core::blocks::BlockId>)>>,
     /// v1.0 P0-c: Pending scroll delta captured during build_grid_vertices
     /// (via grid.take_pending_scroll()). Used by the draw() epilogue to
     /// decide whether to issue a GPU blit before the render pass.
@@ -556,21 +569,38 @@ impl MetalRenderer {
             settings,
             tab_bar,
             &diagnose_texts,
-            // B3-3 + P2 fix (rust-reviewer): drag-time incremental block scan.
-            // The active pane warms under its OWN session id (not a shared
-            // constant): BlockIds are allocated per-Terminal, so after a tab /
-            // focus switch the new active terminal's BlockId(1..N) must not
-            // hit the previous tenant's leftover watermarks.
-            self.live_resize_active,
-            &self.block_scan_watermarks,
-            active_pane_session_id,
         );
         Self::warm_background_pane_atlases(
             &mut self.atlas,
             self.viewport.1,
             background_panes,
             tab_bar,
-            self.live_resize_active,
+            &self.block_scan_watermarks,
+            &self.block_layout_cache.borrow(),
+            &self.live_layout_cache.borrow(),
+            &self.bg_visible_blocks.borrow(),
+            self.scale,
+        );
+        // v1.13.11 N1: the active pane's block-view glyph warmup — the
+        // visible-window, once-ever, byte-budgeted successor of the B3-3
+        // `.rev().take(64)` × 200-line sweep (which lived inside warm_atlas).
+        // Same partial-borrow contract as warm_atlas above; the active pane
+        // warms under its OWN session id (BlockIds are per-Terminal, so a
+        // shared constant namespace would leak watermarks across tab/focus
+        // switches). `visible_override = None` → geometric window from the
+        // previous frame's layout prefix sum.
+        Self::warm_block_view_glyphs(
+            &mut self.atlas,
+            terminal.block_tracker(),
+            terminal.show_block_view(),
+            active_pane_session_id,
+            None,
+            self.viewport.1,
+            block_scroll,
+            grid.num_rows,
+            self.scale,
+            &self.block_layout_cache.borrow(),
+            &self.live_layout_cache.borrow(),
             &self.block_scan_watermarks,
         );
 
@@ -664,6 +694,12 @@ impl MetalRenderer {
             .retain(|id, _| live_ids.contains(id));
         // v1.13.5 T16b: same retain lifecycle — close/promotion both prune.
         self.background_block_caches
+            .borrow_mut()
+            .retain(|id, _| live_ids.contains(id));
+        // v1.13.11 N1.4: the visible-block warm windows follow the same
+        // lifecycle — a closed/promoted pane's entry would otherwise pin its
+        // last window forever.
+        self.bg_visible_blocks
             .borrow_mut()
             .retain(|id, _| live_ids.contains(id));
 
