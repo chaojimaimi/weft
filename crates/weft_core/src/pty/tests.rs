@@ -614,9 +614,16 @@ fn map_write_outcome_reports_written_bytes_honestly() {
 /// Against a real PTY whose child never reads, the master still accepts
 /// the full payload (macOS n_tty discards overflow silently), so
 /// `write_sync_reported` must report the exact byte count.
+///
+/// v1.13.12 FIX-H: the child must stay ALIVE for the whole write — the old
+/// no-arg `/bin/sleep` usage-errored immediately, so a slow 64KiB master
+/// write could land after the child's exit and hit EIO (~1/7 flake).
+/// `sleep 30` (via `spawn_with_args`, production's own entry point) keeps
+/// the pty open well past the test; the OS reaps it when the Pty drops.
 #[tokio::test]
 async fn write_sync_reported_returns_full_len_into_saturated_child() {
-    let pty = Pty::spawn("/bin/sleep", (24, 80)).expect("failed to spawn PTY");
+    let pty = Pty::spawn_with_args("/bin/sleep", &["30"], (24, 80), &[], None, new_flag())
+        .expect("failed to spawn PTY");
     let payload = vec![0x41u8; 64 * 1024];
     let writer = pty.writer();
     let reported = writer
