@@ -505,44 +505,40 @@ impl MetalRenderer {
     /// v1.10.12: `style` (bold/italic from the cell's SGR flags) selects
     /// the atlas face. Clusters (multi-scalar graphemes) always resolve
     /// regular — fallback fonts have no style faces.
+    ///
+    /// v1.13.11 N2.1: the lookup ladder is shared with the text outlets via
+    /// `atlas.resolve_grapheme` — cluster first, then the cell's base
+    /// character (`lead`) through the styled→regular degrade rungs. The
+    /// transient "cluster miss renders the lead scalar" behavior is
+    /// unchanged; only the duplicated ladder is gone.
     fn resolve_glyph_uv(
         &self,
         ch: char,
         cluster: Option<&str>,
         style: crate::glyph::GlyphStyle,
     ) -> ([f32; 4], bool) {
-        if let Some(cluster) = cluster {
-            if let Some(glyph) = self.atlas.get_cluster(cluster) {
-                let (u, v) = glyph.uv_origin;
-                let (uw, vh) = glyph.uv_size;
-                return ([u, v + vh, u + uw, v], glyph.is_color);
-            }
-        }
-        let ch_resolved = if ch == '\0' { ' ' } else { ch };
-        if let Some(glyph) = self.atlas.get_style(ch_resolved, style) {
+        let lead = if ch == '\0' { ' ' } else { ch };
+        // Single-scalar cells have no cluster string: a one-scalar "grapheme"
+        // falls straight through resolve_grapheme to the lead ladder.
+        let mut buf = [0u8; 4];
+        let single = lead.encode_utf8(&mut buf);
+        if let Some((glyph, is_color)) =
+            self.atlas
+                .resolve_grapheme(cluster.unwrap_or(single), lead, style)
+        {
             let (u, v) = glyph.uv_origin;
             let (uw, vh) = glyph.uv_size;
             // V-swap compensates for CAMetalLayer's vertical flip (same
             // convention as the legacy single-stream path).
-            ([u, v + vh, u + uw, v], glyph.is_color)
-        } else if let Some(glyph) = self
-            .atlas
-            .get_style(ch_resolved, crate::glyph::GlyphStyle::REGULAR)
-        {
-            // v1.10.12: styled face not rasterized yet (non-ASCII char before
-            // warmup) — degrade to the regular face instead of a blank cell.
-            let (u, v) = glyph.uv_origin;
-            let (uw, vh) = glyph.uv_size;
-            ([u, v + vh, u + uw, v], glyph.is_color)
-        } else {
-            let (u, v) = self
-                .atlas
-                .get(' ')
-                .map(|g| g.uv_origin)
-                .unwrap_or((0.0, 0.0));
-            let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
-            ([u, v + vh, u + uw, v], false)
+            return ([u, v + vh, u + uw, v], is_color);
         }
+        let (u, v) = self
+            .atlas
+            .get(' ')
+            .map(|g| g.uv_origin)
+            .unwrap_or((0.0, 0.0));
+        let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
+        ([u, v + vh, u + uw, v], false)
     }
 }
 

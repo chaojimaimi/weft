@@ -36,6 +36,47 @@ impl GlyphAtlas {
         self.cache.get(&(ch, key))
     }
 
+    /// v1.13.11 N2.1: shared grapheme resolution ladder for every text
+    /// outlet (block-view `push_text_with_height`, the styled-span canvas
+    /// path, and the live grid's `resolve_glyph_uv`).
+    ///
+    /// - Multi-scalar graphemes resolve through the cluster atlas first
+    ///   (`get_cluster`, CoreText shaping) — an ℹ️/⚠️ cluster then renders
+    ///   wide + color exactly like the live grid instead of splitting into
+    ///   a narrow base char plus an invisible FE0F.
+    /// - On a cluster miss (not rasterized yet) or a single-scalar grapheme,
+    ///   the CALLER-provided `lead` scalar runs the existing degrade ladder
+    ///   `get_style(lead, style)` → `get_style(lead, REGULAR)`. Grid callers
+    ///   pass the cell's base character (FFFD/FF1F for multi-scalar cells) so
+    ///   a transient cluster miss still renders the lead scalar instead of a
+    ///   blank; text callers pass `terminal_grapheme_glyph(grapheme)` to keep
+    ///   the FFFD/FF1F placeholder convention.
+    ///
+    /// Returns the resolved glyph plus its `is_color` flag (feeds the
+    /// existing `fg.a = 2.0` color-atlas sentinel). `None` = every rung
+    /// missed; callers keep their own terminal state (grid → space UV,
+    /// text → skip the quad).
+    pub fn resolve_grapheme(
+        &self,
+        grapheme: &str,
+        lead: char,
+        style: GlyphStyle,
+    ) -> Option<(&GlyphInfo, bool)> {
+        if grapheme.chars().count() > 1 {
+            if let Some(info) = self.get_cluster(grapheme) {
+                return Some((info, info.is_color));
+            }
+        }
+        let info = self.get_style(lead, style).or_else(|| {
+            // v1.10.12 ladder: the styled face may not be rasterized yet —
+            // degrade to the regular face instead of dropping the grapheme.
+            (style != GlyphStyle::REGULAR)
+                .then(|| self.get_style(lead, GlyphStyle::REGULAR))
+                .flatten()
+        })?;
+        Some((info, info.is_color))
+    }
+
     /// Load large TTC fallbacks only when output actually needs them. On the
     /// current macOS font set, eagerly opening PingFang + Apple Color Emoji
     /// retained more than 500 MiB of `MALLOC_LARGE` allocations even in an

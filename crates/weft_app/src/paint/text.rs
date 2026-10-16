@@ -101,17 +101,12 @@ impl MetalRenderer {
             if col + w > max_cols {
                 break; // column budget exhausted
             }
+            // v1.13.11 N2.1: shared ladder — multi-scalar graphemes try the
+            // cluster atlas first (wide + color ℹ️/⚠️ like the live grid);
+            // the FFFD/FF1F lead keeps the transient placeholder semantics
+            // when the cluster isn't rasterized yet.
             let glyph = weft_core::grid::terminal_grapheme_glyph(grapheme);
-            let Some(g) = self.atlas.get_style(glyph, style).or_else(|| {
-                // v1.10.12: styled face not rasterized yet — degrade to the
-                // regular face instead of silently dropping the grapheme.
-                (style != crate::glyph::GlyphStyle::REGULAR)
-                    .then(|| {
-                        self.atlas
-                            .get_style(glyph, crate::glyph::GlyphStyle::REGULAR)
-                    })
-                    .flatten()
-            }) else {
+            let Some((g, is_color)) = self.atlas.resolve_grapheme(grapheme, glyph, style) else {
                 col += w;
                 px += w as f32 * cw;
                 continue;
@@ -122,7 +117,7 @@ impl MetalRenderer {
             // v1.10.4: color emoji live in the RGBA color atlas — the shader
             // routes them there via the fg.a=2.0 sentinel (fg itself is
             // meaningless for color glyphs; the color comes from the atlas).
-            let fg = if g.is_color { [0.0, 0.0, 0.0, 2.0] } else { fg };
+            let fg = if is_color { [0.0, 0.0, 0.0, 2.0] } else { fg };
             push_quad(
                 vertices,
                 [px, y0, px + cell_w, y1],
@@ -205,14 +200,20 @@ impl MetalRenderer {
                 if col + w > max_cols {
                     break 'span_loop;
                 }
+                // v1.13.11 N2.1: same shared ladder as `push_text_with_height`
+                // (regular face only — this path renders user-typed prompt
+                // text without SGR face styles).
                 let glyph = weft_core::grid::terminal_grapheme_glyph(grapheme);
-                if let Some(g) = self.atlas.get(glyph) {
+                if let Some((g, is_color)) =
+                    self.atlas
+                        .resolve_grapheme(grapheme, glyph, crate::glyph::GlyphStyle::REGULAR)
+                {
                     let (u, v) = g.uv_origin;
                     let (uw, vh) = g.uv_size;
                     let cell_w = w as f32 * cw;
                     // v1.10.4: color emoji live in the RGBA color atlas —
                     // same fg.a=2.0 sentinel as `push_text_with_height`.
-                    let color = if g.is_color {
+                    let color = if is_color {
                         [0.0, 0.0, 0.0, 2.0]
                     } else {
                         color

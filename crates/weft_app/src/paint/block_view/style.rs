@@ -8,6 +8,7 @@ use crate::paint::styled_line_cache::{
 };
 use crate::paint::underline::{underline_rects, MAX_UNDERLINE_RECTS};
 use crate::renderer::MetalRenderer;
+use unicode_segmentation::UnicodeSegmentation;
 use weft_core::blocks::{OutputSemanticRole, SemanticSpan, StyledLine};
 use weft_core::config::Theme;
 use weft_core::grid::{CellColor, CellFlags, Color, UnderlineStyle};
@@ -268,16 +269,30 @@ impl MetalRenderer {
         };
         let mut col = 0;
         let mut x = paint.x;
-        for (index, ch) in paint.text.chars().enumerate() {
-            let width = weft_core::grid::terminal_char_width(ch);
+        // v1.13.11 N2.2: grapheme iteration — an ℹ️/⚠️ cluster is ONE
+        // width-2 unit (matching the live grid's column layout) instead of
+        // a width-1 base char followed by a zero-width FE0F. `char_index`
+        // walks the styled RLE's CHAR space: FE0F occupies its own char
+        // index (capture records styles per scalar) and shares the base's
+        // span, so advancing by the grapheme's char count keeps
+        // `attributes_at`/`foreground_at` aligned.
+        let mut char_index = 0usize;
+        for grapheme in paint.text.graphemes(true) {
+            let width = weft_core::grid::terminal_text_width(grapheme);
             if width == 0 {
+                char_index += grapheme.chars().count();
                 continue;
             }
             if col + width > paint.max_cols {
                 break;
             }
+            // In-cluster judgments key on the LEAD scalar (评审 P3-1):
+            // graphic-glyph detection and the selection overlap test use the
+            // base character's RLE index — a selection boundary between the
+            // base and its FE0F must not shift the cluster's highlight.
+            let ch = grapheme.chars().next().unwrap_or(' ');
 
-            let source_index = paint.char_offset + index;
+            let source_index = paint.char_offset + char_index;
             let flags = paint
                 .style
                 .map(|line| line.attributes_at(source_index))
@@ -372,16 +387,20 @@ impl MetalRenderer {
 
             // HIDDEN: skip glyph emission, background already drawn.
             if !flags.contains(CellFlags::HIDDEN) {
-                let mut encoded = [0; 4];
                 let glyph_height = if fills_terminal_cell_edges(ch) {
                     paint.row_pitch
                 } else {
                     self.cell_height() as f32
                 };
+                // v1.13.11 N2.2: push the WHOLE grapheme — `push_text_with_height`
+                // resolves multi-scalar clusters through the shared
+                // `resolve_grapheme` ladder (cluster atlas first, FFFD/FF1F
+                // lead as the transient fallback), so a warmed ℹ️ renders as
+                // the wide color emoji instead of a split narrow base char.
                 self.push_text_with_height(
                     vertices,
                     [x, paint.y],
-                    ch.encode_utf8(&mut encoded),
+                    grapheme,
                     fg_final,
                     width,
                     glyph_height,
@@ -449,6 +468,7 @@ impl MetalRenderer {
 
             col += width;
             x += width as f32 * cw;
+            char_index += grapheme.chars().count();
         }
     }
 
@@ -679,3 +699,10 @@ mod tests {
         );
     }
 }
+
+// v1.13.11 N2 cluster-fidelity suites (PLAN_v1.13.11 测试 4-选区半 / 7) live
+// in a companion file: the inline tests module sits close to the 800-line
+// commit gate (atlas_warmup_tests.rs precedent).
+#[cfg(test)]
+#[path = "style_n2_tests.rs"]
+mod n2_tests;
