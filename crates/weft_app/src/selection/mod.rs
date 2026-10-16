@@ -77,11 +77,18 @@ pub(crate) fn down_autoscroll_threshold(
 /// emoji is one cell but several chars), and trailing blank cells are not
 /// part of the text — so the anchor char stays aligned with the rendered
 /// text the BlockView row displays.
+///
+/// v1.13.12 P2-2 (FIX-D sync): the trailing-blank extent gained the EXTRA
+/// bit alongside `snapshot_row_extent` — a space-led multi-scalar cluster
+/// at the row end is content, so the mirror relationship holds again.
 pub fn grid_col_to_source_char_index(row: &Row, col: usize) -> usize {
     let last = row
         .cells
         .iter()
-        .rposition(|cell| cell.character != ' ' && cell.character != '\0')
+        .rposition(|cell| {
+            cell.flags.contains(CellFlags::EXTRA)
+                || (cell.character != ' ' && cell.character != '\0')
+        })
         .map(|index| index + 1)
         .unwrap_or(0);
     let end = col.min(last);
@@ -380,6 +387,31 @@ impl App {
 mod tests {
     use super::*;
     use weft_core::selection::SelectionContentSource;
+
+    // ── P2-2 (v1.13.12, FIX-D sync): anchor mapping counts clusters ───────
+
+    /// The trailing-blank extent of `grid_col_to_source_char_index` gained
+    /// the EXTRA bit alongside `snapshot_row_extent`: a space-led
+    /// multi-scalar cluster at the row end is content, so the anchor char
+    /// index counts its chars.
+    #[test]
+    fn grid_col_to_source_char_index_counts_trailing_space_led_cluster() {
+        let mut row = Row::new(8);
+        row.cells[0].character = 'a';
+        row.cells[1].character = ' '; // lead of " \u{0300}"
+        row.cells[1].flags = CellFlags::DIRTY | CellFlags::EXTRA;
+        row.extras
+            .set_grapheme(1, std::sync::Arc::from(" \u{0300}"));
+
+        // The extent covers the cluster: a cursor past it maps to 3 chars
+        // ("a" + the 2-char cluster).
+        assert_eq!(grid_col_to_source_char_index(&row, 8), 3);
+        // Cursor ON the cluster cell maps to the lead char's index.
+        assert_eq!(grid_col_to_source_char_index(&row, 1), 1);
+        // A genuinely blank row still trims to zero.
+        let blank = Row::new(8);
+        assert_eq!(grid_col_to_source_char_index(&blank, 8), 0);
+    }
 
     // ── v1.10.26: Warp ramp (replaces the legacy autoscroll_steps) ────────
 

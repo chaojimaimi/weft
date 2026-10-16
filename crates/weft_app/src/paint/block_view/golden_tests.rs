@@ -397,6 +397,40 @@ fn require_metal_or_skip() {
     };
 }
 
+/// v1.13.12 FIX-F (D2): the block view's no-ANSI text fallback fg is
+/// `theme.foreground` (the grid 口径) — `theme.output.output_default` has
+/// ZERO consumers in the paint. Two themes differing ONLY in
+/// output_default must paint byte-identical vertices (this fails on the
+/// pre-FIX code, where output_default fed `output_fg`); the default theme
+/// (foreground == output_default == white) is pinned byte-for-byte by the
+/// goldens above.
+#[test]
+fn block_view_no_ansi_fallback_uses_theme_foreground_not_output_default() {
+    require_metal_or_skip();
+    let mut theme_a = Theme::weft_dark();
+    theme_a.foreground = Color::rgb(0x30, 0xC0, 0x80);
+    theme_a.output.output_default = Color::rgb(0xFE, 0x01, 0x7C);
+    let mut theme_b = theme_a.clone();
+    theme_b.output.output_default = Color::rgb(0x11, 0x22, 0x33);
+
+    let verts_for = |theme: &Theme| {
+        let renderer = MetalRenderer::new_headless_paint(theme.clone());
+        let blocks = vec![block_literal(9, "echo hi", None, "plain output\n", Some(0))];
+        let empty = HashMap::new();
+        let palette = palette_literal();
+        let model = s2_model(&blocks, &palette, &empty);
+        let (verts, _, _) = renderer.build_block_view_vertices(model, &mut SelectionHandler::new());
+        verts
+    };
+
+    let verts_a = verts_for(&theme_a);
+    let verts_b = verts_for(&theme_b);
+    assert_eq!(
+        verts_a, verts_b,
+        "output_default must not influence the block view paint at all"
+    );
+}
+
 #[test]
 fn golden_all_row_types() {
     require_metal_or_skip();

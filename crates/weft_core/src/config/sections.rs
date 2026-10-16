@@ -122,6 +122,11 @@ pub struct SyntaxConfig {
 /// toggle. v1.12.2 (PLAN_S2_render A1): defaults to `false` (disabled) —
 /// unstyled output renders in a single bright `output_default`.
 ///
+/// v1.13.12 FIX-F (D2): `output_default` is a compatibility-only key — the
+/// paint reads the grid 口径 `theme.foreground` for the fallback fg, so a
+/// configured `output_default` no longer affects rendering (the field is
+/// still parsed and stored).
+///
 /// v1.11.0: the `cwd` field was removed — dead config (painter derives
 /// CWD gray from fg×0.65). A leftover `cwd = "..."` in user TOML is
 /// silently ignored (serde's default unknown-key behavior).
@@ -188,7 +193,9 @@ impl ThemeConfig {
     /// semantics (serde `unwrap_or`): users who never configured `enabled`
     /// follow the new default; an explicit `enabled = true` in config.toml
     /// is preserved. When `false`, the classifier is skipped and unstyled
-    /// output uses `output_default` only; ANSI styling is NEVER affected.
+    /// output uses the plain default fg (`theme.foreground` since
+    /// v1.13.12 FIX-F — the `output_default` key is compatibility-only);
+    /// ANSI styling is NEVER affected.
     pub fn semantic_output_enabled(&self) -> bool {
         self.output
             .as_ref()

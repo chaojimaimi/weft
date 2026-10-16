@@ -83,7 +83,15 @@ impl MetalRenderer {
         let theme_bg = scale_color_alpha(color_to_normalized(self.theme.background), self.opacity);
         let fg = color_to_normalized(self.theme.foreground);
         let accent = color_to_normalized(self.theme.accent);
-        let output_fg = color_to_normalized(self.theme.output.output_default);
+        // v1.13.12 FIX-F (D2): the block view's no-ANSI / no-semantic-hit
+        // fallback fg is the SAME data flow as the live grid's Default fg
+        // (output_paint.rs `fallback: ctx.output_fg`), so it must read
+        // `theme.foreground` too — a custom theme with
+        // `output.default ≠ foreground` used to paint the two surfaces
+        // differently for the same command. After this change
+        // `output_default` has zero production consumers (the config key
+        // stays accepted for compatibility).
+        let output_fg = color_to_normalized(self.theme.foreground);
         let prompt_c = crate::paint::color_math::mix_fg_over_bg(fg, theme_bg, 0.30);
         let cwd_c =
             crate::paint::primitives::derive_cwd_gray(color_to_normalized(self.theme.foreground));
