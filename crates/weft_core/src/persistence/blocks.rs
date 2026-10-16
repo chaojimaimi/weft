@@ -15,7 +15,16 @@ use crate::persistence::{millis_to_system_time, system_time_to_millis, Persisten
 /// Upper bound on the JSON-encoded `styled_output` blob we are willing to
 /// read/write. Larger payloads are dropped (treated as `NULL`) so a runaway
 /// styled-output buffer cannot bloat the DB or OOM the decoder.
-pub(crate) const MAX_STYLED_OUTPUT_JSON_BYTES: usize = 256 * 1024;
+///
+/// v1.13.12 FIX-G (D3): raised 256KiB → 1 MiB to ALIGN with the capture
+/// budget [`crate::blocks::DEFAULT_OUTPUT_CAP`] — a block whose captured
+/// output fits the live cap used to silently lose its styling across a
+/// restart. The same constant is injected into every reader's SQL
+/// (`format!` — `concat!` cannot interpolate a const value), so the write
+/// filter and the read-side SQL gate can never drift apart. Parameters
+/// stay `?N`-bound; the interpolation is a compile-time constant with no
+/// injection surface.
+pub(crate) const MAX_STYLED_OUTPUT_JSON_BYTES: usize = 1024 * 1024;
 
 /// SQLite-backed store of finished command blocks.
 ///
@@ -234,12 +243,12 @@ impl BlockStore {
 
     /// The most recent `limit` blocks, newest first (by start time, then id).
     pub fn recent(&self, limit: usize) -> Result<Vec<Block>, PersistenceError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, command, cwd, output, \
-                    CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                    CASE WHEN length(CAST(styled_output AS BLOB)) <= {MAX_STYLED_OUTPUT_JSON_BYTES} THEN styled_output END, \
                     exit_code, started_ms, finished_ms, collapsed, screen_origin \
              FROM blocks ORDER BY started_ms DESC, id DESC LIMIT ?1",
-        )?;
+        ))?;
         let rows = stmt.query_map(params![limit as i64], row_to_block)?;
         rows.map(|r| r.map_err(PersistenceError::from)).collect()
     }
@@ -248,15 +257,15 @@ impl BlockStore {
     /// newest first. Plain substring match via `INSTR` — no FTS overhead for
     /// v0.4; can upgrade to FTS5 if the history grows large.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Block>, PersistenceError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, command, cwd, output, \
-                    CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                    CASE WHEN length(CAST(styled_output AS BLOB)) <= {MAX_STYLED_OUTPUT_JSON_BYTES} THEN styled_output END, \
                     exit_code, started_ms, finished_ms, collapsed, screen_origin \
              FROM blocks \
              WHERE INSTR(LOWER(command), LOWER(?1)) > 0 \
                 OR INSTR(LOWER(output), LOWER(?1)) > 0 \
              ORDER BY started_ms DESC, id DESC LIMIT ?2",
-        )?;
+        ))?;
         let rows = stmt.query_map(params![query, limit as i64], row_to_block)?;
         rows.map(|r| r.map_err(PersistenceError::from)).collect()
     }
@@ -272,14 +281,14 @@ impl BlockStore {
         started_ms_exclusive: i64,
         limit: usize,
     ) -> Result<Vec<Block>, PersistenceError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, command, cwd, output, \
-                    CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                    CASE WHEN length(CAST(styled_output AS BLOB)) <= {MAX_STYLED_OUTPUT_JSON_BYTES} THEN styled_output END, \
                     exit_code, started_ms, finished_ms, collapsed, screen_origin \
              FROM blocks \
              WHERE started_ms < ?1 \
              ORDER BY started_ms DESC, id DESC LIMIT ?2",
-        )?;
+        ))?;
         let rows = stmt.query_map(params![started_ms_exclusive, limit as i64], row_to_block)?;
         rows.map(|r| r.map_err(PersistenceError::from)).collect()
     }
@@ -296,10 +305,12 @@ impl BlockStore {
     pub fn get(&self, block_id: BlockId) -> Result<Option<Block>, PersistenceError> {
         self.conn
             .query_row(
-                "SELECT id, command, cwd, output, \
-                        CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                &format!(
+                    "SELECT id, command, cwd, output, \
+                        CASE WHEN length(CAST(styled_output AS BLOB)) <= {MAX_STYLED_OUTPUT_JSON_BYTES} THEN styled_output END, \
                         exit_code, started_ms, finished_ms, collapsed, screen_origin \
                  FROM blocks WHERE id = ?1",
+                ),
                 params![block_id.0 as i64],
                 row_to_block,
             )
@@ -341,6 +352,13 @@ pub(crate) fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
     })
 }
 
+// v1.13.12 FIX-G: styled-budget persistence tests split out of the inline
+// `mod tests` to keep this file under the architecture gate's 800-line
+// budget (same #[path] pattern as paint/block_view/b_path_tests.rs).
+#[cfg(test)]
+#[path = "blocks_budget_tests.rs"]
+mod blocks_budget_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,8 +368,9 @@ mod tests {
     static TEMP_STORE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// A unique temp DB path for one test (auto-cleaned by the OS temp dir
-    /// lifecycle; we also clear() to keep tests independent).
-    fn temp_store() -> BlockStore {
+    /// lifecycle; we also clear() to keep tests independent). `pub(crate)`:
+    /// the path-mounted `blocks_budget_tests` sibling (FIX-G split) reuses it.
+    pub(crate) fn temp_store() -> BlockStore {
         let path = std::env::temp_dir().join(format!(
             "weft-block-store-{}-{}-{}.db",
             std::process::id(),
@@ -366,7 +385,7 @@ mod tests {
         BlockStore::open(&path).expect("open temp store")
     }
 
-    fn block(id: u64, command: &str, output: &str, exit: Option<i32>) -> Block {
+    pub(crate) fn block(id: u64, command: &str, output: &str, exit: Option<i32>) -> Block {
         Block {
             id: BlockId(id),
             command: command.into(),
