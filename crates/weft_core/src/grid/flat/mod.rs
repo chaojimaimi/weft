@@ -140,9 +140,12 @@ impl FlatStorage {
     }
 
     /// Pops the last `count` rows off the tail of storage (D4 step 5: the
-    /// resize protocol pulls the new viewport back out, dropping the blank
-    /// bottom rows past the cursor). Returns the materialized rows in
-    /// document order; the tail (and its content bytes) is removed.
+    /// resize protocol pulls the new viewport back out; when the rewrapped
+    /// tail cannot fit the new height, rows BELOW the cursor's logical line
+    /// drop out of the physical bottom edge — the reflow 型终端
+    /// （kitty/WezTerm 类）通用语义, v1.13.12 FIX-A). Returns the
+    /// materialized rows in document order; the tail (and its content
+    /// bytes) is removed.
     /// Position / `num_truncated_rows` are untouched — a resize pop is not
     /// scrollback eviction.
     pub(crate) fn pop_rows(&mut self, count: usize) -> Vec<Row> {
@@ -314,10 +317,16 @@ impl FlatStorage {
     /// allocation dominated that cost.
     ///
     /// Mirrors `snapshot_line_map::snapshot_row_text_len` exactly: trailing
-    /// blank graphemes are trimmed (a grapheme is blank iff its lead scalar
-    /// is `' '`; `\0` never reaches flat content), and every kept grapheme
-    /// contributes its full UTF-8 byte length (a multi-scalar cluster's run
-    /// bytes ARE the cluster string the snapshot text uses).
+    /// blank graphemes are trimmed, and every kept grapheme contributes its
+    /// full UTF-8 byte length (a multi-scalar cluster's run bytes ARE the
+    /// cluster string the snapshot text uses).
+    ///
+    /// v1.13.12 FIX-D: the trim is per-CLUSTER — a grapheme is blank iff its
+    /// run is a SINGLE `' '` scalar; a multi-scalar cluster (e.g. space +
+    /// combining mark) counts as content even though its lead is a space,
+    /// matching the cell side's EXTRA-bit rule (`display::row_display_text`
+    /// / `snapshot_line_map::snapshot_row_extent`). `\0` never reaches flat
+    /// content; a non-UTF-8 run is treated as blank (as before).
     ///
     /// The rule stays cross-checked by snapshot_line_map's replay-vs-builder
     /// regression tests, which run this path against the real builder.
@@ -332,8 +341,11 @@ impl FlatStorage {
             for _ in 0..run.count.get() {
                 let end = base + off + run.info.utf8_bytes.get() as usize;
                 let text = std::str::from_utf8(self.content[base + off..end].as_bytes()).ok();
-                let lead = text.and_then(|s| s.chars().next());
-                if lead.is_some_and(|c| c != ' ') {
+                let is_blank = text.map_or(true, |s| {
+                    let mut chars = s.chars();
+                    matches!(chars.next(), Some(' ')) && chars.next().is_none()
+                });
+                if !is_blank {
                     last_contentful = Some(ordinal);
                 }
                 off += run.info.utf8_bytes.get() as usize;

@@ -1991,6 +1991,99 @@ fn resize_move_keeps_scrollback_distribution_intact() {
     );
 }
 
+// ── v1.13.12 FIX-A: non-blank rows below the cursor survive resize ──────
+
+fn write_lines(grid: &mut Grid, lines: &[&str]) {
+    for (i, line) in lines.iter().enumerate() {
+        for ch in line.chars() {
+            grid.write_char_with_attrs(
+                ch,
+                CellColor::Default,
+                CellColor::Default,
+                CellFlags::empty(),
+            );
+        }
+        if i + 1 < lines.len() {
+            grid.newline();
+        }
+    }
+}
+
+/// v1.13.12 FIX-A: a multi-line progress bar repainted in place via `CSI A`
+/// parks the cursor ABOVE non-blank rows (the stale frames below it). The
+/// old `vp_start` formula pinned the cursor logical line's first row to the
+/// viewport bottom and the pop-back silently dropped those rows. Grid-level
+/// stand-in for `print 3 行 → CUU ×k`: the cursor is parked on the first
+/// frame row; both resize directions must keep the frames below it visible.
+#[test]
+fn resize_keeps_nonblank_rows_below_the_cursor_in_both_directions() {
+    let mut grid = Grid::with_scrollback(5, 20, 200);
+    write_lines(&mut grid, &["h1", "f1", "f2", "f3", ""]);
+    // One seed row above keeps the cursor line's flat start L > 0 (the only
+    // shape where old and new `vp_start` diverge); the viewport holds the
+    // three progress frames with the cursor parked on the FIRST one (rows
+    // f2/f3 below it).
+    assert_eq!(row_plain_text(&grid.viewport[1]), "f1");
+    assert_eq!(row_plain_text(&grid.viewport[2]), "f2");
+    assert_eq!(row_plain_text(&grid.viewport[3]), "f3");
+    grid.cursor.row = 1;
+
+    grid.resize(3, 20);
+    let viewport: Vec<String> = grid.viewport.iter().map(row_plain_text).collect();
+    assert_eq!(
+        viewport,
+        vec!["f1", "f2", "f3"],
+        "narrowing must keep the non-blank frames below the cursor"
+    );
+    assert_eq!(grid.cursor.row, 0, "cursor stays on the first frame");
+
+    grid.resize(5, 20);
+    let viewport: Vec<String> = grid.viewport.iter().map(row_plain_text).collect();
+    assert!(
+        viewport.contains(&"f1".to_string())
+            && viewport.contains(&"f2".to_string())
+            && viewport.contains(&"f3".to_string()),
+        "widening must keep the frames below the cursor: {viewport:?}"
+    );
+
+    grid.resize(4, 20);
+    let viewport: Vec<String> = grid.viewport.iter().map(row_plain_text).collect();
+    assert!(
+        viewport.contains(&"f1".to_string())
+            && viewport.contains(&"f2".to_string())
+            && viewport.contains(&"f3".to_string()),
+        "narrowing again must keep the frames below the cursor: {viewport:?}"
+    );
+}
+
+/// v1.13.12 FIX-A: a long (soft-wrapped) command line — the cursor logical
+/// line spans k=3 physical rows — must survive a resize with ALL its
+/// fragments visible. The old formula pinned the first fragment to the
+/// viewport bottom and dropped the later fragments (the wrapped tail under
+/// the cursor included).
+#[test]
+fn resize_keeps_all_wrapped_fragments_of_the_cursor_logical_line() {
+    let mut grid = Grid::with_scrollback(5, 10, 200);
+    let command = "c".repeat(25); // wraps into 3 rows at 10 columns
+    write_lines(&mut grid, &["h1", "h2", &command]);
+    // Cursor sits at the end of the wrapped command (last fragment).
+    assert_eq!(grid.cursor.row, 4);
+
+    grid.resize(3, 10);
+    let viewport: Vec<String> = grid.viewport.iter().map(row_plain_text).collect();
+    let expected_fragments = vec!["c".repeat(10), "c".repeat(10), "c".repeat(5)];
+    assert_eq!(
+        viewport, expected_fragments,
+        "all three wrapped fragments of the cursor line must stay visible"
+    );
+    assert_eq!(grid.cursor.row, 0, "cursor pins to the line's first row");
+    assert_eq!(
+        logical_lines(&grid),
+        vec!["h1".to_string(), "h2".to_string(), command],
+        "the document must stay intact around the window move"
+    );
+}
+
 /// 3B red line, Phase-4 grow branch (FIX_DRAG_RESIZE_STUTTER β, review
 /// P3-3): when the rewrapped document fits the new height
 /// (`total <= new_rows`), the viewport is padded with fresh rows. The
@@ -2327,6 +2420,88 @@ fn walker_pins_the_four_row_level_text_paths_to_one_sequence() {
     assert_eq!(display_text, "a中e\u{0301}x y");
 }
 
+// ── v1.13.12 FIX-D: row-end trim is per-CLUSTER ─────────────────────────
+
+/// A row ending in a space-led multi-scalar cluster (`"ab \u{0300}"`): the
+/// display / snapshot-extent / line-map byte-length paths all keep the
+/// cluster (the old per-lead-scalar trim dropped it); a pure-space row
+/// still trims to empty.
+#[test]
+fn row_trim_keeps_trailing_space_led_grapheme_clusters() {
+    let mut row = Row::new(8);
+    row.cells[0].character = 'a';
+    row.cells[1].character = 'b';
+    row.cells[2].character = ' '; // lead of " \u{0300}"
+    row.cells[2].flags = CellFlags::DIRTY | CellFlags::EXTRA;
+    row.extras
+        .set_grapheme(2, std::sync::Arc::from(" \u{0300}"));
+
+    // Path 1 — display (row_text via the Grid facade).
+    let mut grid = Grid::new(1, 8);
+    grid.viewport[0] = row.clone();
+    assert_eq!(grid.row_text(0), "ab \u{0300}");
+
+    // Path 2 — snapshot styled_row text.
+    let styled = super::snapshot::snapshot_row::styled_row(&row, 8, usize::MAX, None, &|_| None);
+    assert_eq!(styled.text, "ab \u{0300}");
+
+    // Path 3 — line-map extent + byte length.
+    assert_eq!(
+        super::snapshot_line_map::snapshot_row_extent(&row, 8),
+        3,
+        "the EXTRA cell at the row end counts as content"
+    );
+    assert_eq!(
+        super::snapshot_line_map::snapshot_row_text_len(&row, 8),
+        "ab \u{0300}".len()
+    );
+
+    // Pure-space rows still trim to empty on every path.
+    let mut blank = Row::new(8);
+    blank.cells[0].character = ' ';
+    blank.cells[0].flags = CellFlags::DIRTY;
+    blank.cells[1].character = ' ';
+    blank.cells[1].flags = CellFlags::DIRTY;
+    let mut grid2 = Grid::new(1, 8);
+    grid2.viewport[0] = blank.clone();
+    assert_eq!(grid2.row_text(0), "");
+    assert_eq!(super::snapshot_line_map::snapshot_row_extent(&blank, 8), 0);
+}
+
+/// The flat run path (scrollback storage — no Cell side data) applies the
+/// same per-cluster rule: a trailing space+combining cluster keeps its
+/// bytes, a trailing single-space run still trims.
+#[test]
+fn flat_row_snapshot_text_len_trims_per_cluster() {
+    let mut row = Row::new(8);
+    row.cells[0].character = 'a';
+    row.cells[1].character = 'b';
+    row.cells[2].character = ' ';
+    row.cells[2].flags = CellFlags::DIRTY | CellFlags::EXTRA;
+    row.extras
+        .set_grapheme(2, std::sync::Arc::from(" \u{0300}"));
+    let mut grid = Grid::with_scrollback(2, 8, 16);
+    grid.scrollback.push(row);
+    assert_eq!(
+        grid.scrollback.row_snapshot_text_len(0),
+        Some("ab \u{0300}".len()),
+        "the multi-scalar space-led cluster is content on the flat path too"
+    );
+
+    let mut row2 = Row::new(8);
+    row2.cells[0].character = 'a';
+    row2.cells[1].character = 'b';
+    row2.cells[2].character = ' ';
+    row2.cells[2].flags = CellFlags::DIRTY;
+    let mut grid2 = Grid::with_scrollback(2, 8, 16);
+    grid2.scrollback.push(row2);
+    assert_eq!(
+        grid2.scrollback.row_snapshot_text_len(0),
+        Some(2),
+        "a trailing single-space run still trims"
+    );
+}
+
 /// Selection passes `\0` through RAW (its own Grid-level helper, unlike
 /// the display/snapshot `\0`→space mapping) — the deliberate divergence
 /// pinned here so a future unification is a conscious decision.
@@ -2350,4 +2525,29 @@ fn selection_keeps_nul_cells_verbatim_in_simple_and_block_modes() {
         crate::selection::SelectionMode::Block,
     );
     assert_eq!(block.text_from_grid(&grid), "\u{0}b");
+}
+
+/// P2-2 (v1.13.12, FIX-D sync): the Simple/Line copy-text trim is
+/// per-CLUSTER — a space-led multi-scalar cluster at the row end is
+/// content, so the copied text keeps it (matching the display 口径).
+#[test]
+fn simple_selection_keeps_a_trailing_space_led_cluster() {
+    let mut grid = Grid::new(1, 8);
+    grid.viewport[0].cells[0].character = 'a';
+    grid.viewport[0].cells[1].character = ' '; // lead of " \u{0300}"
+    grid.viewport[0].cells[1].flags = CellFlags::DIRTY | CellFlags::EXTRA;
+    grid.viewport[0]
+        .extras
+        .set_grapheme(1, std::sync::Arc::from(" \u{0300}"));
+
+    let simple = crate::selection::Selection::new(
+        crate::selection::GridPos::new(0, 0),
+        crate::selection::GridPos::new(0, 7),
+        crate::selection::SelectionMode::Simple,
+    );
+    assert_eq!(
+        simple.text_from_grid(&grid),
+        "a \u{0300}",
+        "the trailing space+combining cluster must survive the copy trim"
+    );
 }

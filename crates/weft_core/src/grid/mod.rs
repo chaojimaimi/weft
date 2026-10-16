@@ -591,8 +591,8 @@ impl Grid {
     /// storage without truncation, convert the cursor to a content offset,
     /// rebuild the row index at the new width (zero content copies), map the
     /// offset back to a position, pop the new viewport off the bottom of
-    /// storage (dropping only the blank rows past the cursor), then apply
-    /// the retention limit.
+    /// storage (window anchor = cursor logical line + document tail, see
+    /// the `vp_start` note below), then apply the retention limit.
     ///
     /// This replaces the T2 bridge (materialize everything → legacy rewrap →
     /// re-encode, three full passes) with one `Index::rebuild`.
@@ -676,9 +676,17 @@ impl Grid {
             line_first -= 1;
         }
         let line_new_start = map.get(line_first).copied().map_or(0, |(first, _)| first);
-        let vp_start = line_new_start
-            .saturating_sub(new_rows.saturating_sub(1))
-            .min(new_total.saturating_sub(new_rows));
+        // v1.13.12 FIX-A: the old `min(L-(nr-1), T-nr)` pinned the cursor
+        // logical line's FIRST row to the viewport bottom and the pop-back
+        // dropped every row after it — non-blank rows BELOW the cursor
+        // (`CSI A` progress-bar frames) and wrap continuations included
+        // (blank rows below the cursor collapse at push time above).
+        // `min(L, T-nr)` = reflow 型终端（kitty/WezTerm 类）通用语义:
+        // (a) tail fits (B+k < nr) → window at the document tail, rows
+        // below the cursor kept; (b) else cursor line at TOP, rows below
+        // fall off the bottom edge. Prompt shape (k=1, B=0, T=L+1):
+        // min(L, L+1-nr) = L+1-nr — the old value exactly, point-identical.
+        let vp_start = line_new_start.min(new_total.saturating_sub(new_rows));
         let mut popped = self.scrollback.pop_rows(new_total.saturating_sub(vp_start));
         let popped_real = new_rows.min(popped.len());
         let mut viewport_rows: Vec<Row> = popped.drain(..popped_real).collect();

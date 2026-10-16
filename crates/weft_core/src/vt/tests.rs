@@ -1231,8 +1231,13 @@ fn candidate_ownership_reflows_with_startup_output_before_tui_takeover() {
     terminal.set_primary_history_view(true);
 
     let output = terminal.block_tracker().in_flight().unwrap().output;
+    // v1.13.12 FIX-A: the reflow window now aligns with the document tail —
+    // ALL six rewrapped startup fragments fit, so the fixture's own
+    // `banner` overwrite lands on the FIRST fragment ("startup l" →
+    // "bannerp l") instead of on a stale shell row. The untouched later
+    // fragments prove the reflowed startup output survived the resize.
     assert!(
-        output.contains("startup"),
+        output.contains("inear out") && output.contains("wraps bef"),
         "reflowed startup output was lost: {output:?}"
     );
     assert!(output.contains("banner"));
@@ -1655,20 +1660,25 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     );
     assert_eq!(t.grid().cell(0, 3).character, 'B');
 
-    // VS16 at line boundary (2-col grid): cluster width grows to 2 but
-    // there's no room to expand — cell stays width 1, cluster in extras.
-    // 'Y' wraps to the next line as usual.
+    // VS16 at line boundary (2-col grid): v1.13.12 FIX-C — the promoted
+    // cluster (width 2) sits ON the last column, so it straddles to the
+    // next row's col 0 (Full + spacer), exactly like a wide-char print.
+    // 'Y' then wraps again.
     let mut t = Terminal::new(4, 2);
     t.process("A*\u{fe0f}Y".as_bytes());
-    // v1.6.0: row_text returns the full cluster including VS16.
-    assert_eq!(t.grid().row_text(0), "A*\u{fe0f}");
-    assert!(t.grid().cell(0, 1).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().row_text(0), "A");
+    assert_eq!(t.grid().cell(0, 1).character, ' ', "old slot vacated");
+    assert!(!t.grid().cell(0, 1).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().viewport[0].extras.grapheme_at(1), None);
+    assert_eq!(t.grid().cell(1, 0).character, '*');
+    assert_eq!(t.grid().cell(1, 0).width, CellWidth::Full);
     assert_eq!(
-        t.grid().viewport[0].extras.grapheme_at(1),
+        t.grid().viewport[1].extras.grapheme_at(0),
         Some("*\u{fe0f}")
     );
-    assert_eq!(t.grid().row_text(1), "Y");
-    assert_eq!(t.grid().row_text(2), "");
+    assert!(t.grid().cell(1, 1).flags.contains(CellFlags::WIDE_SPACER));
+    assert_eq!(t.grid().row_text(1), "*\u{fe0f}");
+    assert_eq!(t.grid().row_text(2), "Y");
 
     // Regional flag at line boundary (2-col grid): flag wraps to next row.
     let mut t = Terminal::new(4, 2);
@@ -1680,31 +1690,35 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     assert_eq!(t.grid().viewport[1].extras.grapheme_at(0), Some("🇨🇳"));
     assert_eq!(t.grid().row_text(2), "Y");
 
-    // VS16 at end of 4-col row: cluster width grows but can't expand inline.
+    // VS16 at end of 4-col row: v1.13.12 FIX-C — the promoted cluster
+    // straddles to the next row instead of staying Half in place.
     let mut t = Terminal::new(4, 4);
     t.process("ABC*\u{fe0f}Y".as_bytes());
-    // v1.6.0: row_text returns the full cluster including VS16.
-    assert_eq!(t.grid().row_text(0), "ABC*\u{fe0f}");
-    assert!(t.grid().cell(0, 3).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().row_text(0), "ABC");
+    assert_eq!(t.grid().cell(0, 3).character, ' ', "old slot vacated");
+    assert_eq!(t.grid().viewport[0].extras.grapheme_at(3), None);
+    assert_eq!(t.grid().cell(1, 0).character, '*');
+    assert_eq!(t.grid().cell(1, 0).width, CellWidth::Full);
     assert_eq!(
-        t.grid().viewport[0].extras.grapheme_at(3),
+        t.grid().viewport[1].extras.grapheme_at(0),
         Some("*\u{fe0f}")
     );
-    assert_eq!(t.grid().row_text(1), "Y");
+    assert_eq!(t.grid().row_text(1), "*\u{fe0f}Y");
 
-    // v1.6.0: overwriting a cell with '*' + VS16 no longer destroys the
-    // hyperlink on a different row. The v1.5 fallback mechanism replaced
-    // '*' with U+FF1F and wrapped it, overwriting (1, 0). The v1.6.0 path
-    // keeps '*' at (0, 1) with the cluster in extras, leaving (1, 0) intact.
+    // v1.13.12 FIX-C: '*' + VS16 on the last column of a 2-col row now
+    // straddles onto (1, 0). The straddle must clear the overwritten cell's
+    // stale link completely (registry + extras + flag) and the moved
+    // cluster — printed with no active link — carries none.
     let mut t = Terminal::new(3, 2);
     t.process(b"\x1b[2;1H\x1b]8;;https://weft.dev/stale\x1b\\X\x1b]8;;\x1b\\");
     assert_eq!(t.hyperlinks().url_at(1, 0), Some("https://weft.dev/stale"));
     t.process("\x1b[1;2H*\u{fe0f}".as_bytes());
-    assert_eq!(t.grid().cell(0, 1).character, '*');
-    assert!(t.grid().cell(0, 1).flags.contains(CellFlags::EXTRA));
-    assert_eq!(t.grid().cell(1, 0).character, 'X');
-    assert_eq!(t.hyperlinks().url_at(1, 0), Some("https://weft.dev/stale"));
+    assert_eq!(t.grid().cell(1, 0).character, '*');
+    assert_eq!(t.grid().cell(1, 0).width, CellWidth::Full);
+    assert!(!t.grid().cell(1, 0).flags.contains(CellFlags::HYPERLINK));
+    assert_eq!(t.hyperlinks().url_at(1, 0), None);
     assert_eq!(t.hyperlinks().url_at(1, 1), None);
+    assert_eq!(t.grid().cell(0, 1).character, ' ');
 }
 
 #[test]
@@ -1734,6 +1748,76 @@ fn vs16_width_expansion_clears_displaced_cell_extras() {
     assert_eq!(t.grid().row_text(0), "*\u{fe0f}");
     assert_eq!(t.grid().grapheme_at(0, 1), None);
     assert!(t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+}
+
+// ── v1.13.12 FIX-C: VS16 promotion on the LAST column ───────────────────
+
+/// The promoted cluster lands on the final column: it straddles to the next
+/// row (Full + spacer at cols 0-1) with no residue in the old slot — the
+/// same shape as a wide-char print at the line boundary.
+#[test]
+fn vs16_promotion_on_last_column_straddles_to_next_row() {
+    let mut t = Terminal::new(4, 120);
+    t.process("X".repeat(119).as_bytes()); // cols 0..=118, cursor col 119
+    t.process("*\u{fe0f}".as_bytes()); // '*' on col 119, VS16 promotes it
+    assert_eq!(t.grid().cell(0, 119).character, ' ', "old slot vacated");
+    assert!(!t.grid().cell(0, 119).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().grapheme_at(0, 119), None);
+    assert!(
+        t.grid().viewport[0].wrapped,
+        "the straddled row is marked wrapped"
+    );
+    assert_eq!(t.grid().cell(1, 0).character, '*');
+    assert_eq!(t.grid().cell(1, 0).width, CellWidth::Full);
+    assert_eq!(t.grid().grapheme_at(1, 0), Some("*\u{fe0f}"));
+    assert!(t.grid().cell(1, 1).flags.contains(CellFlags::WIDE_SPACER));
+    assert_eq!(t.grid().cursor.row, 1);
+    assert_eq!(t.grid().cursor.col, 2);
+    assert!(!t.grid().cursor.wrap_pending);
+}
+
+/// num_cols == 1 leaves no room for a Full pair: the promotion is skipped
+/// (cluster stays Half in extras) and nothing panics.
+#[test]
+fn vs16_promotion_on_single_column_grid_does_not_expand() {
+    let mut t = Terminal::new(2, 1);
+    t.process("*\u{fe0f}".as_bytes());
+    assert_eq!(t.grid().cell(0, 0).character, '*');
+    assert_eq!(t.grid().grapheme_at(0, 0), Some("*\u{fe0f}"));
+    assert_eq!(t.grid().cell(0, 0).width, CellWidth::Half);
+}
+
+/// P2-1 (v1.13.12 rust-review): the straddle destination may itself hold a
+/// LINKED wide pair whose lead the straddle overwrites — the far half's
+/// spacer at new_col+2 keeps its hyperlink REGISTRY entry unless it is
+/// unlinked explicitly (`clear_wide_pair_at` resets cells + extras but not
+/// the registry, the T3 review P1 gap).
+#[test]
+fn vs16_straddle_unlinks_the_bisected_far_half_registry_entry() {
+    let mut t = Terminal::new(3, 6);
+    // Destination row 1: a linked wide char at cols 1-2 (lead col 1, its
+    // spacer — carrying the same link — at col 2).
+    t.process("\x1b[2;2H\x1b]8;;https://weft.dev/stale\x1b\\中\x1b]8;;\x1b\\".as_bytes());
+    assert_eq!(t.hyperlinks().url_at(1, 1), Some("https://weft.dev/stale"));
+    assert_eq!(
+        t.hyperlinks().url_at(1, 2),
+        Some("https://weft.dev/stale"),
+        "fixture: the spacer half carries the lead's link"
+    );
+
+    // Row 0: fill to the last column, then '*' + VS16 on col 5 straddles
+    // into row 1 cols 0-1, bisecting the linked pair's lead.
+    t.process(b"\x1b[1;1HAAAAA");
+    t.process("*\u{fe0f}".as_bytes());
+
+    assert_eq!(t.grid().cell(1, 0).character, '*');
+    assert_eq!(t.grid().cell(1, 0).width, CellWidth::Full);
+    assert!(t.grid().cell(1, 1).flags.contains(CellFlags::WIDE_SPACER));
+    assert_eq!(
+        t.hyperlinks().url_at(1, 2),
+        None,
+        "the bisected far half's registry entry must die with its pair"
+    );
 }
 
 #[test]
@@ -1874,6 +1958,21 @@ fn multiline_progress_bar_repaints_in_place_via_cursor_up_during_in_flight() {
         "in-flight progress repaint must not grow rows: {output:?}"
     );
     assert_eq!(output, "fetching: 100%\ndownloading:  50%\n");
+}
+
+/// v1.13.12 FIX-E: grid EL(1) erases [0..=col] INCLUDING the cursor cell —
+/// the block capture must consume the char at the cursor too, else the
+/// block text keeps a char the grid no longer shows. `abcd` + CHA col 2 +
+/// EL1 → `␣␣␣d` (the old capture left `␣␣cd`).
+#[test]
+fn erase_line_left_includes_the_cursor_char_in_block_output() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07cmd\n\x1b]133;B\x07\x1b]133;C\x07abcd");
+    t.process(b"\x1b[3G\x1b[1K"); // CHA to 0-based col 2, then EL(1)
+    t.process(b"\x1b]133;D;0\x07");
+
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(block.output.as_ref(), "   d");
 }
 
 #[test]
@@ -2956,6 +3055,100 @@ fn sgr_underline_color_58_does_not_leak_params_into_attributes() {
     assert!(
         !cell2.flags.contains(CellFlags::ITALIC),
         "the `5` inside 58;5;N must not enable ITALIC"
+    );
+}
+
+// ── v1.13.12 FIX-B: malformed 38/48/58 payloads skip their garbage ──────
+
+/// A truncated truecolor payload (`38;2;255` — G/B missing) consumes exactly
+/// its present values: no DIM from the `2`, no palette/R/G/B leak, and the
+/// following independent params still apply.
+#[test]
+fn sgr_truncated_truecolor_payload_does_not_leak() {
+    let mut t = term();
+    t.process(b"\x1b[38;2;255mA");
+    let cell = t.grid().cell(0, 0);
+    assert!(
+        !cell.flags.contains(CellFlags::DIM),
+        "the `2` kind inside 38;2;255 must not enable DIM"
+    );
+    assert_eq!(
+        cell.fg,
+        CellColor::Default,
+        "an incomplete payload must not pollute fg"
+    );
+
+    // Truncated palette form (`38;5` with the index missing): the next
+    // sequence is untouched.
+    let mut t2 = term();
+    t2.process(b"\x1b[38;5\x1b[31mred");
+    let cell2 = t2.grid().cell(0, 0);
+    assert_eq!(cell2.fg, CellColor::Palette(1), "31 must apply as red");
+    assert!(
+        !cell2.flags.contains(CellFlags::ITALIC),
+        "the orphan `5` must not enable ITALIC"
+    );
+}
+
+/// A truecolor form whose payload is followed by independent params: the
+/// first three values after `2` are the color, everything after is walked
+/// as its own SGR (`4` → underline, `31` → red).
+#[test]
+fn sgr_truecolor_extra_values_are_independent_params() {
+    let mut t = term();
+    t.process(b"\x1b[38;2;1;2;3;4;31mX");
+    let cell = t.grid().cell(0, 0);
+    assert_eq!(cell.fg, CellColor::Palette(1), "trailing 31 applies as red");
+    assert!(
+        cell.flags.contains(CellFlags::UNDERLINE),
+        "trailing 4 applies as underline"
+    );
+}
+
+/// Same malformed-payload contract for the flat 58 arm (P1-2: it was
+/// structurally identical to the 38/48 leak). Truncated `58;2;255` must not
+/// enable DIM nor store a partial underline color.
+#[test]
+fn sgr_truncated_underline_color_payload_does_not_leak() {
+    let mut t = term();
+    t.process(b"\x1b[58;2;255mA");
+    let cell = t.grid().cell(0, 0);
+    assert!(
+        !cell.flags.contains(CellFlags::DIM),
+        "the `2` kind inside 58;2;255 must not enable DIM"
+    );
+    assert_eq!(
+        cell.underline_color, None,
+        "an incomplete payload must not pollute the underline color"
+    );
+
+    // Full truecolor 58 followed by independent params: the second `4`
+    // applies as its own SGR.
+    let mut t2 = term();
+    t2.process(b"\x1b[58;2;1;2;3;4;4mY");
+    let cell2 = t2.grid().cell(0, 0);
+    assert_eq!(
+        cell2.underline_color,
+        Some(CellColor::Rgb(Color::rgb(1, 2, 3)))
+    );
+    assert!(
+        cell2.flags.contains(CellFlags::UNDERLINE),
+        "the second 4 must apply independently"
+    );
+}
+
+/// An unknown color kind (non-2/5) consumes only the kind itself — the
+/// following params stay independent (`1` → bold, `31` → red).
+#[test]
+fn sgr_unknown_color_kind_consumes_only_the_kind() {
+    let mut t = term();
+    t.process(b"\x1b[38;9;1;31mX");
+    let cell = t.grid().cell(0, 0);
+    assert!(cell.flags.contains(CellFlags::BOLD), "1 must apply as bold");
+    assert_eq!(cell.fg, CellColor::Palette(1), "31 must apply as red");
+    assert_eq!(
+        cell.character, 'X',
+        "sanity: the printable survives the walk"
     );
 }
 

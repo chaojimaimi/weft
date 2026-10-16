@@ -22,7 +22,7 @@
 //!   `_with_ownership_masks`), so any drift between the two walks fails.
 
 use super::snapshot::snapshot_text_budget;
-use super::{walk_cells, Grid, Row};
+use super::{walk_cells, CellFlags, Grid, Row};
 
 /// Shared cell-extent rule: last non-blank cell of a row's snapshot text
 /// (cells beyond it are not part of the text). `pub(crate)` so the snapshot
@@ -34,10 +34,19 @@ use super::{walk_cells, Grid, Row};
 /// width (see `Scrollback::resize_cols`), and the snapshot must contain the
 /// complete history line. Viewport rows are always exactly `num_cols` wide,
 /// so for them the two widths coincide.
+///
+/// v1.13.12 FIX-D: the trim is per-CLUSTER — a cell carrying EXTRA data
+/// (a multi-scalar cluster, e.g. space + combining mark) is content even
+/// when its lead scalar is a space. Kept in lockstep with
+/// `display::row_display_text` (cell side) and `flat::row_snapshot_text_len`
+/// (run side — "single-' ' run" rule).
 pub(crate) fn snapshot_row_extent(row: &Row, _num_cols: usize) -> usize {
     row.cells
         .iter()
-        .rposition(|cell| cell.character != ' ' && cell.character != '\0')
+        .rposition(|cell| {
+            cell.flags.contains(CellFlags::EXTRA)
+                || (cell.character != ' ' && cell.character != '\0')
+        })
         .map(|index| index + 1)
         .unwrap_or(0)
 }

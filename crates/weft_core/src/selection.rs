@@ -139,9 +139,12 @@ impl Selection {
 /// rows through the Row walker.
 ///
 /// Semantics kept verbatim per branch: `trim = true` (`Simple`/`Line`)
-/// first finds the last cell whose char is NOT a literal space — which
-/// deliberately COUNTS `\0` cells as content — then walks
-/// `[col_start..=last]`; `trim = false` (`Block`) walks the range whole.
+/// first finds the last CONTENTFUL cell — v1.13.12 P2-2 (FIX-D sync): the
+/// trim is per-CLUSTER, so a cell carrying `EXTRA` cluster data counts as
+/// content even when its lead scalar is a space (same rule as
+/// `display::row_display_text` / `snapshot_row_extent`); `\0` cells remain
+/// deliberately counted as content — then walks `[col_start..=last]`;
+/// `trim = false` (`Block`) walks the range whole.
 /// `ch` is pushed RAW: selection passes `\0` through unchanged (unlike
 /// display/snapshot, which map it to a space — known quirk, recorded in
 /// PROGRESS; not "fixed" here under the zero-behavior red line).
@@ -155,7 +158,7 @@ fn row_cells_text(grid: &Grid, row: usize, col_start: usize, col_end: usize, tri
             if cell.flags.contains(CellFlags::WIDE_SPACER) {
                 continue;
             }
-            if cell.character != ' ' {
+            if cell.flags.contains(CellFlags::EXTRA) || cell.character != ' ' {
                 last = col;
             }
         }

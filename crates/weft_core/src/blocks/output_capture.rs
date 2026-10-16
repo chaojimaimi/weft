@@ -406,14 +406,29 @@ impl OutputCapture {
                 self.erase_style_range(self.char_cursor, line_end_char);
             }
             1 => {
-                // Erase from start of line to cursor (inclusive). The erased
-                // range is replaced with spaces, which are default-styled —
-                // drop any style runs in the range. Same-length rewrite: the
-                // char ledger is untouched.
-                let replacement = " ".repeat(self.text[start..self.cursor].chars().count());
-                self.text.replace_range(start..self.cursor, &replacement);
-                self.cursor = start + replacement.len();
-                self.erase_style_range(line_start_char, self.char_cursor);
+                // Erase from start of line to cursor — v1.13.12 FIX-E:
+                // INCLUDING the cursor cell, matching grid `clear_line_left`
+                // ([0..=col]). The extra consumed unit is exactly the char
+                // at the cursor (the first grapheme — in capture text every
+                // printed grapheme is one char: wide chars carry no filler
+                // and combining marks never reach the stream). The rewrite
+                // stays same-length in CHAR space (N chars → N spaces), so
+                // the char ledger is untouched; the cursor keeps pointing
+                // at the space that replaced the cursor char, ready for the
+                // next print to overwrite (the grid cursor also stays put).
+                let pre_chars = self.text[start..self.cursor].chars().count();
+                let cursor_char_len = self.text[self.cursor..end]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+                let erase_end = self.cursor + cursor_char_len;
+                let replacement = " ".repeat(self.text[start..erase_end].chars().count());
+                self.text.replace_range(start..erase_end, &replacement);
+                self.cursor = start + pre_chars;
+                self.erase_style_range(
+                    line_start_char,
+                    self.char_cursor + u32::from(cursor_char_len > 0),
+                );
             }
             2 => {
                 // Erase entire line.

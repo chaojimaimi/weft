@@ -51,9 +51,15 @@ pub(crate) fn walk_cells<'a>(
 /// multi-scalar cluster; `\0` renders as a space; trailing blanks trimmed.
 pub(crate) fn row_display_text(row: &Row, cols: usize) -> String {
     let width = cols.min(row.cells.len());
+    // v1.13.12 FIX-D: the trim is per-CLUSTER — a cell carrying EXTRA data
+    // (a multi-scalar cluster, e.g. space + combining mark) is content even
+    // when its lead scalar is a space.
     let last = row.cells[..width]
         .iter()
-        .rposition(|cell| cell.character != ' ' && cell.character != '\0')
+        .rposition(|cell| {
+            cell.flags.contains(CellFlags::EXTRA)
+                || (cell.character != ' ' && cell.character != '\0')
+        })
         .map_or(0, |index| index + 1);
     let mut out = String::with_capacity(last);
     // v1.12.27a (P1-01): the walk is the shared [`walk_cells`] rule; this

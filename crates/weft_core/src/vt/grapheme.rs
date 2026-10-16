@@ -78,14 +78,24 @@ impl Terminal {
         };
         let old_width = self.grid.viewport[row].cells[col].width as usize;
 
-        let need_expand = new_width > old_width
-            && self.grid.viewport[row].cells[col].width == CellWidth::Half
-            && col + 1 < num_cols;
+        let need_expand =
+            new_width > old_width && self.grid.viewport[row].cells[col].width == CellWidth::Half;
+        // v1.13.12 FIX-C: promotion ON the last column (`col + 1 >= num_cols`)
+        // — the cluster now renders width 2 but no spacer cell exists. With
+        // num_cols >= 2, straddle exactly like the wide-char print path
+        // (perform.rs): deferred wrap first, then the whole cluster cell
+        // moves to the next row's col 0 (Full + spacer). num_cols < 2 keeps
+        // the old no-expand behavior (a Full pair has nowhere to live).
+        let straddle = need_expand && num_cols >= 2 && col + 1 >= num_cols;
         {
             let cell = &mut self.grid.viewport[row].cells[col];
             cell.flags.insert(CellFlags::EXTRA | CellFlags::DIRTY);
         }
-        if need_expand {
+        if straddle {
+            self.straddle_expanded_cluster(row, col);
+            return true;
+        }
+        if need_expand && col + 1 < num_cols {
             // Cluster became wider — expand to Full and insert a spacer.
             // Clear whatever was at col+1 first (could be a written char or
             // the cursor's current position).
@@ -117,5 +127,119 @@ impl Terminal {
         }
         self.grid.viewport[row].mark_dirty(col);
         true
+    }
+
+    /// v1.13.12 FIX-C: a cluster that just grew to width 2 while sitting on
+    /// the LAST column moves to the next row's col 0. Mirrors the wide-char
+    /// straddle in `perform.rs` (`deferred_wrap_newline` + the
+    /// primary-screen exit/ownership hooks + hyperlink registry / extras
+    /// migration, spacer half included).
+    pub(super) fn straddle_expanded_cluster(&mut self, row: usize, col: usize) {
+        // Snapshot everything the move carries BEFORE the wrap: at the
+        // scroll-region bottom `deferred_wrap_newline` scrolls the grid and
+        // invalidates the `row` index.
+        let cell = self.grid.viewport[row].cells[col];
+        let cluster = self.grid.viewport[row].extras.grapheme_arc_at(col);
+        let link = self.grid.viewport[row].extras.hyperlink_id_at(col);
+
+        // Vacate the old slot — the cluster now lives on the next row.
+        self.grid.viewport[row].cells[col].reset();
+        self.grid.viewport[row].extras.clear_cell(col);
+        self.hyperlinks.unlink_cell(row, col);
+        self.grid.viewport[row].mark_dirty(col);
+
+        self.deferred_wrap_newline();
+        let new_row = self.grid.cursor.row;
+        let new_col = self.grid.cursor.col; // 0 right after the wrap
+        self.prepare_primary_screen_exit_row_overwrite();
+        self.include_primary_screen_viewport_row(new_row);
+
+        // T3 review P1 (P2-1): mirror the wrap-first print site — detect a
+        // bisected wide pair's FAR half BEFORE the clears mutate the row.
+        // `clear_wide_pair_at` resets cells + extras but NOT the hyperlink
+        // registry side-map, so a linked lead at new_col+1 whose spacer sits
+        // at new_col+2 leaves a stale clickable link behind unless it is
+        // unlinked here.
+        let num_cols = self.grid.num_cols;
+        let next_bisected = new_col + 2 < num_cols
+            && self.grid.viewport[new_row].cells[new_col + 1].width == CellWidth::Full
+            && self.grid.viewport[new_row].cells[new_col + 2]
+                .flags
+                .contains(CellFlags::WIDE_SPACER);
+
+        // Destination hygiene, same as the wrap-first print site: clear
+        // stale pair halves and orphaned extras before the write.
+        self.grid.viewport[new_row].clear_wide_pair_at(new_col);
+        self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
+        self.grid.viewport[new_row].extras.clear_grapheme(new_col);
+        self.grid.viewport[new_row]
+            .extras
+            .clear_grapheme(new_col + 1);
+        {
+            let cells = &mut self.grid.viewport[new_row].cells;
+            let lead = &mut cells[new_col];
+            lead.character = cell.character;
+            lead.fg = cell.fg;
+            lead.bg = cell.bg;
+            lead.flags = cell.flags | CellFlags::DIRTY;
+            lead.width = CellWidth::Full;
+            lead.underline_style = cell.underline_style;
+            lead.underline_color = cell.underline_color;
+            let spacer = &mut cells[new_col + 1];
+            spacer.character = ' ';
+            spacer.flags = CellFlags::WIDE_SPACER;
+            spacer.width = CellWidth::Half;
+        }
+        // Re-attach the cluster string and the hyperlink on the new row;
+        // the spacer carries the lead's link (T3 P3-2 two-half hover shape).
+        if let Some(cluster) = cluster {
+            self.grid.viewport[new_row]
+                .extras
+                .set_grapheme(new_col, cluster);
+        }
+        match link {
+            Some(id) => {
+                self.hyperlinks.link_cell(new_row, new_col, id);
+                self.hyperlinks.link_cell(new_row, new_col + 1, id);
+            }
+            None => {
+                self.hyperlinks.unlink_cell(new_row, new_col);
+                self.hyperlinks.unlink_cell(new_row, new_col + 1);
+            }
+        }
+        self.grid.viewport[new_row]
+            .extras
+            .set_hyperlink(new_col, link);
+        self.grid.viewport[new_row]
+            .extras
+            .set_hyperlink(new_col + 1, link);
+        {
+            let cells = &mut self.grid.viewport[new_row].cells;
+            match link {
+                Some(_) => {
+                    cells[new_col].flags |= CellFlags::HYPERLINK;
+                    cells[new_col + 1].flags |= CellFlags::HYPERLINK;
+                }
+                None => {
+                    cells[new_col].flags.remove(CellFlags::HYPERLINK);
+                    cells[new_col + 1].flags.remove(CellFlags::HYPERLINK);
+                }
+            }
+        }
+        self.grid.viewport[new_row].mark_dirty(new_col);
+        self.grid.viewport[new_row].mark_dirty(new_col + 1);
+        // T3 review P1: the bisected far half's registry entry dies with
+        // its pair (extras were handled by clear_wide_pair_at).
+        if next_bisected {
+            self.hyperlinks.unlink_cell(new_row, new_col + 2);
+        }
+
+        // Cursor lands past the moved pair, clamped like the print path
+        // (num_cols == 2 → col 2 → wrap_pending + clamp to 1).
+        self.grid.cursor.col = new_col + 2;
+        if self.grid.cursor.col >= self.grid.num_cols {
+            self.grid.cursor.wrap_pending = true;
+            self.grid.cursor.col = self.grid.num_cols - 1;
+        }
     }
 }

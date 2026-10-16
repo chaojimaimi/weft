@@ -192,6 +192,70 @@ fn erase_line_mode_2_clears_all_styles_on_line() {
     assert!(styled.line(1).is_none(), "line 1 had all styles erased");
 }
 
+// ── v1.13.12 FIX-E: EL(1) includes the char at the cursor ───────────────
+
+/// Grid `clear_line_left` erases [0..=col] INCLUDING the cursor cell, so
+/// the capture must consume the char AT the cursor too: `abcd` + CHA col 2
+/// + EL1 leaves `␣␣␣d` (was `␣␣cd`).
+#[test]
+fn erase_line_mode_1_includes_the_char_at_the_cursor() {
+    let mut output = OutputCapture::default();
+    output.print_ascii(b"abcd", CapturedStyle::default(), 1024);
+    output.set_cursor_column(2, 1024);
+    output.erase_line(1);
+    assert_eq!(output.as_str(), "   d");
+    // The cursor sits on the space that replaced the erased char — the
+    // next print overwrites it onward (grid: the cursor stays put after
+    // EL1, "XY" reprints over cols 2-3).
+    output.print_ascii(b"XY", CapturedStyle::default(), 1024);
+    assert_eq!(output.as_str(), "  XY");
+}
+
+/// The style drop extends over the cursor char: the erased range's style
+/// runs die, the char after it keeps its own.
+#[test]
+fn erase_line_mode_1_drops_style_through_the_cursor_char() {
+    let mut output = OutputCapture::default();
+    output.print_ascii(b"ab", fg_style(1), 1024);
+    output.print_ascii(b"cd", fg_style(2), 1024);
+    output.set_cursor_column(2, 1024);
+    output.erase_line(1);
+    let (text, styled) = output.take_styled();
+    assert_eq!(text, "   d");
+    let styled = styled.expect("styled");
+    let line = styled.line(0).expect("line 0");
+    assert_eq!(line.foreground_at(2), None, "cursor char's style dropped");
+    assert_eq!(line.foreground_at(3), Some(CellColor::Palette(2)));
+}
+
+/// A wide char at the cursor is consumed WHOLE (1 char in capture text —
+/// no filler), keeping the cursor on a char boundary.
+#[test]
+fn erase_line_mode_1_consumes_a_wide_cursor_char_whole() {
+    let mut output = OutputCapture::default();
+    output.print('a', CapturedStyle::default(), 1024);
+    output.print('安', CapturedStyle::default(), 1024);
+    output.print('b', CapturedStyle::default(), 1024);
+    // CHA to display col 1 lands ON the wide char.
+    output.set_cursor_column(1, 1024);
+    output.erase_line(1);
+    assert_eq!(output.as_str(), "  b");
+    // The cursor is char-boundary safe for the next print: it sits on the
+    // space that replaced 安, so 'Z' lands there ('b' stays).
+    output.print_ascii(b"Z", CapturedStyle::default(), 1024);
+    assert_eq!(output.as_str(), " Zb");
+}
+
+/// EL1 with the cursor at the line end consumes nothing extra (no char at
+/// the cursor) — byte-identical to the pre-FIX-E behavior.
+#[test]
+fn erase_line_mode_1_at_line_end_is_unchanged() {
+    let mut output = OutputCapture::default();
+    output.print_ascii(b"abcd", CapturedStyle::default(), 1024);
+    output.erase_line(1);
+    assert_eq!(output.as_str(), "    ");
+}
+
 #[test]
 fn multiline_capture_indexes_lines_independently() {
     let mut output = OutputCapture::default();

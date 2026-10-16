@@ -56,29 +56,39 @@ pub(super) fn apply_flat_sgr(attrs: &mut Attrs, vals: &[u16]) {
             29 => attrs.flags.remove(CellFlags::STRIKETHROUGH),
             30..=37 => attrs.fg = CellColor::Palette((v - 30) as u8),
             38 => {
-                if let Some((color, skip)) = parse_sgr_color(vals, i + 1) {
+                // v1.13.12 FIX-B: parse_sgr_color ALWAYS reports how many
+                // values the 38-form consumed — on a malformed payload the
+                // garbage bytes are skipped instead of leaking into the flat
+                // walk as DIM/reset/… (same whole-group semantics as the 58
+                // colon form, AUDIT_v1.10.39 P0-1).
+                let (color, skip) = parse_sgr_color(vals, i + 1);
+                if let Some(color) = color {
                     attrs.fg = color;
-                    i += skip;
                 }
+                i += skip;
             }
             39 => attrs.fg = CellColor::Default,
             40..=47 => attrs.bg = CellColor::Palette((v - 40) as u8),
             48 => {
-                if let Some((color, skip)) = parse_sgr_color(vals, i + 1) {
+                let (color, skip) = parse_sgr_color(vals, i + 1);
+                if let Some(color) = color {
                     attrs.bg = color;
-                    i += skip;
                 }
+                i += skip;
             }
             49 => attrs.bg = CellColor::Default,
             // Underline color set/reset (AUDIT_v1.10.39 P0-1 + v1.11.3).
             // Consumed here so `2`/`5`/`0` payload bytes can't leak into
             // the flat walk as DIM/ITALIC/reset; the color is STORED now
             // (colon form `58:x` was dispatched in the group view).
+            // v1.13.12 FIX-B: the flat 58 arm skips malformed payloads by
+            // the same consumed-count contract as 38/48 above.
             58 => {
-                if let Some((color, skip)) = parse_sgr_color(vals, i + 1) {
+                let (color, skip) = parse_sgr_color(vals, i + 1);
+                if let Some(color) = color {
                     attrs.underline_color = Some(color);
-                    i += skip;
                 }
+                i += skip;
             }
             59 => attrs.underline_color = None,
             90..=97 => attrs.fg = CellColor::Palette((v - 90 + 8) as u8),
@@ -92,26 +102,50 @@ pub(super) fn apply_flat_sgr(attrs: &mut Attrs, vals: &[u16]) {
 }
 
 /// Parse SGR color starting after the 38/48/58 marker.
-/// Returns `(CellColor, skip_count)` where skip_count is how many extra
-/// values (beyond the 38/48/58) were consumed. Stores the *origin* (palette
-/// index or explicit RGB) rather than resolving against the palette, so a
-/// theme/palette change can recolor already-written cells.
-fn parse_sgr_color(vals: &[u16], start: usize) -> Option<(CellColor, usize)> {
-    let kind = vals.get(start).copied()?;
+///
+/// v1.13.12 FIX-B: returns `(color, consumed)` where `consumed` counts how
+/// many values the color form used IN TOTAL, computed from how many payload
+/// values are ACTUALLY present — a truncated/malformed sequence skips
+/// exactly its garbage instead of leaking it into the flat walk:
+/// - `5` form: consumed ≤ 2 (kind + palette index when present);
+/// - `2` form: consumed ≤ 4 (kind + however many of R/G/B exist);
+/// - kind missing: consumed 0;
+/// - unknown kind (not 2/5): consumed 1 (the kind alone).
+///
+/// `color` is `None` whenever the form is incomplete/unknown — the caller
+/// must skip `consumed` values without applying anything. Stores the
+/// *origin* (palette index or explicit RGB) rather than resolving against
+/// the palette, so a theme/palette change can recolor already-written cells.
+fn parse_sgr_color(vals: &[u16], start: usize) -> (Option<CellColor>, usize) {
+    let Some(kind) = vals.get(start).copied() else {
+        return (None, 0);
+    };
     match kind {
         // Indexed 256-color: 38;5;N
-        5 => {
-            let idx = vals.get(start + 1).copied()?.min(255) as u8;
-            Some((CellColor::Palette(idx), 2))
-        }
-        // Truecolor: 38;2;R;G;B
+        5 => match vals.get(start + 1) {
+            Some(&idx) => (Some(CellColor::Palette(idx.min(255) as u8)), 2),
+            None => (None, 1),
+        },
+        // Truecolor: 38;2;R;G;B — consume only the payload values that are
+        // actually present (a truncated `38;2;255` eats kind+R, never the
+        // following independent SGR params).
         2 => {
-            let r = vals.get(start + 1).copied()? as u8;
-            let g = vals.get(start + 2).copied()? as u8;
-            let b = vals.get(start + 3).copied()? as u8;
-            Some((CellColor::Rgb(Color::rgb(r, g, b)), 4))
+            let rgb = [
+                vals.get(start + 1).copied(),
+                vals.get(start + 2).copied(),
+                vals.get(start + 3).copied(),
+            ];
+            let present = rgb.iter().filter(|v| v.is_some()).count();
+            if present == 3 {
+                let r = rgb[0].unwrap_or(0) as u8;
+                let g = rgb[1].unwrap_or(0) as u8;
+                let b = rgb[2].unwrap_or(0) as u8;
+                (Some(CellColor::Rgb(Color::rgb(r, g, b))), 4)
+            } else {
+                (None, 1 + present)
+            }
         }
-        _ => None,
+        _ => (None, 1),
     }
 }
 
