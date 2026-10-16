@@ -45,6 +45,30 @@ pub fn mask(text: &str) -> String {
     out
 }
 
+/// v1.13.10 FIX (audit P1): char-count- and newline-preserving mask for the
+/// block-finalize path. Captured style runs (`CapturedStyleRun`) are
+/// char-indexed, so the fixed-length [`mask`] replacement desynced spans from
+/// text and finalize had to drop the whole block's colors on any match.
+/// Replacing per char — with `\n` kept so `StyledLine` line indices survive
+/// multi-line matches (PEM blocks) — keeps spans aligned. Same pattern set
+/// and replacement order as [`mask`]; the AI/export paths keep [`mask`]
+/// (fixed width, no alignment need).
+pub fn mask_aligned(text: &str) -> String {
+    let mut out = text.to_string();
+    for re in patterns() {
+        match re.replace_all(&out, |caps: &regex::Captures| {
+            caps[0]
+                .chars()
+                .map(|c| if c == '\n' { c } else { '•' })
+                .collect::<String>()
+        }) {
+            std::borrow::Cow::Borrowed(_) => {}
+            std::borrow::Cow::Owned(s) => out = s,
+        }
+    }
+    out
+}
+
 /// Compiled redaction patterns (v1.8 AI integration). Broader than `mask`:
 /// catches inline credentials that would leak via AI prompts (Bearer tokens,
 /// `password=`, `api_key=`, URL userinfo, env assignments). Cached after
@@ -247,5 +271,59 @@ mod tests {
         let r = redact_for_ai(s);
         // value preserved (too short to look like a real secret)
         assert!(r.contains("password=abc"));
+    }
+
+    // --- v1.13.10 FIX (audit P1): mask_aligned (capture-side) ---
+
+    #[test]
+    fn mask_aligned_preserves_char_count() {
+        let s = "key=sk-abcdefghijklmnopqrstuvwxyz1234567890abcd end";
+        let m = mask_aligned(s);
+        assert_eq!(m.chars().count(), s.chars().count());
+        assert!(m.starts_with("key=•"), "match masked in place: {m:?}");
+        assert!(!m.contains("sk-abcdefghijklmnop"));
+        assert!(m.ends_with(" end"), "surroundings untouched");
+    }
+
+    #[test]
+    fn mask_aligned_keeps_multibyte_surroundings() {
+        let s = "中文提示：sk-abcdefghijklmnopqrstuvwxyz1234567890abcd 完成";
+        let m = mask_aligned(s);
+        assert_eq!(m.chars().count(), s.chars().count());
+        assert!(m.contains("中文提示：•"), "got: {m:?}");
+        assert!(m.ends_with("完成"));
+    }
+
+    #[test]
+    fn mask_aligned_preserves_pem_line_structure() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQ\n-----END PRIVATE KEY-----\nafter";
+        let m = mask_aligned(pem);
+        assert_eq!(m.chars().count(), pem.chars().count());
+        assert_eq!(m.lines().count(), pem.lines().count(), "newline count kept");
+        let lines: Vec<&str> = m.lines().collect();
+        assert!(lines[0].chars().all(|c| c == '•'), "got: {:?}", lines[0]);
+        assert!(lines[1].chars().all(|c| c == '•'));
+        assert!(lines[2].chars().all(|c| c == '•'));
+        assert_eq!(lines[3], "after", "trailing line untouched");
+    }
+
+    #[test]
+    fn mask_aligned_multi_pattern_coexistence() {
+        let s = "sk-abcdefghijklmnopqrstuvwxyz1234567890abcd \
+                 ghp_0123456789abcdefghijklmnopqrstuvwxyzABCD tail";
+        let m = mask_aligned(s);
+        assert_eq!(m.chars().count(), s.chars().count());
+        assert!(!m.contains("sk-"));
+        assert!(!m.contains("ghp_"));
+        assert!(m.ends_with(" tail"));
+        // '•' is not in any pattern's char class — no double-masking drift.
+        let again = mask_aligned(&m);
+        assert_eq!(again.chars().count(), m.chars().count());
+    }
+
+    #[test]
+    fn mask_aligned_no_match_is_identity() {
+        let s = "plain output with no secrets\nsecond line 中文";
+        assert_eq!(mask_aligned(s), s);
     }
 }

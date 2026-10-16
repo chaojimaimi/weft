@@ -101,11 +101,24 @@ impl BlockTracker {
         let screen_owned = self.screen_document_start.take().is_some();
         self.continuation_candidate = None;
 
-        let output = crate::secrets::mask(&raw_output);
+        // v1.13.10 FIX (audit P1): mask_aligned preserves char counts and
+        // newlines, so the char-indexed style runs still align to the masked
+        // text — a masked block keeps its colors instead of losing all of
+        // them. The guard compares per-line char counts as a safety net: a
+        // future mask rule that ever changes length or line structure falls
+        // back to dropping styles (the old behavior) rather than rendering
+        // misaligned spans. (`redact_for_ai`/`redact_for_export` keep the
+        // fixed-width [`secrets::mask`] — they have no alignment need.)
+        let output = crate::secrets::mask_aligned(&raw_output);
         // v1.7.0-A: prefer the freshly-captured styled output from the RLE.
         // Fall back to the screen-snapshot styled_output (primary-screen TUI
         // blocks) only when the capture path didn't produce one.
-        let styled_output = if output == raw_output {
+        let spans_align = output == raw_output
+            || output
+                .lines()
+                .map(|line| line.chars().count())
+                .eq(raw_output.lines().map(|line| line.chars().count()));
+        let styled_output = if spans_align {
             captured_styled
                 .map(Arc::new)
                 .or_else(|| self.styled_output.take())

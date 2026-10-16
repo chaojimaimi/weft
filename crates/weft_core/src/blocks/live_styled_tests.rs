@@ -243,3 +243,41 @@ fn screen_takeover_clears_plain_phase_snapshot() {
         "no orphan styled output after takeover finalize"
     );
 }
+
+/// v1.13.10 FIX (audit P1): output containing a secret pattern used to
+/// lose the WHOLE block's colors at finalize — the fixed-width mask
+/// desynced the char-indexed style runs, so finalize dropped
+/// styled_output. mask_aligned keeps char counts and newlines aligned.
+#[test]
+fn masked_secret_output_keeps_styled_output() {
+    let mut t = Terminal::new(24, 80);
+    boot_prompt(&mut t);
+    t.process(b"\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"\x1b[31mexport KEY=sk-abcdefghijklmnopqrstuvwxyz1234567890abcd\x1b[0m done\r\n");
+    t.process(b"\x1b]133;D;0\x07");
+    let block = t.block_tracker().blocks().last().expect("one block");
+    let output = block.output.as_ref();
+    assert!(
+        !output.contains("sk-abcdefghijklmnop"),
+        "secret masked, got: {output:?}"
+    );
+    let styled = block
+        .styled_output
+        .as_deref()
+        .expect("masked block KEEPS styled output (v1.13.10)");
+    let line = styled.line(0).expect("line 0 of the masked block");
+    assert_eq!(
+        line.foreground_at(0),
+        Some(CellColor::Palette(1)),
+        "first char keeps SGR 31 foreground"
+    );
+    // Alignment proof: the 'done' tail after the SGR reset must sit at the
+    // same char index as printed (default fg → None), i.e. the mask did
+    // not shift any span.
+    let line_len = output.lines().next().expect("non-empty").chars().count();
+    assert_eq!(
+        line.foreground_at(line_len - 1),
+        None,
+        "mask must not shift span indices"
+    );
+}
