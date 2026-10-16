@@ -5534,3 +5534,69 @@ fn bench_shrink_and_grow_resize_18900_lines() {
         eprintln!("cycle {cycle}: shrink={s:?} grow={g:?}");
     }
 }
+
+/// 2026-10-16 forensics (audit P0), v1.13.10 FIX: `print_ascii_run`'s stale
+/// hyperlink unlink used a fixed `[usize; 128]` and indexed out of bounds when
+/// a >=129-cell stale-link row was overwritten by an ASCII run on a wide
+/// terminal. The fix unlinks eagerly before the overwrite (unbounded).
+#[test]
+fn hyperlink_unlink_survives_full_row_overwrite() {
+    let mut t = Terminal::new(34, 130);
+    // 1. Active OSC 8 link + 130 columns of ASCII → all 130 cells flagged.
+    t.process(b"\x1b]8;;http://example.com/very/long\x1b\\");
+    t.process(b"A".repeat(130).as_slice());
+    // 2. Close the link (active id None, cell_map non-empty).
+    t.process(b"\x1b]8;;\x1b\\");
+    // 3. Plain ASCII run overwrites all 130 flagged cells — must not panic.
+    t.process(b"\r");
+    t.process(b"B".repeat(130).as_slice());
+    for c in 0..130 {
+        let cell = t.grid().cell(0, c);
+        assert_eq!(cell.character, 'B', "col {c}");
+        assert!(
+            !cell.flags.contains(crate::grid::CellFlags::HYPERLINK),
+            "col {c} kept a stale hyperlink flag"
+        );
+    }
+}
+
+/// Boundary twin: exactly 128 linked cells must unlink cleanly too.
+#[test]
+fn hyperlink_unlink_survives_128_cell_boundary() {
+    let mut t = Terminal::new(34, 130);
+    t.process(b"\x1b]8;;http://example.com\x1b\\");
+    t.process(b"A".repeat(128).as_slice());
+    t.process(b"\x1b]8;;\x1b\\");
+    t.process(b"\r");
+    t.process(b"B".repeat(128).as_slice());
+    for c in 0..128 {
+        let cell = t.grid().cell(0, c);
+        assert_eq!(cell.character, 'B', "col {c}");
+        assert!(
+            !cell.flags.contains(crate::grid::CellFlags::HYPERLINK),
+            "col {c} kept a stale hyperlink flag"
+        );
+    }
+}
+
+/// One print run spanning two rows, both carrying stale links — the unlink
+/// pre-scan must run per row segment inside the chunk loop.
+#[test]
+fn hyperlink_unlink_survives_multiline_overwrite() {
+    let mut t = Terminal::new(34, 130);
+    t.process(b"\x1b]8;;http://example.com\x1b\\");
+    t.process(b"A".repeat(260).as_slice()); // rows 0 and 1 fully linked
+    t.process(b"\x1b]8;;\x1b\\");
+    t.process(b"\x1b[1;1H"); // home cursor, clears wrap_pending
+    t.process(b"B".repeat(260).as_slice()); // rewrite both rows in one run
+    for r in 0..2 {
+        for c in 0..130 {
+            let cell = t.grid().cell(r, c);
+            assert_eq!(cell.character, 'B', "row {r} col {c}");
+            assert!(
+                !cell.flags.contains(crate::grid::CellFlags::HYPERLINK),
+                "row {r} col {c} kept a stale hyperlink flag"
+            );
+        }
+    }
+}

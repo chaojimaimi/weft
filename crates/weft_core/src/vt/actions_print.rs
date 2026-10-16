@@ -119,6 +119,30 @@ impl Terminal {
             self.grid.viewport[row].clear_wide_pair_at(col);
             self.grid.viewport[row].clear_wide_pair_at(col + count - 1);
 
+            // v1.13.10 FIX (audit P0): stale-hyperlink unlink used to collect
+            // positions into a fixed `[usize; 128]` inside the write loop and
+            // indexed past the end on wide terminals (cols > 128 with a
+            // >=129-cell stale-link row) — an index-out-of-bounds panic on the
+            // PTY parse hot path. Unlink BEFORE the overwrite instead: the
+            // write resets flags, so stale positions can't be recovered after
+            // it, and unlinking only touches the registry + extras (never
+            // cells), so doing it eagerly per cell is equivalent within the
+            // frame. The branch is entered whenever no OSC 8 link is active
+            // and the hyperlink cell_map is non-empty (a stale link anywhere
+            // on screen); whether THIS row segment has stale links is decided
+            // per cell by the flags check below.
+            if need_unlink_check {
+                for c in col..col + count {
+                    if self.grid.viewport[row].cells[c]
+                        .flags
+                        .contains(CellFlags::HYPERLINK)
+                    {
+                        self.hyperlinks.unlink_cell(row, c);
+                        self.grid.viewport[row].extras.set_hyperlink(c, None);
+                    }
+                }
+            }
+
             // Write cells — tight inner loop, no per-cell wrap/bounds check.
             {
                 let cells = &mut self.grid.viewport[row].cells;
@@ -155,42 +179,10 @@ impl Terminal {
                             extras.set_hyperlink(col + i, Some(id));
                         }
                     }
-                } else if need_unlink_check {
-                    // Slow path: some cells might have old hyperlinks to clean.
-                    // Collect positions first, then unlink after writing.
-                    let mut to_unlink: [usize; 128] = [0; 128];
-                    let mut unlink_n = 0;
-                    for (i, &b) in chunk.iter().enumerate() {
-                        let c = col + i;
-                        if cells[c].flags.contains(CellFlags::HYPERLINK) {
-                            to_unlink[unlink_n] = c;
-                            unlink_n += 1;
-                        }
-                        cells[c].character = b as char;
-                        cells[c].fg = fg;
-                        cells[c].bg = bg;
-                        cells[c].flags = base_flags;
-                        cells[c].width = CellWidth::Half;
-                        // v1.11.3 (PLAN_v1113 §1.1): carry underline
-                        // style/color (see hyperlink path).
-                        cells[c].underline_style = self.attrs.underline_style;
-                        cells[c].underline_color = self.attrs.underline_color;
-                    }
-                    for &c in to_unlink.iter().take(unlink_n) {
-                        self.hyperlinks.unlink_cell(row, c);
-                    }
-                    // v1.6.1: clear extras for unlinked cells too.
-                    // v1.6.0 review C1: also clear orphaned grapheme extras
-                    // for the full overwritten range (not just unlinked cells).
-                    {
-                        let extras = &mut self.grid.viewport[row].extras;
-                        for &c in to_unlink.iter().take(unlink_n) {
-                            extras.set_hyperlink(c, None);
-                        }
-                        extras.clear_grapheme_range(col, col + count);
-                    }
                 } else {
-                    // Fast path: no hyperlink logic at all.
+                    // Fast path: no active OSC 8 link. (Stale links were
+                    // unlinked above when need_unlink_check was set — v1.13.10
+                    // FIX merged the old bounded-array branch into this path.)
                     for (i, &b) in chunk.iter().enumerate() {
                         let c = col + i;
                         cells[c].character = b as char;
