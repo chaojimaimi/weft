@@ -712,3 +712,202 @@ fn cjk_and_latin_share_baseline() {
          ink: M=[{m_top},{m_bot}] 中=[{cjk_top},{cjk_bot}]"
     );
 }
+
+/// 2026-10-16 forensics (openclaw update symbol complaint): run the openclaw
+/// update symbol set through the ACTUAL glyph pipeline functions and report
+/// pixel yields. Run with:
+///   cargo test -p weft_app probe_openclaw -- --nocapture
+#[test]
+fn probe_openclaw_symbol_rasterization() {
+    use font_kit::source::SystemSource;
+
+    let scaled_size = 26.0f32; // 13pt @2x, the common case
+    let primary = super::font::resolve_font("Menlo", &["/System/Library/Fonts/Menlo.ttc"])
+        .expect("Menlo must load");
+    let symbols = super::font::resolve_font(
+        "Apple Symbols",
+        &["/System/Library/Fonts/Apple Symbols.ttf"],
+    );
+    let emoji = super::font::resolve_font(
+        "Apple Color Emoji",
+        &["/System/Library/Fonts/Apple Color Emoji.ttc"],
+    );
+
+    // CJK chain as configured by default.
+    let cjk = super::font::resolve_font(
+        "PingFang SC",
+        &[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+        ],
+    );
+    let pingfang_family = SystemSource::new()
+        .select_family_by_name("PingFang SC")
+        .is_ok();
+    println!(
+        "CJK: resolve_font(PingFang SC, [PingFang.ttc, STHeiti Light.ttc]) = {}",
+        cjk.is_some()
+    );
+    println!("CJK: CoreText family lookup 'PingFang SC' = {pingfang_family}");
+
+    // Loader-equivalent metrics (glyph.rs init).
+    let cell_w = super::GlyphAtlas::measure_advance(&primary, 'M', scaled_size).max(1);
+    let cell_h = (scaled_size * 1.2f32).ceil() as u32;
+    let m = primary.metrics();
+    let descent = m.descent.abs() * (scaled_size / m.units_per_em as f32);
+    println!("metrics: cell {cell_w}x{cell_h}, descent {descent:.1}px");
+
+    // --- narrow ladder: Menlo -> Apple Symbols -> (blind primary) ---
+    println!("--- narrow chars (ladder: Menlo -> Apple Symbols -> blank) ---");
+    for ch in ['✓', '✔', '✗', '❯', '→', '◇', '⠋', '⚠', '│'] {
+        let in_primary = primary.glyph_for_char(ch).is_some();
+        let in_symbols = symbols
+            .as_ref()
+            .is_some_and(|f| f.glyph_for_char(ch).is_some());
+        let chosen = if in_primary {
+            "Menlo"
+        } else if in_symbols {
+            "AppleSymbols"
+        } else {
+            "BLANK(menlo)"
+        };
+        let font_used = if in_primary {
+            &primary
+        } else if in_symbols {
+            symbols.as_ref().unwrap()
+        } else {
+            &primary
+        };
+        let pixels = super::GlyphAtlas::rasterize_glyph(
+            font_used,
+            ch,
+            scaled_size,
+            cell_w,
+            cell_h,
+            false,
+            descent,
+            false,
+        );
+        let nonzero = pixels.iter().filter(|&&p| p > 0).count();
+        println!(
+            "U+{:04X} {:>2}: primary={} symbols={} -> route={} {} px nonzero /{} (A8)",
+            ch as u32,
+            ch,
+            in_primary,
+            in_symbols,
+            chosen,
+            nonzero,
+            cell_w * cell_h
+        );
+    }
+
+    // --- emoji color path: rasterize_emoji_rgba ---
+    println!("--- color emoji (Apple Color Emoji, CTFontDrawGlyphs) ---");
+    if let Some(emoji_font) = emoji.as_ref() {
+        for ch in ['✅', '❌', 'ℹ'] {
+            let rgba = super::font::rasterize_emoji_rgba(
+                emoji_font,
+                ch,
+                scaled_size,
+                cell_w * 2,
+                cell_h,
+                descent,
+            );
+            match rgba {
+                Some(buf) => {
+                    let opaque = buf.chunks_exact(4).filter(|px| px[3] > 0).count();
+                    println!(
+                        "U+{:04X} {:>2}: RGBA Some, alpha>0 px = {}/{}",
+                        ch as u32,
+                        ch,
+                        opaque,
+                        cell_w * 2 * cell_h
+                    );
+                }
+                None => println!("U+{:04X} {:>2}: RGBA None (BLANK)", ch as u32, ch),
+            }
+        }
+    } else {
+        println!("emoji font DID NOT LOAD -> all color emoji render blank");
+    }
+
+    // --- cluster path gate: ◇+FE0F, ⚠️ ---
+    println!("--- VS16 clusters route via cluster query (color gate) ---");
+    let wants_color = super::query::cluster_wants_color_atlas(true, false);
+    println!("cluster_wants_color_atlas(is_emoji=true) = {wants_color} (gate for FE0F clusters)");
+
+    // Hard assertions tied to the actual bug question:
+    assert!(
+        emoji.is_some(),
+        "Apple Color Emoji must load (color emoji fallback)"
+    );
+    assert!(cjk.is_some(), "CJK fallback must resolve on this system");
+    let em_rgba = super::font::rasterize_emoji_rgba(
+        emoji.as_ref().unwrap(),
+        '✅',
+        scaled_size,
+        cell_w * 2,
+        cell_h,
+        descent,
+    );
+    assert!(
+        em_rgba.is_some_and(|b| b.chunks_exact(4).any(|px| px[3] > 0)),
+        "✅ must rasterize to a non-blank RGBA bitmap (else it renders blank)"
+    );
+}
+
+/// 2026-10-16 forensics: block view draws glyphs via `get_style` (pure cache
+/// lookup, paint/text.rs:103) — prove that (a) a fresh atlas MISSES ✅ so the
+/// block view would draw a blank gap, (b) the live-grid warm path fixes it,
+/// (c) ℹ/⚠ are NOT classified emoji so the block view draws them narrow from
+/// Menlo (monochrome) while the live grid draws the FE0F cluster wide/color.
+#[test]
+fn probe_block_view_glyph_lookup_misses_unwarmed_emoji() {
+    let Some(device) = metal::Device::system_default() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let mut atlas =
+        crate::glyph::GlyphAtlas::new(&device, &weft_core::config::FontConfig::default(), 2.0);
+
+    // (a) fresh atlas: block view's ONLY lookup path misses ✅ → blank gap.
+    assert!(
+        atlas
+            .get_style('✅', crate::glyph::GlyphStyle::REGULAR)
+            .is_none(),
+        "fresh atlas must miss ✅ (block view draws blank until warmed)"
+    );
+
+    // (b) live-grid warm path (get_or_rasterize) succeeds via color atlas.
+    let warmed = atlas.get_or_rasterize('✅', crate::glyph::GlyphStyle::REGULAR);
+    assert!(warmed.is_some(), "✅ must warm through get_or_rasterize");
+    assert!(warmed.unwrap().is_color, "✅ must take the RGBA color path");
+
+    // (c) after warm, block view lookup hits the shared cache.
+    assert!(atlas
+        .get_style('✅', crate::glyph::GlyphStyle::REGULAR)
+        .is_some());
+
+    // (d) ℹ/⚠/◇ are not in is_emoji_char → block view scalar path is
+    // narrow/monochrome, unlike the live grid's wide FE0F cluster.
+    assert!(
+        !crate::glyph::font::is_emoji_char('\u{2139}'),
+        "ℹ must NOT be classified emoji"
+    );
+    assert!(
+        !crate::glyph::font::is_emoji_char('\u{26a0}'),
+        "⚠ must NOT be classified emoji"
+    );
+    assert!(
+        !crate::glyph::font::is_emoji_char('\u{25c7}'),
+        "◇ must NOT be classified emoji"
+    );
+    assert!(crate::glyph::font::is_emoji_char('✅'));
+    assert!(crate::glyph::font::is_emoji_char('❌'));
+
+    // (e) block view cluster splitting: push_block_output_text iterates
+    // chars, so "ℹ️" contributes width-1 'ℹ' + width-0 FE0F = 1 column,
+    // while the live grid stores the cluster at width 2.
+    assert_eq!(weft_core::grid::terminal_char_width('ℹ'), 1);
+    assert_eq!(weft_core::grid::terminal_text_width("ℹ\u{fe0f}"), 2);
+}
