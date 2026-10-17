@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::cluster;
 use super::font::{is_emoji_char, rasterize_emoji_rgba, resolve_font};
-use super::{ClusterEntry, GlyphAtlas, GlyphInfo, GlyphStyle, MAX_CLUSTER_CACHE_ENTRIES};
+use super::{GlyphAtlas, GlyphInfo, GlyphStyle};
 
 /// v1.10.4: a cluster renders via the RGBA color atlas only when it is
 /// classified emoji **and** the emoji font contains the base scalar.
@@ -301,22 +301,19 @@ impl GlyphAtlas {
     /// v1.6.0 step 5: the grid paint path now calls this from the UV
     /// resolver closure in `build_grid_instances` / `build_grid_instances_for_background_pane`.
     ///
-    /// v1.6.0 step 6: tracks hits/misses for perf diagnostics. Hits update
-    /// the entry's `last_used` counter for LRU eviction. Uses interior
-    /// mutability via `Cell` for the counter to keep the `&self` signature
-    /// (the paint path holds an immutable borrow during `push_row`).
+    /// v1.13.13 FIX-B: tracks hits/misses for perf diagnostics ONLY — the
+    /// LRU bookkeeping this function used to defer is gone (no eviction, no
+    /// re-ordering). Interior mutability via `Cell` keeps the `&self`
+    /// signature (the paint path holds an immutable borrow during
+    /// `push_row`).
     pub fn get_cluster(&self, cluster: &str) -> Option<&GlyphInfo> {
-        // v1.6.0 step 6: bump the access counter and update last_used on hit.
-        // We can't mutate `cluster_cache` through `&self`, so we track hits
-        // via Cell. The LRU `last_used` update is deferred to the next
-        // `get_or_rasterize_cluster` call — a read-only lookup doesn't
-        // reorder the LRU. This is a deliberate simplification: the paint
-        // path calls `get_cluster` many times per frame for the same clusters,
-        // and updating `last_used` on every paint would require `&mut self`
-        // which conflicts with the immutable atlas borrow in `draw()`.
-        if self.cluster_cache.contains_key(cluster) {
+        // P3-2 (rust-reviewer): single hash lookup — `contains_key` + `get`
+        // double-hashes. The borrow-scope reason behind `get_or_rasterize_
+        // cluster`'s same shape does not apply here: this is a pure `&self`
+        // reader with no insert to block.
+        if let Some(info) = self.cluster_cache.get(cluster) {
             self.cluster_hits.set(self.cluster_hits.get() + 1);
-            self.cluster_cache.get(cluster).map(|e| &e.info)
+            Some(info)
         } else {
             self.cluster_misses.set(self.cluster_misses.get() + 1);
             None
@@ -347,32 +344,10 @@ impl GlyphAtlas {
         // immutable borrow scoped to this block — a direct `if let Some(info)
         // = self.cluster_cache.get(cluster)` would extend the borrow to the
         // end of the function and block the insert below.
+        // v1.13.13 FIX-B: no LRU touch on hits — every unique cluster is
+        // rasterized exactly once and never evicted.
         if self.cluster_cache.contains_key(cluster) {
-            // v1.6.0 step 6: update last_used for LRU on re-rasterization hits.
-            let now = self.cluster_access_counter.get().saturating_add(1);
-            self.cluster_access_counter.set(now);
-            if let Some(entry) = self.cluster_cache.get_mut(cluster) {
-                entry.last_used = now;
-            }
-            return self.cluster_cache.get(cluster).map(|e| &e.info);
-        }
-
-        // v1.6.0 step 6: evict the LRU entry if the cluster cache is at capacity.
-        // Linear scan is O(n) but n ≤ 512, and eviction is rare (only when
-        // the working set exceeds 512 distinct clusters — uncommon for
-        // terminal output). The evicted entry's atlas texture slot is leaked
-        // (not reclaimed) — see [`MAX_CLUSTER_CACHE_ENTRIES`] doc comment.
-        if self.cluster_cache.len() >= MAX_CLUSTER_CACHE_ENTRIES {
-            let lru_key = self
-                .cluster_cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(k, _)| Arc::clone(k));
-            if let Some(key) = lru_key {
-                self.cluster_cache.remove(&key);
-                let evictions = self.cluster_evictions.get().saturating_add(1);
-                self.cluster_evictions.set(evictions);
-            }
+            return self.cluster_cache.get(cluster);
         }
 
         // Pick the font for the cluster's base scalar. Emoji clusters (ZWJ
@@ -512,16 +487,9 @@ impl GlyphAtlas {
         }
 
         let key = Arc::from(cluster);
-        // v1.6.0 step 6: store with current access counter as last_used.
-        let now = self.cluster_access_counter.get().saturating_add(1);
-        self.cluster_access_counter.set(now);
-        self.cluster_cache.insert(
-            key,
-            ClusterEntry {
-                info,
-                last_used: now,
-            },
-        );
+        // v1.13.13 FIX-B: insert without LRU bookkeeping — consistent with
+        // the scalar cache, each unique cluster enters the map exactly once.
+        self.cluster_cache.insert(key, info);
 
         // Return from cluster_cache so the caller's reference matches what
         // future get_cluster() calls will return.
@@ -529,6 +497,6 @@ impl GlyphAtlas {
         // borrows cluster_cache immutably and returns a reference into it.
         // The mutable borrow of self ended with the insert above; the
         // immutable borrow for the lookup is the only outstanding borrow.
-        self.cluster_cache.get(cluster).map(|e| &e.info)
+        self.cluster_cache.get(cluster)
     }
 }

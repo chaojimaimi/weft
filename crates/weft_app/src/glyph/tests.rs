@@ -911,3 +911,94 @@ fn probe_block_view_glyph_lookup_misses_unwarmed_emoji() {
     assert_eq!(weft_core::grid::terminal_char_width('ℹ'), 1);
     assert_eq!(weft_core::grid::terminal_text_width("ℹ\u{fe0f}"), 2);
 }
+
+// ── v1.13.13 FIX-B: cluster cache has NO eviction ───────────────────────
+
+/// FIX-B ①: >512 unique clusters (the old MAX_CLUSTER_CACHE_ENTRIES) must
+/// ALL stay cached — no LRU eviction — and re-access must NOT re-rasterize
+/// (same GlyphInfo, i.e. no atlas slot re-burned). The old eviction path
+/// leaked the evicted entry's texture slot AND re-rasterized re-accesses
+/// into fresh slots; removal makes the cluster cache match the scalar
+/// cache's "rasterize exactly once" behavior.
+#[test]
+fn cluster_cache_holds_every_unique_cluster_without_eviction() {
+    let Some(device) = metal::Device::system_default() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let mut atlas =
+        crate::glyph::GlyphAtlas::new(&device, &weft_core::config::FontConfig::default(), 2.0);
+
+    // 600 unique two-scalar clusters (base letters + combining acute) —
+    // beyond the old 512-entry cap. Latin Extended-A/B bases keep the
+    // slots narrow (is_wide = false), so 600 entries fit the 2048² atlas
+    // with room to spare.
+    let cluster = |i: u32| {
+        let base = char::from_u32(0x0100 + i).expect("in-range scalar");
+        let full = format!("{base}\u{0301}");
+        (full, base)
+    };
+
+    // First insert: record the GlyphInfo so re-access can be compared.
+    let (first_cluster, first_base) = cluster(0);
+    let first_info = *atlas
+        .get_or_rasterize_cluster(&first_cluster, first_base, false)
+        .expect("the first cluster must rasterize");
+
+    for i in 1..600 {
+        let (c, base) = cluster(i);
+        atlas
+            .get_or_rasterize_cluster(&c, base, false)
+            .expect("every cluster must rasterize (no eviction pressure)");
+    }
+
+    // No eviction: the OLDEST entry (the first-inserted cluster, which the
+    // old LRU would have evicted at insert #513) still hits.
+    assert!(
+        atlas.get_cluster(&first_cluster).is_some(),
+        ">512 unique clusters must NOT evict earlier entries"
+    );
+    // No re-rasterization: re-inserting the first cluster returns the SAME
+    // GlyphInfo (same atlas slot). Under the old path the re-access after
+    // eviction would have allocated a fresh slot.
+    let reaccessed = atlas
+        .get_or_rasterize_cluster(&first_cluster, first_base, false)
+        .expect("re-access must hit the cache");
+    assert_eq!(
+        reaccessed.uv_origin, first_info.uv_origin,
+        "re-access must reuse the original atlas slot (no re-rasterization)"
+    );
+    assert_eq!(reaccessed.uv_size, first_info.uv_size);
+    assert_eq!(reaccessed.size, first_info.size);
+}
+
+/// FIX-B ②: the hit/miss counters (kept as diagnostics after the LRU
+/// removal) still count both paths — a miss on a fresh atlas, a hit after
+/// insert, and no counter movement on the insertion call itself.
+#[test]
+fn cluster_cache_counts_hits_and_misses() {
+    let Some(device) = metal::Device::system_default() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let mut atlas =
+        crate::glyph::GlyphAtlas::new(&device, &weft_core::config::FontConfig::default(), 2.0);
+
+    let cluster = "e\u{0301}";
+    let hits_before = atlas.cluster_hits.get();
+    let misses_before = atlas.cluster_misses.get();
+
+    // Miss: fresh atlas has never seen the cluster.
+    assert!(atlas.get_cluster(cluster).is_none());
+    assert_eq!(atlas.cluster_misses.get(), misses_before + 1);
+    assert_eq!(atlas.cluster_hits.get(), hits_before);
+
+    // Insert (no counter movement on the insert path itself).
+    atlas.get_or_rasterize_cluster(cluster, 'e', false);
+    assert_eq!(atlas.cluster_hits.get(), hits_before);
+    assert_eq!(atlas.cluster_misses.get(), misses_before + 1);
+
+    // Hit: the inserted cluster resolves through the cache.
+    assert!(atlas.get_cluster(cluster).is_some());
+    assert_eq!(atlas.cluster_hits.get(), hits_before + 1);
+}

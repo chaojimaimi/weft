@@ -1,8 +1,11 @@
 //! Glyph atlas: rasterize glyphs with font-kit, pack into a Metal texture.
-//! v0.2: Dynamic atlas for CJK support. Linear fill with NO eviction — when
-//! the texture is exhausted, rasterization fails and those glyphs render
-//! blank until the next atlas rebuild. (AUDIT_v1.10.39: this header used to
-//! claim "LRU eviction", which the implementation never had.)
+//! v0.2: Dynamic atlas for CJK support. Linear fill with NO eviction and NO
+//! automatic rebuild: the atlas is a fixed 2048×2048 texture (see `new`);
+//! when its slots are exhausted `allocate_slot` returns `None` and those
+//! glyphs render blank for the window's lifetime. (AUDIT_v1.10.39: this
+//! header used to claim "LRU eviction", which the implementation never had.
+//! v1.13.13 FIX-B: the cluster cache's LRU eviction was removed too — every
+//! unique cluster rasterizes exactly once, matching the scalar cache.)
 //! On-demand rasterization of any character, not just ASCII.
 //!
 //! Module structure (Batch 6 Step 4 split):
@@ -34,38 +37,6 @@ use font::{nonzero_cell_dimension, resolve_font, resolve_font_variant};
 pub use atlas::GlyphInfo;
 pub use style::GlyphStyle;
 
-/// v1.6.0 step 6: LRU-tracked entry in the cluster cache. Each entry carries
-/// its `GlyphInfo` plus a `last_used` generation counter for LRU eviction.
-/// The counter is compared against `GlyphAtlas::cluster_access_counter` to
-/// determine which entry was least recently used when the cache is full.
-#[derive(Clone, Copy, Debug)]
-struct ClusterEntry {
-    info: GlyphInfo,
-    /// Generation counter at the time of last access. Updated on every
-    /// `get_cluster` hit and on insert via `get_or_rasterize_cluster`.
-    last_used: u64,
-}
-
-/// v1.6.0 step 6: Maximum number of cluster entries the atlas will cache.
-/// Multi-scalar graphemes are rare in typical terminal output (most chars
-/// are single-scalar ASCII), so 512 slots cover even CJK-heavy workloads
-/// with combining marks. When exceeded, the LRU entry is evicted — its
-/// atlas texture slot is leaked (not reclaimed), but 512 × ~20px × ~20px
-/// ≈ 200Kpx is negligible against a 4096² atlas.
-const MAX_CLUSTER_CACHE_ENTRIES: usize = 512;
-
-/// v1.6.0 step 6: Performance counters for the cluster cache. Exposed via
-/// [`GlyphAtlas::cluster_stats`] for diagnostics and the perf gate.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ClusterCacheStats {
-    pub hits: u64,
-    pub misses: u64,
-    pub evictions: u64,
-    pub entries: usize,
-    pub capacity: usize,
-}
-
 /// Pre-rasterized glyph atlas uploaded to a Metal texture.
 pub struct GlyphAtlas {
     texture: metal::Texture,
@@ -96,21 +67,18 @@ pub struct GlyphAtlas {
     /// path costs one `Arc<str>` hash per lookup, which is intentionally
     /// avoided for the ASCII fast path.
     ///
-    /// v1.6.0 step 6: entries are wrapped in [`ClusterEntry`] for LRU tracking.
-    /// When [`MAX_CLUSTER_CACHE_ENTRIES`] is reached, the least-recently-used
-    /// entry is evicted. `cluster_access_counter` is bumped on every access
-    /// so `last_used` ordering stays correct.
-    cluster_cache: HashMap<Arc<str>, ClusterEntry>,
-    /// v1.6.0 step 6: Monotonic counter bumped on every cluster access
-    /// (hit or miss). Used as the `last_used` timestamp for LRU eviction.
-    /// Stored as `Cell` because `get_cluster` takes `&self` (the paint path
-    /// holds an immutable atlas borrow during `push_row`).
-    cluster_access_counter: std::cell::Cell<u64>,
+    /// v1.13.13 FIX-B: NO eviction — the map stores the `GlyphInfo` directly
+    /// (same shape as the scalar `cache`). Every unique cluster string is
+    /// rasterized exactly once, which inherently stops re-burning atlas
+    /// slots on re-access; the entry count is bounded by the atlas slots
+    /// that can host them (slot exhaustion → `allocate_slot` → `None` →
+    /// blank glyph, the header's documented behavior — no auto rebuild).
+    /// `cluster_hits`/`cluster_misses` remain as diagnostics-only counters.
+    cluster_cache: HashMap<Arc<str>, GlyphInfo>,
     /// v1.6.0 step 6: Performance counters for diagnostics / perf gate.
     /// All `Cell` so they can be updated from `&self` in `get_cluster`.
     cluster_hits: std::cell::Cell<u64>,
     cluster_misses: std::cell::Cell<u64>,
-    cluster_evictions: std::cell::Cell<u64>,
     /// Monospace cell width in pixels.
     pub cell_width: u32,
     /// Monospace cell height in pixels (line height).
@@ -147,7 +115,10 @@ pub struct GlyphAtlas {
     emoji_font: Option<Font>,
     emoji_family: String,
     /// Symbol fallback font (Apple Symbols) — last-resort glyphs the primary
-    /// font lacks (e.g. ❯ U+276F in the Dingbats block, box-drawing, arrows).
+    /// font lacks (box drawing, arrows). NOT a ❯ source: Menlo ships ❯
+    /// U+276F itself and Apple Symbols lacks it (tests.rs
+    /// `menlo_renders_angle_quote_with_ink` pins both facts; v1.13.13 G.3
+    /// corrected the stale "Menlo lacks ❯" claim here).
     symbol_font: Option<Font>,
     /// Scaled font size in pixels.
     scaled_size: f32,
@@ -193,8 +164,13 @@ impl GlyphAtlas {
             );
         }
 
-        // Symbol fallback (Apple Symbols) — covers glyphs like ❯ (U+276F) that
-        // Menlo lacks, so the prompt marker renders instead of blanking.
+        // Symbol fallback (Apple Symbols) — covers glyphs the primary font
+        // lacks (box drawing, arrows). ❯ U+276F is NOT one of them: Menlo
+        // has it and Apple Symbols does not (tests.rs
+        // `menlo_renders_angle_quote_with_ink`; v1.13.13 G.3 corrected the
+        // stale comment). The prewarm loop below still probes
+        // `glyph_for_char` before picking the font, so the marker renders
+        // from whichever face actually carries it.
         let symbol_font = resolve_font(
             "Apple Symbols",
             &["/System/Library/Fonts/Apple Symbols.ttf"],
@@ -347,10 +323,8 @@ impl GlyphAtlas {
             cache,
             ascii,
             cluster_cache: HashMap::new(),
-            cluster_access_counter: std::cell::Cell::new(0),
             cluster_hits: std::cell::Cell::new(0),
             cluster_misses: std::cell::Cell::new(0),
-            cluster_evictions: std::cell::Cell::new(0),
             cell_width: cell_w,
             cell_height: cell_h,
             atlas_w,
@@ -387,19 +361,5 @@ impl GlyphAtlas {
     /// `GlyphInfo::is_color` is set (via the fg.a sentinel).
     pub fn color_texture(&self) -> &metal::Texture {
         &self.color_texture
-    }
-
-    /// v1.6.0 step 6: Snapshot of cluster cache performance counters for
-    /// diagnostics and the perf gate. Returns hits, misses, evictions,
-    /// current entry count, and capacity.
-    #[allow(dead_code)]
-    pub fn cluster_stats(&self) -> ClusterCacheStats {
-        ClusterCacheStats {
-            hits: self.cluster_hits.get(),
-            misses: self.cluster_misses.get(),
-            evictions: self.cluster_evictions.get(),
-            entries: self.cluster_cache.len(),
-            capacity: MAX_CLUSTER_CACHE_ENTRIES,
-        }
     }
 }
