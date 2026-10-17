@@ -349,6 +349,10 @@ impl MetalRenderer {
             // turning the intended dim border into a glaring white bar, so
             // skip it for graphic characters (same set as
             // `fills_terminal_cell_edges`).
+            // v1.13.13 G.2口径: the exemption keys on the FOREGROUND only —
+            // a bg-only explicit color does NOT opt out; default/theme text
+            // keeps the readability correction even on an explicitly colored
+            // band (intentional, mirrors grid_instances.rs).
             let fg_final = resolve_block_fg_color(
                 fg_final,
                 contrast_background,

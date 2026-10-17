@@ -314,9 +314,17 @@ pub(crate) fn build_row_instances(
             std::mem::swap(&mut fg, &mut bg);
         }
 
-        // Scale plain background alpha by window opacity so empty cells
-        // show the desktop through them. Cursor/selection colors are
-        // fully opaque (they override bg below).
+        // Weft's OWN semantics (v1.13.13 G.1 ruling, deliberate): window
+        // opacity fades EVERY cell background — REVERSE bars and explicit
+        // SGR/ANSI backgrounds included — so a transparent window shows the
+        // desktop through all of them; chrome (cursor/selection) stays fully
+        // opaque (it overrides bg below). This DIFFERS from kitty's default,
+        // where background_opacity fades only cells whose background equals
+        // the default background (colored/reverse cells render opaque).
+        // Verified against kitty's docs 2026-10-17. The difference is
+        // self-consistent and shipped for several versions, but is flagged
+        // for reconsideration — preferring kitty semantics would be a small
+        // standalone behavior change on top of this line.
         bg[3] *= opacity;
 
         // ── Determine cell state ───────────────────────────────────
@@ -368,6 +376,11 @@ pub(crate) fn build_row_instances(
         // owned by the terminal application. Preserve them exactly so its
         // text hierarchy and subtle decorations survive; default/theme text
         // still receives Weft's configured readability correction.
+        // v1.13.13 G.2口径: the exemption keys on the FOREGROUND only — a
+        // bg-only explicit color does NOT opt out. A cell with an explicit
+        // background but default/theme fg still gets the correction on its
+        // text: the correction exists to protect theme-owned glyphs, and
+        // that is exactly what it keeps doing here (intentional).
         let final_fg = if !is_cursor
             && (is_terminal_graphic_char(cell.character) || explicit_terminal_color)
         {

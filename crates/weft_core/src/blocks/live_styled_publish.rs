@@ -28,7 +28,23 @@ impl BlockTracker {
     fn publish_live_styled(&mut self) {
         match self.output.peek_styled() {
             Some(styled) => self.live_styled_snapshot = Some(Arc::new(styled)),
-            None if self.output.style_overflow() => {}
+            None if self.output.style_overflow() => {
+                // v1.13.13 FIX-A ruling (PLAN_v1.13.13) — overflow is a
+                // TERMINAL freeze, not a transient: `splice_style` and
+                // `erase_style_range` early-return once `style_overflow`
+                // latches, so runs can NEVER re-accumulate; `(None,
+                // overflow)` holds until finalize's full rebuild. Keeping
+                // the last good snapshot is the m1 anti-flicker guarantee
+                // for the main victim group — commands still streaming
+                // colored output when they hit MAX_STYLE_RUNS_PER_BLOCK
+                // (~8k colored lines); any bounded-clear variant would
+                // strip their live colors ~200ms in (worse than the bug it
+                // replaces). The rarer sub-state — output that goes back to
+                // pure default colors AFTER overflow keeps showing stale
+                // colors, indistinguishable from still-flowing colored
+                // output at this layer — is KNOWN and accepted; finalize
+                // rebuilds from scratch and self-heals.
+            }
             None => self.live_styled_snapshot = None,
         }
     }
