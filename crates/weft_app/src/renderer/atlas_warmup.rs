@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::time::SystemTime;
 
 use crate::glyph::GlyphAtlas;
 use crate::overlay::{OverlayContent, OverlayWarmup, PaletteDrawParams, SettingsDrawParams};
@@ -18,7 +19,9 @@ use crate::paint::panel::PanelDrawParams;
 use crate::paint::preedit::TuiPreeditDrawParams;
 use crate::paint::prompt::PromptDrawParams;
 use crate::paint::tab_bar::TabBarDrawState;
-use crate::paint::ui_helpers::{block_duration_str, panel_display, visible_panel_rows};
+use crate::paint::ui_helpers::{
+    block_duration_str, live_context_label, live_elapsed_label, panel_display, visible_panel_rows,
+};
 use crate::renderer::MetalRenderer;
 use unicode_segmentation::UnicodeSegmentation;
 use weft_core::blocks::{Block, BlockId};
@@ -456,6 +459,10 @@ impl MetalRenderer {
     /// Same partial-borrow contract as [`MetalRenderer::warm_atlas`]:
     /// associated function, `&mut atlas` disjoint from everything else.
     ///
+    /// `cwd`/`git_branch` are the pane terminal's cwd/branch
+    /// (`Terminal::cwd()` / `Terminal::git_branch()`, layout_pass 同参) —
+    /// v1.13.13 FIX-E feeds them into the in-flight header label warm.
+    ///
     /// Returns the number of output bytes actually scanned this frame (the
     /// budget's test observability hook).
     #[allow(clippy::too_many_arguments)]
@@ -465,6 +472,8 @@ impl MetalRenderer {
         show_block_view: bool,
         warm_namespace: u64,
         visible_override: Option<&[BlockId]>,
+        cwd: Option<&str>,
+        git_branch: Option<&str>,
         viewport_h: f32,
         block_scroll: f32,
         viewport_rows: usize,
@@ -541,6 +550,73 @@ impl MetalRenderer {
             }
         };
 
+        // v1.13.13 FIX-C: the in-flight scan runs BEFORE the finished loop —
+        // it gets first claim on the shared [`BLOCK_WARM_BUDGET_BYTES`]. The
+        // old order let a megabyte finished block consume ≤ 8 frames of
+        // budget while a live command's fresh rows starved (v1.13.11 备案
+        // starvation order). Deliberate side effect (评审 P3 备案): the
+        // untouched-budget first-line guarantee effectively hands over from
+        // the finished head block to the live lines — a finished block's
+        // first over-budget line defers one extra frame, by design, not a
+        // regression.
+        //
+        // In-flight (live) block during CommandExecuting. Append-only
+        // watermark, 200-line cap REMOVED (N1.3) — the budget bounds the
+        // per-frame cost instead. No line-count cache: a live output has no
+        // identity Arc; scanning from the watermark to EOF under the budget
+        // needs no total. P1-1: the watermark's identity keys on the
+        // tracker's COMMAND GENERATION — a chained command that starts
+        // inside the same batch as its predecessor's finalize bumps the
+        // generation, so its live scan restarts at 0 instead of inheriting
+        // the previous command's watermark. v1.13.13 FIX-D: the epoch folds
+        // in too — a screen-snapshot REWRITE (`replace_screen_snapshot` /
+        // `split_screen_history`) replaces the live text wholesale,
+        // invalidating the append-only watermark. Both counters are
+        // monotonic; the fold is injective while both stay < 2^32.
+        if let Some(live) = tracker.in_flight() {
+            missing.extend("❯ ".chars());
+            missing.extend(live.command.chars());
+            // v1.13.13 FIX-E: the live header renders `live_context_label`
+            // (layout_pass.rs 同参: abbreviated cwd · git branch · elapsed),
+            // whose product charset (abbreviated path forms, branch name,
+            // `…` ellipsis) does not coincide with the raw command/output
+            // strings — warm the rendered artifact itself, same inputs as
+            // the paint path (`live.cwd` first, terminal cwd fallback).
+            let elapsed = live_elapsed_label(live.started_at, SystemTime::now());
+            if let Some(label) = live_context_label(live.cwd.or(cwd), git_branch, Some(&elapsed)) {
+                missing.extend(label.chars());
+            }
+            let live_identity = (tracker.command_generation()
+                ^ tracker.screen_rewrite_epoch().rotate_left(32))
+                as usize;
+            let (start, end) =
+                wm.output_scan_range(warm_namespace, IN_FLIGHT_KEY, live_identity, usize::MAX);
+            let mut scanned_to = start;
+            let mut bytes = 0usize;
+            for line in live.output.lines().skip(start).take(end - start) {
+                // P1-2c: same untouched-budget-only first-line guarantee.
+                let first_line_guarantee = bytes == 0 && budget_left == BLOCK_WARM_BUDGET_BYTES;
+                if bytes + line.len() > budget_left && !first_line_guarantee {
+                    break;
+                }
+                bytes += line.len();
+                scanned_to += 1;
+                collect_line_glyphs(&mut missing, &mut missing_clusters, line);
+            }
+            wm.record_scanned(warm_namespace, IN_FLIGHT_KEY, scanned_to, live_identity);
+            // FIX-C: first claim on the budget — the finished loop below
+            // sees whatever the live scan left (the old trailing position
+            // never needed this deduction).
+            budget_left = budget_left.saturating_sub(bytes);
+            scanned_bytes += bytes as u64;
+        } else {
+            // P3 fix: the sentinel watermark belongs to the *previous*
+            // command once nothing is in flight. The generation key above
+            // is the real invalidation since P1-1; the forget stays as the
+            // table-bounds hygiene.
+            wm.forget(warm_namespace, IN_FLIGHT_KEY);
+        }
+
         for b in selected {
             let identity = output_identity(&b.output);
             // Command + duration strings render on every header, collapsed
@@ -598,43 +674,6 @@ impl MetalRenderer {
             wm.record_scanned(warm_namespace, b.id, scanned_to, identity);
             budget_left = budget_left.saturating_sub(bytes);
             scanned_bytes += bytes as u64;
-        }
-
-        // In-flight (live) block during CommandExecuting. Append-only
-        // watermark, 200-line cap REMOVED (N1.3) — the budget bounds the
-        // per-frame cost instead. No line-count cache: a live output has no
-        // identity Arc; scanning from the watermark to EOF under the budget
-        // needs no total. P1-1: the watermark's identity is the tracker's
-        // COMMAND GENERATION — a chained command that starts inside the
-        // same batch as its predecessor's finalize bumps the generation,
-        // so its live scan restarts at 0 instead of inheriting the
-        // previous command's watermark.
-        if let Some(live) = tracker.in_flight() {
-            missing.extend("❯ ".chars());
-            missing.extend(live.command.chars());
-            let live_identity = tracker.command_generation() as usize;
-            let (start, end) =
-                wm.output_scan_range(warm_namespace, IN_FLIGHT_KEY, live_identity, usize::MAX);
-            let mut scanned_to = start;
-            let mut bytes = 0usize;
-            for line in live.output.lines().skip(start).take(end - start) {
-                // P1-2c: same untouched-budget-only first-line guarantee.
-                let first_line_guarantee = bytes == 0 && budget_left == BLOCK_WARM_BUDGET_BYTES;
-                if bytes + line.len() > budget_left && !first_line_guarantee {
-                    break;
-                }
-                bytes += line.len();
-                scanned_to += 1;
-                collect_line_glyphs(&mut missing, &mut missing_clusters, line);
-            }
-            wm.record_scanned(warm_namespace, IN_FLIGHT_KEY, scanned_to, live_identity);
-            scanned_bytes += bytes as u64;
-        } else {
-            // P3 fix: the sentinel watermark belongs to the *previous*
-            // command once nothing is in flight. The generation key above
-            // is the real invalidation since P1-1; the forget stays as the
-            // table-bounds hygiene.
-            wm.forget(warm_namespace, IN_FLIGHT_KEY);
         }
 
         for ch in &missing {
@@ -723,6 +762,12 @@ fn collect_line_glyphs(
 // v1.13.11: the watermark + warm-mechanism test suites moved to
 // `atlas_warmup_tests.rs` (#[path] companion file) — this file sits close to
 // the 800-line commit gate and N1's rewritten suites are sizeable.
+// v1.13.13: the FIX-C/D/E suites went to a second companion
+// (`atlas_warmup_v11313_tests.rs`) — the first companion was itself near
+// the gate, so the new suites got their own file instead of pushing it over.
 #[cfg(test)]
 #[path = "atlas_warmup_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "atlas_warmup_v11313_tests.rs"]
+mod v11313_tests;

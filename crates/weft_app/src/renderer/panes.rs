@@ -105,6 +105,8 @@ impl MetalRenderer {
                 bg_visible_blocks
                     .get(&pane.pane_session_id)
                     .map(|v| v.as_slice()),
+                pane.terminal.cwd(),
+                pane.terminal.git_branch(),
                 viewport_h,
                 pane.block_scroll,
                 pane.terminal.grid().num_rows,

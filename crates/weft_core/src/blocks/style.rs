@@ -323,6 +323,12 @@ impl BlockTracker {
             // would silently re-truncate the in-flight block back to 1 MiB on
             // every boundary rewrite. Reads the configured field instead.
             self.output.replace(snapshot, self.output_cap);
+            // v1.13.13 FIX-D P2-1 (rust-reviewer): third `output.replace`
+            // wholesale rewrite point — same contract and same
+            // `screen_document_start` gate as `replace_screen_snapshot` /
+            // `split_screen_history`, so it must invalidate the renderer's
+            // in-flight warm watermark identity the same way.
+            self.screen_rewrite_epoch = self.screen_rewrite_epoch.wrapping_add(1);
             self.styled_output = None;
             self.live_output_version = self.live_output_version.wrapping_add(1);
         }
@@ -358,6 +364,13 @@ impl BlockTracker {
         // `replace_screen_output` — a raised cap must not have its in-flight
         // block re-truncated to 1 MiB by this boundary rewrite.
         self.output.replace(text, self.output_cap);
+        // v1.13.13 FIX-D: this is a real REWRITE of the live text (we are
+        // past the content-equality short-circuit above — idle TUIs
+        // re-publishing the same document every 50ms must NOT reach this
+        // line). Bump the epoch so the renderer's in-flight warm watermark
+        // identity changes and the next frame rescans the rewritten rows
+        // from line 0 instead of trusting the append-only watermark.
+        self.screen_rewrite_epoch = self.screen_rewrite_epoch.wrapping_add(1);
         // Gate MUST stay the post-replace comparison (truncation guard), NOT
         // the pre-replace text_unchanged — with text <= cap on this path it
         // is always true, i.e. effectively styled.has_colors() (architect

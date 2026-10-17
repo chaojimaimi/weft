@@ -13,6 +13,10 @@
 //! - `block_warm_window_*`                   ← NEW (superset, 测试 6)
 //! - device-gated mechanism tests            ← NEW (测试 1/2/3/4-机制/6)
 //!
+//! v1.13.13: the FIX-C/D/E suites live in the sibling companion
+//! `atlas_warmup_v11313_tests.rs` (this file sat just under the 800-line
+//! commit gate; helpers below are `pub(crate)` for that sibling).
+//!
 //! 测试 0 conclusion (PLAN_v1.13.11 前置核查): the goldens
 //! (`paint/block_view/golden_tests.rs`) are vertex-BYTE baselines whose
 //! scenario literals are ASCII-only — they never produce color-atlas pixels
@@ -33,7 +37,7 @@ use weft_core::blocks::{Block, BlockId, BlockTracker, CapturedStyle};
 
 // ── fixtures ────────────────────────────────────────────────────────────
 
-fn fixture_block(id: u64, command: &str, output: &str) -> Block {
+pub(crate) fn fixture_block(id: u64, command: &str, output: &str) -> Block {
     let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     Block {
         id: BlockId(id),
@@ -49,7 +53,7 @@ fn fixture_block(id: u64, command: &str, output: &str) -> Block {
     }
 }
 
-fn tracker_with(blocks: Vec<Block>) -> BlockTracker {
+pub(crate) fn tracker_with(blocks: Vec<Block>) -> BlockTracker {
     let mut tracker = BlockTracker::new();
     tracker.load_blocks(blocks);
     tracker
@@ -57,7 +61,7 @@ fn tracker_with(blocks: Vec<Block>) -> BlockTracker {
 
 /// Mirror the golden skip precedent: no Metal device (CI without GPU)
 /// skips instead of failing (the atlas rasterizer needs a device).
-fn headless_atlas_or_skip() -> Option<GlyphAtlas> {
+pub(crate) fn headless_atlas_or_skip() -> Option<GlyphAtlas> {
     let device = metal::Device::system_default()?;
     Some(GlyphAtlas::new(
         &device,
@@ -69,7 +73,7 @@ fn headless_atlas_or_skip() -> Option<GlyphAtlas> {
 /// Warm ONLY the block-view scan (all cache/window inputs at their defaults:
 /// an empty layout cache forces the full-scan fallback, the live cache is
 /// unowned). Returns the scanned output bytes.
-fn warm_block(
+pub(crate) fn warm_block(
     tracker: &BlockTracker,
     atlas: &mut GlyphAtlas,
     watermarks: &RefCell<BlockScanWatermarks>,
@@ -82,6 +86,8 @@ fn warm_block(
         true,
         namespace,
         visible,
+        None,
+        None,
         600.0,
         0.0,
         24,

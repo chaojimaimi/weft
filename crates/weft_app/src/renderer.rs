@@ -595,6 +595,8 @@ impl MetalRenderer {
             terminal.show_block_view(),
             active_pane_session_id,
             None,
+            terminal.cwd(),
+            terminal.git_branch(),
             self.viewport.1,
             block_scroll,
             grid.num_rows,

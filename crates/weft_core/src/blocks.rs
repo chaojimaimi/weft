@@ -303,6 +303,22 @@ pub struct BlockTracker {
     /// watermark (which would leave command 2's first lines forever
     /// unscanned).
     command_generation: u64,
+    /// v1.13.13 FIX-D (PLAN_v1.13.13): bumped by every screen-snapshot
+    /// REWRITE that replaces the in-flight capture's text wholesale. Three
+    /// sites, one contract: `replace_screen_snapshot` (style.rs,
+    /// primary-screen TUI snapshot path), `replace_screen_output` (style.rs,
+    /// plain-phase snapshot rewrite; P2-1) and `split_screen_history`
+    /// (screen_capture.rs, the >1MiB split branch). Those paths break the
+    /// append-only contract the renderer's in-flight warm watermark relies
+    /// on: rows below the old watermark may hold rewritten content whose
+    /// glyphs would never be rescanned before finalize. The watermark
+    /// identity folds this epoch in (atlas_warmup live identity), so a
+    /// rewrite restarts the live scan at 0. Deliberately NOT bumped by the
+    /// content-equality short-circuit in `replace_screen_snapshot` — idle
+    /// TUIs re-publish the same document every 50ms, and an unconditional
+    /// bump would restart the warm scan every frame. In-memory only (no
+    /// persistence).
+    screen_rewrite_epoch: u64,
     /// Absolute document position where primary-screen output begins.
     screen_document_start: Option<u64>,
     /// Session-local primary-screen blocks eligible for replay continuation.
@@ -399,6 +415,7 @@ impl BlockTracker {
             batch_clock: Instant::now(),
             live_output_version: 0,
             command_generation: 0,
+            screen_rewrite_epoch: 0,
             screen_document_start: None,
             screen_owned_blocks: HashSet::new(),
             continuation_candidate: None,
@@ -556,6 +573,14 @@ impl BlockTracker {
     /// on. Monotonic per `133;B`, never reused within a session.
     pub fn command_generation(&self) -> u64 {
         self.command_generation
+    }
+
+    /// v1.13.13 FIX-D: current screen-rewrite epoch (see the field doc).
+    /// Folds into the renderer's in-flight warm watermark identity together
+    /// with [`command_generation`](Self::command_generation) so a wholesale
+    /// snapshot rewrite invalidates the append-only live watermark.
+    pub fn screen_rewrite_epoch(&self) -> u64 {
+        self.screen_rewrite_epoch
     }
 
     pub fn in_flight(&self) -> Option<InFlightBlock<'_>> {

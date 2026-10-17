@@ -171,6 +171,12 @@ impl BlockTracker {
         // paths. Reads the configured field per the review's own linkage
         // note ("freeze 若升 A 此处须联动重审").
         self.output.replace(&tail, self.output_cap);
+        // v1.13.13 FIX-D: the >1MiB split path REWROTE the live tail
+        // wholesale (same contract as `replace_screen_snapshot`) — bump the
+        // screen-rewrite epoch so the renderer's in-flight warm watermark
+        // restarts from 0 for the new tail instead of trusting lines below
+        // the old append-only watermark.
+        self.screen_rewrite_epoch = self.screen_rewrite_epoch.wrapping_add(1);
         self.output.drain_screen_prefix(consumed_prefix);
         self.styled_output = tail_styled.map(Arc::new);
         self.live_output_version = self.live_output_version.wrapping_add(1);
