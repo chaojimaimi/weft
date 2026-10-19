@@ -37,6 +37,34 @@ use font::{nonzero_cell_dimension, resolve_font, resolve_font_variant};
 pub use atlas::GlyphInfo;
 pub use style::GlyphStyle;
 
+/// Narrow-char font ladder: primary → Apple Symbols → Menlo → blind primary.
+/// 第三跳只补勾叉家族（✓✔✗）：Apple Symbols 缺它们而 Menlo 全有（2026-10-19 取证，
+/// 取证背景 docs/FIX_hack-checkmark-fallback.md）。顺序不得调整——改变既有字形
+/// 的来源字体即改变像素（金像风险）。取 `&Option<Font>` 而非值，让调用点用
+/// 字段级离散借用（get_or_rasterize 是 &mut self，&self 薄方法会 E0502）。
+fn narrow_font_ladder<'a>(
+    primary: &'a Font,
+    symbol: &'a Option<Font>,
+    menlo: &'a Option<Font>,
+    ch: char,
+) -> &'a Font {
+    if primary.glyph_for_char(ch).is_some() {
+        primary
+    } else if symbol
+        .as_ref()
+        .is_some_and(|f| f.glyph_for_char(ch).is_some())
+    {
+        symbol.as_ref().unwrap()
+    } else if menlo
+        .as_ref()
+        .is_some_and(|f| f.glyph_for_char(ch).is_some())
+    {
+        menlo.as_ref().unwrap()
+    } else {
+        primary
+    }
+}
+
 /// Pre-rasterized glyph atlas uploaded to a Metal texture.
 pub struct GlyphAtlas {
     texture: metal::Texture,
@@ -120,6 +148,17 @@ pub struct GlyphAtlas {
     /// `menlo_renders_angle_quote_with_ink` pins both facts; v1.13.13 G.3
     /// corrected the stale "Menlo lacks ❯" claim here).
     symbol_font: Option<Font>,
+    /// v1.13.14: Menlo fallback — third hop of the narrow-char ladder
+    /// (`narrow_font_ladder`). WHY: Apple Symbols lacks U+2713/2714/2717
+    /// (✓/✔/✗ — 双 API 复核 CTFontGetGlyphsForCharacters +
+    /// CTFontCopyCharacterSet，2026-10-19)，so when the primary font also
+    /// lacks them (user config font.family=Hack) the old two-hop ladder
+    /// blindly reused the primary font, rasterized an all-zero bitmap and
+    /// permanently cached a blank. Menlo is the only ladder-reachable family
+    /// that carries the check/cross marks. This hop is consulted ONLY when
+    /// hops 1/2 both miss — the source font of every pre-existing glyph is
+    /// unchanged.
+    menlo_font: Option<Font>,
     /// Scaled font size in pixels.
     scaled_size: f32,
     /// Primary font's |descent| in pixels — the single vertical-baseline
@@ -175,6 +214,11 @@ impl GlyphAtlas {
             "Apple Symbols",
             &["/System/Library/Fonts/Apple Symbols.ttf"],
         );
+
+        // v1.13.14: third hop of the narrow ladder — see the `menlo_font`
+        // field docs for why Apple Symbols is not enough. Local is named
+        // `menlo_font` because `menlo` above is the variant path array.
+        let menlo_font = resolve_font("Menlo", &["/System/Library/Fonts/Menlo.ttc"]);
 
         let font_size = font_config.size;
         let scaled_size = font_size * scale_factor as f32;
@@ -271,11 +315,8 @@ impl GlyphAtlas {
         // Pre-rasterize the prompt marker and common UI glyphs at init.
         for &ch in &['❯', '❮', '›', '→', '•', '·', '…', '─', '▸', '▾', '●', '○']
         {
-            let font = if primary_font.glyph_for_char(ch).is_some() {
-                &primary_font
-            } else {
-                symbol_font.as_ref().unwrap_or(&primary_font)
-            };
+            // Struct fields don't exist yet here — pass the locals.
+            let font = narrow_font_ladder(&primary_font, &symbol_font, &menlo_font, ch);
             let placed = Self::rasterize_and_place(
                 font,
                 ch,
@@ -346,6 +387,7 @@ impl GlyphAtlas {
             emoji_font: None,
             emoji_family: font_config.emoji_family.clone(),
             symbol_font,
+            menlo_font,
             scaled_size,
             primary_descent_px,
         }

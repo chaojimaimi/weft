@@ -757,8 +757,13 @@ fn probe_openclaw_symbol_rasterization() {
     let descent = m.descent.abs() * (scaled_size / m.units_per_em as f32);
     println!("metrics: cell {cell_w}x{cell_h}, descent {descent:.1}px");
 
-    // --- narrow ladder: Menlo -> Apple Symbols -> (blind primary) ---
-    println!("--- narrow chars (ladder: Menlo -> Apple Symbols -> blank) ---");
+    // --- narrow ladder: primary -> Apple Symbols -> Menlo -> blank ---
+    // v1.13.14: reuse the production ladder instead of an inline copy. This
+    // probe's primary IS Menlo, so the third hop receives the same face
+    // cloned (font-kit `Font` is a cheap #[derive(Clone)] handle). Bound to a
+    // local first — `&Some(primary.clone())` as a temporary would be E0716.
+    println!("--- narrow chars (ladder: primary -> Apple Symbols -> Menlo -> blank) ---");
+    let menlo_hop = Some(primary.clone());
     for ch in ['✓', '✔', '✗', '❯', '→', '◇', '⠋', '⚠', '│'] {
         let in_primary = primary.glyph_for_char(ch).is_some();
         let in_symbols = symbols
@@ -771,13 +776,7 @@ fn probe_openclaw_symbol_rasterization() {
         } else {
             "BLANK(menlo)"
         };
-        let font_used = if in_primary {
-            &primary
-        } else if in_symbols {
-            symbols.as_ref().unwrap()
-        } else {
-            &primary
-        };
+        let font_used = super::narrow_font_ladder(&primary, &symbols, &menlo_hop, ch);
         let pixels = super::GlyphAtlas::rasterize_glyph(
             font_used,
             ch,
@@ -853,6 +852,130 @@ fn probe_openclaw_symbol_rasterization() {
     assert!(
         em_rgba.is_some_and(|b| b.chunks_exact(4).any(|px| px[3] > 0)),
         "✅ must rasterize to a non-blank RGBA bitmap (else it renders blank)"
+    );
+}
+
+// ── v1.13.14: narrow ladder third hop (Menlo) ───────────────────────────
+// 取证: docs/FIX_hack-checkmark-fallback.md — Apple Symbols 缺 ✓/✔/✗，
+// 主字体也缺时（用户 font=Hack）两跳阶梯盲走 primary → 全零位图永久缓存 → 空白。
+
+/// Fact pin: Apple Symbols does NOT carry the check/cross family (✓ U+2713 /
+/// ✔ U+2714 / ✗ U+2717) while Menlo has all three (2026-10-19, verified via
+/// both CTFontGetGlyphsForCharacters and CTFontCopyCharacterSet). This pins
+/// the system facts that justify the ladder's third hop — deleting the hop
+/// would re-break ✓/✔/✗ for primaries that lack the family.
+#[test]
+fn fact_pin_apple_symbols_lacks_check_family_menlo_has_it() {
+    let symbols = super::font::resolve_font(
+        "Apple Symbols",
+        &["/System/Library/Fonts/Apple Symbols.ttf"],
+    );
+    let menlo = super::font::resolve_font("Menlo", &["/System/Library/Fonts/Menlo.ttc"]);
+    let symbols = symbols.expect("Apple Symbols must load on macOS");
+    let menlo = menlo.expect("Menlo must load on macOS");
+    for ch in ['✓', '✔', '✗'] {
+        assert!(
+            symbols.glyph_for_char(ch).is_none(),
+            "fact pin: Apple Symbols must NOT have U+{:04X} (this gap is why the ladder needs the Menlo hop)",
+            ch as u32
+        );
+        assert!(
+            menlo.glyph_for_char(ch).is_some(),
+            "fact pin: Menlo must have U+{:04X} (the third hop must reach ink)",
+            ch as u32
+        );
+    }
+}
+
+/// v1.13.14: with a primary that lacks ✓ — Apple Symbols itself, so hop 1 and
+/// hop 2 are the same font and both miss — the ladder's third hop must route
+/// ✓ to Menlo, `get_or_rasterize` must succeed through the A8 mask path (not
+/// the color atlas), and Menlo must produce a non-blank bitmap.
+#[test]
+fn narrow_ladder_third_hop_reaches_menlo() {
+    let Some(device) = metal::Device::system_default() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let config = weft_core::config::FontConfig {
+        family: "Apple Symbols".into(),
+        ..Default::default()
+    };
+    let mut atlas = crate::glyph::GlyphAtlas::new(&device, &config, 2.0);
+
+    // Ladder: primary (Apple Symbols) misses ✓, the symbol hop is the same
+    // font and misses too → the third hop must hand back Menlo.
+    let font = super::narrow_font_ladder(
+        &atlas.primary_font,
+        &atlas.symbol_font,
+        &atlas.menlo_font,
+        '✓',
+    );
+    assert_eq!(
+        font.postscript_name().as_deref(),
+        Some("Menlo-Regular"),
+        "third hop must route ✓ to Menlo when primary and Apple Symbols both miss"
+    );
+
+    // End-to-end: the scalar path rasterizes ✓ via the mask (non-color) atlas.
+    let info = atlas
+        .get_or_rasterize('✓', crate::glyph::GlyphStyle::REGULAR)
+        .expect("✓ must rasterize via the Menlo third hop");
+    assert!(
+        !info.is_color,
+        "✓ must stay on the A8 mask path, not the RGBA color atlas"
+    );
+
+    // Pixel-level: Menlo actually rasterizes ✓ into ink (probe-style call).
+    let menlo = atlas.menlo_font.as_ref().expect("Menlo must load on macOS");
+    let scaled_size = 26.0f32; // 13pt @2x, matches the probe above
+    let cell_w = super::GlyphAtlas::measure_advance(&atlas.primary_font, 'M', scaled_size).max(1);
+    let cell_h = (scaled_size * 1.2f32).ceil() as u32;
+    let pixels = super::GlyphAtlas::rasterize_glyph(
+        menlo,
+        '✓',
+        scaled_size,
+        cell_w,
+        cell_h,
+        false,
+        descent_px(menlo, scaled_size),
+        false,
+    );
+    assert!(
+        pixels.iter().filter(|&&p| p > 0).count() > 0,
+        "Menlo must rasterize ✓ to a non-blank A8 bitmap (else the third hop still renders blank)"
+    );
+}
+
+/// v1.13.14 real-world repro: 用户 config font.family=Hack 场景 — Hack lacks
+/// ✓/✔/✗ AND Apple Symbols lacks them, so the ladder's third hop must route
+/// ✓ to Menlo. Skips gracefully where Hack isn't installed.
+#[test]
+fn hack_primary_routes_check_via_menlo() {
+    use font_kit::source::SystemSource;
+    if SystemSource::new().select_family_by_name("Hack").is_err() {
+        eprintln!("skipping hack_primary_routes_check_via_menlo: Hack not installed");
+        return;
+    }
+    let Some(device) = metal::Device::system_default() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let config = weft_core::config::FontConfig {
+        family: "Hack".into(),
+        ..Default::default()
+    };
+    let atlas = crate::glyph::GlyphAtlas::new(&device, &config, 2.0);
+    let font = super::narrow_font_ladder(
+        &atlas.primary_font,
+        &atlas.symbol_font,
+        &atlas.menlo_font,
+        '✓',
+    );
+    assert_eq!(
+        font.postscript_name().as_deref(),
+        Some("Menlo-Regular"),
+        "用户 config font.family=Hack 场景: Hack 与 Apple Symbols 都无 ✓, 阶梯第三跳必须路由到 Menlo"
     );
 }
 

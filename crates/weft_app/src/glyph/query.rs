@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::cluster;
 use super::font::{is_emoji_char, rasterize_emoji_rgba, resolve_font};
-use super::{GlyphAtlas, GlyphInfo, GlyphStyle};
+use super::{narrow_font_ladder, GlyphAtlas, GlyphInfo, GlyphStyle};
 
 /// v1.10.4: a cluster renders via the RGBA color atlas only when it is
 /// classified emoji **and** the emoji font contains the base scalar.
@@ -143,37 +143,22 @@ impl GlyphAtlas {
             }
             .filter(|f| f.glyph_for_char(ch).is_some())
             .unwrap_or_else(|| {
-                if self.primary_font.glyph_for_char(ch).is_some() {
-                    &self.primary_font
-                } else if self
-                    .symbol_font
-                    .as_ref()
-                    .is_some_and(|f| f.glyph_for_char(ch).is_some())
-                {
-                    self.symbol_font.as_ref().unwrap()
-                } else {
-                    &self.primary_font
-                }
+                // Edition 2021 disjoint capture: the closure borrows the three
+                // font fields individually, so it never borrows `self` whole
+                // and stays compatible with the `&mut self.*cursor` uses below.
+                narrow_font_ladder(&self.primary_font, &self.symbol_font, &self.menlo_font, ch)
             })
         } else if is_emoji {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
         } else if is_wide {
             self.cjk_font.as_ref().unwrap_or(&self.primary_font)
         } else {
-            // Narrow text: prefer the monospace primary, then the lightweight
-            // symbol fallback. CJK and emoji fonts are loaded by script class
-            // above instead of probing both large TTCs for every missing glyph.
-            if self.primary_font.glyph_for_char(ch).is_some() {
-                &self.primary_font
-            } else if self
-                .symbol_font
-                .as_ref()
-                .is_some_and(|f| f.glyph_for_char(ch).is_some())
-            {
-                self.symbol_font.as_ref().unwrap()
-            } else {
-                &self.primary_font
-            }
+            // Narrow text: the shared ladder — monospace primary, then the
+            // lightweight symbol fallback, then Menlo (third hop, see
+            // `narrow_font_ladder`). CJK and emoji fonts are loaded by script
+            // class above instead of probing both large TTCs for every
+            // missing glyph.
+            narrow_font_ladder(&self.primary_font, &self.symbol_font, &self.menlo_font, ch)
         };
 
         // Step 1: Allocate atlas slot (layout only, no pixel work). Color
@@ -362,16 +347,14 @@ impl GlyphAtlas {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
         } else if is_wide {
             self.cjk_font.as_ref().unwrap_or(&self.primary_font)
-        } else if self.primary_font.glyph_for_char(base_char).is_some() {
-            &self.primary_font
-        } else if self
-            .symbol_font
-            .as_ref()
-            .is_some_and(|f| f.glyph_for_char(base_char).is_some())
-        {
-            self.symbol_font.as_ref().unwrap()
         } else {
-            &self.primary_font
+            // Narrow base scalar: same ladder as `get_or_rasterize`.
+            narrow_font_ladder(
+                &self.primary_font,
+                &self.symbol_font,
+                &self.menlo_font,
+                base_char,
+            )
         };
 
         // v1.10.4: only emoji clusters whose base scalar the emoji font
