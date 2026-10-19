@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::cluster;
 use super::font::{is_emoji_char, rasterize_emoji_rgba, resolve_font};
-use super::{narrow_font_ladder, GlyphAtlas, GlyphInfo, GlyphStyle};
+use super::{narrow_font_ladder, wide_font_ladder, GlyphAtlas, GlyphInfo, GlyphStyle};
 
 /// v1.10.4: a cluster renders via the RGBA color atlas only when it is
 /// classified emoji **and** the emoji font contains the base scalar.
@@ -14,6 +14,29 @@ use super::{narrow_font_ladder, GlyphAtlas, GlyphInfo, GlyphStyle};
 /// fg-tinted. Those stay on the A8 mask path. Real emoji keep the color path.
 pub(super) fn cluster_wants_color_atlas(is_emoji: bool, emoji_font_has_base: bool) -> bool {
     is_emoji && emoji_font_has_base
+}
+
+/// 宽字符是否落在 PingFang 缺、SD Gothic Neo 可补的区间(v1.13.15 取证定表)。
+/// URO/ExtA/全角/CJK 标点等 PingFang 领地直接 false,连 cjk 探测都不做。
+/// 门是"触发惰性加载"的启发式,不是覆盖承诺:过门字符仍走 cjk-first
+/// (`wide_font_ladder`)。排除项(双法定案,不入门,详见
+/// docs/PLAN_v1.13.15.md §二/§五):31F0-31FF 阿伊努假名扩展(SDG 双法 N)、
+/// 32A4-32FE 圈号表意/圈号假名(32A4 PingFang 有=领地,32D0 SDG N)、
+/// Yi A000-A48F(双法冲突,保守排除)、文恰字 17000+(未过双法)。
+/// (crate 内私有;`pub(super)` 仅为让兄弟模块 tests 直调做区间矩阵测试,
+/// 与 `cluster_wants_color_atlas` 同模式。)
+pub(super) fn may_need_wide_fallback(ch: char) -> bool {
+    matches!(ch,
+        '\u{3040}'..='\u{30FF}'      // 假名 + ・(30FB)——PingFang 双法 N,SDG Y
+      | '\u{1100}'..='\u{11FF}'      // 谚文字母——SDG Y
+      | '\u{3130}'..='\u{318F}'      // 兼容字母——SDG Y
+      | '\u{A960}'..='\u{A97F}'      // 字母扩展-A(同文字族,SDG 三类字母探针全 Y)
+      | '\u{AC00}'..='\u{D7FF}'      // 音节 + 扩展-B——SDG Y
+      | '\u{3200}'..='\u{321F}'      // 括号谚文 (가)——PingFang N,SDG Y(双法)
+      | '\u{3260}'..='\u{327F}'      // 圈号谚文 ㉠——PingFang N,SDG Y(双法)
+      | '\u{1B000}'..='\u{1B16F}'    // 假名补充/扩展-A/小假名扩展——SDG 覆盖版本相关(本机 1B000 亦缺→过门盲区,渲染不变仅一次性加载,见 §五 A-4);1B170+ 努舒字收窄排除
+      | '\u{20000}'..='\u{323AF}'    // CJK ExtB-H——SDG 覆盖版本相关(本机 ExtB 亦缺→过门盲区,渲染不变仅一次性加载,见 §五 A-4)
+    )
 }
 
 impl GlyphAtlas {
@@ -81,7 +104,7 @@ impl GlyphAtlas {
     /// current macOS font set, eagerly opening PingFang + Apple Color Emoji
     /// retained more than 500 MiB of `MALLOC_LARGE` allocations even in an
     /// ASCII-only idle terminal.
-    fn ensure_script_font(&mut self, is_emoji: bool, is_wide: bool) {
+    fn ensure_script_font(&mut self, ch: char, is_emoji: bool, is_wide: bool) {
         if is_emoji && self.emoji_font.is_none() {
             self.emoji_font = resolve_font(
                 &self.emoji_family,
@@ -95,6 +118,28 @@ impl GlyphAtlas {
                     "/System/Library/Fonts/STHeiti Light.ttc",
                 ],
             );
+        }
+
+        // v1.13.15 FIX-B: wide fallback (Apple SD Gothic Neo) — second rung
+        // of `wide_font_ladder`. PingFang lacks the hangul family (kana/ExtB
+        // coverage is version-dependent — runtime probing decides, 取证见
+        // `may_need_wide_fallback` 与 tests.rs),those wide chars rendered
+        // blank under the old `unwrap_or` blind walk. Range gate first:
+        // pure function, zero font probing — 纯中文/ASCII 会话永不触达
+        // SDG。Per-session at most one load (首次 miss).
+        if is_wide && self.wide_fallback_font.is_none() && may_need_wide_fallback(ch) {
+            // cjk 加载失败(None)也算 miss → SDG 仍兜底。
+            // MSRV 注意:勿用 is_none_or(项目已有 MSRV 陷阱备案),用 map_or(true, …)。
+            let cjk_misses = self
+                .cjk_font
+                .as_ref()
+                .map_or(true, |f| f.glyph_for_char(ch).is_none());
+            if cjk_misses {
+                self.wide_fallback_font = resolve_font(
+                    "Apple SD Gothic Neo",
+                    &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
+                );
+            }
         }
     }
 
@@ -124,7 +169,7 @@ impl GlyphAtlas {
         // Determine which font to use
         let is_wide = weft_core::grid::terminal_char_width(ch) > 1;
         let is_emoji = is_emoji_char(ch);
-        self.ensure_script_font(is_emoji, is_wide);
+        self.ensure_script_font(ch, is_emoji, is_wide);
 
         // v1.10.12: styled glyphs use the primary font's variant face when
         // available; fallback fonts (CJK/emoji/symbol) and missing variants
@@ -151,7 +196,17 @@ impl GlyphAtlas {
         } else if is_emoji {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
         } else if is_wide {
-            self.cjk_font.as_ref().unwrap_or(&self.primary_font)
+            // v1.13.15 FIX-A: wide ladder — PingFang 缺的宽字符(假名/韩文/
+            // ExtB-H)不再盲走 cjk 的全零位图,由 wide_fallback(SDG)兜底;
+            // cjk-first 保序,既有 PingFang 墨迹零漂移。
+            wide_font_ladder(
+                &self.cjk_font,
+                &self.wide_fallback_font,
+                &self.primary_font,
+                &self.symbol_font,
+                &self.menlo_font,
+                ch,
+            )
         } else {
             // Narrow text: the shared ladder — monospace primary, then the
             // lightweight symbol fallback, then Menlo (third hop, see
@@ -342,11 +397,20 @@ impl GlyphAtlas {
         let is_emoji = is_emoji_char(base_char)
             || cluster.contains('\u{fe0f}')
             || cluster.contains('\u{200d}');
-        self.ensure_script_font(is_emoji, is_wide);
+        self.ensure_script_font(base_char, is_emoji, is_wide);
         let font = if is_emoji {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
         } else if is_wide {
-            self.cjk_font.as_ref().unwrap_or(&self.primary_font)
+            // v1.13.15 FIX-A: same wide ladder as `get_or_rasterize` —
+            // cjk-first 保序,SDG 兜底 PingFang 缺的宽字符。
+            wide_font_ladder(
+                &self.cjk_font,
+                &self.wide_fallback_font,
+                &self.primary_font,
+                &self.symbol_font,
+                &self.menlo_font,
+                base_char,
+            )
         } else {
             // Narrow base scalar: same ladder as `get_or_rasterize`.
             narrow_font_ladder(

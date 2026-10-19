@@ -65,6 +65,34 @@ fn narrow_font_ladder<'a>(
     }
 }
 
+/// Wide-char font ladder: CJK → wide fallback (Apple SD Gothic Neo) → narrow tail.
+/// 顺序不得调整:宽字符墨迹今天 100% 来自 CJK 字体(cjk_font 加载后无条件选用),
+/// cjk-first 探测保序 = 每个 PingFang 覆盖的宽字符来源不变(金像零漂移)。
+/// 取证(运行时实测口径,2026-10-19,与 tests.rs 取证注释一致):PingFang 运行时
+/// face 缺韩文全族(假名/ExtB 因 macOS 版本与 face 选择而异,本机 AssetsV2
+/// PingFang 有假名/𠮷);SD Gothic Neo 补韩文全族+假名(ExtB/1B000 本机亦缺,
+/// 留 A-4)。与 `narrow_font_ladder` 同构的探测式阶梯,取 `&Option<Font>` 让
+/// 调用点用字段级离散借用(get_or_rasterize 是 &mut self,&self 薄方法会 E0502)。
+fn wide_font_ladder<'a>(
+    cjk: &'a Option<Font>,
+    wide_fallback: &'a Option<Font>,
+    primary: &'a Font,
+    symbol: &'a Option<Font>,
+    menlo: &'a Option<Font>,
+    ch: char,
+) -> &'a Font {
+    if cjk.as_ref().is_some_and(|f| f.glyph_for_char(ch).is_some()) {
+        cjk.as_ref().unwrap()
+    } else if wide_fallback
+        .as_ref()
+        .is_some_and(|f| f.glyph_for_char(ch).is_some())
+    {
+        wide_fallback.as_ref().unwrap()
+    } else {
+        narrow_font_ladder(primary, symbol, menlo, ch)
+    }
+}
+
 /// Pre-rasterized glyph atlas uploaded to a Metal texture.
 pub struct GlyphAtlas {
     texture: metal::Texture,
@@ -139,6 +167,17 @@ pub struct GlyphAtlas {
     /// CJK fallback font (PingFang SC).
     cjk_font: Option<Font>,
     cjk_family: String,
+    /// v1.13.15: wide-char fallback (Apple SD Gothic Neo) — second rung of
+    /// `wide_font_ladder`. WHY: the PingFang SC runtime face always lacks
+    /// the hangul family(假名/ExtB 覆盖版本相关——本机 AssetsV2 PingFang 有
+    /// 假名/𠮷;运行时探测裁决,见 tests.rs 取证注释),so the old
+    /// `cjk_font.unwrap_or(primary)` is_wide branch rendered those wide
+    /// chars blank (PingFang's all-zero bitmap). SD Gothic Neo supplies
+    /// hangul in full plus kana. 惰性纪律: AppleSDGothicNeo.ttc is ~55MB —
+    /// loaded once, only when `may_need_wide_fallback(ch)` passes the range
+    /// gate AND the CJK font misses the glyph (see `ensure_script_font`;
+    /// the 500MiB MALLOC_LARGE lesson lives in its header comment).
+    wide_fallback_font: Option<Font>,
     /// Emoji fallback font (Apple Color Emoji).
     emoji_font: Option<Font>,
     emoji_family: String,
@@ -384,6 +423,7 @@ impl GlyphAtlas {
             synthesize_bold_italic,
             cjk_font: None,
             cjk_family: font_config.cjk_family.clone(),
+            wide_fallback_font: None,
             emoji_font: None,
             emoji_family: font_config.emoji_family.clone(),
             symbol_font,

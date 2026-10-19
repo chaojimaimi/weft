@@ -1125,3 +1125,224 @@ fn cluster_cache_counts_hits_and_misses() {
     assert!(atlas.get_cluster(cluster).is_some());
     assert_eq!(atlas.cluster_hits.get(), hits_before + 1);
 }
+
+// ── v1.13.15: wide ladder + Apple SD Gothic Neo fallback ────────────────
+// 取证: docs/PLAN_v1.13.15.md §〇 — 旧 is_wide 分支
+// `cjk_font.unwrap_or(primary)` 加载后无条件选用,PingFang 缺的宽字符渲染
+// 其全零位图 = 空白。
+//
+// 本机实测(2026-10-19, macOS 27.0.1;三法一致:font-kit `glyph_for_char`
+// 运行时探测 + CoreText 双 API 复核 CTFontGetGlyphsForCharacters/
+// CTFontCopyCharacterSet + AssetsV2 PingFang.ttc cmap 直读):
+//  - PingFang SC(家族解析实际落在
+//    /System/Library/AssetsV2/com_apple_MobileAsset_Font8/.../PingFang.ttc,
+//    老 /System/Library/Fonts/PingFang.ttc 已不存在)自带假名/・/𠮷,
+//    缺韩文全族(한/가/㈜/㉠/𛀀)—— 与 PLAN §〇 取证表的假名/ExtB 行不符,
+//    断言以本机实测为准。
+//  - Apple SD Gothic Neo 补韩文全族 + 假名;但 𛀀(1B000)/ExtB 亦缺
+//    (PLAN §〇 的"SDG ExtB-H 全 Y/1B000 Y"在本机不成立,留 A-4)。
+
+/// Fact pin: PingFang SC does NOT carry the hangul family (syllables 한/가,
+/// parenthesized ㈜ U+321C, circled ㉠ U+3260, kana-supplement 𛀀 U+1B000)
+/// — while Apple SD Gothic Neo has the full hangul family AND kana. This
+/// pins the system facts that justify the wide ladder's second rung —
+/// deleting the rung would re-blank hangul for wide routing.
+#[test]
+fn fact_pin_pingfang_lacks_hangul_sdgothic_covers_hangul_and_kana() {
+    let pingfang =
+        super::font::resolve_font("PingFang SC", &["/System/Library/Fonts/PingFang.ttc"])
+            .expect("PingFang SC must load on macOS (fact pin target)");
+    let sdg = super::font::resolve_font(
+        "Apple SD Gothic Neo",
+        &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
+    )
+    .expect("Apple SD Gothic Neo must load on macOS (wide fallback)");
+    // The gap that justifies the wide rung: PingFang misses every hangul
+    // class (the old unwrap_or branch rendered them as its all-zero bitmap).
+    for ch in ['한', '가', '㈜', '㉠', '𛀀'] {
+        assert!(
+            pingfang.glyph_for_char(ch).is_none(),
+            "fact pin: PingFang SC must NOT have U+{:04X} (this gap is why the wide ladder needs the SDG rung)",
+            ch as u32
+        );
+    }
+    // The rung must reach ink: SDG carries the whole hangul family plus
+    // kana (the ladder's cjk-first keeps kana on PingFang where present,
+    // but SDG must still be able to supply both classes).
+    for ch in ['한', '가', '㈜', '㉠', 'あ', 'ア', '・'] {
+        assert!(
+            sdg.glyph_for_char(ch).is_some(),
+            "fact pin: Apple SD Gothic Neo must have U+{:04X} (the wide rung must reach ink)",
+            ch as u32
+        );
+    }
+    // Pin the flip side: on this system PingFang itself covers kana —
+    // cjk-first serves them without ever loading SDG. A regression here
+    // means the kana range gate would start loading SDG for characters
+    // PingFang already carries.
+    for ch in ['あ', 'ア', '・', '中'] {
+        assert!(
+            pingfang.glyph_for_char(ch).is_some(),
+            "fact pin: PingFang SC must have U+{:04X} on this system (kana territory served cjk-first, zero SDG cost)",
+            ch as u32
+        );
+    }
+    // ExtB 覆盖版本相关(本机 AssetsV2 PingFang 有 𠮷;CI macos-14/Sonoma 的
+    // 老 PingFang 无在库证据),不作为跨版本硬事实:有→pin 自持;无→记录
+    // 版本差异跳过(仿 PingFang.ttc 路径探测先例)。
+    if pingfang.glyph_for_char('𠮷').is_none() {
+        eprintln!(
+            "note: PingFang SC lacks U+20BB7 on this macOS build — ExtB coverage is version-dependent, optional pin skipped"
+        );
+    }
+}
+
+/// Range gate matrix (`may_need_wide_fallback`): true exactly for the
+/// v1.13.15 取证定表 blocks (kana / hangul jamo + syllables / compat jamo /
+/// 3200-321F / 3260-327F / 1B000-1B16F / ExtB-H); false for PingFang
+/// territory (URO, CJK punctuation, fullwidth forms) and the documented
+/// exclusion blocks (31F0 Ainu kana — SDG 双法 N; 32A4 circled ideographs —
+/// PingFang territory).
+#[test]
+fn may_need_wide_fallback_ranges() {
+    for ch in ['あ', 'ア', '・', '한', 'ᄀ', '가', '㈜', '㉠', '𛀀', '𠮷'] {
+        assert!(
+            super::query::may_need_wide_fallback(ch),
+            "U+{:04X} must pass the wide-fallback range gate",
+            ch as u32
+        );
+    }
+    for ch in ['中', '！', '、', '→', 'A', '㊤', 'ㇰ'] {
+        assert!(
+            !super::query::may_need_wide_fallback(ch),
+            "U+{:04X} must NOT pass the wide-fallback range gate (PingFang territory or documented exclusion)",
+            ch as u32
+        );
+    }
+}
+
+/// v1.13.15: with the default config (primary Menlo), '한' is wide and
+/// PingFang misses it — `ensure_script_font` must lazily load Apple SD
+/// Gothic Neo (FIX-B), the wide ladder must route '한' to it, and
+/// `get_or_rasterize` must succeed through the A8 mask path (not the color
+/// atlas) for both hangul and kana.
+#[test]
+fn wide_ladder_routes_kana_hangul_to_sdgothic() {
+    let Some(device) = metal::Device::system_default() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let mut atlas =
+        crate::glyph::GlyphAtlas::new(&device, &weft_core::config::FontConfig::default(), 2.0);
+
+    // Warm path: '한' (wide, non-emoji) triggers the cjk load + the FIX-B
+    // SDG load, then rasterizes via the mask atlas.
+    let info = atlas
+        .get_or_rasterize('한', crate::glyph::GlyphStyle::REGULAR)
+        .expect("한 must rasterize via the wide ladder");
+    assert!(
+        !info.is_color,
+        "한 must stay on the A8 mask path, not the RGBA color atlas"
+    );
+
+    // Ladder routing: cjk (PingFang) misses '한' → the wide rung must hand
+    // back the SDG face.
+    let font = super::wide_font_ladder(
+        &atlas.cjk_font,
+        &atlas.wide_fallback_font,
+        &atlas.primary_font,
+        &atlas.symbol_font,
+        &atlas.menlo_font,
+        '한',
+    );
+    assert_eq!(
+        font.postscript_name().as_deref(),
+        Some("AppleSDGothicNeo-Regular"),
+        "wide ladder must route '한' to Apple SD Gothic Neo when PingFang misses it"
+    );
+
+    // Kana rides the same rung end-to-end.
+    let kana = atlas
+        .get_or_rasterize('あ', crate::glyph::GlyphStyle::REGULAR)
+        .expect("あ must rasterize via the wide ladder");
+    assert!(
+        !kana.is_color,
+        "あ must stay on the A8 mask path, not the RGBA color atlas"
+    );
+
+    // Pixel-level: SDG actually rasterizes '한' into ink (probe-style call,
+    // parameters follow the narrow_ladder_third_hop precedent; wide cells
+    // are cell_w * 2 + is_wide=true, matching the production call).
+    let sdg = atlas
+        .wide_fallback_font
+        .as_ref()
+        .expect("FIX-B must have loaded Apple SD Gothic Neo");
+    let scaled_size = 26.0f32; // 13pt @2x, matches the probe above
+    let cell_w = super::GlyphAtlas::measure_advance(&atlas.primary_font, 'M', scaled_size).max(1);
+    let cell_h = (scaled_size * 1.2f32).ceil() as u32;
+    let pixels = super::GlyphAtlas::rasterize_glyph(
+        sdg,
+        '한',
+        scaled_size,
+        cell_w * 2,
+        cell_h,
+        true,
+        descent_px(sdg, scaled_size),
+        false,
+    );
+    assert!(
+        pixels.iter().filter(|&&p| p > 0).count() > 0,
+        "Apple SD Gothic Neo must rasterize '한' to a non-blank A8 bitmap (else the wide rung still renders blank)"
+    );
+}
+
+/// v1.13.15 金像不变式: cjk-first 保序 — '中' is in PingFang's territory
+/// (URO), so the wide ladder must hand it back to PingFang EVEN when SDG is
+/// already loaded (mixed Chinese+Korean session — SDG also carries 中, so a
+/// swapped probe order would steal it and drift every pre-existing wide
+/// glyph). The hangul warm-up puts the atlas in that worst-case world; the
+/// trailing assert pins the range gate keeping SDG unloaded for pure
+/// Chinese sessions (zero cost).
+#[test]
+fn wide_ladder_keeps_chinese_on_pingfang() {
+    let Some(device) = metal::Device::system_default() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let mut atlas =
+        crate::glyph::GlyphAtlas::new(&device, &weft_core::config::FontConfig::default(), 2.0);
+
+    // Range gate: '中' alone must NOT trigger the SDG load (pure-Chinese
+    // session zero cost — the wide fallback stays None).
+    atlas
+        .get_or_rasterize('中', crate::glyph::GlyphStyle::REGULAR)
+        .expect("中 must rasterize via the CJK rung");
+    assert!(
+        atlas.wide_fallback_font.is_none(),
+        "范围门: '中' 是 PingFang 领地,SDG 不得加载(纯中文会话零成本)"
+    );
+
+    // Warm the wide fallback: after hangul, wide_fallback_font is Some
+    // — the only world where cjk-first ordering is actually under threat.
+    atlas
+        .get_or_rasterize('한', crate::glyph::GlyphStyle::REGULAR)
+        .expect("한 must rasterize via the wide rung");
+    assert!(
+        atlas.wide_fallback_font.is_some(),
+        "precondition: hangul must have loaded the SDG fallback"
+    );
+
+    let font = super::wide_font_ladder(
+        &atlas.cjk_font,
+        &atlas.wide_fallback_font,
+        &atlas.primary_font,
+        &atlas.symbol_font,
+        &atlas.menlo_font,
+        '中',
+    );
+    assert_eq!(
+        font.postscript_name().as_deref(),
+        Some("PingFangSC-Regular"),
+        "cjk-first 保序(金像不变式): 即便 SDG 已加载,'中' 必须仍来自 PingFang,不得被 SDG 抢走"
+    );
+}
