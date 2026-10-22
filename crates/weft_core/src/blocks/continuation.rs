@@ -8,6 +8,33 @@ const MIN_REPLAY_LINES: usize = 6;
 const MIN_REPLAY_BYTES: usize = 160;
 const MIN_REPLAY_PERCENT: usize = 55;
 
+/// PLAN_v1.13.16: 命令结束分类(对齐 Warp `SUCCESSFUL_EXIT_CODES = &[0, 130, 141]`
+/// 白名单)。Ctrl-C(130 = 128 + SIGINT)与 SIGPIPE(141 = 128 + SIGPIPE)是
+/// 用户/管道的常规中止,不算失败。所有失败判定消费方(diagnose 按钮、自动
+/// 诊断、通知措辞、面板染色)必须走 [`classify_exit`],禁止各自 `exit_code != 0`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitClass {
+    /// `Some(0)` —— 干净退出。
+    Success,
+    /// `Some(130) | Some(141)` —— 用户 Ctrl-C / 管道 SIGPIPE 中止。
+    Cancelled,
+    /// 其余非零退出码(含 137/143/129 等 —— Warp 也不豁免)。
+    Failed,
+    /// `None` —— 未收到 133;D(孤儿块,维持现 "interrupted" 语义)。
+    Orphan,
+}
+
+/// 唯一的退出码分类入口。持久化仍存原始 `i32`,分类只发生在展示/消费层,
+/// 历史数据零迁移。
+pub fn classify_exit(exit_code: Option<i32>) -> ExitClass {
+    match exit_code {
+        Some(0) => ExitClass::Success,
+        Some(130) | Some(141) => ExitClass::Cancelled,
+        Some(_) => ExitClass::Failed,
+        None => ExitClass::Orphan,
+    }
+}
+
 impl BlockTracker {
     pub(super) fn prepare_screen_continuation(&mut self, command: &str) {
         self.continuation_candidate = self
@@ -271,6 +298,28 @@ mod tests {
     use crate::grid::CellColor;
 
     const REPLAY: &str = "banner line with enough content\nmodel and account information\nworking directory /tmp/project\nprompt asking for a performance report\nanswer line one with useful detail\nanswer line two with useful detail";
+
+    /// PLAN_v1.13.16: 真值表 —— 0 成功;130/141 取消(Ctrl-C/SIGPIPE,不算
+    /// 失败,Warp 白名单对齐);其余非零(含 137/143)一律失败;None 孤儿。
+    #[test]
+    fn classify_exit_truth_table() {
+        assert_eq!(classify_exit(Some(0)), ExitClass::Success);
+        for code in [130, 141] {
+            assert_eq!(
+                classify_exit(Some(code)),
+                ExitClass::Cancelled,
+                "exit {code} is user/pipeline cancel, not a failure"
+            );
+        }
+        for code in [1, 2, 126, 127, 131, 137, 143, 255, -1] {
+            assert_eq!(
+                classify_exit(Some(code)),
+                ExitClass::Failed,
+                "exit {code} must stay Failed"
+            );
+        }
+        assert_eq!(classify_exit(None), ExitClass::Orphan);
+    }
 
     fn finish_screen(tracker: &mut BlockTracker, command: &str, output: &str) {
         tracker.on_prompt_start();

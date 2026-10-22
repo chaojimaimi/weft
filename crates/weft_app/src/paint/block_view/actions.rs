@@ -3,6 +3,7 @@
 use crate::overlay::HitRegion;
 use crate::paint::primitives::{push_line, push_quad};
 use crate::renderer::MetalRenderer;
+use weft_core::blocks::continuation::{classify_exit, ExitClass};
 use weft_core::blocks::{Block, BlockId};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,7 +112,8 @@ pub(super) struct BlockHeaderActionPaint {
     pub(super) foreground: [f32; 4],
     /// v1.8.2: Whether the local Ollama backend is configured. When true,
     /// the diagnose button slot is reserved in geometry and the button is
-    /// drawn + hit-tested for blocks with `exit_code != 0`.
+    /// drawn + hit-tested for failed (non-zero; 130/141 excluded as
+    /// user-cancel/SIGPIPE) blocks only.
     pub(super) ai_configured: bool,
 }
 
@@ -163,12 +165,12 @@ pub(super) fn push_block_header_actions(
         let inset_x = metrics.stroke * 2.0;
         let inset_y = (pitch * 0.10).max(metrics.stroke);
         // v1.8.2: include the diagnose surface in the hover loop only when
-        // the slot is active (ai_configured) and the block has failed.
+        // the slot is active (ai_configured) and the block has failed
+        // (non-zero; 130/141 excluded as user-cancel/SIGPIPE).
         let block_failed = blocks
             .iter()
             .find(|b| b.id == block_id)
-            .and_then(|b| b.exit_code)
-            .map(|c| c != 0)
+            .map(|b| classify_exit(b.exit_code) == ExitClass::Failed)
             .unwrap_or(false);
         let diagnose_active = ai_configured && block_failed;
         let mut hover_targets: Vec<([f32; 4], bool)> =
@@ -362,12 +364,12 @@ pub(super) fn push_block_header_actions(
         );
     }
 
-    // v1.8.2: Diagnose button (leftmost, only when ai_configured && failed).
+    // v1.8.2: Diagnose button (leftmost, only when ai_configured && failed
+    // — non-zero; 130/141 excluded as user-cancel/SIGPIPE).
     let block_failed = blocks
         .iter()
         .find(|b| b.id == block_id)
-        .and_then(|b| b.exit_code)
-        .map(|c| c != 0)
+        .map(|b| classify_exit(b.exit_code) == ExitClass::Failed)
         .unwrap_or(false);
     if ai_configured && block_failed {
         hit_regions.push(crate::overlay::HitRegion {

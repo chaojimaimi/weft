@@ -127,8 +127,9 @@ pub fn block_complete_should_notify(
 /// Shape the notification payload for a finished command block.
 ///
 /// Title: the command, truncated at the share NOTIFY_TITLE_MAX char cap.
-/// Body: one line — `Finished in <s>` / `Failed after <s>` (`failed` = the
-/// block's exit code != 0). The body template is bounded well under
+/// Body: one line — `Finished in <s>` / `Failed after <s>` (`failed` =
+/// `ExitClass::Failed` per `classify_exit`; 130/141 cancel excluded). The
+/// body template is bounded well under
 /// NOTIFY_BODY_MAX (256) for any realistic elapsed rendering.
 pub fn notification_text(command: &str, elapsed: Duration, failed: bool) -> (String, String) {
     let title: String = command.chars().take(NOTIFY_TITLE_MAX).collect();

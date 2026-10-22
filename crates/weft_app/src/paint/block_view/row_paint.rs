@@ -248,6 +248,9 @@ pub(super) fn paint_header(
     let meta_c = color_to_normalized(renderer.theme.output.metadata);
     let status_c = match tone {
         BlockTone::Success => cwd_c, // 成功块 status 恒为空,不会用到
+        // PLAN_v1.13.16: Ctrl-C/SIGPIPE 头部 "exit 130" 用 muted 灰
+        // (对齐 Warp muted_text_style),不用 error 红/warning 黄。
+        BlockTone::Cancelled => cwd_c,
         BlockTone::Error => color_to_normalized(ui.error),
         BlockTone::Warning => color_to_normalized(ui.warning),
     };

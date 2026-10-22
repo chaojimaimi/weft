@@ -9,6 +9,7 @@
 
 use crate::ai::DiagnosePrompt;
 use crate::app_state::BlockDiagnoseState;
+use weft_core::blocks::continuation::{classify_exit, ExitClass};
 use weft_core::blocks::BlockId;
 
 impl crate::App {
@@ -16,7 +17,8 @@ impl crate::App {
     /// selected block if no hover). Pulls the block's data from the active
     /// terminal's `BlockTracker`, constructs a `DiagnosePrompt`, and spawns
     /// an AI request. No-op when AI is not configured, the block doesn't
-    /// exist, or the block hasn't failed (exit_code is None or 0).
+    /// exist, or the block isn't a failure — skips non-Failed blocks
+    /// (success / cancel / orphan; PLAN_v1.13.16).
     pub(crate) fn spawn_block_diagnose_from_hover(&mut self) {
         if !self.ai_state.is_configured() {
             tracing::debug!("AI not configured; DiagnoseBlock ignored");
@@ -64,13 +66,15 @@ impl crate::App {
             return;
         };
 
-        // Only diagnose failed blocks (exit_code is Some and non-zero).
+        // PLAN_v1.13.16: only diagnose ExitClass::Failed — Ctrl-C (130) and
+        // SIGPIPE (141) are user/pipeline cancels (ExitClass::Cancelled),
+        // not failures worth an AI diagnosis; None is an orphan block.
         let Some(exit_code) = block.exit_code else {
             tracing::debug!(?block_id, "block has no exit code; skipping diagnose");
             return;
         };
-        if exit_code == 0 {
-            tracing::debug!(?block_id, "block succeeded (exit 0); skipping diagnose");
+        if classify_exit(Some(exit_code)) != ExitClass::Failed {
+            tracing::debug!(?block_id, exit_code, "non-Failed exit; skipping diagnose");
             return;
         }
 

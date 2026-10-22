@@ -35,7 +35,8 @@ pub struct AiConfig {
     /// Idle read timeout in seconds. The timer resets after every response
     /// chunk, so a healthy long generation may exceed it. `None` ⇒ 30.
     pub timeout_secs: Option<u32>,
-    /// Auto-diagnose failed blocks (exit_code != 0). Off by default —
+    /// Auto-diagnose failed blocks (non-zero; 130/141 Ctrl-C/SIGPIPE
+    /// excluded via `classify_exit`). Off by default —
     /// the user triggers diagnosis manually via the block action button
     /// until they opt in here.
     pub enable_error_diagnosis: bool,

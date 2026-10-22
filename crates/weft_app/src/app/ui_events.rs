@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
+use weft_core::blocks::continuation::{classify_exit, ExitClass};
 use weft_core::config::Osc52Mode;
 use weft_core::pane_layout::PaneId;
 use weft_core::vt::UiEvent;
@@ -463,7 +464,9 @@ impl App {
             let (title, body) = crate::notify_policy::notification_text(
                 &block.command,
                 elapsed,
-                block.exit_code.is_some_and(|code| code != 0),
+                // v1.13.16: Ctrl-C(130)/SIGPIPE(141) 是常规中止,不再走
+                // failed 措辞;仅 ExitClass::Failed 才算失败。
+                classify_exit(block.exit_code) == ExitClass::Failed,
             );
             tracing::debug!(
                 block_id = block.id.0,

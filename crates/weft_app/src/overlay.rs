@@ -548,7 +548,8 @@ pub enum HitTarget {
     /// F3-1: Block header hover-action "toggle fold" button.
     BlockActionFold(BlockId),
     /// v1.8.2: Block header hover-action "diagnose failure" button.
-    /// Only rendered for failed blocks (exit_code != 0) when AI is configured.
+    /// Only rendered for failed blocks (non-zero; 130/141 excluded as
+    /// user-cancel/SIGPIPE via `classify_exit`) when AI is configured.
     BlockActionDiagnose(BlockId),
     /// v1.8.2: Close button on the AI diagnose panel rendered below a
     /// failed block's output. Clicking it clears `block_diagnose_state`

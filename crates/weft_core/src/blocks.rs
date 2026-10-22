@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 pub mod annotations;
-mod continuation;
+pub mod continuation;
 mod cursor_capture;
 pub mod export;
 // Live-styled publish family lives in the child module (v1.13.9

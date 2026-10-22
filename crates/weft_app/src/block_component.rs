@@ -2,6 +2,7 @@
 
 use crate::paint::grid_cache::{block_line_chunks, command_line_chunks};
 use crate::paint::ui_helpers::{abbreviate_path, block_duration_str, strip_prompt_prefix};
+use weft_core::blocks::continuation::{classify_exit, ExitClass};
 use weft_core::blocks::Block;
 use weft_core::vt::Terminal;
 
@@ -11,6 +12,9 @@ pub(crate) use hover::{block_header_action_at, hovered_block_for_row, BlockHeade
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockTone {
     Success,
+    /// PLAN_v1.13.16: Ctrl-C(130)/SIGPIPE(141)—— 用户/管道常规中止,
+    /// 非 Error(无红条红底),头部仍显示 muted "exit 130"。
+    Cancelled,
     Error,
     Warning,
 }
@@ -43,10 +47,13 @@ impl BlockPresentation {
 
 pub(crate) fn block_presentation(block: &Block, output_lines: usize) -> BlockPresentation {
     let duration = block_duration_str(block);
-    let tone = match block.exit_code {
-        Some(0) => BlockTone::Success,
-        Some(_) => BlockTone::Error,
-        None => BlockTone::Warning,
+    // PLAN_v1.13.16: 分类收口到 classify_exit —— 130/141 归 Cancelled(中性),
+    // 不再落入 Error 红色系。
+    let tone = match classify_exit(block.exit_code) {
+        ExitClass::Success => BlockTone::Success,
+        ExitClass::Cancelled => BlockTone::Cancelled,
+        ExitClass::Failed => BlockTone::Error,
+        ExitClass::Orphan => BlockTone::Warning,
     };
 
     let cwd = if block.collapsed {
@@ -88,6 +95,9 @@ pub(crate) fn command_resume_hints(block: &Block) -> &'static [&'static str] {
         .split_whitespace()
         .next()
         .and_then(|part| part.rsplit('/').next());
+    // PLAN_v1.13.16: 有意不迁移到 ExitClass::Failed —— 这里的语义是
+    // "opencode 非干净退出"(含 Ctrl-C 130/141 与孤儿 None),此时恢复
+    // 提示对用户仍有用,与失败判定(仅 Failed)是两个独立的决策点。
     if block.exit_code != Some(0) && executable == Some("opencode") {
         OPENCODE_HINTS
     } else {

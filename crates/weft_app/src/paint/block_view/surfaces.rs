@@ -77,6 +77,8 @@ pub(super) fn block_surface_color(
         colors.foreground,
         if block_id.0 % 2 == 0 { 0.024 } else { 0.014 },
     );
+    // PLAN_v1.13.16: 只有 Error 混 error tint、Warning 混 warning tint;
+    // Cancelled(130/141)与 Success 一样保持中性斑马底,不混任何 tint。
     if tone == BlockTone::Error {
         color = blend(color, colors.error, 0.12);
     } else if tone == BlockTone::Warning {
@@ -186,6 +188,8 @@ pub(super) fn push_block_surfaces(
         if y1 <= y0 {
             continue;
         }
+        // PLAN_v1.13.16: 左 rail 只给 Error(红)/ Warning(黄);Cancelled
+        // (130/141)不画 rail(等值比较分支,天然落入 None)。
         let failed = tone == BlockTone::Error;
         let interrupted = tone == BlockTone::Warning;
         push_quad(
@@ -287,6 +291,19 @@ mod tests {
     #[test]
     fn failed_surface_text_reaches_target_contrast() {
         assert_surface_contrast(BlockTone::Error, false, false);
+    }
+
+    /// PLAN_v1.13.16: Ctrl-C/SIGPIPE 块与成功块共用同一中性斑马底 ——
+    /// 无 error/warning tint(同 id 下必须逐通道相等)。
+    #[test]
+    fn cancelled_surface_matches_success_without_tint() {
+        let id = BlockId(2);
+        let (_, colors) = warm_surface_colors(None);
+        assert_eq!(
+            block_surface_color(colors, id, BlockTone::Cancelled),
+            block_surface_color(colors, id, BlockTone::Success),
+            "Cancelled (130/141) must keep the neutral zebra surface, no error/warning tint"
+        );
     }
 
     #[test]

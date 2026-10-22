@@ -84,6 +84,42 @@ fn interrupted_block_has_warning_tone() {
     assert_eq!(presentation.tone, BlockTone::Warning);
 }
 
+/// PLAN_v1.13.16: Ctrl-C(130)/SIGPIPE(141)归 Cancelled tone(中性,非红),
+/// 但 status 文案仍保留 "exit {code}" —— 信息不丢,头部照画。
+#[test]
+fn cancelled_exit_codes_get_muted_tone_and_keep_status_text() {
+    let ctrl_c = block_presentation(&block(Some(130), false), 3);
+    assert_eq!(ctrl_c.tone, BlockTone::Cancelled);
+    assert_eq!(ctrl_c.status, "exit 130");
+
+    let sigpipe = block_presentation(&block(Some(141), false), 3);
+    assert_eq!(sigpipe.tone, BlockTone::Cancelled);
+    assert_eq!(sigpipe.status, "exit 141");
+
+    // 邻界场景回归:真失败仍是 Error,成功/孤儿语义不变。
+    assert_eq!(
+        block_presentation(&block(Some(1), false), 3).tone,
+        BlockTone::Error
+    );
+    assert_eq!(
+        block_presentation(&block(Some(1), false), 3).status,
+        "exit 1"
+    );
+    assert_eq!(
+        block_presentation(&block(Some(0), false), 3).tone,
+        BlockTone::Success
+    );
+    assert_eq!(block_presentation(&block(Some(0), false), 3).status, "");
+    assert_eq!(
+        block_presentation(&block(None, false), 3).tone,
+        BlockTone::Warning
+    );
+    assert_eq!(
+        block_presentation(&block(None, false), 3).status,
+        "interrupted"
+    );
+}
+
 #[test]
 fn interrupted_opencode_block_surfaces_stable_resume_commands() {
     let mut interrupted = block(None, false);

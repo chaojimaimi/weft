@@ -6,6 +6,7 @@ use crate::paint::ui_helpers::{
     visible_panel_rows,
 };
 use crate::renderer::MetalRenderer;
+use weft_core::blocks::continuation::{classify_exit, ExitClass};
 use weft_core::blocks::{Block, BlockId};
 
 /// What the sidebar history panel should draw. Built by the app only when the
@@ -304,10 +305,14 @@ impl MetalRenderer {
             let cmd_color = if selected {
                 selection_fg
             } else {
-                match block.exit_code {
-                    Some(0) => green,
-                    Some(_) => red,
-                    None => dim,
+                // v1.13.16 (P1): consume classify_exit so Ctrl-C(130)/
+                // SIGPIPE(141) stay neutral (dim) here too, matching the
+                // main view; only real failures turn red.
+                match classify_exit(block.exit_code) {
+                    ExitClass::Success => green,
+                    ExitClass::Cancelled => dim,
+                    ExitClass::Failed => red,
+                    ExitClass::Orphan => dim,
                 }
             };
             let dur = block_duration_str(block);
