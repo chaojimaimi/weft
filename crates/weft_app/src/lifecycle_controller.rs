@@ -702,6 +702,9 @@ impl App {
         let reduce = unsafe { system_reduce_motion() };
         if reduce != self.window_runtime.reduce_motion {
             self.window_runtime.reduce_motion = reduce;
+            // v1.13.17 S4: the zoom: IMP has no App access — bridge the same
+            // value at the same update point (single source of truth).
+            crate::macos_zoom::set_zoom_reduce_motion(reduce);
         }
 
         // F6: Poll macOS Increase Contrast setting (always, regardless of

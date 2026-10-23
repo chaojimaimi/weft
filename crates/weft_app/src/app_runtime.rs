@@ -378,6 +378,13 @@ impl ApplicationHandler<AppEvent> for App {
             self.config_state.theme_is_dark = dark;
         }
 
+        // v1.13.17 S4: seed the zoom Reduce-Motion bridge at startup. The
+        // 1Hz poller's first query is delayed 1s (`last_appearance_check`
+        // inits to `Instant::now()`), and the `follow_system` block above
+        // governs the THEME only — reduce-motion polling is unconditional —
+        // so this sync sits outside it, immediately after window creation.
+        crate::macos_zoom::set_zoom_reduce_motion(unsafe { system_reduce_motion() });
+
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.
         let block_store = weft_cache_dir().and_then(|cache| {

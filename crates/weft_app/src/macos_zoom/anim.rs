@@ -98,6 +98,26 @@ static ZOOM_ANIM: std::sync::Mutex<Option<ZoomAnim>> = std::sync::Mutex::new(Non
 /// refresh in the setFrameSize IMP.
 static ZOOM_RESTORE_FRAME: std::sync::Mutex<Option<ZoomFrame>> = std::sync::Mutex::new(None);
 
+/// v1.13.17 S4: Reduce-Motion bridge. The `zoom:` IMP runs on the ObjC side
+/// with no App access, so the 1Hz `poll_system_appearance` result (the same
+/// value stored in `window_runtime.reduce_motion`, same update point — single
+/// source of truth) is mirrored into this flag at that update point plus
+/// once at startup. Default false = animate (the pre-S4 behavior).
+static REDUCE_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// v1.13.17 S4: mirror `window_runtime.reduce_motion` into the zoom IMP's
+/// reach. Relaxed ordering suffices: the flag gates a cosmetic animation and
+/// both writer and reader run on the main thread.
+pub(crate) fn set_zoom_reduce_motion(reduce: bool) {
+    REDUCE_MOTION.store(reduce, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// v1.13.17 S4: the `zoom:` IMP reads this to decide intercept vs. super
+/// forward (see the check in `zoom_imp_objc`).
+pub(crate) fn zoom_reduce_motion() -> bool {
+    REDUCE_MOTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn lock_zoom_anim() -> std::sync::MutexGuard<'static, Option<ZoomAnim>> {
     ZOOM_ANIM
         .lock()
@@ -542,6 +562,18 @@ unsafe fn zoom_imp_objc(
         }
     };
     tracing::debug!(sender_class, "zoom: invoked");
+    // v1.13.17 S4: Reduce Motion → the system's own zoom (instant, no 220ms
+    // self-managed animation). Merged into the existing super-forward guard
+    // family (fullscreen / screen-nil / main-height-None below). Deliberate
+    // tradeoff: an animation already armed when the user flips the setting
+    // still runs its current 220ms segment to completion — aborting mid-flight
+    // would jump the window to its target frame, exactly the motion the user
+    // asked to avoid. The NEXT zoom: invocation takes the instant path.
+    if zoom_reduce_motion() {
+        forwarded.set(true);
+        zoom_imp_forward_super(this, sender);
+        return;
+    }
     // Fullscreen fallback (plan I-2): zoom: inside fullscreen is the
     // system's own behavior -- forward untouched.
     // SAFETY: `styleMask` on a live NSWindow returns the mask by value.
