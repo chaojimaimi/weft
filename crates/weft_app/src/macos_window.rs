@@ -7,6 +7,8 @@ use objc2::msg_send;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+use crate::layout::Rect;
+
 /// v1.11.6 (PLAN_v1116 M2/D-i): query whether the winit window's NSWindow is
 /// currently in a live (user-drag) resize. The renderer flips
 /// `presentsWithTransaction` on the CAMetalLayer while true, so the resized
@@ -295,4 +297,254 @@ pub(crate) fn set_window_opaque(window: &Window, opaque: bool) -> bool {
         true
     }))
     .unwrap_or(false)
+}
+
+// ── v1.13.17 S1: traffic-light gap drag + double-click system preference ──
+
+/// What a double-click on the titlebar background should do (v1.13.17 S1),
+/// resolved from the system's `AppleActionOnDoubleClick` preference.
+///
+/// There is no `Fill` variant: the setting's stored value `"Fill"` (macOS
+/// Sequoia+ window tiling) is approximated with `Zoom` for this release —
+/// Weft has no macOS 26 tiling ability to fill with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DoubleClickTitlebarAction {
+    /// Toggle maximize/restore (the macOS default; stored value "Maximize",
+    /// which is what System Settings' "Zoom" label writes).
+    Zoom,
+    /// Minimize the window (stored value "Minimize").
+    Minimize,
+    /// Explicitly configured no-op (stored value "None") — the double-click
+    /// must not toggle anything; single-click drag stays unaffected.
+    NoAction,
+}
+
+/// Pure mapping from the `AppleActionOnDoubleClick` stored string to the
+/// action. `None` (key absent) / `""` / `"Maximize"` / `"Fill"` / unknown
+/// values all resolve to `Zoom` — the macOS default. "Fill" is approximated
+/// as Zoom (Weft has no macOS 26 fill/tiling ability; stopgap release).
+pub(crate) fn double_click_action_from_pref(value: Option<&str>) -> DoubleClickTitlebarAction {
+    match value {
+        Some("Minimize") => DoubleClickTitlebarAction::Minimize,
+        Some("None") => DoubleClickTitlebarAction::NoAction,
+        _ => DoubleClickTitlebarAction::Zoom,
+    }
+}
+
+/// Read `AppleActionOnDoubleClick` from the standard user defaults and map
+/// it to a [`DoubleClickTitlebarAction`]. Queried live on each double-click
+/// (a low-frequency path — no caching). Any broken query (null class, nil
+/// value, non-UTF8, ObjC panic) degrades to the macOS default `Zoom`,
+/// matching `system_appearance_is_dark`'s guarded-unwind convention.
+pub(crate) fn double_click_titlebar_action() -> DoubleClickTitlebarAction {
+    let raw: Option<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        read_double_click_pref_raw()
+    }))
+    .unwrap_or_else(|_| {
+        tracing::warn!("double_click_pref: ObjC panic; using the Zoom default");
+        None
+    });
+    double_click_action_from_pref(raw.as_deref())
+}
+
+/// SAFETY: main-thread NSUserDefaults query via class lookup + `msg_send!`;
+/// every pointer is null-checked before it is messaged, and `UTF8String`'s
+/// returned pointer is only read through `CStr::from_ptr` while the string
+/// object is still alive in this scope (same shape as
+/// `macos_system::system_appearance_is_dark`).
+unsafe fn read_double_click_pref_raw() -> Option<String> {
+    use objc2::runtime::AnyObject;
+
+    let defaults_cls = objc2::ffi::objc_getClass(c"NSUserDefaults".as_ptr());
+    if defaults_cls.is_null() {
+        return None;
+    }
+    // SAFETY: `standardUserDefaults` on the looked-up class; returns a live
+    // singleton (never released here).
+    let defaults: *mut AnyObject =
+        unsafe { msg_send![defaults_cls as *const AnyObject, standardUserDefaults] };
+    if defaults.is_null() {
+        return None;
+    }
+    let c_key = std::ffi::CString::new("AppleActionOnDoubleClick").ok()?;
+    // SAFETY: `stringWithUTF8String` on the NSString class with a valid
+    // C string pointer.
+    let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
+    if str_cls.is_null() {
+        return None;
+    }
+    let key_ns: *mut AnyObject =
+        unsafe { msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_key.as_ptr()] };
+    if key_ns.is_null() {
+        return None;
+    }
+    // SAFETY: `stringForKey:` on the live defaults dictionary; a missing key
+    // legally returns nil (mapped to the Zoom default by the caller).
+    let value_ns: *mut AnyObject = unsafe { msg_send![defaults, stringForKey: key_ns] };
+    if value_ns.is_null() {
+        return None;
+    }
+    // SAFETY: `UTF8String` on a live NSString; the pointer stays valid for
+    // the remainder of this scope.
+    let c_str: *const std::os::raw::c_char = unsafe { msg_send![value_ns, UTF8String] };
+    if c_str.is_null() {
+        return None;
+    }
+    let value = std::ffi::CStr::from_ptr(c_str).to_str().ok()?; // non-UTF8 → default
+    Some(value.trim().to_string())
+}
+
+/// v1.13.17 S1: click point vs. rectangle test, half-open on the right/bottom
+/// edges so adjacent rectangles never both claim the point (matches
+/// `HitRegion::contains_half_open`'s convention).
+pub(crate) fn point_in_rect(x: f64, y: f64, rect: Rect) -> bool {
+    let (x, y) = (x as f32, y as f32);
+    x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3]
+}
+
+/// Flip AppKit window-base rects (bottom-left origin, logical points) to
+/// Weft's top-left physical-pixel space. Pure — unit-tested with scale=1 and
+/// scale=2 fixtures; `press_tab_bar`'s x/y and `traffic_lights_width()` both
+/// speak physical pixels, so the ×scale must happen here, not at the caller.
+fn rects_flip_to_physical(rects_ns: [[f64; 4]; 3], window_height_pt: f64, scale: f64) -> [Rect; 3] {
+    rects_ns.map(|[x, y, w, h]| {
+        let y_top_pt = window_height_pt - y - h;
+        [
+            (x * scale) as f32,
+            (y_top_pt * scale) as f32,
+            ((x + w) * scale) as f32,
+            ((y_top_pt + h) * scale) as f32,
+        ]
+    })
+}
+
+/// v1.13.17 S1: the three standard traffic-light buttons' rectangles in the
+/// window's top-left physical-pixel space — the same space `press_tab_bar`
+/// receives its x/y in. Queried live on every press (no cache: the rects
+/// move with window width/fullscreen state, and a press is low-frequency).
+///
+/// `None` on any failure (no handle, no NSWindow, a button absent for the
+/// current style mask, ObjC panic) — the caller falls back to the previous
+/// conservative "whole traffic-light strip is consumed" behavior.
+pub(crate) fn traffic_button_rects(window: &Window) -> Option<[Rect; 3]> {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSView, NSWindowButton};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return None; // Not macOS — nothing to query.
+    };
+    // SAFETY: retain of the live winit-owned NSView (install_zoom_override_hook
+    // precedent); only valid for the window's lifetime, which `window` outlives.
+    let view: Retained<NSView> = unsafe { Retained::retain(appkit.ns_view.as_ptr().cast()) }?;
+    let ns_window = unsafe { ns_window_of(&view) }?;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frame = ns_window.frame();
+        let scale = window.scale_factor();
+        let kinds = [
+            NSWindowButton::NSWindowCloseButton,
+            NSWindowButton::NSWindowMiniaturizeButton,
+            NSWindowButton::NSWindowZoomButton,
+        ];
+        let mut rects_ns = [[0.0f64; 4]; 3];
+        for (slot, kind) in rects_ns.iter_mut().zip(kinds.iter()) {
+            // Typed objc2-app-kit API (no msg_send!): a hidden/absent button
+            // (e.g. zoom omitted by a custom style mask) yields None and the
+            // whole query degrades to the caller's conservative fallback.
+            let button = ns_window.standardWindowButton(*kind)?;
+            // `bounds` in the button's own space + convert-to-window (nil
+            // target) → window-base logical points, bottom-left origin.
+            let in_window = button.convertRect_toView(button.bounds(), None);
+            *slot = [
+                in_window.origin.x,
+                in_window.origin.y,
+                in_window.size.width,
+                in_window.size.height,
+            ];
+        }
+        Some(rects_flip_to_physical(rects_ns, frame.size.height, scale))
+    }))
+    .unwrap_or_else(|_| {
+        tracing::warn!("traffic_button_rects: ObjC panic; using the conservative fallback");
+        None
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        double_click_action_from_pref, point_in_rect, rects_flip_to_physical,
+        DoubleClickTitlebarAction,
+    };
+
+    #[test]
+    fn double_click_pref_maps_every_stored_value() {
+        // macOS default when the key is absent or empty.
+        assert_eq!(
+            double_click_action_from_pref(None),
+            DoubleClickTitlebarAction::Zoom
+        );
+        assert_eq!(
+            double_click_action_from_pref(Some("")),
+            DoubleClickTitlebarAction::Zoom
+        );
+        // System Settings' "Zoom" label stores "Maximize".
+        assert_eq!(
+            double_click_action_from_pref(Some("Maximize")),
+            DoubleClickTitlebarAction::Zoom
+        );
+        // "Fill" (macOS Sequoia+) is approximated with Zoom — no tiling here.
+        assert_eq!(
+            double_click_action_from_pref(Some("Fill")),
+            DoubleClickTitlebarAction::Zoom
+        );
+        // Explicit minimize / explicitly-none.
+        assert_eq!(
+            double_click_action_from_pref(Some("Minimize")),
+            DoubleClickTitlebarAction::Minimize
+        );
+        assert_eq!(
+            double_click_action_from_pref(Some("None")),
+            DoubleClickTitlebarAction::NoAction
+        );
+        // Unknown future values stay on the macOS default.
+        assert_eq!(
+            double_click_action_from_pref(Some("SomethingNew")),
+            DoubleClickTitlebarAction::Zoom
+        );
+    }
+
+    /// Bottom-left logical rect (x=10, y=20, w=30, h=40) in a 100pt-tall
+    /// window at scale 1: top-left origin flips y to 100-20-40 = 40.
+    #[test]
+    fn flip_to_physical_at_scale_one() {
+        let rects = [[10.0, 20.0, 30.0, 40.0], [0.0; 4], [0.0; 4]];
+        let [out, _, _] = rects_flip_to_physical(rects, 100.0, 1.0);
+        assert_eq!(out, [10.0, 40.0, 40.0, 80.0]);
+    }
+
+    /// Same rect at scale 2: every coordinate doubles in physical pixels —
+    /// the 2x-display fixture (unmultiplied logical values would land the
+    /// hit test at half the real position).
+    #[test]
+    fn flip_to_physical_at_scale_two() {
+        let rects = [[10.0, 20.0, 30.0, 40.0], [0.0; 4], [0.0; 4]];
+        let [out, _, _] = rects_flip_to_physical(rects, 100.0, 2.0);
+        assert_eq!(out, [20.0, 80.0, 80.0, 160.0]);
+    }
+
+    #[test]
+    fn point_in_rect_is_half_open() {
+        let rect: crate::layout::Rect = [10.0, 20.0, 40.0, 60.0];
+        assert!(point_in_rect(10.0, 20.0, rect));
+        assert!(point_in_rect(39.9, 59.9, rect));
+        // Right/bottom edges are exclusive…
+        assert!(!point_in_rect(40.0, 30.0, rect));
+        assert!(!point_in_rect(20.0, 60.0, rect));
+        // …left/top edges inclusive, outside points reject.
+        assert!(point_in_rect(10.0, 30.0, rect));
+        assert!(!point_in_rect(9.9, 30.0, rect));
+        assert!(!point_in_rect(20.0, 19.9, rect));
+    }
 }

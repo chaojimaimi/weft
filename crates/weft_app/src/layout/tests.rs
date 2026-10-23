@@ -443,6 +443,97 @@ fn supported_minimum_window_keeps_tab_controls_inside_viewport() {
     }
 }
 
+// ── v1.13.17 S1: drag_reserve 保底拖拽区 ─────────────────────────────
+//
+// The blank bar background right of "+" is the only always-reachable
+// drag/double-click region (tab_bar_target_at → None). layout_tab_strip must
+// keep at least cell_width * 4.0 of it even when tabs overflow, and the
+// padding share must never shrink below that floor.
+
+/// padding_x = 0 (the config default, config/sections.rs): the blank after
+/// "+" is exactly the drag_reserve floor. Asserted for both the fitting and
+/// the overflowing mode.
+#[test]
+fn drag_reserve_keeps_blank_after_plus_with_default_padding() {
+    for count in [3_usize, 10, 30] {
+        let input = TabStripInput {
+            viewport_width: 1200.0,
+            bar_height: 56.0,
+            cell_width: 8.0,
+            padding_x: 0.0,
+            chrome_left: 0.0,
+            traffic_lights_width: 72.0,
+            tab_count: count,
+            requested_scroll_offset: 0.0,
+        };
+        let strip = layout_tab_strip(input);
+        let blank = 1200.0 - strip.plus_rect[2];
+        assert!(
+            blank >= input.cell_width * 4.0,
+            "count={count}: blank after '+' is {blank}, floor is {}",
+            input.cell_width * 4.0
+        );
+    }
+}
+
+/// In overflow mode "+" is pinned to the right reserve, so the blank equals
+/// `max(padding share, drag_reserve)` exactly — a wide padding_x (20 → 10pt
+/// share) must NOT grow it, and the floor must not shrink it.
+#[test]
+fn drag_reserve_wins_over_a_wider_padding_share() {
+    // overflow mode: exact max(padding, reserve) blank.
+    let overflowing = layout_tab_strip(TabStripInput {
+        viewport_width: 1200.0,
+        bar_height: 56.0,
+        cell_width: 8.0,
+        padding_x: 20.0,
+        chrome_left: 0.0,
+        traffic_lights_width: 72.0,
+        tab_count: 30,
+        requested_scroll_offset: 0.0,
+    });
+    assert!(overflowing.overflowing);
+    let blank = 1200.0 - overflowing.plus_rect[2];
+    assert!(
+        (blank - 32.0).abs() < 1e-3,
+        "blank = max(10, 8*4) = 32, got {blank}"
+    );
+
+    // fitting mode: the blank can only be wider than the floor.
+    let fitting = layout_tab_strip(TabStripInput {
+        viewport_width: 1200.0,
+        bar_height: 56.0,
+        cell_width: 8.0,
+        padding_x: 20.0,
+        chrome_left: 0.0,
+        traffic_lights_width: 72.0,
+        tab_count: 2,
+        requested_scroll_offset: 0.0,
+    });
+    assert!(!fitting.overflowing);
+    assert!(1200.0 - fitting.plus_rect[2] >= 32.0);
+}
+
+/// The minimum supported window must keep the reserve inside the viewport
+/// (blank ≥ cw*4 when the viewport allows it) and stay panic-free.
+#[test]
+fn drag_reserve_holds_at_minimum_window_width() {
+    let cw = 8.0_f32;
+    let strip = layout_tab_strip(TabStripInput {
+        viewport_width: crate::ui_tokens::MIN_WINDOW_WIDTH as f32,
+        bar_height: 56.0,
+        cell_width: cw,
+        padding_x: 0.0,
+        chrome_left: 0.0,
+        traffic_lights_width: 72.0,
+        tab_count: 12,
+        requested_scroll_offset: 0.0,
+    });
+    assert!(strip.overflowing);
+    let blank = crate::ui_tokens::MIN_WINDOW_WIDTH as f32 - strip.plus_rect[2];
+    assert!(blank >= cw * 4.0, "blank after '+' is {blank}");
+}
+
 // ── Context menu layout (stage 4 — U2) ──────────────────────────────
 
 /// Click in the middle of the viewport: menu anchored at click, items

@@ -86,6 +86,12 @@ pub fn layout_tab_strip(input: TabStripInput) -> TabStripLayout {
     let min_tab_width = input.cell_width * 15.0;
     let arrow_width = input.cell_width * 2.5;
     let plus_width = input.cell_width * 3.0;
+    // v1.13.17 S1: 保底可拖拽空白 — "+" 右侧永远保留至少这么宽的 bar 背景
+    // （`tab_bar_target_at` 的 None 命中区，即现有拖拽/双击路径），即使 tab
+    // 溢出填满整条 strip 也不失效（Chrome 式"永不失效的拖拽区"）。
+    // cell 派生（cw*4.0）：与本函数上方 arrow=cw*2.5 / plus=cw*3.0 同一约定，
+    // 随 DPI 缩放；默认字号下约合 36 逻辑 pt。
+    let drag_reserve = input.cell_width * 4.0;
     let right_padding = input.padding_x * 0.5;
     let traffic_offset = if input.chrome_left > 0.0 {
         0.0
@@ -93,7 +99,7 @@ pub fn layout_tab_strip(input: TabStripInput) -> TabStripLayout {
         input.traffic_lights_width
     };
     let tabs_start = input.chrome_left + traffic_offset + input.padding_x;
-    let right_reserve = plus_width + right_padding;
+    let right_reserve = plus_width + right_padding.max(drag_reserve);
     let available = (input.viewport_width - tabs_start - right_reserve).max(0.0);
     let count = input.tab_count as f32;
     let total_at_max = count * max_tab_width;
