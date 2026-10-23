@@ -21,11 +21,15 @@ mod advanced;
 mod keybindings;
 mod local_ai;
 mod pages;
+// v1.13.17 S2 line-budget split: the shared row helpers (push_settings_row
+// + settings_hover_bg) moved here verbatim so paint/settings.rs stays under
+// the architecture gate together with the S2 hover additions.
+mod rows;
 mod update;
 
-use crate::paint::primitives::{color_to_normalized, push_filled_triangle, push_line, push_quad};
+use crate::paint::primitives::{color_to_normalized, push_line, push_quad};
 use crate::renderer::MetalRenderer;
-use crate::settings_component::settings_value_x;
+use crate::settings_component::SettingsTarget;
 
 /// F5: Red color for inline field validation errors.
 const ERROR_COLOR: [f32; 4] = [0.85, 0.25, 0.25, 1.0];
@@ -184,6 +188,15 @@ impl MetalRenderer {
                     break;
                 }
                 let is_active = *tab == s.active_tab;
+                // v1.13.17 S2: hover feedback. The sidebar background is
+                // itself the 4% lift (`sidebar_bg`), so the shared 4% hover
+                // token would be invisible here — use the popup background
+                // token (the next visible step in the same lift family).
+                let is_hovered = crate::settings_component::settings_row_hovered(
+                    s.hovered,
+                    SettingsTarget::SidebarCategory(*tab),
+                    is_active,
+                );
                 if is_active {
                     push_quad(
                         &mut verts,
@@ -200,6 +213,14 @@ impl MetalRenderer {
                         bg_uv,
                         [0.0; 4],
                         accent,
+                    );
+                } else if is_hovered {
+                    push_quad(
+                        &mut verts,
+                        [sx0, row_y, sx1, row_y + ch],
+                        bg_uv,
+                        [0.0; 4],
+                        popup_bg,
                     );
                 }
                 let color = if is_active { fg } else { label_c };
@@ -344,6 +365,12 @@ impl MetalRenderer {
                             label,
                             value,
                             s.selection == i,
+                            // v1.13.17 S2: hover follows ContentRow space.
+                            crate::settings_component::settings_row_hovered(
+                                s.hovered,
+                                SettingsTarget::ContentRow(i),
+                                s.selection == i,
+                            ),
                             content_x0,
                             content_x1,
                             value_x,
@@ -419,6 +446,12 @@ impl MetalRenderer {
                             label,
                             value,
                             is_sel,
+                            // v1.13.17 S2: hover follows ContentRow space.
+                            crate::settings_component::settings_row_hovered(
+                                s.hovered,
+                                SettingsTarget::ContentRow(i),
+                                is_sel,
+                            ),
                             content_x0,
                             content_x1,
                             value_x,
@@ -577,6 +610,13 @@ impl MetalRenderer {
             let row_y = content_top + i as f32 * ch;
             let is_current = theme.name == s.theme_name;
             let is_selected = i == s.selection;
+            // v1.13.17 S2: hover feedback — content-area rows use the shared
+            // command-surface hover token; selection wins.
+            let is_hovered = crate::settings_component::settings_row_hovered(
+                s.hovered,
+                SettingsTarget::Theme(i),
+                is_selected,
+            );
             if is_selected {
                 push_quad(
                     verts,
@@ -584,6 +624,14 @@ impl MetalRenderer {
                     bg_uv,
                     [0.0; 4],
                     selection_bg,
+                );
+            } else if is_hovered {
+                push_quad(
+                    verts,
+                    [content_x0, row_y, content_x1, row_y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    self.settings_hover_bg(),
                 );
             }
             // Vector circle: filled (current) or dim ring (others).
@@ -684,6 +732,13 @@ impl MetalRenderer {
                 label,
                 value,
                 is_sel,
+                // v1.13.17 S2: hover follows the scene's ContentRow space
+                // (== the selection index space).
+                crate::settings_component::settings_row_hovered(
+                    s.hovered,
+                    SettingsTarget::ContentRow(row_idx),
+                    is_sel,
+                ),
                 content_x0,
                 content_x1,
                 value_x,
@@ -701,85 +756,6 @@ impl MetalRenderer {
                     find_field_error(s.field_errors, err_label)
                 },
             );
-        }
-    }
-
-    /// F5: Render a standard label/value row with selection highlight,
-    /// triangles on the selected row, and an optional inline field error.
-    #[allow(clippy::too_many_arguments)]
-    fn push_settings_row(
-        &self,
-        verts: &mut Vec<f32>,
-        row_y: f32,
-        label: &str,
-        value: &str,
-        is_sel: bool,
-        content_x0: f32,
-        content_x1: f32,
-        value_x: f32,
-        cw: f32,
-        ch: f32,
-        content_cols: usize,
-        bg_uv: [f32; 4],
-        selection_bg: [f32; 4],
-        fg: [f32; 4],
-        label_c: [f32; 4],
-        accent: [f32; 4],
-        error_msg: Option<&str>,
-    ) {
-        let value_x = settings_value_x(value_x, content_x0, cw, Self::text_col_width(label));
-        if is_sel {
-            push_quad(
-                verts,
-                [content_x0, row_y, content_x1, row_y + ch],
-                bg_uv,
-                [0.0; 4],
-                selection_bg,
-            );
-        }
-        let label_color = if is_sel { fg } else { label_c };
-        self.push_text(verts, content_x0, row_y, label, label_color, content_cols);
-        let value_color = if is_sel { accent } else { fg };
-        self.push_text(verts, value_x, row_y, value, value_color, content_cols);
-        // Triangles on the selected row.
-        if is_sel {
-            let tri_h = ch * 0.14;
-            let tri_w = ch * 0.10;
-            let tri_cy = row_y + ch * 0.5;
-            let val_text_w = cw * Self::text_col_width(value) as f32;
-            let tri_lx = value_x - cw * 0.6;
-            let tri_rx = value_x + val_text_w + cw * 0.6;
-            push_filled_triangle(
-                verts,
-                tri_lx,
-                tri_cy,
-                tri_lx + tri_w,
-                tri_cy - tri_h,
-                tri_lx + tri_w,
-                tri_cy + tri_h,
-                accent,
-            );
-            push_filled_triangle(
-                verts,
-                tri_rx,
-                tri_cy,
-                tri_rx - tri_w,
-                tri_cy - tri_h,
-                tri_rx - tri_w,
-                tri_cy + tri_h,
-                accent,
-            );
-        }
-        // Inline field error (red text after the value/triangles).
-        if let Some(err) = error_msg {
-            let val_text_w = cw * Self::text_col_width(value) as f32;
-            let err_x = value_x + val_text_w + cw * 2.5;
-            let err_cols =
-                content_cols.saturating_sub(((err_x - content_x0) / cw).max(0.0) as usize);
-            if err_cols > 3 {
-                let msg = format!("\u{26a0} {}", err);
-                self.push_text(verts, err_x, row_y, &msg, ERROR_COLOR, err_cols);
-            }
         }
     }
 }

@@ -235,6 +235,10 @@ pub struct SettingsDrawParams<'a> {
     pub active_tab: SettingsTab,
     /// Row cursor position within the active category's content area.
     pub selection: usize,
+    /// v1.13.17 S2: mouse-hovered settings target (`settings_target_at`
+    /// resolution). Only SidebarCategory / Theme / ContentRow targets get a
+    /// hover background; selection wins when both land on the same row.
+    pub hovered: Option<crate::settings_component::SettingsTarget>,
     /// v1.0 fix: vertical scroll offset for list-based categories (Keybindings).
     /// The renderer renders rows `[offset .. offset+max_rows]`.
     pub scroll_offset: usize,
@@ -330,6 +334,10 @@ pub struct PaletteDrawParams<'a> {
     pub query: &'a str,
     pub entries: &'a [PaletteEntryView<'a>],
     pub selection: usize,
+    /// v1.13.17 S2: mouse-hovered results row (`None` = no hover). Drives the
+    /// shared `CommandSurfaceRowState::hovered` background; never affects the
+    /// keyboard `selection`.
+    pub hovered_row: Option<usize>,
     /// Variable-fill form (Some = form mode, None = search mode).
     pub form: Option<&'a PaletteFormView<'a>>,
     /// Sub-mode banner text (e.g. "New workflow — name:", "Edit deploy:",
@@ -364,6 +372,8 @@ pub struct CompletionDrawParams<'a> {
     pub matches: &'a [Match],
     /// Currently highlighted candidate index.
     pub selected: usize,
+    /// v1.13.17 S2: mouse-hovered candidate row (`None` = no hover).
+    pub hovered: Option<usize>,
     /// The prompt input box's top y-coordinate in physical pixels. The popup
     /// is positioned directly above this anchor (matching the old behavior
     /// where `popup_bottom = box_y0` inside `build_prompt_vertices`).

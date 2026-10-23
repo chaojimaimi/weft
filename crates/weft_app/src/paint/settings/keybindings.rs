@@ -58,6 +58,14 @@ impl MetalRenderer {
         for (i, kb) in s.keybindings[offset..end].iter().enumerate() {
             let row_y = list_top + i as f32 * ch;
             let is_selected = offset + i == s.selection;
+            // v1.13.17 S2: hover feedback. The scene's ContentRow index for
+            // the Keybindings tab starts at the scroll offset, so it equals
+            // `offset + i` — the same space as the keyboard selection here.
+            let is_hovered = crate::settings_component::settings_row_hovered(
+                s.hovered,
+                crate::settings_component::SettingsTarget::ContentRow(offset + i),
+                is_selected,
+            );
             if is_selected {
                 push_quad(
                     verts,
@@ -65,6 +73,14 @@ impl MetalRenderer {
                     bg_uv,
                     [0.0; 4],
                     selection_bg,
+                );
+            } else if is_hovered {
+                push_quad(
+                    verts,
+                    [content_x0, row_y, content_x1, row_y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    self.settings_hover_bg(),
                 );
             }
             let action_color = if kb.conflict { warning_c } else { label_c };

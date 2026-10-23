@@ -32,7 +32,9 @@ pub(super) struct FrameOverlays<'a> {
     pub panel: Option<&'a PanelDrawParams<'a>>,
     pub prompt: Option<&'a PromptDrawParams<'a>>,
     pub tui_preedit: Option<TuiPreeditDrawParams<'a>>,
-    pub completions: Option<(&'a [weft_core::complete::Match], usize)>,
+    /// `(matches, selected, hovered)` — v1.13.17 S2 added the hover mirror
+    /// of `CompletionDrawParams::hovered` so the popup paints the hovered row.
+    pub completions: Option<(&'a [weft_core::complete::Match], usize, Option<usize>)>,
     pub palette: Option<&'a crate::overlay::PaletteDrawParams<'a>>,
     pub settings: Option<&'a crate::overlay::SettingsDrawParams<'a>>,
 }
@@ -105,7 +107,7 @@ impl crate::renderer::MetalRenderer {
         let completions = overlays.layers.iter().find_map(|l| {
             if l.kind == OverlayKind::Completion {
                 if let OverlayContent::Completion(c) = &l.content {
-                    return Some((c.matches, c.selected));
+                    return Some((c.matches, c.selected, c.hovered));
                 }
             }
             None
@@ -566,7 +568,7 @@ impl crate::renderer::MetalRenderer {
 
         // Completion popup (split out from prompt — overlay refactor commit 2).
         // Positioned above the prompt input box using the same geometry.
-        if let Some((matches, selected)) = completions {
+        if let Some((matches, selected, hovered)) = completions {
             if !matches.is_empty() {
                 let visual_prompt = prompt.map(|p| {
                     let ctx = draw_ctx;
@@ -591,7 +593,7 @@ impl crate::renderer::MetalRenderer {
                     self.popup_width_scale,
                 ) {
                     vertices.extend_from_slice(
-                        &self.build_completion_vertices(matches, selected, layout),
+                        &self.build_completion_vertices(matches, selected, hovered, layout),
                     );
                 }
             }

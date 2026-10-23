@@ -31,6 +31,8 @@ pub struct PanelViewParams<'a> {
     /// v1.12.26 (P1-03): active IME composition for the panel search box.
     pub panel_ime_preedit: &'a str,
     pub panel_selection: usize,
+    /// v1.13.17 S2: mouse-hovered history row (topmost visible = 0).
+    pub panel_hovered_row: Option<usize>,
     pub panel_expanded: Option<BlockId>,
     pub panel_search_focused: bool,
     pub panel_scroll_offset: usize,
@@ -50,6 +52,9 @@ pub struct PaletteViewParams<'a> {
     pub palette_open: bool,
     pub palette_query: &'a str,
     pub palette_selection: usize,
+    /// v1.13.17 S2: mouse-hovered results row (same index space as
+    /// `palette_selection`).
+    pub palette_hovered_row: Option<usize>,
     pub palette_entries: &'a [(String, String, &'a str)],
     pub palette_banner: &'a str,
     pub palette_submode_input: &'a str,
@@ -63,6 +68,11 @@ pub struct PaletteViewParams<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct PromptViewParams {
     pub prompt_selection: Option<((usize, usize), (usize, usize))>,
+    /// v1.13.17 S2: mouse-hovered completion-popup row (same index space as
+    /// the popup's `selected`). Carried in the prompt group because the
+    /// completion layer is built right after the prompt layer from editor
+    /// state plus this one app-side transient.
+    pub completion_hovered_row: Option<usize>,
     pub submit_on_ctrl_enter: bool,
 }
 
@@ -75,6 +85,9 @@ pub struct SettingsViewParams<'a> {
     pub settings_tab: SettingsTab,
     pub settings_selection: usize,
     pub settings_scroll_offset: usize,
+    /// v1.13.17 S2: mouse-hovered settings target (transient interaction
+    /// state, projected off `SettingsState.hovered` — never the draft).
+    pub settings_hovered: Option<crate::settings_component::SettingsTarget>,
     pub settings_theme_name: &'a str,
     pub settings_themes: &'a [SettingsThemeView],
     pub settings_font_family: &'a str,
@@ -168,6 +181,7 @@ impl crate::app_state::SettingsState {
             settings_tab: self.tab,
             settings_selection: self.selection,
             settings_scroll_offset: self.scroll_offset,
+            settings_hovered: self.hovered,
             settings_theme_name: &self.draft.theme.name,
             settings_themes: &owned.themes,
             settings_font_family: &self.draft.font.family,

@@ -362,6 +362,7 @@ impl App {
                             panel_query: &self.panel.query,
                             panel_ime_preedit: &self.panel.ime_preedit,
                             panel_selection: self.panel.selection,
+                            panel_hovered_row: self.panel.hovered_row,
                             panel_expanded: self.panel.expanded,
                             panel_search_focused: self.panel.search_focused,
                             panel_scroll_offset: self.panel.scroll_offset,
@@ -375,6 +376,7 @@ impl App {
                             palette_open: self.palette.open,
                             palette_query: &self.palette.query,
                             palette_selection: self.palette.selection,
+                            palette_hovered_row: self.palette.hovered_row,
                             palette_entries: &palette_entries,
                             palette_banner: &palette_banner,
                             palette_submode_input: &palette_submode_input,
@@ -384,6 +386,22 @@ impl App {
                         },
                         crate::overlay::PromptViewParams {
                             prompt_selection: terminal.editor().buffer.selection_range(),
+                            // v1.13.17 S2 (review P3): the stored hover must
+                            // never outlive the popup instance it was
+                            // computed for — the popup closes/reopens on
+                            // typing while the pointer may not move (no
+                            // update_surface_row_hover pass in between). Gate
+                            // the draw value on the CURRENT completion_view:
+                            // closed popup → None; reopened with fewer
+                            // matches → a stale out-of-range index is dropped
+                            // instead of painting a wrong row.
+                            completion_hovered_row: terminal.editor().completion_view().and_then(
+                                |(matches, _)| {
+                                    self.interaction
+                                        .completion_hovered_row
+                                        .filter(|index| *index < matches.len())
+                                },
+                            ),
                             submit_on_ctrl_enter: self
                                 .config_state
                                 .config

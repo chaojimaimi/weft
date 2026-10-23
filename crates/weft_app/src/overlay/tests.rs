@@ -178,6 +178,7 @@ fn overlay_warmup_palette_collects_query_and_entries() {
         query: "gi",
         entries: &views,
         selection: 0,
+        hovered_row: None,
         form: None,
         banner: "",
         submode_input: "",
@@ -259,6 +260,7 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
     let s = SettingsDrawParams {
         active_tab: SettingsTab::Appearance,
         selection: 0,
+        hovered: None,
         scroll_offset: 0,
         theme_name: "weft-warm",
         themes: &themes,
@@ -328,6 +330,7 @@ fn settings_overlay_is_modal_and_highest_z() {
                 content: OverlayContent::Settings(SettingsDrawParams {
                     active_tab: SettingsTab::Appearance,
                     selection: 0,
+                    hovered: None,
                     scroll_offset: 0,
                     theme_name: "",
                     themes: &[],
@@ -393,6 +396,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         panel_query: "query",
         panel_ime_preedit: "preedit",
         panel_selection: 3,
+        panel_hovered_row: None,
         panel_expanded: None,
         panel_search_focused: true,
         panel_scroll_offset: 7,
@@ -406,6 +410,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         palette_open: false,
         palette_query: "",
         palette_selection: 0,
+        palette_hovered_row: None,
         palette_entries: &[],
         palette_banner: "",
         palette_submode_input: "",
@@ -415,6 +420,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
     };
     let prompt = PromptViewParams {
         prompt_selection: None,
+        completion_hovered_row: None,
         submit_on_ctrl_enter: true,
     };
 
@@ -431,6 +437,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         palette_open: false,
         palette_query: "",
         palette_selection: 0,
+        palette_hovered_row: None,
         palette_entries: &[],
         palette_banner: "",
         palette_submode_input: "",

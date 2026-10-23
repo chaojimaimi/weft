@@ -119,6 +119,36 @@ impl MetalRenderer {
             ),
         );
 
+        // v1.13.17 S3: focus ring around the query input row — the palette
+        // captures keyboard input while open, and the query box is the active
+        // input target (find.rs:63-83 precedent: rect outer-expanded 1px,
+        // accent color, alpha/thickness follow the Increase Contrast tier).
+        // Geometry reuses existing layout values (popup x-range + query row
+        // band down to the separator); no new layout constants.
+        {
+            use crate::paint::primitives::{
+                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+            };
+            let ring_rect = [popup_x0, popup_top, popup_x1, sep_y];
+            let ring_color = [
+                accent[0],
+                accent[1],
+                accent[2],
+                focus_ring_alpha(self.increase_contrast),
+            ];
+            build_focus_ring(
+                &mut verts,
+                [
+                    ring_rect[0] - 1.0,
+                    ring_rect[1] - 1.0,
+                    ring_rect[2] + 1.0,
+                    ring_rect[3] + 1.0,
+                ],
+                ring_color,
+                focus_ring_thickness(self.increase_contrast),
+            );
+        }
+
         // Banner / query row. When a sub-mode banner is active, show it
         // instead of the normal search prompt.
         if !p.banner.is_empty() {
@@ -245,11 +275,14 @@ impl MetalRenderer {
             }
             let is_sel = i == p.selection;
             // F4: unified row background (selected/hovered/disabled).
+            // v1.13.17 S2: hovered row feedback via the shared row state
+            // (selection keeps priority when both hit the same row).
             build_command_surface_row_bg(
                 &mut verts,
                 [popup_x0, y, popup_x1, y + ch],
                 CommandSurfaceRowState {
                     selected: is_sel,
+                    hovered: p.hovered_row == Some(i),
                     ..Default::default()
                 },
                 theme_bg,

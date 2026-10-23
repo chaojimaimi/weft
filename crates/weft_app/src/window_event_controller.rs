@@ -345,6 +345,18 @@ impl App {
             self.update_context_menu_hover(position.x, position.y);
             return DispatchOutcome::Abort;
         }
+        // v1.13.17 S2: palette + settings row hover — both surfaces are
+        // modal (route_modal_pointer consumes CursorMoved below), so this is
+        // the only pointer handling they receive while open
+        // (update_context_menu_hover precedent). Hover is cosmetic only and
+        // never changes the keyboard selection. A tab drag short-circuits
+        // above, so a modal drag gesture never updates these.
+        if self.palette.open {
+            self.update_palette_hover(position.x, position.y);
+        }
+        if self.settings.open {
+            self.update_settings_hover(position.x, position.y);
+        }
         if crate::input_router::route_modal_pointer(
             self.palette.open,
             self.settings.open,

@@ -49,6 +49,7 @@ pub fn build_overlay_stack<'a>(
                 query: panel.panel_query,
                 panel_ime_preedit: panel.panel_ime_preedit,
                 selection: panel.panel_selection,
+                hovered_row: panel.panel_hovered_row,
                 expanded_id: panel.panel_expanded,
                 search_focused: panel.panel_search_focused,
                 scroll_offset: panel.panel_scroll_offset,
@@ -131,6 +132,7 @@ pub fn build_overlay_stack<'a>(
                     content: OverlayContent::Completion(CompletionDrawParams {
                         matches,
                         selected,
+                        hovered: prompt.completion_hovered_row,
                         // anchor_y is recalculated by the renderer from its
                         // own viewport geometry (see draw() completion block).
                         anchor_y: 0.0,
@@ -181,6 +183,7 @@ pub fn build_overlay_stack<'a>(
                 query: palette.palette_query,
                 entries: entry_views_box,
                 selection: palette.palette_selection,
+                hovered_row: palette.palette_hovered_row,
                 form: palette.palette_form,
                 banner: palette.palette_banner,
                 submode_input: palette.palette_submode_input,
@@ -201,6 +204,7 @@ pub fn build_overlay_stack<'a>(
             content: OverlayContent::Settings(SettingsDrawParams {
                 active_tab: settings.settings_tab,
                 selection: settings.settings_selection,
+                hovered: settings.settings_hovered,
                 scroll_offset: settings.settings_scroll_offset,
                 theme_name: settings.settings_theme_name,
                 themes: settings.settings_themes,

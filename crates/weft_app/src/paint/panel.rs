@@ -20,6 +20,10 @@ pub struct PanelDrawParams<'a> {
     pub query: &'a str,
     /// Index of the selected row within the newest-first filtered list.
     pub selection: usize,
+    /// v1.13.17 S2: mouse-hovered row (topmost visible = 0, the same space
+    /// the paint loop's `i` iterates). Drawn only when it isn't the selected
+    /// row (selection wins, command-surface row-state order).
+    pub hovered_row: Option<usize>,
     /// Id of the block whose output is expanded inline (None = all collapsed).
     pub expanded_id: Option<BlockId>,
     /// v0.9 fix: whether the search box has keyboard focus (draws accent
@@ -293,6 +297,10 @@ impl MetalRenderer {
                 break;
             }
             let selected = i == p.selection;
+            // v1.13.17 S2: hover feedback (same token as the command-surface
+            // rows: 4% lift toward white). Selection wins when both hit the
+            // same row (CommandSurfaceRowState branch order).
+            let hovered = !selected && p.hovered_row == Some(i);
             if selected {
                 push_quad(
                     &mut vertices,
@@ -300,6 +308,14 @@ impl MetalRenderer {
                     bg_uv,
                     [0.0; 4],
                     sel_bg,
+                );
+            } else if hovered {
+                push_quad(
+                    &mut vertices,
+                    [panel_x, y - ch * 0.1, panel_x + width_px, y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    crate::paint::color_math::lighten_to_white(theme_bg, 0.04),
                 );
             }
             let cmd_color = if selected {

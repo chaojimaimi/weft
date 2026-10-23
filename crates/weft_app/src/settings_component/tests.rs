@@ -427,3 +427,43 @@ fn non_advanced_tabs_do_not_register_import_export_hits() {
         Some(SettingsTarget::AdvancedExport)
     );
 }
+
+/// v1.13.17 S2: the row-hover predicate — target equality with selection
+/// priority (the CommandSurfaceRowState branch order).
+#[test]
+fn settings_row_hovered_requires_target_equality_and_yields_to_selection() {
+    let hovered = Some(SettingsTarget::ContentRow(2));
+    assert!(settings_row_hovered(
+        hovered,
+        SettingsTarget::ContentRow(2),
+        false
+    ));
+    // A different row (or no hover at all) never highlights.
+    assert!(!settings_row_hovered(
+        hovered,
+        SettingsTarget::ContentRow(3),
+        false
+    ));
+    assert!(!settings_row_hovered(
+        None,
+        SettingsTarget::ContentRow(2),
+        false
+    ));
+    // Selection wins over hover on the same row.
+    assert!(!settings_row_hovered(
+        hovered,
+        SettingsTarget::ContentRow(2),
+        true
+    ));
+    // Non-row targets only match themselves.
+    assert!(settings_row_hovered(
+        Some(SettingsTarget::SidebarCategory(SettingsTab::Terminal)),
+        SettingsTarget::SidebarCategory(SettingsTab::Terminal),
+        false
+    ));
+    assert!(!settings_row_hovered(
+        Some(SettingsTarget::SidebarCategory(SettingsTab::Terminal)),
+        SettingsTarget::SidebarCategory(SettingsTab::Appearance),
+        false
+    ));
+}

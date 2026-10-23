@@ -189,6 +189,10 @@ pub(crate) struct PaletteState {
     pub(crate) open: bool,
     pub(crate) query: String,
     pub(crate) selection: usize,
+    /// v1.13.17 S2: mouse-hovered results row (`palette_row_at` index space =
+    /// `selection`). Transient interaction state only — it never changes the
+    /// keyboard selection and is cleared on close.
+    pub(crate) hovered_row: Option<usize>,
     pub(crate) last_click: Option<(Instant, usize)>,
     pub(crate) results: Vec<PaletteEntry>,
     pub(crate) form: Option<WorkflowForm>,
@@ -215,6 +219,7 @@ impl PaletteState {
             open: false,
             query: String::new(),
             selection: 0,
+            hovered_row: None,
             last_click: None,
             results: Vec::new(),
             form: None,
@@ -263,6 +268,9 @@ impl PaletteState {
     fn reset_search(&mut self) {
         self.query.clear();
         self.selection = 0;
+        // v1.13.17 S2: hover is transient — an open/close boundary must never
+        // resurrect a stale row highlight (results may have changed anyway).
+        self.hovered_row = None;
         self.last_click = None;
         self.results.clear();
         self.form = None;

@@ -3,7 +3,7 @@
 use super::App;
 
 impl App {
-    pub(super) fn settings_target_at(
+    pub(crate) fn settings_target_at(
         &self,
         x: f32,
         y: f32,

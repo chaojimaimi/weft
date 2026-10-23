@@ -229,7 +229,7 @@ impl MetalRenderer {
         panel: Option<&PanelDrawParams<'_>>,
         prompt: Option<&PromptDrawParams<'_>>,
         tui_preedit: Option<TuiPreeditDrawParams<'_>>,
-        completions: Option<(&[Match], usize)>,
+        completions: Option<(&[Match], usize, Option<usize>)>,
         palette: Option<&PaletteDrawParams<'_>>,
         settings: Option<&SettingsDrawParams<'_>>,
         tab_bar: &TabBarDrawState,
@@ -309,7 +309,7 @@ impl MetalRenderer {
             missing.extend(preedit.text.chars());
         }
         // Completion popup warm-up: scan emoji icons + match labels.
-        if let Some((completions, _)) = completions {
+        if let Some((completions, _, _)) = completions {
             // Emoji icons used by the popup (📁📄 via CoreText color path).
             missing.extend(['📁', '📄', '»']);
             for m in completions {

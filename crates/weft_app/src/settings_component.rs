@@ -83,6 +83,20 @@ pub(crate) fn settings_scene_row_window(
     )
 }
 
+/// v1.13.17 S2: hover predicate for settings rows — the stored hover target
+/// must equal `target`, and selection wins when both land on the same row
+/// (the shared `CommandSurfaceRowState` branch order). `ContentRow`'s index
+/// space is `SettingsState::selection`'s (the scene registers rows in
+/// selection space; the Keybindings tab adds `scroll_offset`), so paint
+/// sites pass the same row index they compare against `selection`.
+pub(crate) fn settings_row_hovered(
+    hovered: Option<SettingsTarget>,
+    target: SettingsTarget,
+    is_selected: bool,
+) -> bool {
+    !is_selected && hovered == Some(target)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SettingsFooterHint {
     pub keys: &'static [&'static str],

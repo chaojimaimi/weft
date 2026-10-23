@@ -342,6 +342,11 @@ pub struct InteractionState {
     /// F3-1: Block currently hovered by the mouse in the block view, if any.
     /// Drives the inline copy/fold action buttons rendered on the header row.
     pub block_hovered: Option<BlockId>,
+    /// v1.13.17 S2: mouse-hovered completion-popup row (editor
+    /// `completion_view` index space = `selected`). Transient interaction
+    /// state — never changes the keyboard selection; recomputed (or cleared)
+    /// on every free pointer move and never persisted.
+    pub completion_hovered_row: Option<usize>,
     pub block_selected: Option<BlockId>,
     pub block_action_hovered: Option<crate::block_component::BlockHeaderAction>,
     /// F3-3: Active sidebar resize drag. Set on press at the sidebar's right
@@ -389,6 +394,7 @@ impl InteractionState {
             modal_mouse_capture: crate::input_router::ModalMouseCapture::default(),
             context_menu: None,
             block_hovered: None,
+            completion_hovered_row: None,
             block_selected: None,
             block_action_hovered: None,
             sidebar_drag: None,
@@ -432,6 +438,12 @@ pub struct PanelState {
     /// unconverted exactly like `palette.ime_preedit_cursor`.
     pub ime_preedit_cursor: Option<(usize, usize)>,
     pub selection: usize,
+    /// v1.13.17 S2: mouse-hovered history row (topmost visible = 0, the
+    /// `PanelTarget::Row` index space — the same space the paint loop's `i`
+    /// iterates). Transient interaction state; cleared on close. NOTE: the
+    /// expanded-block output push-down in the paint path is not mirrored by
+    /// the hit geometry (known drift, review P3) — hover matches clicks.
+    pub hovered_row: Option<usize>,
     pub expanded: Option<BlockId>,
     pub search_focused: bool,
     pub highlight: Option<BlockId>,
@@ -447,6 +459,8 @@ impl PanelState {
     pub fn close(&mut self) {
         self.open = false;
         self.search_focused = false;
+        // v1.13.17 S2: hover is transient — never outlives the surface.
+        self.hovered_row = None;
         // v1.12.26 (P1-03): a stale composition must never outlive the bar.
         self.ime_preedit.clear();
         self.ime_preedit_cursor = None;
@@ -459,6 +473,8 @@ impl PanelState {
     pub fn clear_transient_selection(&mut self) {
         self.selection = 0;
         self.expanded = None;
+        // v1.13.17 S2: stale hover must not survive a fresh open either.
+        self.hovered_row = None;
         // v1.12.26 (P1-03): the panel-open path clears the query right
         // before this call — the composition goes with it.
         self.ime_preedit.clear();
@@ -669,6 +685,12 @@ pub struct SettingsState {
     pub tab: SettingsTab,
     pub selection: usize,
     pub scroll_offset: usize,
+    /// v1.13.17 S2: mouse-hovered settings target, exactly what
+    /// `settings_target_at` resolves (SidebarCategory / Theme / ContentRow /
+    /// button targets). Transient interaction state — deliberately NOT in
+    /// `draft` (the draft is the rollback-able edit state; hover never
+    /// survives a close). Only row targets get a hover background.
+    pub hovered: Option<crate::settings_component::SettingsTarget>,
     pub draft: Config,
     pub dirty: bool,
     pub dirty_sections: ConfigSectionMask,
@@ -688,6 +710,7 @@ impl SettingsState {
             tab: SettingsTab::Appearance,
             selection: 0,
             scroll_offset: 0,
+            hovered: None,
             draft: Config::default(),
             dirty: false,
             dirty_sections: ConfigSectionMask::empty(),
@@ -702,6 +725,7 @@ impl SettingsState {
         self.tab = SettingsTab::Appearance;
         self.selection = 0;
         self.scroll_offset = 0;
+        self.hovered = None;
         self.draft = config.clone();
         self.dirty = false;
         self.dirty_sections = ConfigSectionMask::empty();
@@ -716,6 +740,8 @@ impl SettingsState {
         self.dirty_sections = ConfigSectionMask::empty();
         self.error = None;
         self.drill_down = false;
+        // v1.13.17 S2: hover is transient — never outlives the panel.
+        self.hovered = None;
         self.field_errors.clear();
     }
 

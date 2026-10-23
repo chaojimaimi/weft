@@ -72,6 +72,12 @@ impl MetalRenderer {
                 label,
                 value,
                 is_sel,
+                // v1.13.17 S2: hover follows the scene's ContentRow space.
+                crate::settings_component::settings_row_hovered(
+                    s.hovered,
+                    crate::settings_component::SettingsTarget::ContentRow(i),
+                    is_sel,
+                ),
                 content_x0,
                 content_x1,
                 value_x,

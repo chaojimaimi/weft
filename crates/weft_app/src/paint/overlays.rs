@@ -193,6 +193,8 @@ impl MetalRenderer {
         &self,
         matches: &[weft_core::complete::Match],
         selected: usize,
+        // v1.13.17 S2: mouse-hovered row (draw-param mirror; `None` = no hover).
+        hovered: Option<usize>,
         layout: crate::layout::CompletionLayout,
     ) -> Vec<f32> {
         use crate::paint::command_surface::{
@@ -263,11 +265,14 @@ impl MetalRenderer {
             let is_sel = i == selected;
             let lcolor = if is_sel { sel_label_color } else { label_color };
             // F4: unified row background (selected/hovered/disabled).
+            // v1.13.17 S2: hovered row feedback — same row-state token as the
+            // palette; selection wins when both land on the same row.
             build_command_surface_row_bg(
                 &mut verts,
                 [popup_x0, y, popup_x1, y + ch],
                 CommandSurfaceRowState {
                     selected: is_sel,
+                    hovered: hovered == Some(i),
                     ..Default::default()
                 },
                 theme_bg,

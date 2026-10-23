@@ -183,6 +183,10 @@ impl App {
 
     /// Handle mouse movement.
     pub(super) fn handle_mouse_move(&mut self, x: f64, y: f64) {
+        // v1.13.17 S2: the non-modal surfaces' row hover runs FIRST (before
+        // the drag early-returns below) so an active drag can clear it —
+        // update_surface_row_hover guards on drag state internally.
+        self.update_surface_row_hover(x, y);
         // F3-3: sidebar resize drag — update the renderer's sidebar width
         // from the pointer delta. The drag persists on release.
         if self.update_sidebar_drag(x) {
@@ -527,6 +531,73 @@ impl App {
                     self.request_redraw();
                 }
             }
+        }
+    }
+
+    /// v1.13.17 S2: palette row hover — the palette is modal
+    /// (route_modal_pointer consumes CursorMoved while it is open), so this
+    /// is the only pointer handling it receives while open
+    /// (update_context_menu_hover precedent). Recomputes from the shared
+    /// Palette Scene; a miss (outside any row) clears the highlight.
+    pub(super) fn update_palette_hover(&mut self, x: f64, y: f64) {
+        let hit = self.palette_row_at(x, y);
+        if hit != self.palette.hovered_row {
+            self.palette.hovered_row = hit;
+            self.request_redraw();
+        }
+    }
+
+    /// v1.13.17 S2: settings target hover — same modal story as the palette.
+    /// The state stores exactly what `settings_target_at` resolves; only the
+    /// row targets (SidebarCategory / Theme / ContentRow) get a painted
+    /// hover background, so button targets simply never highlight.
+    pub(super) fn update_settings_hover(&mut self, x: f64, y: f64) {
+        let hit = self.settings_target_at(x as f32, y as f32);
+        if hit != self.settings.hovered {
+            self.settings.hovered = hit;
+            self.request_redraw();
+        }
+    }
+
+    /// v1.13.17 S2: transient row hover for the two NON-modal surfaces
+    /// (completion popup + history panel). CursorMoved reaches
+    /// handle_mouse_move for them (route_modal_pointer lets it through when
+    /// no modal overlay is open), so unlike palette/settings this runs on
+    /// the free-move path. An active drag gesture owns the pointer: hover
+    /// clears and stays cleared until the next free move (plan §2.2).
+    pub(super) fn update_surface_row_hover(&mut self, x: f64, y: f64) {
+        let drag_active = self.interaction.drag_state.is_some()
+            || self.interaction.scrollbar_drag.is_some()
+            || self.interaction.panel_scrollbar_drag.is_some()
+            || self.interaction.sidebar_drag.is_some()
+            || self.interaction.pane_divider_drag.is_some();
+        let (completion_hit, panel_hit) = if drag_active {
+            (None, None)
+        } else {
+            let completion = self.completion_scene().and_then(|scene| {
+                match crate::completion_component::completion_target_at(&scene, x as f32, y as f32)
+                {
+                    Some(crate::completion_component::CompletionTarget::Item(index)) => Some(index),
+                    _ => None,
+                }
+            });
+            // `panel_target_at` already gates on panel.open; a miss (search
+            // field, footer, outside the panel) clears the highlight.
+            let panel = self
+                .panel_target_at(x as f32, y as f32)
+                .and_then(|target| match target {
+                    crate::panel_component::PanelTarget::Row(index) => Some(index),
+                    _ => None,
+                });
+            (completion, panel)
+        };
+        if completion_hit != self.interaction.completion_hovered_row {
+            self.interaction.completion_hovered_row = completion_hit;
+            self.request_redraw();
+        }
+        if panel_hit != self.panel.hovered_row {
+            self.panel.hovered_row = panel_hit;
+            self.request_redraw();
         }
     }
 
