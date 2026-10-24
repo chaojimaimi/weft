@@ -80,6 +80,20 @@ pub(crate) fn visual_thumb(layout: &ScrollbarLayout, emphasized: bool) -> Rect {
     ]
 }
 
+/// v1.14.0 (PLAN_v1140 T4): eased variant of [`visual_thumb`] — `fade` in
+/// [0, 1] lerps the width between the idle and hover widths so the thumb's
+/// 加宽 transition is smooth instead of binary. `fade == 0.0` /
+/// `1.0` reproduce the exact `visual_thumb` endpoints.
+pub(crate) fn visual_thumb_faded(layout: &ScrollbarLayout, fade: f32) -> Rect {
+    let width = layout.idle_width + (layout.hover_width - layout.idle_width) * fade;
+    [
+        layout.thumb[2] - width,
+        layout.thumb[1],
+        layout.thumb[2],
+        layout.thumb[3],
+    ]
+}
+
 pub(crate) fn thumb_grab_offset(
     layout: &ScrollbarLayout,
     x: f32,

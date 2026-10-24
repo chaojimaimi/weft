@@ -50,12 +50,15 @@ impl MetalRenderer {
                 .text_secondary,
         );
 
-        // Shell (shadow + bg + border).
+        // Shell (shadow + bg + border). v1.14.0 (T5): token-driven material
+        // (compact radius + dual-layer soft shadow).
         build_command_surface_shell(
             &mut verts,
             CommandSurfaceShell::canonical(
                 [popup_x0, popup_y0, popup_x1, popup_y1],
-                2.0,
+                crate::ui_tokens::SurfaceTokens::compact()
+                    .scaled(self.scale as f32)
+                    .for_environment(self.theme.is_dark(), self.increase_contrast),
                 false,
                 theme_bg,
                 bg_uv,

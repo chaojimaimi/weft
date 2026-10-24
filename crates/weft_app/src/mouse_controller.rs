@@ -6,6 +6,9 @@
 
 use super::*;
 
+// v1.14.0 (rust-reviewer batch split): the drag-selection autoscroll pump,
+// moved verbatim out of scroll.rs (800-line gate).
+mod autoscroll;
 mod scroll;
 
 impl App {
@@ -41,6 +44,11 @@ impl App {
                             self.scroll_active_tab_into_view();
                         }
                     }
+                    // v1.14.0 (PLAN_v1140 T3): commit reorders the tab Vec —
+                    // index-keyed tweens lose their meaning, and the
+                    // post-commit natural slots equal the tween targets, so
+                    // clearing lands seamlessly (提交时全部清空吸附).
+                    self.clear_tab_bar_tweens();
                     self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
                 } else if drag.close_on_release {
                     self.perform_close_request(drag.drag_index);
@@ -262,8 +270,8 @@ impl App {
                 .is_some_and(|r| x < r.sidebar_width() as f64);
         let terminal_cursor_allowed = in_terminal_content
             && !over_panel
-            && !self.settings.open
-            && !self.palette.open
+            && !self.settings.interactive()
+            && !self.palette.interactive()
             && self.interaction.context_menu.is_none();
         // F3-3: hover the sidebar's right edge → EwResize cursor. Takes
         // precedence over text/arrow so the resize affordance is discoverable
@@ -333,8 +341,8 @@ impl App {
         // modal overlays open and no active drag/selection.
         let new_block_hovered = if self.block_view_active()
             && self.interaction.context_menu.is_none()
-            && !self.settings.open
-            && !self.palette.open
+            && !self.settings.interactive()
+            && !self.palette.interactive()
             && !self.interaction.prompt_dragging
         {
             match self.block_at(y as f32) {

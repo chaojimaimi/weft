@@ -5,7 +5,7 @@
 //! follows the access paths: the event-loop / pump callers sit outside
 //! this module (`pub(crate)`), the intra-controller ones don't.
 
-use crate::selection::{autoscroll_ramp_rows, down_autoscroll_threshold, AutoscrollDir};
+use crate::selection::{down_autoscroll_threshold, AutoscrollDir};
 use crate::*;
 
 impl App {
@@ -328,7 +328,163 @@ impl App {
         }
 
         // Otherwise, scroll the terminal viewport.
+        // v1.14.0 (PLAN_v1140 T6): grid (纯终端模式) trackpad gestures fold
+        // into the sub-row px accumulator — whole rows feed the existing
+        // line path and the remainder renders as a sub-row offset. LineDelta
+        // wheels keep whole rows and clear the remainder (below). Block view
+        // PixelDelta returned at the fractional branch above; alt screen and
+        // mouse-protocol gestures returned even earlier (滚轮转发键盘,
+        // plan 边界 — the accumulator never runs for them).
+        if !block_view {
+            if let winit::event::MouseScrollDelta::PixelDelta(pos) = delta {
+                // rust-reviewer P3: mirror the block branch's touch
+                // cancellation guard — a cancelled gesture must not scroll.
+                if phase == winit::event::TouchPhase::Cancelled {
+                    return;
+                }
+                self.scroll_grid_view_pixel(pos.y as f32);
+                return;
+            }
+            // LineDelta (notched wheel): whole rows only — clear any px
+            // remainder so the next trackpad gesture starts clean.
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.active_mut().grid_scroll_px = 0.0;
+            }
+        }
         self.scroll_local_view(rows);
+    }
+
+    /// v1.14.0 (PLAN_v1140 T6): grid (纯终端模式) PixelDelta path — fold the
+    /// gesture into whole rows + a sub-row px remainder, with the SAME
+    /// scroll-up preamble `scroll_local_view` runs before its grid branch
+    /// (rust-reviewer P1-2): the selection migration / primary-history entry
+    /// decide whether the rows belong to the BLOCK path (a primary-screen
+    /// TUI or a running command enters the history view — applying grid rows
+    /// there would silently drop the user's scroll, the same class of bug
+    /// the A1 live-max-scroll fix addressed) and keep the wheel and trackpad
+    /// paths behaviorally identical. The accumulator itself stays pure.
+    pub(crate) fn scroll_grid_view_pixel(&mut self, delta_px: f32) {
+        let cell_h = self
+            .renderer
+            .as_ref()
+            .map_or(40.0, |renderer| renderer.cell_height() as f32)
+            .max(1.0);
+        // 1) Read + accumulate (short pane borrow; no grid mutation yet).
+        let (rows, remain) = {
+            let Some(tab) = self.sessions.active_mut() else {
+                return;
+            };
+            let pane = tab.active_mut();
+            let current = pane.grid_scroll_px;
+            let (offset, len) = pane
+                .with_terminal(|t| {
+                    let grid = t.grid();
+                    (grid.scroll_offset(), grid.scrollback.len())
+                })
+                .unwrap_or((0, 0));
+            crate::tab::accumulate_grid_scroll_px(current, delta_px, cell_h, offset, len)
+        };
+        if rows == 0 {
+            // Pure sub-row motion — no preamble, no line scroll.
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.active_mut().grid_scroll_px = remain;
+            }
+            self.request_redraw();
+            return;
+        }
+        // 2) rows != 0 → the scroll_local_view up-arm preamble, verbatim.
+        let up = rows > 0;
+        if up {
+            let (selecting, has_grid_selection, tui_active) = {
+                match self.sessions.active() {
+                    Some(tab) => (
+                        tab.selection_handler.selecting,
+                        tab.selection_handler.selection.is_some(),
+                        tab.with_terminal(|t| t.primary_screen_app_active())
+                            .unwrap_or(false),
+                    ),
+                    None => (false, false, false),
+                }
+            };
+            if selecting && has_grid_selection && tui_active {
+                if !self.migrate_grid_selection_to_primary_history() {
+                    self.request_redraw();
+                    return;
+                }
+            } else {
+                let entered = self
+                    .sessions
+                    .active_mut()
+                    .map(|tab| tab.enter_primary_history_if_active())
+                    .unwrap_or(false);
+                tracing::debug!(
+                    entered,
+                    rows,
+                    app_active = tui_active,
+                    "SCROLL_DIAG: pixel scroll up into primary history"
+                );
+            }
+        }
+        // 3) Route by the post-preamble view — the history entry above may
+        // have flipped the active pane into block view.
+        let block_view = self
+            .sessions
+            .active()
+            .and_then(|tab| tab.with_terminal(|t| t.show_block_view()))
+            .unwrap_or(false);
+        if block_view {
+            // A1: compute max_scroll LIVE from the layout cache (the
+            // per-frame cached value is None during grid-mode execution —
+            // scroll_local_view's block-branch twin).
+            let max_scroll = self
+                .renderer
+                .as_ref()
+                .and_then(|renderer| {
+                    let tab = self.sessions.active()?;
+                    let terminal = tab.lock_terminal()?;
+                    let (_total, _visible, max) =
+                        renderer.block_scroll_metrics(&terminal, tab.pane_session_id);
+                    Some(max)
+                })
+                .unwrap_or(0);
+            if up {
+                if let Some(tab) = self.sessions.active_mut() {
+                    tab.scroll_up_by(rows.unsigned_abs() as usize);
+                    tab.clamp_block_scroll(max_scroll);
+                }
+            } else if let Some(tab) = self.sessions.active_mut() {
+                tab.scroll_down_by(rows.unsigned_abs() as usize);
+            }
+            // The block path owns sub-row motion via block_scroll_fraction —
+            // the grid px remainder is meaningless while browsing history.
+            if let Some(tab) = self.sessions.active_mut() {
+                tab.active_mut().grid_scroll_px = 0.0;
+            }
+            self.request_redraw();
+            return;
+        }
+        // 4) Grid view: keep the remainder, apply the whole rows (the grid
+        // branch of scroll_local_view's drift guard, rows != 0 ⇒ the offset
+        // moves).
+        if let Some(tab) = self.sessions.active_mut() {
+            let pane = tab.active_mut();
+            pane.grid_scroll_px = remain;
+            if pane.selection_handler.selection.is_some() {
+                tracing::debug!(
+                    "cleared grid selection before pixel viewport scroll (drift guard)"
+                );
+                pane.selection_handler.clear();
+            }
+            if let Some(mut terminal) = pane.lock_terminal() {
+                let grid = terminal.grid_mut();
+                if up {
+                    grid.scroll_up_history(rows as usize);
+                } else {
+                    grid.scroll_down_history((-rows) as usize);
+                }
+            }
+        }
+        self.request_redraw();
     }
 
     /// Apply signed rows to the normal terminal/block viewport. Positive rows
@@ -560,105 +716,5 @@ impl App {
                 .selection_autoscroll_active
                 .store(false, Ordering::Relaxed);
         }
-    }
-
-    /// Drag-selection autoscroll: when the pointer is held past the block
-    /// content edge, scroll the viewport toward it and extend the selection
-    /// endpoint to the newly revealed edge row. Returns true when a
-    /// scroll+extend happened (the caller requests a redraw). v1.10.26
-    /// (FIX_SELECTION_CONTENT_ANCHORS): called ONLY from the redraw entry on
-    /// the 40ms timer wake — mouse-move events arm the timer
-    /// (`arm_selection_autoscroll`) but never pump (the old move-driven pump
-    /// stacked scrolls under event pressure: "停滞+瞬移"). Speed follows the
-    /// Warp ramp — `autoscroll_ramp_rows(overshoot)` rows per tick, the
-    /// fractional remainder carried so long drags accumulate sub-row progress.
-    pub(crate) fn pump_selection_autoscroll(&mut self) -> bool {
-        let Some((x, y)) = self.interaction.selection_drag_pos else {
-            self.window_runtime
-                .selection_autoscroll_active
-                .store(false, Ordering::Relaxed);
-            return false;
-        };
-        if !self.block_view_active() {
-            // v1.10.20: grid-mode drag autoscroll for primary-screen TUIs.
-            // The grid selection is viewport-relative and cannot scroll; a
-            // drag held past the top edge migrates the anchor into the
-            // primary history snapshot view, where the block branch below
-            // takes over (scroll + extend). Failure degrades: keep the grid
-            // selection visible, never switch views and orphan it.
-            if self.selection_autoscroll_overshoot(y).is_none() {
-                self.window_runtime
-                    .selection_autoscroll_active
-                    .store(false, Ordering::Relaxed);
-                return false;
-            }
-            if !self.migrate_grid_selection_to_primary_history() {
-                tracing::warn!(
-                    y,
-                    "TUI drag autoscroll migration failed; keeping grid selection"
-                );
-                self.window_runtime
-                    .selection_autoscroll_active
-                    .store(false, Ordering::Relaxed);
-                return false;
-            }
-        }
-        let Some((dir, overshoot_px)) = self.selection_autoscroll_overshoot(y) else {
-            self.window_runtime
-                .selection_autoscroll_active
-                .store(false, Ordering::Relaxed);
-            return false;
-        };
-        // Live max_scroll (same A1 pattern as `scroll_local_view`): the
-        // per-frame cached metric is None during grid-mode execution, which
-        // would clamp to 0 and make the autoscroll a no-op.
-        let max_scroll = self
-            .renderer
-            .as_ref()
-            .and_then(|renderer| {
-                let tab = self.sessions.active()?;
-                let terminal = tab.lock_terminal()?;
-                Some(
-                    renderer
-                        .block_scroll_metrics(&terminal, tab.pane_session_id)
-                        .2,
-                )
-            })
-            .unwrap_or(0);
-        // Warp ramp speed, whole rows with fractional carry.
-        let raw = autoscroll_ramp_rows(overshoot_px);
-        let total = self.interaction.selection_autoscroll_carry + raw;
-        let steps = total.floor().max(1.0) as usize;
-        self.interaction.selection_autoscroll_carry = total - steps as f32;
-        // At the history top/bottom the saturating scroll has no net effect;
-        // detect that so the 40ms timer can stop instead of idle-spinning
-        // (before = immutable read, then the mutable scroll, then re-read).
-        let before = self.sessions.active().map_or(0, |tab| tab.block_scroll());
-        if let Some(tab) = self.sessions.active_mut() {
-            match dir {
-                AutoscrollDir::Up => {
-                    tab.scroll_up_by(steps);
-                    tab.clamp_block_scroll(max_scroll);
-                }
-                AutoscrollDir::Down => {
-                    tab.scroll_down_by(steps);
-                    tab.clamp_block_scroll(max_scroll);
-                }
-            }
-        }
-        let moved = before != self.sessions.active().map_or(0, |tab| tab.block_scroll());
-        // Extend the endpoint: clamp y into the content band so the shared
-        // row hit-test naturally lands on the new edge row.
-        let (top, bottom) = self.block_content_vbounds().unwrap_or((0.0, 0.0));
-        let cy = (y as f32).clamp(top, (bottom - 1.0).max(top));
-        if let Some(anchor) = self.pixel_to_block_view_pos(x, cy as f64) {
-            if let Some(tab) = self.sessions.active_mut() {
-                tab.selection_handler.extend_block_view(anchor);
-            }
-        }
-        self.window_runtime
-            .selection_autoscroll_active
-            .store(moved, Ordering::Relaxed);
-        true
     }
 }

@@ -277,9 +277,14 @@ fn layout_scene_snapshot() -> Value {
         0,
     );
 
+    // v1.14.0 (PLAN_v1140 T5): the shell carries material tokens instead of
+    // a shadow pad; the snapshot reports the resolved radius + layer alphas.
+    let shell_tokens = crate::ui_tokens::SurfaceTokens::modal()
+        .scaled(1.0)
+        .for_environment(true, false);
     let shell = CommandSurfaceShell::canonical(
         [180.0, 120.0, 620.0, 420.0],
-        6.0,
+        shell_tokens,
         true,
         [0.1, 0.08, 0.06, 1.0],
         [0.0, 0.0, 1.0, 1.0],
@@ -309,9 +314,12 @@ fn layout_scene_snapshot() -> Value {
         },
         "command_surface": {
             "popup": rect32(shell.popup_rect),
-            "shadow_pad": shell.shadow_pad,
+            "radius": rounded(f64::from(shell.tokens.radius)),
+            "ambient_alpha": rounded(f64::from(shell.tokens.ambient.alpha)),
+            "key_alpha": rounded(f64::from(shell.tokens.key.alpha)),
             "resize_handles": shell.with_resize_handles,
             "border": shell.border_color,
+            "border_alpha": rounded(f64::from(shell.tokens.border_alpha)),
             "background": shell.bg_color.map(|value| rounded(f64::from(value))),
             "vertex_floats": shell_vertices.len(),
         },

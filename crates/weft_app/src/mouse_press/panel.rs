@@ -28,6 +28,10 @@ impl App {
                     .as_ref()
                     .map(|r| r.sidebar_width() / r.scale() as f32)
                     .unwrap_or(240.0);
+                // v1.14.0 (PLAN_v1140 T2): 拖拽起始取消动画取当前值 — the
+                // drag channel owns the width from here on (defensive second
+                // layer; sidebar_resize_hit already ignores a running anim).
+                self.cancel_sidebar_width_anim();
                 self.interaction.sidebar_drag = Some(crate::app_state::SidebarDragState {
                     start_x: x,
                     start_width,

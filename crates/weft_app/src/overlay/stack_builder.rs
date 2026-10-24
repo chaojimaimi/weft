@@ -189,6 +189,7 @@ pub fn build_overlay_stack<'a>(
                 submode_input: palette.palette_submode_input,
                 ime_preedit: palette.palette_ime_preedit,
                 ime_preedit_cursor: palette.palette_ime_preedit_cursor,
+                reveal: palette.palette_reveal,
             }),
         });
     }
@@ -242,6 +243,7 @@ pub fn build_overlay_stack<'a>(
                 blocks_history_max_age_days: settings.settings_blocks_history_max_age_days,
                 blocks_history_max_db_mb: settings.settings_blocks_history_max_db_mb,
                 update_tier: settings.settings_update_tier,
+                reveal: settings.settings_reveal,
             }),
         });
     }

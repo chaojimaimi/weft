@@ -327,6 +327,10 @@ pub struct SettingsDrawParams<'a> {
     pub blocks_history_max_db_mb: u32,
     /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Update tab draft tier (projection).
     pub update_tier: weft_core::config::UpdateCheckTier,
+    /// v1.14.0 (PLAN_v1140 T1): reveal factor [0,1] — every pushed quad/text
+    /// alpha is scaled by it (post-pass in `draw_phases`), so the panel
+    /// fades in/out with the open/close animation.
+    pub reveal: f32,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -349,6 +353,10 @@ pub struct PaletteDrawParams<'a> {
     /// banner submodes). Rendered inline after the input buffer.
     pub ime_preedit: &'a str,
     pub ime_preedit_cursor: Option<(usize, usize)>,
+    /// v1.14.0 (PLAN_v1140 T1): reveal factor [0,1] — every pushed quad/text
+    /// alpha is scaled by it (post-pass in `draw_phases`), so the palette
+    /// fades in/out with the open/close animation.
+    pub reveal: f32,
 }
 
 /// A palette entry, rendered in the dropdown.

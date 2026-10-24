@@ -95,6 +95,16 @@ pub struct MetalRenderer {
     pub block_hovered: Option<BlockId>,
     pub block_selected: Option<BlockId>,
     pub block_action_hovered: Option<crate::block_component::BlockHeaderAction>,
+    /// v1.14.0 (PLAN_v1140 T6): active pane's grid sub-row scroll offset
+    /// (physical px, projected per-frame from `Pane::grid_scroll_px`).
+    /// Consumed by `build_grid_instances` — bg instances shift by the exact
+    /// px, glyph instances by `floor(px)`. Always 0.0 outside the grid view.
+    pub(crate) grid_scroll_px: f32,
+    /// v1.14.0 (PLAN_v1140 T4): per-frame hover fade progress snapshot
+    /// ((key, progress) pairs projected off `InteractionState.hover_fades`)
+    /// — block action buttons + the scrollbar thumb lerp their idle/hover
+    /// visuals by it. Absent key = 0.0 (idle fallback).
+    pub hover_fades: Vec<(crate::app::motion::HoverKey, f32)>,
     /// v1.7.3-C: Set of bookmarked block IDs (set per-frame by the app from
     /// `AnnotationStore`); block view draws a ★ before bookmarked headers.
     /// v1.11 audit C3 (PLAN_audit_fix_batch3): Arc — refcount-bump handoff.
@@ -401,7 +411,6 @@ impl MetalRenderer {
         // v0.8 U6: block-content metrics (total_rows, visible_rows,
         // max_scroll) for the dynamic scrollbar thumb. None in grid view.
         scroll_metrics: Option<(usize, usize, usize)>,
-        scrollbar_emphasized: bool,
         // v0.9 H1: tab bar state. When tab_count > 1 the tab bar is drawn
         // at the top of the window and the content area is shifted down.
         tab_bar: &TabBarDrawState,
@@ -715,7 +724,6 @@ impl MetalRenderer {
             cursor_blink_on,
             cursor_blink_phase,
             block_scroll,
-            scrollbar_emphasized,
             active_pane_rect,
             active_pane_id,
             active_pane_session_id,

@@ -481,6 +481,94 @@ fn selection_colors(panel: Color, accent: Color, preferred_text: Color) -> (Colo
     (background, text_for(background))
 }
 
+// ── v1.14.0 (PLAN_v1140 T5): surface material tokens ──────────────────
+
+/// One soft-shadow layer of a floating surface (T5: two layers replace the
+/// single hard 15% quad). All lengths are logical points; call sites scale
+/// them to physical px via [`SurfaceTokens::scaled`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SurfaceShadow {
+    /// Rect expansion on every side (pt).
+    pub(crate) expand: f32,
+    /// Black alpha of the layer.
+    pub(crate) alpha: f32,
+    /// Downward offset (pt) — the key light sits above the surface.
+    pub(crate) offset_y: f32,
+}
+
+/// Material tokens for floating command surfaces (palette / settings /
+/// find / note / context menu / completion): corner radius + the dual-layer
+/// soft shadow + the border strength. Derived per surface kind, then tuned
+/// for the environment (light theme + Increase Contrast).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SurfaceTokens {
+    /// Corner radius in logical points (10 = modal, 8 = compact surfaces).
+    pub(crate) radius: f32,
+    /// Wide, faint "ambient" occlusion layer (no offset).
+    pub(crate) ambient: SurfaceShadow,
+    /// Tight, stronger "key" layer offset downward (light from above).
+    pub(crate) key: SurfaceShadow,
+    /// Border alpha (the 1px stroke). Increase Contrast strengthens it.
+    pub(crate) border_alpha: f32,
+}
+
+impl SurfaceTokens {
+    /// Modal surfaces: Command Palette + Settings panel (10pt radius).
+    pub(crate) fn modal() -> Self {
+        Self::with_radius(10.0)
+    }
+
+    /// Compact surfaces: find bar / note card / context menu / completion
+    /// popup (8pt radius).
+    pub(crate) fn compact() -> Self {
+        Self::with_radius(8.0)
+    }
+
+    fn with_radius(radius: f32) -> Self {
+        Self {
+            radius,
+            // T5 spec: ambient {expand 6pt, alpha 0.06, offset 0} +
+            // key {expand 2pt, alpha 0.14, offset_y 3pt}.
+            ambient: SurfaceShadow {
+                expand: 6.0,
+                alpha: 0.06,
+                offset_y: 0.0,
+            },
+            key: SurfaceShadow {
+                expand: 2.0,
+                alpha: 0.14,
+                offset_y: 3.0,
+            },
+            // The pre-T5 border was [0.5, 0.5, 0.5, 0.20].
+            border_alpha: 0.20,
+        }
+    }
+
+    /// Logical pt → physical px for a backing scale factor.
+    pub(crate) fn scaled(mut self, scale: f32) -> Self {
+        self.radius *= scale;
+        self.ambient.expand *= scale;
+        self.ambient.offset_y *= scale;
+        self.key.expand *= scale;
+        self.key.offset_y *= scale;
+        self
+    }
+
+    /// Environment tuning: light themes soften the shadow alphas ×0.7
+    /// (from_theme 内定 — the plan's T5 rule); Increase Contrast strengthens
+    /// the border stroke (F6: borders must stay perceivable without color).
+    pub(crate) fn for_environment(mut self, is_dark: bool, increase_contrast: bool) -> Self {
+        if !is_dark {
+            self.ambient.alpha *= 0.7;
+            self.key.alpha *= 0.7;
+        }
+        if increase_contrast {
+            self.border_alpha = 0.45;
+        }
+        self
+    }
+}
+
 // Tests live in the gate-exempt sibling module (repo test-module
 // convention, pty/tests.rs precedent) so inline test lines stay out of
 // the production-file budget.

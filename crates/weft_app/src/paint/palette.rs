@@ -107,12 +107,15 @@ impl MetalRenderer {
         let end = layout.end;
 
         // F4: shared shell (shadow + bg + border + resize handles).
-        let shadow_pad = ch * 0.15;
+        // v1.14.0 (T5): token-driven material (modal radius + dual-layer
+        // soft shadow).
         build_command_surface_shell(
             &mut verts,
             CommandSurfaceShell::canonical(
                 [popup_x0, popup_top, popup_x1, popup_bottom],
-                shadow_pad,
+                crate::ui_tokens::SurfaceTokens::modal()
+                    .scaled(self.scale as f32)
+                    .for_environment(self.theme.is_dark(), self.increase_contrast),
                 true,
                 theme_bg,
                 bg_uv,
@@ -346,12 +349,15 @@ impl MetalRenderer {
         let popup_bottom = popup_top + popup_h;
 
         // F4: shared shell (shadow + bg + border, no resize handles).
-        let shadow_pad = ch * 0.15;
+        // v1.14.0 (T5): token-driven material (modal radius + dual-layer
+        // soft shadow).
         build_command_surface_shell(
             &mut verts,
             CommandSurfaceShell::canonical(
                 [popup_x0, popup_top, popup_x1, popup_bottom],
-                shadow_pad,
+                crate::ui_tokens::SurfaceTokens::modal()
+                    .scaled(self.scale as f32)
+                    .for_environment(self.theme.is_dark(), self.increase_contrast),
                 false,
                 theme_bg,
                 bg_uv,

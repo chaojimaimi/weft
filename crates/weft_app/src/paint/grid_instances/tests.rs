@@ -19,8 +19,9 @@ const LINK: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
 
 // v1.10.4: the color-emoji sentinel is fg.a = 2.0; every real fg alpha
 // source (palette u8/255, contrast boost, REVERSE swap, DIM, opacity)
-// stays ≤ 1.0, so `fg.a > 1.5` in the shader is unambiguous. Assert the
-// test constants here at compile time.
+// stays ≤ 1.0, so `fg.a >= 1.5` in the shader is unambiguous (rust-reviewer
+// R2 hardened the threshold from > to >= so a fade can never drop an emoji
+// onto the mask path). Assert the test constants here at compile time.
 const _: () = {
     assert!(FG[3] <= 1.0 && BG[3] <= 1.0 && CURSOR[3] <= 1.0 && SELECTION[3] <= 1.0);
 };
@@ -56,6 +57,7 @@ fn build(
         0.0,
         false,
         LINK,
+        None,
     )
 }
 
@@ -387,7 +389,7 @@ fn batch_push_row_serializes_both_streams() {
     let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
         ([0.1, 0.2, 0.3, 0.4], false)
     };
-    let ranges = batch.push_row(&row, &resolve_uv);
+    let ranges = batch.push_row(&row, 0.0, &resolve_uv);
 
     // Bg stream: 8 floats per run.
     assert_eq!(batch.bg_stream.len(), 8);
@@ -396,6 +398,102 @@ fn batch_push_row_serializes_both_streams() {
     // Glyph stream: 16 floats per glyph.
     assert_eq!(batch.glyph_stream.len(), 16);
     assert_eq!(ranges.glyph_range, (0, 16));
+}
+
+// ── v1.14.0 (PLAN_v1140 T6): sub-row scroll offset alignment ───────────
+
+#[test]
+fn batch_push_row_shifts_bg_by_exact_px_and_glyphs_by_whole_px() {
+    let grid = make_grid(&[Cell::with_char('A')]);
+    let row = build_plain(&grid);
+
+    let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
+        ([0.1, 0.2, 0.3, 0.4], false)
+    };
+
+    // Baseline (offset 0) — both streams at the baked coordinates.
+    let mut base = GridInstanceBatch::default();
+    base.push_row(&row, 0.0, &resolve_uv);
+
+    // Sub-row shift 10.4px: bg moves the EXACT px (continuous), glyphs move
+    // floor(10.4) = 10 whole physical pixels (no sub-pixel smear).
+    let mut shifted = GridInstanceBatch::default();
+    shifted.push_row(&row, 10.4, &resolve_uv);
+    assert!((shifted.bg_stream[1] - base.bg_stream[1] - 10.4).abs() < 1e-4);
+    let glyph_y = shifted.glyph_stream[1];
+    assert!((glyph_y - base.glyph_stream[1] - 10.0).abs() < 1e-4);
+    // Instance layout is origin(2)+size(2): the height (offset 3) is
+    // unchanged — only the origin shifts.
+    assert!((shifted.glyph_stream[3] - base.glyph_stream[3]).abs() < 1e-6);
+
+    // 0.0 is the exact pre-T6 output.
+    let mut zero = GridInstanceBatch::default();
+    zero.push_row(&row, 0.0, &resolve_uv);
+    assert_eq!(zero.bg_stream, base.bg_stream);
+    assert_eq!(zero.glyph_stream, base.glyph_stream);
+}
+
+// ── v1.14.0 (rust-reviewer P1-1): sub-row top-band coverage ────────────
+
+#[test]
+fn subrow_extra_row_index_pins_the_row_above_the_viewport_top() {
+    // Live tail: the row above is the LAST scrollback row.
+    assert_eq!(crate::paint::grid::subrow_extra_row_index(3, 0), Some(2));
+    assert_eq!(crate::paint::grid::subrow_extra_row_index(3, 1), Some(1));
+    assert_eq!(crate::paint::grid::subrow_extra_row_index(3, 2), Some(0));
+    // History top: nothing above.
+    assert_eq!(crate::paint::grid::subrow_extra_row_index(3, 3), None);
+    // No scrollback at all.
+    assert_eq!(crate::paint::grid::subrow_extra_row_index(0, 0), None);
+}
+
+#[test]
+fn subrow_extra_top_row_covers_the_viewport_top_band() {
+    use crate::paint::grid::build_subrow_extra_top_row;
+    // 2 viewport rows × 3 cols with one scrollback row above (offset 1 →
+    // the extra row is scrollback index 0, marked with an 'X').
+    let mut grid = Grid::with_scrollback(2, 3, 100);
+    let mut above = Row::new(3);
+    above.cells[0] = Cell::with_char('X');
+    grid.scrollback.push(above);
+    grid.scrollback.push(Row::new(3));
+    grid.set_scroll_offset(1);
+
+    let palette = Color::standard_palette();
+    let origin_x = 30.0; // rust-reviewer R1: non-zero content origin (sidebar/split).
+    let origin_y = 100.0;
+    let extra = build_subrow_extra_top_row(
+        &grid, &palette, FG, BG, 1.0, 1.0, CW, CH, origin_x, origin_y, false, LINK,
+    )
+    .expect("a row exists above the viewport top");
+
+    // px = 8 (physical): the extra row is baked at origin_y - CH = 80 and
+    // pushed with the SAME +8 shift as the cached rows → it occupies
+    // [88, 108], so its bottom 8px band exactly fills the viewport-top gap
+    // [100, 108) that a bare px-shift would have left showing the background.
+    let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
+        ([0.1, 0.2, 0.3, 0.4], false)
+    };
+    let mut batch = GridInstanceBatch::default();
+    batch.push_row(&extra, 8.0, &resolve_uv);
+
+    // The bg run starts at 80 + 8 and spans one full row → covers the band.
+    assert!((batch.bg_stream[1] - (origin_y - CH + 8.0)).abs() < 1e-4);
+    assert!((batch.bg_stream[3] - CH).abs() < 1e-4);
+    assert!(batch.bg_stream[1] + batch.bg_stream[3] >= origin_y);
+    // rust-reviewer R1: the run's x origin is the REAL content origin, not
+    // a hardcoded 0.0 (sidebar/split alignment).
+    assert!((batch.bg_stream[0] - origin_x).abs() < 1e-4);
+    // The 'X' glyph rides along at the whole-pixel shift (floor(8) = 8).
+    assert!((batch.glyph_stream[1] - (origin_y - CH + 8.0)).abs() < 1e-4);
+
+    // At the history top there is no row above — the helper returns None
+    // (the accumulator already zeroes px at that bound).
+    grid.set_scroll_offset(2);
+    assert!(build_subrow_extra_top_row(
+        &grid, &palette, FG, BG, 1.0, 1.0, CW, CH, origin_x, origin_y, false, LINK,
+    )
+    .is_none());
 }
 
 // ── v1.10.4: color-emoji fg sentinel ─────────────────────────────
@@ -412,7 +510,7 @@ fn color_glyph_replaces_fg_with_alpha_2_sentinel() {
     let color_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
         ([0.1, 0.2, 0.3, 0.4], true)
     };
-    batch.push_row(&row, &color_uv);
+    batch.push_row(&row, 0.0, &color_uv);
     // Layout: origin(2) size(2) uv(4) fg(4) bg(4) → fg = floats[8..12].
     assert_eq!(&batch.glyph_stream[8..12], &[0.0, 0.0, 0.0, 2.0]);
     // UV unchanged.
@@ -423,7 +521,7 @@ fn color_glyph_replaces_fg_with_alpha_2_sentinel() {
     let mask_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
         ([0.1, 0.2, 0.3, 0.4], false)
     };
-    batch.push_row(&row, &mask_uv);
+    batch.push_row(&row, 0.0, &mask_uv);
     assert_eq!(&batch.glyph_stream[8..12], &FG[..]);
 }
 
@@ -441,8 +539,8 @@ fn multi_pane_ranges_are_sequential_and_non_overlapping() {
     let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
         ([0.1, 0.2, 0.3, 0.4], false)
     };
-    let ranges_a = batch.push_row(&row_a, &resolve_uv);
-    let ranges_b = batch.push_row(&row_b, &resolve_uv);
+    let ranges_a = batch.push_row(&row_a, 0.0, &resolve_uv);
+    let ranges_b = batch.push_row(&row_b, 0.0, &resolve_uv);
 
     // Pane A occupies floats [0, 8) in bg and [0, 16) in glyph.
     assert_eq!(ranges_a.bg_range, (0, 8));
@@ -558,7 +656,7 @@ fn pixel_equivalence_dual_stream_matches_single_stream() {
     let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
         ([0.5, 0.5, 0.6, 0.6], false)
     };
-    batch.push_row(&row_instances, &resolve_uv);
+    batch.push_row(&row_instances, 0.0, &resolve_uv);
     let gs = &batch.glyph_stream;
     for chunk in gs.chunks(16) {
         if chunk.len() == 16 {

@@ -152,6 +152,13 @@ pub struct Pane {
     /// Persistence remains row-based; this transient fraction resets on
     /// programmatic jumps and session restore.
     pub(crate) block_scroll_fraction: f32,
+    /// v1.14.0 (PLAN_v1140 T6): sub-row scroll remainder for the GRID view
+    /// (physical px, `0.0..cell_height`), the block_scroll_fraction twin.
+    /// Trackpad PixelDelta folds into whole rows + this remainder; the
+    /// renderer projects it per-frame and `push_row` shifts glyph instances
+    /// by `floor(px)` / bg instances by the exact px. Cleared on resize,
+    /// LineDelta (whole-row) scrolls, and snap-to-bottom.
+    pub(crate) grid_scroll_px: f32,
     /// Original persisted state retained while a restored shell is starting.
     /// Set only by the REAL restore paths (`restore_from_snapshot`,
     /// `attach_recovery_snapshot`) — never as a stub. The pre-OSC-7 cwd
@@ -280,6 +287,7 @@ impl Pane {
             last_sent_winsize: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
+            grid_scroll_px: 0.0,
             restored_snapshot: None,
             restored_cwd: None,
             restored_cwd_set: false,
@@ -318,6 +326,7 @@ impl Pane {
             last_sent_winsize: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
+            grid_scroll_px: 0.0,
             restored_snapshot: None,
             restored_cwd: None,
             restored_cwd_set: false,
@@ -360,6 +369,7 @@ impl Pane {
             last_sent_winsize: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
+            grid_scroll_px: 0.0,
             restored_snapshot: None,
             restored_cwd: None,
             restored_cwd_set: false,

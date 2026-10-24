@@ -52,13 +52,19 @@ impl crate::App {
                 true
             }
             Action::ToggleBlockPanel => {
-                if self.panel.open {
+                // v1.14.0 (T2): sidebar_stable_open gate — a closing width
+                // animation keeps `open` true until it lands, but the next
+                // toggle must reopen (reverse the tween) instead of
+                // re-closing. Expanded windows animate (180/150ms); Compact
+                // drawers and Reduce Motion keep the instant path.
+                if self.panel.sidebar_stable_open() {
                     // v1.12.26 (review P2): panel close drops its IME state
                     // via close(), but the native marked text also needs the
                     // discard — same family as palette/find toggles.
                     self.reset_ime_context("block panel closed");
-                    self.panel.close();
+                    self.animate_sidebar_close();
                 } else {
+                    self.animate_sidebar_open();
                     self.panel.open = true;
                     // Fresh search/selection each time the panel opens.
                     self.panel.query.clear();
@@ -73,9 +79,12 @@ impl crate::App {
             }
             Action::ToggleCommandPalette => {
                 self.reset_ime_context("command palette toggled");
-                if self.palette.open {
-                    self.palette.close();
-                    self.clear_prev_focus_if_no_modal();
+                // v1.14.0 (T1): interactive gate — a Closing palette is
+                // already handing input off; a Cmd+P during Closing is a
+                // reopen request (begin_palette_reveal runs the real
+                // teardown first, then a fresh 0→1 fade — 防抖).
+                if self.palette.interactive() {
+                    self.close_palette();
                 } else {
                     // v0.9 fix: opening the palette closes the find bar (and
                     // vice versa) so only one modal owns keyboard input at a
@@ -87,6 +96,7 @@ impl crate::App {
                     // F4: save the current focus so it can be restored when
                     // the palette closes.
                     self.save_focus_for_modal(crate::scene::FocusId::PaletteQuery);
+                    self.begin_palette_reveal();
                     self.palette.open_search();
                     self.refresh_palette_results();
                 }
@@ -99,9 +109,10 @@ impl crate::App {
             }
             Action::FindInGrid => {
                 self.reset_ime_context("find toggled");
-                if self.find.open {
-                    self.find.close();
-                    self.clear_prev_focus_if_no_modal();
+                // v1.14.0 (T1): interactive gate + Closing-reopen, same
+                // contract as ToggleCommandPalette.
+                if self.find.interactive() {
+                    self.close_find();
                 } else {
                     // v0.9 fix: opening find closes the palette (see above).
                     // v1.0 S1: also close the Settings panel.
@@ -110,6 +121,7 @@ impl crate::App {
                     // F4: save the current focus so it can be restored when
                     // the find bar closes.
                     self.save_focus_for_modal(crate::scene::FocusId::FindQuery);
+                    self.begin_find_reveal();
                     self.find.reset_query();
                     self.find.open = true;
                 }
@@ -141,7 +153,9 @@ impl crate::App {
                 true
             }
             Action::ToggleSettings => {
-                if self.settings.open {
+                // v1.14.0 (T1): interactive gate + Closing-reopen, same
+                // contract as ToggleCommandPalette.
+                if self.settings.interactive() {
                     self.close_settings();
                 } else {
                     self.reset_ime_context("settings opened");
@@ -149,6 +163,7 @@ impl crate::App {
                     self.close_palette();
                     self.close_find();
                     self.save_focus_for_modal(crate::scene::FocusId::Settings);
+                    self.begin_settings_reveal();
                     self.open_settings();
                 }
                 self.request_redraw();
@@ -352,6 +367,9 @@ impl crate::App {
                     self.close_find();
                     self.close_settings();
                     self.save_focus_for_modal(crate::scene::FocusId::PaletteQuery);
+                    // v1.14.0 (T1): reveal-aware open — finishes a Closing
+                    // fade first; a steady-open palette must not restart it.
+                    self.begin_palette_reveal();
                     self.palette.open = true;
                     self.palette.submode = PaletteSubMode::AiCommand {
                         buffer: String::new(),

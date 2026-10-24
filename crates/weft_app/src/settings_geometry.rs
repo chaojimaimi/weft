@@ -8,7 +8,9 @@ impl App {
         x: f32,
         y: f32,
     ) -> Option<crate::settings_component::SettingsTarget> {
-        if !self.settings.open {
+        // v1.14.0 (T1): interactive — Closing 期 targets 视作已关
+        // (PLAN_v1140 §2.1: geometry targets 归 interactive)。
+        if !self.settings.interactive() {
             return None;
         }
         let renderer = self.renderer.as_ref()?;
@@ -60,7 +62,9 @@ impl App {
     }
 
     fn settings_layout(&self, footer_widths: &[f32; 6]) -> Option<crate::layout::SettingsLayout> {
-        if !self.settings.open {
+        // v1.14.0 (T1): interactive — Closing 期 targets 视作已关
+        // (PLAN_v1140 §2.1: geometry targets 归 interactive)。
+        if !self.settings.interactive() {
             return None;
         }
         let renderer = self.renderer.as_ref()?;

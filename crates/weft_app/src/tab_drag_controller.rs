@@ -72,8 +72,133 @@ impl App {
     /// pill on screen and swallow every subsequent CursorMoved.
     pub(super) fn cancel_tab_drag(&mut self) {
         if self.interaction.tab_drag.take().is_some() {
+            // v1.14.0 (PLAN_v1140 T3): 取消时全部清空吸附 — the slot-shift
+            // tweens are keyed by index and the drag preview is abandoned,
+            // so the eased positions snap back to their natural slots.
+            self.clear_tab_bar_tweens();
             self.request_redraw();
         }
+    }
+
+    // ── v1.14.0 (PLAN_v1140 T3): tab-bar motion (indicator + drag yield) ──
+
+    /// Start the active-indicator slide (140ms ease-out) from the currently
+    /// drawn underline position to `to_idx`'s tab rect. `from_idx` seeds the
+    /// from-rect when no tween is in flight (the pre-switch active tab).
+    /// Reduce Motion / missing layout snap: the underline draws in-slot.
+    /// Call AFTER `scroll_active_tab_into_view` so the tween coordinates use
+    /// the settled scroll offset.
+    pub(super) fn begin_tab_indicator_slide(&mut self, from_idx: usize, to_idx: usize) {
+        let now = std::time::Instant::now();
+        if !crate::app::motion::gated(self.window_runtime.reduce_motion) {
+            self.tab_bar.indicator = None;
+            return;
+        }
+        let Some(strip) = self.tab_strip_layout() else {
+            self.tab_bar.indicator = None;
+            return;
+        };
+        let (from_x0, from_x1) = match self.tab_bar.indicator.as_ref() {
+            // Continuity: retargeting mid-slide starts from the drawn value.
+            Some((t0, t1)) => (t0.value_at(now), t1.value_at(now)),
+            None => {
+                let fx = strip.tabs_start + from_idx as f32 * strip.tab_width - strip.scroll_offset;
+                (fx, fx + strip.tab_width)
+            }
+        };
+        let to_x0 = strip.tabs_start + to_idx as f32 * strip.tab_width - strip.scroll_offset;
+        let to_x1 = to_x0 + strip.tab_width;
+        self.tab_bar.indicator = Some((
+            crate::app::motion::Tween::new(
+                from_x0,
+                to_x0,
+                crate::app::motion::TAB_INDICATOR_DUR,
+                now,
+            ),
+            crate::app::motion::Tween::new(
+                from_x1,
+                to_x1,
+                crate::app::motion::TAB_INDICATOR_DUR,
+                now,
+            ),
+        ));
+    }
+
+    /// Rebuild the per-index slot-shift tweens (100ms ease-out) for the
+    /// non-dragged tabs after an `insert_index` change. The tween drives an
+    /// x DELTA relative to the tab's natural slot, so scroll-offset changes
+    /// never invalidate it. Mid-flight retargets start from the drawn value
+    /// (no jump). Reduce Motion → all shifts snap to zero (instant preview).
+    pub(super) fn update_tab_slot_shifts(&mut self) {
+        let Some(drag) = self.interaction.tab_drag else {
+            return;
+        };
+        if !drag.moved {
+            return; // sub-threshold: no gap is open yet
+        }
+        let n = self.sessions.len();
+        let Some(strip) = self.tab_strip_layout() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let animated = crate::app::motion::gated(self.window_runtime.reduce_motion);
+        // Match the tab count. Tween is deliberately non-Clone (RAII counter
+        // pairing), so this is `resize_with`/`truncate`, not `resize`.
+        if self.tab_bar.tab_slot_shifts.len() < n {
+            self.tab_bar.tab_slot_shifts.resize_with(n, || None);
+        } else {
+            self.tab_bar.tab_slot_shifts.truncate(n);
+        }
+        for i in 0..n {
+            if i == drag.drag_index {
+                continue;
+            }
+            let target_slot =
+                crate::layout::render_slot(i, drag.drag_index, drag.insert_index, n).unwrap_or(i);
+            let delta = (target_slot as f32 - i as f32) * strip.tab_width;
+            let from = match self.tab_bar.tab_slot_shifts[i].as_ref() {
+                Some(t) => t.value_at(now),
+                None => 0.0,
+            };
+            if !animated || (from - delta).abs() < 0.5 {
+                self.tab_bar.tab_slot_shifts[i] = None;
+            } else {
+                self.tab_bar.tab_slot_shifts[i] = Some(crate::app::motion::Tween::new(
+                    from,
+                    delta,
+                    crate::app::motion::TAB_SHIFT_DUR,
+                    now,
+                ));
+            }
+        }
+    }
+
+    /// v1.14.0 (T3): per-frame tab-bar tween maintenance — drop finished
+    /// tweens so the live counter releases. Paint falls back to the settled
+    /// position (indicator → in-slot, shift → 0), which equals the tween's
+    /// target, so the drop never jumps.
+    pub(super) fn maintain_tab_bar_tweens(&mut self, now: std::time::Instant) {
+        if let Some((t0, t1)) = self.tab_bar.indicator.as_ref() {
+            if t0.finished(now) && t1.finished(now) {
+                self.tab_bar.indicator = None;
+            }
+        }
+        for entry in self.tab_bar.tab_slot_shifts.iter_mut() {
+            if let Some(t) = entry.as_ref() {
+                if t.finished(now) {
+                    *entry = None;
+                }
+            }
+        }
+    }
+
+    /// v1.14.0 (T3): snap both tab-bar animations to their settled positions
+    /// (indicator glued to the active slot, shifts zeroed). Called at every
+    /// index-instability point: scroll-offset change (防拖影), drag
+    /// start/release/commit/cancel, close/new tab.
+    pub(super) fn clear_tab_bar_tweens(&mut self) {
+        self.tab_bar.indicator = None;
+        self.tab_bar.tab_slot_shifts.clear();
     }
 
     /// v1.11: Handle tab drag-to-reorder. Called from CursorMoved before
@@ -118,6 +243,9 @@ impl App {
             drag.moved = true;
             // A real drag revokes the deferred close request.
             drag.close_on_release = false;
+            // v1.14.0 (PLAN_v1140 T3): drag start snaps the indicator
+            // (防拖影 — the underline must not chase the ghost pill).
+            self.tab_bar.indicator = None;
             // Capture the grip: pointer X offset within the dragged tab's
             // slot at lift, so the ghost pill never jumps on the first move.
             if let Some(strip) = self.tab_strip_layout() {
@@ -136,6 +264,8 @@ impl App {
         };
         drag.insert_index = insert;
         self.interaction.tab_drag = Some(drag);
+        // v1.14.0 (T3): rebuild the 让位 tweens for the new gap slot.
+        self.update_tab_slot_shifts();
         self.request_redraw();
     }
 }

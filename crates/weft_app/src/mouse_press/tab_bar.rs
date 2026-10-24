@@ -103,8 +103,15 @@ impl App {
                             );
                             if self.sessions.active_idx() != hit_index {
                                 self.reset_ime_context("tab clicked");
+                                let prev_active = self.sessions.active_idx();
                                 self.sessions.switch_to(hit_index);
                                 self.refresh_find_for_active_tab();
+                                self.scroll_active_tab_into_view();
+                                // v1.14.0 (PLAN_v1140 T3): click-switch slides
+                                // the underline (next_tab/prev_tab twin) —
+                                // after the scroll settles so the tween uses
+                                // the final offset.
+                                self.begin_tab_indicator_slide(prev_active, hit_index);
                             }
                             self.tab_bar.hovered_tab = None;
                             self.interaction.block_hovered = None;

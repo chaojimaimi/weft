@@ -60,6 +60,10 @@ pub struct FindDrawState {
     /// Async grid scan is still running. Drives the shared Loading state so
     /// a large scrollback search never looks like a completed empty result.
     pub worker_busy: bool,
+    /// v1.14.0 (PLAN_v1140 T1): reveal factor [0,1] — every pushed quad/text
+    /// alpha is scaled by it (post-pass in `draw_phases`), so the bar fades
+    /// in/out with the open/close animation.
+    pub reveal: f32,
 }
 
 /// v1.7.3-C: Per-frame note editor draw state. Set by the app before
@@ -73,6 +77,10 @@ pub struct NoteEditorDrawState {
     pub cursor: usize,
     /// v1.12.24 (N-1): active IME composition, rendered inline at the caret.
     pub ime_preedit: String,
+    /// v1.14.0 (PLAN_v1140 T1): reveal factor [0,1] — every pushed quad/text
+    /// alpha is scaled by it (post-pass in `draw_phases`), so the card
+    /// fades in/out with the open/close animation.
+    pub reveal: f32,
 }
 
 impl FindDrawState {
@@ -126,10 +134,20 @@ impl MetalRenderer {
         let text_x = layout.text_x;
 
         let theme_bg = color_to_normalized(self.theme.background);
-        // F4: shared shell (bg + border, no shadow, no resize handles).
+        // F4: shared shell (bg + border). v1.14.0 (T5): token-driven material
+        // (compact radius + dual-layer soft shadow — the menu gains the
+        // surface shadow it previously lacked).
         build_command_surface_shell(
             &mut verts,
-            CommandSurfaceShell::canonical(layout.menu_rect, 0.0, false, theme_bg, bg_uv),
+            CommandSurfaceShell::canonical(
+                layout.menu_rect,
+                crate::ui_tokens::SurfaceTokens::compact()
+                    .scaled(self.scale as f32)
+                    .for_environment(self.theme.is_dark(), self.increase_contrast),
+                false,
+                theme_bg,
+                bg_uv,
+            ),
         );
 
         // Items.
@@ -221,10 +239,19 @@ impl MetalRenderer {
         let label_cols = layout.label_cols;
         let suffix_cols = layout.suffix_cols;
 
-        // F4: shared shell (bg + border + resize handles, no drop shadow).
+        // F4: shared shell (bg + border + resize handles). v1.14.0 (T5):
+        // token-driven material (compact radius + dual-layer soft shadow).
         build_command_surface_shell(
             &mut verts,
-            CommandSurfaceShell::canonical(layout.popup_rect, 0.0, true, theme_bg, bg_uv),
+            CommandSurfaceShell::canonical(
+                layout.popup_rect,
+                crate::ui_tokens::SurfaceTokens::compact()
+                    .scaled(self.scale as f32)
+                    .for_environment(self.theme.is_dark(), self.increase_contrast),
+                true,
+                theme_bg,
+                bg_uv,
+            ),
         );
 
         // F4: formal state. When there are no matches, show the Empty status

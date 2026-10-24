@@ -588,6 +588,28 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
 
+        // v1.14.0 (PLAN_v1140 T0): motion tick — drives every v1.14.0
+        // animation (overlay reveal / sidebar width / tab indicator / hover
+        // fade) by waking the loop at 16ms while any Tween is alive and
+        // dropping to a 40ms idle probe otherwise (RAII counter in
+        // app::motion; rust-reviewer P3: the shorter probe halves the
+        // worst-case first-frame latency after an idle period, and an idle
+        // probe only burns a counter read — no Wake is posted). Same
+        // sleep-loop shape as the three timers above: the motor only posts
+        // Wake — progress and drawing still ride the existing
+        // request_redraw → draw chain.
+        let motion_proxy = self.proxy.clone();
+        spawn_named("weft-motion", move || loop {
+            if crate::app::motion::live_tweens() > 0 {
+                if motion_proxy.send_event(AppEvent::Wake).is_err() {
+                    break; // event loop exited
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+        });
+
         if self.performance_probe.enabled() {
             let probe_proxy = self.proxy.clone();
             spawn_named("weft-probe", move || {
@@ -707,6 +729,10 @@ impl App {
                     (false, false)
                 }
             };
+            // v1.14.0 (PLAN_v1140 T6): a geometry change invalidates the
+            // sub-row scroll remainder (plan: resize 清零) — the baked row
+            // coordinates the px shifts against are about to change.
+            pane.grid_scroll_px = 0.0;
             let mut committed = false;
             // T10 P1: the guard is owned (`lock_arc`) so the disjoint
             // `pending_pty_resize` field stays mutable under the lock.

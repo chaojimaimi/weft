@@ -52,7 +52,6 @@ pub(super) struct FrameDrawCore {
     pub cursor_blink_on: bool,
     pub cursor_blink_phase: f32,
     pub block_scroll: f32,
-    pub scrollbar_emphasized: bool,
     pub active_pane_rect: crate::layout::Rect,
     pub active_pane_id: weft_core::pane_layout::PaneId,
     pub active_pane_session_id: u64,
@@ -449,7 +448,6 @@ impl crate::renderer::MetalRenderer {
             draw_ctx,
             show_blocks,
             block_scroll,
-            scrollbar_emphasized,
             ..
         } = *frame;
         // v0.8 U6 scrollbar: dynamic thumb position + height proportional to
@@ -473,14 +471,31 @@ impl crate::renderer::MetalRenderer {
                     block_scroll.floor() as usize,
                 ) {
                     // v1.0: label_c (70% fg + 30% bg) — was accent_dim.
+                    // v1.14.0 (PLAN_v1140 T4): the thumb's 加宽+色 hover
+                    // transition rides the ScrollbarThumb fade progress —
+                    // width lerps idle→hover, color deepens toward a more
+                    // present 55% mix. Fade 0.0 reproduces the idle pair
+                    // exactly (bit-faithful with the pre-T4 idle look).
+                    let thumb_fade = crate::app::motion::fade_progress(
+                        &self.hover_fades,
+                        crate::app::motion::HoverKey::ScrollbarThumb,
+                    );
                     let fg_v = color_to_normalized(self.theme.foreground);
                     let bg_v = color_to_normalized(self.theme.background);
                     let thumb_color = crate::paint::color_math::mix_fg_over_bg(fg_v, bg_v, 0.30);
+                    let emphasized_color =
+                        crate::paint::color_math::mix_fg_over_bg(fg_v, bg_v, 0.55);
+                    let thumb_color = [
+                        thumb_color[0] + (emphasized_color[0] - thumb_color[0]) * thumb_fade,
+                        thumb_color[1] + (emphasized_color[1] - thumb_color[1]) * thumb_fade,
+                        thumb_color[2] + (emphasized_color[2] - thumb_color[2]) * thumb_fade,
+                        thumb_color[3],
+                    ];
                     let (su, sv, suw, svh) = self.space_uv();
                     let bg_uv = [su, sv + svh, su + suw, sv];
                     push_quad(
                         vertices,
-                        crate::scrollbar_component::visual_thumb(&scrollbar, scrollbar_emphasized),
+                        crate::scrollbar_component::visual_thumb_faded(&scrollbar, thumb_fade),
                         bg_uv,
                         [0.0; 4],
                         thumb_color,
@@ -606,12 +621,19 @@ impl crate::renderer::MetalRenderer {
 
         // Command Palette overlay (v0.7) — centered floating window.
         if let Some(p) = palette {
-            vertices.extend_from_slice(&self.build_palette_vertices(p));
+            // v1.14.0 (T1): alpha post-pass — every layer's fg/bg alpha is
+            // scaled by the reveal factor in one place (miss-proof; see
+            // `scale_vertex_alpha`).
+            let mut verts = self.build_palette_vertices(p);
+            crate::paint::primitives::scale_vertex_alpha(&mut verts, p.reveal);
+            vertices.extend_from_slice(&verts);
         }
 
         // v1.0 S1: Settings panel (Cmd+,) — centered modal overlay.
         if let Some(s) = settings {
-            vertices.extend_from_slice(&self.build_settings_vertices(*s));
+            let mut verts = self.build_settings_vertices(*s);
+            crate::paint::primitives::scale_vertex_alpha(&mut verts, s.reveal);
+            vertices.extend_from_slice(&verts);
         }
 
         // Context menu overlay (F7) — drawn at mouse position.
@@ -623,13 +645,19 @@ impl crate::renderer::MetalRenderer {
         // plus a yellow translucent highlight on the current match. Drawn
         // last so it composites above all other overlays.
         if let Some(find) = self.find_state.as_ref() {
-            vertices.extend_from_slice(&self.build_find_vertices(find));
+            let mut verts = self.build_find_vertices(find);
+            // v1.14.0 (T1): alpha post-pass (palette/settings twin).
+            crate::paint::primitives::scale_vertex_alpha(&mut verts, find.reveal);
+            vertices.extend_from_slice(&verts);
         }
 
         // v1.7.3-C: Inline note editor — top-center card with "Note: [buffer|]".
         // Drawn after find so it composites above when both are open (rare).
         if let Some(note) = self.note_editor_state.as_ref() {
-            vertices.extend_from_slice(&self.build_note_editor_vertices(note));
+            let mut verts = self.build_note_editor_vertices(note);
+            // v1.14.0 (T1): alpha post-pass (palette/settings twin).
+            crate::paint::primitives::scale_vertex_alpha(&mut verts, note.reveal);
+            vertices.extend_from_slice(&verts);
         }
 
         // v0.9 H1: Tab bar — drawn at the top of the window. The content

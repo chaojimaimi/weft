@@ -120,33 +120,46 @@ impl MetalRenderer {
         let content_x1 = layout.content_x1;
         let content_cols = (((content_x1 - content_x0) / cw).max(1.0)) as usize;
 
-        let shadow_pad = ch * 0.15;
-        push_quad(
-            &mut verts,
-            [
-                box_x0 - shadow_pad,
-                box_y0 - shadow_pad,
-                box_x1 + shadow_pad,
-                box_y1 + shadow_pad,
-            ],
-            bg_uv,
-            [0.0; 4],
-            [0.0, 0.0, 0.0, 0.15],
-        );
-        push_quad(
-            &mut verts,
-            [box_x0, box_y0, box_x1, box_y1],
-            bg_uv,
-            [0.0; 4],
-            popup_bg,
-        );
-        for (bx0, by0, bx1, by1) in [
-            (box_x0, box_y0, box_x1, box_y0 + 1.0),
-            (box_x0, box_y1 - 1.0, box_x1, box_y1),
-            (box_x0, box_y0, box_x0 + 1.0, box_y1),
-            (box_x1 - 1.0, box_y0, box_x1, box_y1),
-        ] {
-            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
+        // v1.14.0 (PLAN_v1140 T5): token-driven material — the hard shadow
+        // quad + square border became the dual-layer rounded shadow + the
+        // rounded shell background + the rounded border stroke (outer
+        // border-colored rounded rect over-painted by the inset bg rect).
+        // Geometry only — hit tests keep the original box rect.
+        {
+            use crate::paint::primitives::push_rounded_rect;
+            let tokens = crate::ui_tokens::SurfaceTokens::modal()
+                .scaled(self.scale as f32)
+                .for_environment(self.theme.is_dark(), self.increase_contrast);
+            let radius = tokens.radius;
+            let border = [border_c[0], border_c[1], border_c[2], tokens.border_alpha];
+            for layer in [tokens.ambient, tokens.key] {
+                push_rounded_rect(
+                    &mut verts,
+                    [
+                        box_x0 - layer.expand,
+                        box_y0 - layer.expand + layer.offset_y,
+                        box_x1 + layer.expand,
+                        box_y1 + layer.expand + layer.offset_y,
+                    ],
+                    radius + layer.expand,
+                    [0.0, 0.0, 0.0, layer.alpha],
+                    bg_uv,
+                );
+            }
+            push_rounded_rect(
+                &mut verts,
+                [box_x0, box_y0, box_x1, box_y1],
+                radius,
+                border,
+                bg_uv,
+            );
+            push_rounded_rect(
+                &mut verts,
+                [box_x0 + 1.0, box_y0 + 1.0, box_x1 - 1.0, box_y1 - 1.0],
+                (radius - 1.0).max(0.0),
+                popup_bg,
+                bg_uv,
+            );
         }
 
         // Title row.

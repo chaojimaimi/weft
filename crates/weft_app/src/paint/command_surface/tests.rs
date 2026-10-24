@@ -7,7 +7,9 @@ use weft_core::input::{KeyCode, Modifiers};
 fn canonical_shell_lifts_background_and_uses_unified_border() {
     let shell = CommandSurfaceShell::canonical(
         [0.0, 0.0, 100.0, 50.0],
-        4.0,
+        crate::ui_tokens::SurfaceTokens::modal()
+            .scaled(1.0)
+            .for_environment(true, false),
         true,
         [0.1, 0.1, 0.1, 1.0],
         [0.0, 0.0, 1.0, 1.0],
@@ -15,47 +17,59 @@ fn canonical_shell_lifts_background_and_uses_unified_border() {
     // bg = bg + (1 - bg) * 0.08 = 0.1 + 0.9*0.08 = 0.172
     assert!((shell.bg_color[0] - 0.172).abs() < 1e-4);
     assert!((shell.bg_color[3] - 1.0).abs() < 1e-4);
-    assert_eq!(shell.border_color, [0.5, 0.5, 0.5, 0.20]);
+    // Border RGB is fixed; the alpha now rides the tokens (T5).
+    assert_eq!(shell.border_color[..3], [0.5, 0.5, 0.5]);
+    assert!((shell.tokens.border_alpha - 0.20).abs() < 1e-6);
+    assert!((shell.tokens.radius - 10.0).abs() < 1e-6);
     assert!(shell.with_resize_handles);
-    assert_eq!(shell.shadow_pad, 4.0);
 }
 
 #[test]
-fn build_shell_emits_shadow_bg_border_and_handles() {
+fn build_shell_emits_dual_layer_shadows_rounded_shell_and_handles() {
+    // v1.14.0 (PLAN_v1140 T5) — INTENTIONAL REWRITE of the pre-T5
+    // "1 shadow + 1 bg + 4 border = 6 quads (720 floats)" vertex assertion:
+    // the shell now emits the token material — 2 rounded shadow layers +
+    // 1 rounded border stroke + 1 rounded bg inset, where one rounded shape
+    // = 5 quads (5×6×12 = 360 floats) + 24 corner triangles (24×3×12 = 864
+    // floats) = 1224 floats. 4 shapes → 4896; + resize handles 288 → 5184.
     let mut verts = Vec::new();
     let shell = CommandSurfaceShell::canonical(
         [10.0, 10.0, 110.0, 60.0],
-        4.0,
+        crate::ui_tokens::SurfaceTokens::modal()
+            .scaled(1.0)
+            .for_environment(true, false),
         true,
         [0.2, 0.2, 0.2, 1.0],
         [0.0, 0.0, 1.0, 1.0],
     );
     build_command_surface_shell(&mut verts, shell);
+    assert_eq!(verts.len(), 5184);
 
-    // Each push_quad emits 6 verts × 12 floats = 72 floats.
-    // Expected quads: 1 shadow + 1 bg + 4 border edges = 6 quads.
-    // Plus resize handles: 4 triangles (3 verts × 12 floats = 36) +
-    // 2 connecting lines (quads, 72 each). Total handle floats:
-    // 4*36 + 2*72 = 144 + 144 = 288.
-    // Shell quads: 6 * 72 = 432. Total = 432 + 288 = 720.
-    assert_eq!(verts.len(), 720);
-
-    // Shadow pad expands the rect by 4 on each side.
-    // Verify the first quad's first vertex is the shadow top-left.
-    assert_eq!(verts[0], 10.0 - 4.0); // x0 - shadow_pad
-    assert_eq!(verts[1], 10.0 - 4.0); // y0 - shadow_pad
+    // First vertex: the ambient shadow's center-column quad top-left —
+    // x = x0 - 6 + radius (radius clamped to min(w,h)/2 = 16), y = y0 - 6.
+    assert_eq!(verts[0], 10.0 - 6.0 + 16.0);
+    assert_eq!(verts[1], 10.0 - 6.0);
+    // The ambient layer's alpha rides the bg color slot (vertex offset 11).
+    assert!((verts[11] - 0.06).abs() < 1e-6);
+    // The key shadow layer starts one full shape later (1224 floats) with
+    // alpha 0.14.
+    assert!((verts[1224 + 11] - 0.14).abs() < 1e-6);
+    // The key layer is offset 3pt downward (its center-quad y0).
+    assert!((verts[1224 + 1] - (10.0 - 2.0 + 3.0)).abs() < 1e-6);
 }
 
 #[test]
-fn build_shell_skips_shadow_when_pad_zero() {
+fn build_shell_renders_identical_body_without_handles() {
     let mut verts_with = Vec::new();
     let mut verts_without = Vec::new();
     build_command_surface_shell(
         &mut verts_with,
         CommandSurfaceShell::canonical(
             [0.0, 0.0, 100.0, 50.0],
-            4.0,
-            false,
+            crate::ui_tokens::SurfaceTokens::compact()
+                .scaled(1.0)
+                .for_environment(true, false),
+            true,
             [0.2, 0.2, 0.2, 1.0],
             [0.0, 0.0, 1.0, 1.0],
         ),
@@ -64,14 +78,17 @@ fn build_shell_skips_shadow_when_pad_zero() {
         &mut verts_without,
         CommandSurfaceShell::canonical(
             [0.0, 0.0, 100.0, 50.0],
-            0.0,
+            crate::ui_tokens::SurfaceTokens::compact()
+                .scaled(1.0)
+                .for_environment(true, false),
             false,
             [0.2, 0.2, 0.2, 1.0],
             [0.0, 0.0, 1.0, 1.0],
         ),
     );
-    // The version with shadow has one extra quad (the shadow).
-    assert_eq!(verts_with.len() - verts_without.len(), 72);
+    // The only difference is the resize-handle block (4 triangles +
+    // 2 connecting quads = 288 floats).
+    assert_eq!(verts_with.len() - verts_without.len(), 288);
 }
 
 #[test]

@@ -19,7 +19,7 @@
 //! See `docs/FRONTEND_DESIGN_OPTIMIZATION_PLAN.md` §4.5/4.6/4.9.
 
 use crate::layout::Rect;
-use crate::paint::primitives::{push_quad, push_triangle};
+use crate::paint::primitives::{push_quad, push_rounded_rect, push_triangle};
 use crate::scene::FocusId;
 use weft_core::input::{KeyCode, Modifiers};
 
@@ -32,14 +32,14 @@ use weft_core::input::{KeyCode, Modifiers};
 pub(crate) struct CommandSurfaceShell {
     /// Outer popup rectangle `[x0, y0, x1, y1]` in physical pixels.
     pub popup_rect: Rect,
-    /// Drop-shadow padding in physical pixels. `0.0` skips the shadow
-    /// (used by surfaces like Find that sit flush with the viewport edge).
-    pub shadow_pad: f32,
+    /// v1.14.0 (PLAN_v1140 T5): surface material tokens (radius + dual-layer
+    /// shadow + border alpha), already resolved to physical px by the caller
+    /// (`SurfaceTokens::*().scaled(scale).for_environment(..)`).
+    pub tokens: crate::ui_tokens::SurfaceTokens,
     /// Whether to paint Warp-style resize handles on the top + right
     /// borders. Completion + Palette opt in; Find does not.
     pub with_resize_handles: bool,
-    /// Border RGBA (already normalized). Shared across surfaces for visual
-    /// consistency — typically `[0.5, 0.5, 0.5, 0.20]`.
+    /// Border RGB (already normalized; alpha comes from the tokens).
     pub border_color: [f32; 4],
     /// Background RGBA (already normalized). Typically the theme background
     /// lifted by 8% toward white.
@@ -50,13 +50,14 @@ pub(crate) struct CommandSurfaceShell {
 
 impl CommandSurfaceShell {
     /// Construct a shell with the canonical Weft styling: 8% lifted
-    /// background, `[0.5, 0.5, 0.5, 0.20]` border, and the given shadow
-    /// padding + resize-handle flag. The caller still picks `popup_rect`
-    /// and `bg_uv` because those derive from the surface's layout + the
-    /// renderer's glyph atlas.
+    /// background, the token-derived border, and the given material tokens
+    /// + resize-handle flag.
+    ///
+    /// The caller still picks `popup_rect` and `bg_uv` because those derive
+    /// from the surface's layout + the renderer's glyph atlas.
     pub(crate) fn canonical(
         popup_rect: Rect,
-        shadow_pad: f32,
+        tokens: crate::ui_tokens::SurfaceTokens,
         with_resize_handles: bool,
         theme_bg: [f32; 4],
         bg_uv: [f32; 4],
@@ -64,61 +65,72 @@ impl CommandSurfaceShell {
         let bg_color = crate::paint::color_math::lighten_to_white(theme_bg, 0.08);
         Self {
             popup_rect,
-            shadow_pad,
+            tokens,
             with_resize_handles,
-            border_color: [0.5, 0.5, 0.5, 0.20],
+            border_color: [0.5, 0.5, 0.5, 1.0],
             bg_color,
             bg_uv,
         }
     }
 }
 
-/// Emit the shared shell (shadow + background + 1px border + optional
-/// resize handles) for a command surface. Pure vertex emitter — pushes raw
-/// `f32` data into `verts`, no renderer dependency.
+/// Emit the shared shell (dual-layer soft shadow + rounded background +
+/// rounded 1px border + optional resize handles) for a command surface.
+/// Pure vertex emitter — pushes raw `f32` data into `verts`, no renderer
+/// dependency.
+///
+/// v1.14.0 (PLAN_v1140 T5): the single hard 15% shadow quad + square 4-edge
+/// border became the token-driven material — two rounded shadow layers
+/// (ambient + key), then the rounded border stroke (outer rounded rect in
+/// border color over-painted by an inset rounded rect in bg color), then
+/// the rounded shell background. Geometry only — hit tests and resize
+/// handles keep the original rect.
 pub(crate) fn build_command_surface_shell(verts: &mut Vec<f32>, shell: CommandSurfaceShell) {
     let [x0, y0, x1, y1] = shell.popup_rect;
+    let tokens = shell.tokens;
+    let border_color = [
+        shell.border_color[0],
+        shell.border_color[1],
+        shell.border_color[2],
+        tokens.border_alpha,
+    ];
 
-    // Drop shadow (offset pad on all sides, low opacity black).
-    if shell.shadow_pad > 0.0 {
-        push_quad(
+    // Dual-layer soft shadow (ambient occlusion + key light from above).
+    for layer in [tokens.ambient, tokens.key] {
+        if layer.alpha <= 0.0 {
+            continue;
+        }
+        push_rounded_rect(
             verts,
             [
-                x0 - shell.shadow_pad,
-                y0 - shell.shadow_pad,
-                x1 + shell.shadow_pad,
-                y1 + shell.shadow_pad,
+                x0 - layer.expand,
+                y0 - layer.expand + layer.offset_y,
+                x1 + layer.expand,
+                y1 + layer.expand + layer.offset_y,
             ],
+            tokens.radius + layer.expand,
+            [0.0, 0.0, 0.0, layer.alpha],
             shell.bg_uv,
-            [0.0; 4],
-            [0.0, 0.0, 0.0, 0.15],
         );
     }
 
-    // Background.
-    push_quad(
+    // Rounded border stroke: outer rounded rect in border color, over-
+    // painted by the bg-colored rounded rect inset 1px — the surviving 1px
+    // rim follows the rounded outline.
+    push_rounded_rect(
         verts,
         shell.popup_rect,
+        tokens.radius,
+        border_color,
         shell.bg_uv,
-        [0.0; 4],
-        shell.bg_color,
     );
-
-    // 1px border on all four edges.
-    for (bx0, by0, bx1, by1) in [
-        (x0, y0, x1, y0 + 1.0),
-        (x0, y1 - 1.0, x1, y1),
-        (x0, y0, x0 + 1.0, y1),
-        (x1 - 1.0, y0, x1, y1),
-    ] {
-        push_quad(
-            verts,
-            [bx0, by0, bx1, by1],
-            shell.bg_uv,
-            [0.0; 4],
-            shell.border_color,
-        );
-    }
+    push_rounded_rect(
+        verts,
+        [x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0],
+        (tokens.radius - 1.0).max(0.0),
+        shell.bg_color,
+        shell.bg_uv,
+    );
 
     if shell.with_resize_handles {
         build_command_surface_resize_handles(verts, shell.popup_rect, shell.bg_uv);

@@ -309,6 +309,8 @@ impl MetalRenderer {
             block_hovered: None,
             block_selected: None,
             block_action_hovered: None,
+            hover_fades: Vec::new(),
+            grid_scroll_px: 0.0,
             bookmarked_blocks: std::sync::Arc::new(std::collections::HashSet::new()),
             block_diagnose_state: std::collections::HashMap::new(),
             ai_configured: false,

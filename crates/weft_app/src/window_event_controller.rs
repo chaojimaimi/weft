@@ -231,8 +231,10 @@ impl App {
     ) {
         match state {
             winit::event::ElementState::Pressed => {
-                let modal_open = self.palette.open
-                    || self.settings.open
+                // v1.14.0 (T1): interactive predicates — a Closing modal must
+                // not capture presses (clicks pass through while it fades).
+                let modal_open = self.palette.interactive()
+                    || self.settings.interactive()
                     || self.interaction.context_menu.is_some();
                 let capture_active = self.interaction.modal_mouse_capture.is_active();
                 if modal_open || capture_active {
@@ -261,8 +263,8 @@ impl App {
                 // menu consumed the press without emitting PTY bytes, so
                 // its later release belongs to the same modal gesture.
                 self.interaction.modal_mouse_capture.capture_press(
-                    self.palette.open
-                        || self.settings.open
+                    self.palette.interactive()
+                        || self.settings.interactive()
                         || self.interaction.context_menu.is_some(),
                     button,
                 );
@@ -297,8 +299,8 @@ impl App {
                         );
                     }
                     None if crate::input_router::route_modal_pointer(
-                        self.palette.open,
-                        self.settings.open,
+                        self.palette.interactive(),
+                        self.settings.interactive(),
                         self.interaction.context_menu.is_some(),
                         self.interaction.modal_mouse_capture.is_active(),
                         !self.sessions.is_empty(),
@@ -351,15 +353,16 @@ impl App {
         // (update_context_menu_hover precedent). Hover is cosmetic only and
         // never changes the keyboard selection. A tab drag short-circuits
         // above, so a modal drag gesture never updates these.
-        if self.palette.open {
+        // v1.14.0 (T1): interactive — hover stops tracking during Closing.
+        if self.palette.interactive() {
             self.update_palette_hover(position.x, position.y);
         }
-        if self.settings.open {
+        if self.settings.interactive() {
             self.update_settings_hover(position.x, position.y);
         }
         if crate::input_router::route_modal_pointer(
-            self.palette.open,
-            self.settings.open,
+            self.palette.interactive(),
+            self.settings.interactive(),
             self.interaction.context_menu.is_some(),
             self.interaction.modal_mouse_capture.is_active(),
             !self.sessions.is_empty(),
@@ -423,8 +426,8 @@ impl App {
         phase: winit::event::TouchPhase,
     ) {
         if crate::input_router::route_modal_pointer(
-            self.palette.open,
-            self.settings.open,
+            self.palette.interactive(),
+            self.settings.interactive(),
             self.interaction.context_menu.is_some(),
             self.interaction.modal_mouse_capture.is_active(),
             !self.sessions.is_empty(),

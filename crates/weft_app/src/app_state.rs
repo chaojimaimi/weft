@@ -158,6 +158,16 @@ impl Default for SessionManager {
 // `config_state.config.<field>` read sites keep compiling unchanged.
 pub use crate::config_state::ConfigState;
 
+// v1.14.0 (PLAN_v1140 batch splits): the drag/gesture + context-menu value
+// types moved to `app_state/drag.rs` — the reveal/width/px animation fields
+// pushed this file past the 800-line gate. Re-exported so every
+// `app_state::{DragState, ...}` consumer keeps compiling unchanged.
+mod drag;
+
+pub use drag::{
+    ContextMenu, DragState, DragTarget, PaneDividerDragState, SidebarDragState, TabBarDragState,
+};
+
 pub struct WindowRuntimeState {
     pub cursor_blink_on: bool,
     pub cursor_blink_phase: f32,
@@ -239,92 +249,6 @@ impl WindowRuntimeState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DragTarget {
-    Right,
-    Top,
-}
-
-/// F3-3: Sidebar resize drag state. Captured at drag start so the new width
-/// can be computed from the pointer delta without accumulating rounding error.
-#[derive(Clone, Copy)]
-pub struct SidebarDragState {
-    /// Physical X where the drag started.
-    pub start_x: f64,
-    /// Logical sidebar width (points) at drag start.
-    pub start_width: f32,
-}
-
-/// v1.3.2: Pane divider resize drag state. Stashed at drag start so each
-/// mouse-move can compute the new ratio from the pointer position and the
-/// split's bounds (stored here) without re-deriving which divider was grabbed.
-#[derive(Clone, Copy)]
-pub struct PaneDividerDragState {
-    /// The divider axis (Vertical → left/right panes; Horizontal → top/bottom).
-    pub axis: crate::paint::pane_dividers::DividerAxis,
-    /// The first child (top/left) of the split being resized.
-    pub first: weft_core::pane_layout::PaneId,
-    /// The second child (bottom/right) of the split being resized.
-    pub second: weft_core::pane_layout::PaneId,
-    /// The union rect of the two panes the divider separates. Used to compute
-    /// `new_ratio = (pointer - bounds[0]) / (bounds[2] - bounds[0])`.
-    pub bounds: crate::layout::Rect,
-}
-
-/// v1.11: Tab drag-to-reorder state. Set when the user presses on a tab label
-/// (after switching to it); cleared on mouse release. While `moved` is false,
-/// the gesture is indistinguishable from a plain click (tab already switched
-/// on press, or a close request pending when `close_on_release` is set).
-/// Once the pointer exceeds the drag threshold, `moved` flips to true and
-/// subsequent moves update `insert_index` (ghost gap slot) without touching
-/// the `SessionManager` order — the reorder is committed once on release.
-#[derive(Clone, Copy)]
-pub struct TabBarDragState {
-    /// Physical X where the press started.
-    pub start_x: f64,
-    /// Physical Y where the press started.
-    pub start_y: f64,
-    /// Index of the dragged tab in the `tabs` Vec. Stable for the whole
-    /// gesture — the Vec is only reordered on release.
-    pub drag_index: usize,
-    /// Pointer X offset within the dragged tab's rect at lift (physical px).
-    /// The ghost pill keeps this grip so it never jumps on the first move.
-    pub grab_offset: f32,
-    /// Current gap slot (0..=n-1) the pointer would drop the dragged tab at.
-    /// Updated on every move past the threshold; rendered as a one-slot gap.
-    pub insert_index: usize,
-    /// Whether the drag threshold has been exceeded. Until this flips, no
-    /// reorder happens — the press was treated as a normal click.
-    pub moved: bool,
-    /// Press landed on the tab's close "×" button: a click (no movement)
-    /// performs the close instead of being a no-op tab switch.
-    pub close_on_release: bool,
-}
-
-#[derive(Clone)]
-pub struct DragState {
-    pub target: DragTarget,
-    pub start_x: f64,
-    pub start_y: f64,
-    pub start_scale: f32,
-    pub start_rows: usize,
-    pub cell_h: f32,
-}
-
-pub struct ContextMenu {
-    pub session_id: u64,
-    pub block_id: Option<BlockId>,
-    pub x: f32,
-    pub y: f32,
-    pub selection: usize,
-}
-
-impl ContextMenu {
-    pub fn belongs_to_session(&self, session_id: u64) -> bool {
-        self.session_id == session_id
-    }
-}
-
 pub struct InteractionState {
     pub mods: winit::event::Modifiers,
     pub last_mouse_x: f64,
@@ -373,6 +297,10 @@ pub struct InteractionState {
     /// focus (visually / for accessibility) when the modal closes. `None`
     /// when no modal is open or the focus was already on the modal target.
     pub prev_focus: Option<crate::scene::FocusId>,
+    /// v1.14.0 (PLAN_v1140 T4): hover fades for the block action buttons +
+    /// scrollbar thumb (Block*/ScrollbarThumb keys) — the plan's 借用面
+    /// split: block/scrollbar state lives beside their hover signals.
+    pub hover_fades: crate::app::motion::HoverFades,
 }
 
 impl InteractionState {
@@ -403,6 +331,7 @@ impl InteractionState {
             selection_drag_pos: None,
             selection_autoscroll_carry: 0.0,
             prev_focus: None,
+            hover_fades: crate::app::motion::HoverFades::default(),
         }
     }
 }
@@ -415,6 +344,24 @@ pub struct TabBarState {
     pub arrow_left_hovered: bool,
     pub arrow_right_hovered: bool,
     pub last_titlebar_click: Option<Instant>,
+    /// v1.14.0 (PLAN_v1140 T3): active-tab indicator slide tween — (x0, x1)
+    /// in physical px, 140ms ease-out, from the currently drawn underline
+    /// position to the new active tab's rect. `None` = the underline draws
+    /// glued to the active tab's slot (pre-T3 behavior). Snapped (cleared)
+    /// on scroll-offset change, drag start, and every index-instability
+    /// point (close/new/commit) — plan's 防拖影 rule.
+    pub indicator: Option<(crate::app::motion::Tween, crate::app::motion::Tween)>,
+    /// v1.14.0 (T3): per-index slot-shift tweens (x delta, physical px,
+    /// 100ms ease-out) — the eased 让位 of non-dragged tabs during a drag.
+    /// Keyed by index (stable within the gesture: the tab Vec only reorders
+    /// on release — TabBarDragState contract); fully cleared on
+    /// release/commit/cancel where index stability ends. A single tween per
+    /// index: the shift is ONE x-delta (tab width is constant, both edges
+    /// move together — rust-reviewer P3 de-twin).
+    pub tab_slot_shifts: Vec<Option<crate::app::motion::Tween>>,
+    /// v1.14.0 (PLAN_v1140 T4): hover color fades for the tab bar's four
+    /// elements (row / "+" / ‹› / ×) — Tab* keys only.
+    pub hover_fades: crate::app::motion::HoverFades,
 }
 
 impl TabBarState {
@@ -453,6 +400,18 @@ pub struct PanelState {
     /// of filtered blocks skipped from the newest end). 0 = newest visible.
     /// Clamped to `[0, total_filtered - visible_blocks]`.
     pub scroll_offset: usize,
+    /// v1.14.0 (PLAN_v1140 T2): sidebar open/close width tween (180ms open,
+    /// 150ms close). While in flight, each frame writes the tween value
+    /// STRAIGHT into `renderer.sidebar_width_override` (bypassing the
+    /// `[240, 360]` clamp so an opening 0→target sweep is not pinned at 240).
+    pub sidebar_width_anim: Option<crate::app::motion::Tween>,
+    /// v1.14.0 (T2): the pre-animation `sidebar_width_override` restored
+    /// when the tween lands — `None` (responsive-default width) must not be
+    /// frozen into a fixed width by the animation channel.
+    pub sidebar_width_restore: Option<Option<f32>>,
+    /// v1.14.0 (T2): true while an OPEN tween runs; false while closing
+    /// (the real `panel.close()` runs when the tween lands — 先动画后状态).
+    pub sidebar_width_opening: bool,
 }
 
 impl PanelState {
@@ -468,6 +427,14 @@ impl PanelState {
         self.highlight_until = None;
         self.last_click = None;
         self.scroll_offset = 0;
+    }
+
+    /// v1.14.0 (T2): toggle-side predicate — true when the sidebar is
+    /// visually present AND not shrinking. A closing width animation keeps
+    /// `open` true (visible) until it lands, but the next toggle must reopen
+    /// (reverse the tween) instead of closing twice.
+    pub fn sidebar_stable_open(&self) -> bool {
+        self.open && !(self.sidebar_width_anim.is_some() && !self.sidebar_width_opening)
     }
 
     pub fn clear_transient_selection(&mut self) {
@@ -502,6 +469,9 @@ pub struct NoteEditorState {
     /// v1.12.24 (N-1): raw winit (cursor, selection) tuple — the palette
     /// stores it unconverted, so this field mirrors that exactly.
     pub ime_preedit_cursor: Option<(usize, usize)>,
+    /// v1.14.0 (PLAN_v1140 T1): open/close reveal tween (palette/settings
+    /// twin). `open` stays true through the Closing phase.
+    pub reveal: crate::app::motion::Reveal,
 }
 
 impl NoteEditorState {
@@ -510,6 +480,12 @@ impl NoteEditorState {
         self.target_block_id = Some(block_id);
         self.buffer = existing.unwrap_or("").to_string();
         self.cursor = self.buffer.len();
+    }
+
+    /// v1.14.0 (T1): the input-routing predicate — true only while the card
+    /// is open AND not fading out (palette_state twin).
+    pub fn interactive(&self) -> bool {
+        self.open && !self.reveal.is_closing()
     }
 
     pub fn close(&mut self) {
@@ -605,6 +581,9 @@ pub struct FindState {
     pub regex_error: Option<String>,
     pub worker_busy: bool,
     pub worker_generation: u64,
+    /// v1.14.0 (PLAN_v1140 T1): open/close reveal tween (palette/settings
+    /// twin). `open` stays true through the Closing phase.
+    pub reveal: crate::app::motion::Reveal,
 }
 
 impl FindState {
@@ -633,7 +612,14 @@ impl FindState {
             regex_error: None,
             worker_busy: false,
             worker_generation: 0,
+            reveal: crate::app::motion::Reveal::default(),
         }
+    }
+
+    /// v1.14.0 (T1): the input-routing predicate — true only while the bar
+    /// is open AND not fading out (palette_state twin).
+    pub fn interactive(&self) -> bool {
+        self.open && !self.reveal.is_closing()
     }
 
     #[cfg(test)]
@@ -701,6 +687,10 @@ pub struct SettingsState {
     /// F5: Field-level validation errors (field_label, message). Set by
     /// validation before save; cleared on successful save or panel close.
     pub field_errors: Vec<(String, String)>,
+    /// v1.14.0 (PLAN_v1140 T1): open/close reveal tween. `open` stays true
+    /// through the Closing phase so drawing readers are unchanged; input
+    /// readers consult [`Self::interactive`].
+    pub reveal: crate::app::motion::Reveal,
 }
 
 impl SettingsState {
@@ -717,7 +707,14 @@ impl SettingsState {
             error: None,
             drill_down: false,
             field_errors: Vec::new(),
+            reveal: crate::app::motion::Reveal::default(),
         }
+    }
+
+    /// v1.14.0 (T1): the input-routing predicate — true only while the
+    /// panel is open AND not fading out (palette_state twin).
+    pub fn interactive(&self) -> bool {
+        self.open && !self.reveal.is_closing()
     }
 
     pub fn open_from(&mut self, config: &Config) {

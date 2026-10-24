@@ -14,11 +14,14 @@ use winit::keyboard::KeyCode as WinitKeyCode;
 
 impl crate::App {
     pub(crate) fn overlay_input_owner(&self) -> Option<OverlayInputOwner> {
+        // v1.14.0 (PLAN_v1140 T1): interactive predicates — a Closing
+        // overlay has already handed input off, so it must not own the
+        // router (keys/clicks/IME fall through while it fades).
         OverlayInputOwner::resolve(OverlayInputContext {
-            note_editor_open: self.note_editor.open,
-            palette_open: self.palette.open,
-            settings_open: self.settings.open,
-            find_open: self.find.open,
+            note_editor_open: self.note_editor.interactive(),
+            palette_open: self.palette.interactive(),
+            settings_open: self.settings.interactive(),
+            find_open: self.find.interactive(),
             context_menu_open: self.interaction.context_menu.is_some(),
             panel_search_focused: self.panel.open && self.panel.search_focused,
         })
@@ -100,7 +103,9 @@ impl crate::App {
         // v1.7.3-C: Note editor captures all keyboard input when open.
         // Intercepts before keybinding lookup and overlay routing so the
         // user's typing never leaks to the PTY or other overlays.
-        if self.note_editor.open {
+        // v1.14.0 (T1): interactive — during the Closing fade, keys flow to
+        // the terminal path below.
+        if self.note_editor.interactive() {
             self.handle_note_editor_key(key, m, text);
             return;
         }
@@ -127,7 +132,7 @@ impl crate::App {
         // SelectAll (Cmd+A) so they target the find query, not the shell
         // editor. Other Cmd chords (Cmd+R regex toggle, Cmd+I case toggle)
         // are handled inside `handle_find_key` below.
-        if self.find.open
+        if self.find.interactive()
             && m.contains(Modifiers::SUPER)
             && matches!(key, KeyCode::Char('v') | KeyCode::Char('a'))
         {
@@ -149,7 +154,7 @@ impl crate::App {
         // the palette input (query or submode buffer), not the shell PTY.
         // Without this, bound_action(Action::Paste) fires first and sends
         // bracketed-paste bytes to the PTY, bypassing the palette entirely.
-        if self.palette.open && m.contains(Modifiers::SUPER) && key == KeyCode::Char('v') {
+        if self.palette.interactive() && m.contains(Modifiers::SUPER) && key == KeyCode::Char('v') {
             if let Some(text) = clipboard_paste() {
                 match &mut self.palette.submode {
                     crate::palette_state::PaletteSubMode::Search => {
@@ -407,7 +412,10 @@ impl crate::App {
         use crate::paint::command_surface::CommandSurfaceKeyAction;
         match crate::paint::command_surface::resolve_command_surface_key(key, mods) {
             CommandSurfaceKeyAction::Cancel => {
-                self.note_editor.close();
+                // v1.14.0 (T1): two-step note close (this is the CLOSING
+                // step; the real teardown runs in finish_note_close when the
+                // fade lands — palette/settings/find precedent in focus.rs).
+                self.begin_note_close();
                 // v1.12.24 (N-1): discard residual marked text so Esc isn't
                 // intercepted by the IME (focus.rs palette/find precedent;
                 // v1.8.7's native discard sits in the else branch the note
@@ -513,8 +521,16 @@ impl crate::App {
     /// close the editor. Called on Enter.
     fn commit_note_editor(&mut self) {
         let target = self.note_editor.target_block_id;
-        let buffer = std::mem::take(&mut self.note_editor.buffer);
-        self.note_editor.close();
+        // rust-reviewer P2-2: CLONE, don't take — the Closing fade must keep
+        // painting the real buffer (the note_editor.close() teardown in
+        // finish_note_close owns the clear; a mem::take here faded out an
+        // empty card, contradicting the fade contract below).
+        let buffer = self.note_editor.buffer.clone();
+        // v1.14.0 (T1): CLOSING step — the fade starts now; the real
+        // teardown (buffer/cursor/preedit clear) runs in finish_note_close.
+        // The save below happens immediately so the annotation store is
+        // already consistent while the card fades out.
+        self.begin_note_close();
         // v1.12.24 (N-1): same IME cleanup as the Cancel arm — the Enter
         // commit must not leave marked text intercepting the next Esc.
         self.reset_ime_context("note editor closed");

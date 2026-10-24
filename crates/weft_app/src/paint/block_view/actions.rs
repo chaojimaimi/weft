@@ -153,15 +153,36 @@ pub(super) fn push_block_header_actions(
     let geometry = block_header_action_geometry(right, y, pitch, cw, renderer.scale, ai_configured);
     let metrics = crate::ui_tokens::UiMetrics::for_scale(renderer.scale);
     let line_w = metrics.stroke * 1.5;
-    let btn_color = if is_hovered {
-        fg
-    } else {
-        [fg[0], fg[1], fg[2], fg[3] * 0.38]
-    };
+    // v1.14.0 (PLAN_v1140 T4): hover fades ride the projected progress
+    // snapshot (renderer.hover_fades). Absent keys read 0.0 = the exact
+    // pre-T4 idle colors, so an unhovered block renders bit-identically.
+    let block_fade = crate::app::motion::fade_progress(
+        &renderer.hover_fades,
+        crate::app::motion::HoverKey::BlockHover(block_id),
+    );
+    let copy_fade = crate::app::motion::fade_progress(
+        &renderer.hover_fades,
+        crate::app::motion::HoverKey::BlockActionCopy(block_id),
+    );
+    let fold_fade = crate::app::motion::fade_progress(
+        &renderer.hover_fades,
+        crate::app::motion::HoverKey::BlockActionFold(block_id),
+    );
+    let diagnose_fade = crate::app::motion::fade_progress(
+        &renderer.hover_fades,
+        crate::app::motion::HoverKey::BlockActionDiagnose(block_id),
+    );
+    // Icon brightness ramp: 38% alpha (idle) → full fg (hovered).
+    let btn_color = [
+        fg[0],
+        fg[1],
+        fg[2],
+        fg[3] * (0.38 + (1.0 - 0.38) * block_fade),
+    ];
     let (su, sv, suw, svh) = renderer.space_uv();
     let bg_uv = [su, sv + svh, su + suw, sv];
 
-    if is_hovered {
+    if is_hovered || block_fade > 0.0 {
         let inset_x = metrics.stroke * 2.0;
         let inset_y = (pitch * 0.10).max(metrics.stroke);
         // v1.8.2: include the diagnose surface in the hover loop only when
@@ -173,13 +194,16 @@ pub(super) fn push_block_header_actions(
             .map(|b| classify_exit(b.exit_code) == ExitClass::Failed)
             .unwrap_or(false);
         let diagnose_active = ai_configured && block_failed;
-        let mut hover_targets: Vec<([f32; 4], bool)> =
-            vec![(geometry.copy, copy_hovered), (geometry.fold, fold_hovered)];
+        let mut hover_targets: Vec<([f32; 4], bool, f32)> = vec![
+            (geometry.copy, copy_hovered, copy_fade),
+            (geometry.fold, fold_hovered, fold_fade),
+        ];
         if diagnose_active {
-            hover_targets.push((geometry.diagnose, diagnose_hovered));
+            hover_targets.push((geometry.diagnose, diagnose_hovered, diagnose_fade));
         }
-        for (rect, exact_hover) in hover_targets {
-            let surface = [fg[0], fg[1], fg[2], if exact_hover { 0.22 } else { 0.055 }];
+        for (rect, exact_hover, fade) in hover_targets {
+            // Surface alpha ramps 5.5% → 22% with the precise-hover fade.
+            let surface = [fg[0], fg[1], fg[2], 0.055 + (0.22 - 0.055) * fade];
             push_quad(
                 verts,
                 [
@@ -192,8 +216,8 @@ pub(super) fn push_block_header_actions(
                 [0.0; 4],
                 surface,
             );
-            if exact_hover {
-                let border = [fg[0], fg[1], fg[2], 0.34];
+            if exact_hover || fade > 0.0 {
+                let border = [fg[0], fg[1], fg[2], 0.34 * fade];
                 let [x0, y0, x1, y1] = [
                     rect[0] + inset_x,
                     rect[1] + inset_y,

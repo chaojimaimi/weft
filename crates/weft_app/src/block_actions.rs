@@ -43,6 +43,9 @@ impl App {
                 let existing = self
                     .get_annotation(block_id)
                     .and_then(|annotation| annotation.note);
+                // v1.14.0 (T1): reveal-aware open (palette twin) — starts the
+                // 0→1 fade; a steady-open card must not restart it.
+                self.begin_note_reveal();
                 self.note_editor.open_for(block_id, existing.as_deref());
                 self.request_redraw();
             }

@@ -66,7 +66,8 @@ impl App {
         // Find popup button clicks (regex / case / up / down). Bypasses the
         // normal selection / PTY mouse path so the buttons work even inside
         // TUI apps that captured the mouse — same rationale as Cmd+Click.
-        if button == winit::event::MouseButton::Left && self.find.open {
+        // v1.14.0 (T1): interactive — the fading bar must not route clicks.
+        if button == winit::event::MouseButton::Left && self.find.interactive() {
             if let Some(action) = self.find_button_at(x as f32, y as f32) {
                 match action {
                     FindButtonAction::ToggleRegex => {
@@ -119,7 +120,9 @@ impl App {
         // (but not on the border drag zone) selects the entry; double-click
         // runs it immediately. Mirrors the history panel's click/double-click
         // pattern so the user doesn't have to press Enter.
-        if button == winit::event::MouseButton::Left && self.palette.open {
+        // v1.14.0 (T1): interactive — the fading palette must not route
+        // clicks (they pass through to the terminal).
+        if button == winit::event::MouseButton::Left && self.palette.interactive() {
             if let Some(clicked_idx) = self.palette_row_at(x, y) {
                 let now = std::time::Instant::now();
                 let is_double = self

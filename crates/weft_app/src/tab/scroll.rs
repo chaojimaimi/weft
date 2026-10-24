@@ -61,6 +61,56 @@ pub(crate) fn primary_history_browsing(
         && (detached || ((selecting || block_selection_active) && history_view_active))
 }
 
+/// v1.14.0 (PLAN_v1140 T6): pure grid sub-row scroll accumulator — fold a
+/// trackpad PixelDelta (physical px, positive = up toward older content,
+/// the block_scroll_fraction sign convention) together with the carried
+/// remainder into `(whole rows, new remainder)`.
+///
+/// Boundary rules (防粘滞):
+/// - scrolling up while already at the history top (`scroll_offset >=
+///   scrollback_len`) or down while at the live tail (`scroll_offset == 0`)
+///   zeroes the remainder — accumulated-but-unspendable px would otherwise
+///   make the next reverse flick feel sticky;
+/// - whole rows are clamped to the valid offset range; landing exactly on a
+///   bound also zeroes the remainder (a hard stop has no sub-row progress).
+pub(crate) fn accumulate_grid_scroll_px(
+    current_px: f32,
+    delta_px: f32,
+    row_height_px: f32,
+    scroll_offset: usize,
+    scrollback_len: usize,
+) -> (i32, f32) {
+    let row_h = row_height_px.max(1.0);
+    let at_history_top = scroll_offset >= scrollback_len;
+    let at_live_tail = scroll_offset == 0;
+    if (delta_px > 0.0 && at_history_top) || (delta_px < 0.0 && at_live_tail) {
+        return (0, 0.0);
+    }
+    let total = current_px + delta_px;
+    let rows_f = (total / row_h).floor();
+    let mut remain = total - rows_f * row_h;
+    let mut rows = rows_f as i32;
+    // Clamp the whole rows so the post-scroll offset stays in range; a
+    // clamped or boundary-landing scroll drops its remainder.
+    if rows > 0 {
+        let headroom = (scrollback_len.saturating_sub(scroll_offset)) as i32;
+        if rows >= headroom {
+            rows = headroom;
+            remain = 0.0;
+        }
+    } else if rows < 0 {
+        let tailroom = scroll_offset as i32;
+        if -rows >= tailroom {
+            rows = -tailroom;
+            remain = 0.0;
+        }
+    }
+    if rows == 0 && remain.abs() < f32::EPSILON {
+        remain = 0.0;
+    }
+    (rows, remain.clamp(0.0, row_h))
+}
+
 /// v1.10.21: whether finishing the drained blocks should snap the view to
 /// the live tail. A non-empty drain snaps UNLESS the user is browsing
 /// primary history or the alt-screen history peek — both are
@@ -314,6 +364,9 @@ impl Pane {
     pub(super) fn snap_to_bottom(&mut self) {
         self.block_scroll_anchor = BlockScrollAnchor::FollowBottom;
         self.block_scroll_fraction = 0.0;
+        // v1.14.0 (T6): a programmatic jump also drops the grid sub-row
+        // remainder (block_scroll_fraction twin).
+        self.grid_scroll_px = 0.0;
         // v1.10.21: the peek flag is read under its own short lock (T10
         // accessors) so the gate — a sibling pane field — can be armed
         // after the lock ends.
@@ -344,6 +397,59 @@ impl Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── v1.14.0 (PLAN_v1140 T6): grid sub-row scroll accumulator ─────────
+
+    #[test]
+    fn grid_px_accumulator_folds_cross_row_deltas_into_rows_and_remainder() {
+        // 40px rows. A 30px flick stays sub-row (0 rows, 30px remain).
+        assert_eq!(
+            accumulate_grid_scroll_px(0.0, 30.0, 40.0, 0, 100),
+            (0, 30.0)
+        );
+        // A further 30px crosses one row: 1 whole row + 20px remain.
+        assert_eq!(
+            accumulate_grid_scroll_px(30.0, 30.0, 40.0, 0, 100),
+            (1, 20.0)
+        );
+        // The remainder always carries the DOWNWARD content shift, for both
+        // directions: 30px down-scroll = 1 row up-applied + 10px back down.
+        assert_eq!(
+            accumulate_grid_scroll_px(0.0, -30.0, 40.0, 5, 100),
+            (-1, 10.0)
+        );
+        // px == 0 with no delta is the identity (no rows, no offset).
+        assert_eq!(accumulate_grid_scroll_px(0.0, 0.0, 40.0, 5, 100), (0, 0.0));
+    }
+
+    #[test]
+    fn grid_px_accumulator_clears_at_bounds_and_clamps_rows() {
+        // At the live tail scrolling down: hard stop zeroes the remainder.
+        assert_eq!(
+            accumulate_grid_scroll_px(20.0, -30.0, 40.0, 0, 100),
+            (0, 0.0)
+        );
+        // At the history top scrolling up: same.
+        assert_eq!(
+            accumulate_grid_scroll_px(20.0, 30.0, 40.0, 100, 100),
+            (0, 0.0)
+        );
+        // Up-scroll past the top clamps to the headroom and drops the px.
+        assert_eq!(
+            accumulate_grid_scroll_px(0.0, 200.0, 40.0, 98, 100),
+            (2, 0.0)
+        );
+        // Landing exactly on a bound also zeroes the remainder.
+        assert_eq!(
+            accumulate_grid_scroll_px(0.0, 80.0, 40.0, 98, 100),
+            (2, 0.0)
+        );
+        // Down-scroll past the tail clamps symmetrically.
+        assert_eq!(
+            accumulate_grid_scroll_px(0.0, -200.0, 40.0, 3, 100),
+            (-3, 0.0)
+        );
+    }
 
     /// v1.10.20 改动 2 + S1 state machine: an active selection drag delays
     /// the history-view exit, but never forces it open for a plain grid

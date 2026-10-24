@@ -13,7 +13,9 @@ impl App {
     pub(crate) fn palette_scene(
         &self,
     ) -> Option<crate::scene::Scene<crate::palette_component::PaletteTarget>> {
-        if !self.palette.open {
+        // v1.14.0 (T1): interactive — Closing 期 targets 视作已关
+        // (PLAN_v1140 §2.1: geometry targets 归 interactive)。
+        if !self.palette.interactive() {
             return None;
         }
         let ctx = self.renderer.as_ref()?.layout_ctx?;
@@ -102,6 +104,12 @@ impl App {
     /// independently of the renderer/App state).
     pub(crate) fn sidebar_resize_hit(&self, x: f32, y: f32, tolerance: f32) -> bool {
         if !self.panel.open {
+            return false;
+        }
+        // v1.14.0 (PLAN_v1140 T2): animation/drag mutual exclusion — the
+        // animated edge hit-test is ignored (命中忽略) so a tween can never
+        // start a resize drag from a stale animated width.
+        if self.panel.sidebar_width_anim.is_some() {
             return false;
         }
         let Some(renderer) = &self.renderer else {

@@ -61,6 +61,9 @@ pub struct PaletteViewParams<'a> {
     pub palette_ime_preedit: &'a str,
     pub palette_ime_preedit_cursor: Option<(usize, usize)>,
     pub palette_form: Option<&'a PaletteFormView<'a>>,
+    /// v1.14.0 (PLAN_v1140 T1): reveal factor [0,1], computed once per frame
+    /// in `run_redraw` (the state owns the tween; this is the projection).
+    pub palette_reveal: f32,
 }
 
 /// Prompt input box view inputs (the box itself is built from the terminal's
@@ -135,6 +138,9 @@ pub struct SettingsViewParams<'a> {
     /// v1.13.0 (PLAN_v1.13.0_SPARKLE §WP2): Update tab draft tier (draft
     /// projection, same discipline as the T13/T14 fields).
     pub settings_update_tier: weft_core::config::UpdateCheckTier,
+    /// v1.14.0 (PLAN_v1140 T1): reveal factor [0,1], computed once per frame
+    /// in `run_redraw` (the state owns the tween; this is the projection).
+    pub settings_reveal: f32,
 }
 
 /// v1.11 audit (PLAN_audit_fix_batch3 C4): settings-domain *owned* computed
@@ -162,6 +168,7 @@ impl crate::app_state::SettingsState {
         owned: &'a SettingsOwnedSnapshot,
         ai: AiSettingsView<'a>,
         settings_is_narrow: bool,
+        settings_reveal: f32,
     ) -> SettingsViewParams<'a> {
         // v1.5.1: profile toolbar views, rebuilt from the owned snapshot.
         // Index 0 is always "Base" (is_active = no active profile).
@@ -222,6 +229,7 @@ impl crate::app_state::SettingsState {
             settings_blocks_history_max_age_days: self.draft.blocks.history_max_age_days,
             settings_blocks_history_max_db_mb: self.draft.blocks.history_max_db_mb,
             settings_update_tier: self.draft.update.check,
+            settings_reveal,
         }
     }
 }

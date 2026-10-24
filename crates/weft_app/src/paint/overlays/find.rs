@@ -50,14 +50,21 @@ impl MetalRenderer {
             1.0,
         ];
 
-        // F4: shared shell (shadow + bg + border). Find uses a 2px shadow
-        // pad and no resize handles (it's a utility bar, not a resizable
-        // popup). Replaces the hand-rolled shadow/bg/border quads with the
-        // unified command-surface shell so Find, Palette, Completion and
-        // ContextMenu share the same visual language.
+        // F4: shared shell (shadow + bg + border). No resize handles (it's
+        // a utility bar, not a resizable popup). v1.14.0 (T5): token-driven
+        // material (compact radius + dual-layer soft shadow) — unified with
+        // Palette, Completion and ContextMenu.
         build_command_surface_shell(
             &mut verts,
-            CommandSurfaceShell::canonical(layout.popup_rect, 2.0, false, theme_bg, bg_uv),
+            CommandSurfaceShell::canonical(
+                layout.popup_rect,
+                crate::ui_tokens::SurfaceTokens::compact()
+                    .scaled(self.scale as f32)
+                    .for_environment(self.theme.is_dark(), self.increase_contrast),
+                false,
+                theme_bg,
+                bg_uv,
+            ),
         );
 
         // F6: Focus ring — the Find popup captures keyboard input while open,

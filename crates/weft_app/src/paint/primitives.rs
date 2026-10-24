@@ -4,6 +4,7 @@
 //! raw `f32` vertex data into a caller-owned buffer — no `MetalRenderer`
 //! dependency. Call sites use `crate::paint::primitives::push_quad(...)`.
 
+use crate::layout::Rect;
 use weft_core::config::Theme;
 use weft_core::grid::{CellColor, Color};
 use weft_core::syntax::TokenKind;
@@ -91,6 +92,93 @@ pub(crate) fn push_filled_triangle(
     }
 }
 
+/// Corner fan resolution for [`push_rounded_rect`] — 6 segments per 90°
+/// corner arc (15° per triangle), the plan's T5 default (4 corners × 6
+/// segments + 5 rects ≈ 28 draw units per shape).
+pub(crate) const ROUNDED_RECT_SEGMENTS: usize = 6;
+
+/// v1.14.0 (PLAN_v1140 T5): filled rounded rectangle as a polygon
+/// decomposition — **no shader change**.
+///
+/// Structure: 1 center rect + 4 edge strips + 4 corner triangle fans of
+/// `corner_segments` segments each (default 6). `radius` is clamped to
+/// `min(w, h) / 2` (the plan's 钳制 rule); a sub-half-pixel radius degrades
+/// to a plain quad so existing square call sites keep their exact geometry.
+/// Overdraw is intentional and cheap: rounded shapes appear only on
+/// single-digit floating surfaces per frame.
+pub(crate) fn push_rounded_rect(
+    vertices: &mut Vec<f32>,
+    rect: Rect,
+    radius: f32,
+    color: [f32; 4],
+    bg_uv: [f32; 4],
+) {
+    let [x0, y0, x1, y1] = rect;
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = radius.clamp(0.0, w.min(h) * 0.5);
+    if r < 0.5 {
+        push_quad(vertices, rect, bg_uv, [0.0; 4], color);
+        return;
+    }
+    // Interior: center column + the four side strips.
+    push_quad(vertices, [x0 + r, y0, x1 - r, y1], bg_uv, [0.0; 4], color);
+    push_quad(
+        vertices,
+        [x0, y0 + r, x0 + r, y1 - r],
+        bg_uv,
+        [0.0; 4],
+        color,
+    );
+    push_quad(
+        vertices,
+        [x1 - r, y0 + r, x1, y1 - r],
+        bg_uv,
+        [0.0; 4],
+        color,
+    );
+    push_quad(
+        vertices,
+        [x0 + r, y0, x1 - r, y0 + r],
+        bg_uv,
+        [0.0; 4],
+        color,
+    );
+    push_quad(
+        vertices,
+        [x0 + r, y1 - r, x1 - r, y1],
+        bg_uv,
+        [0.0; 4],
+        color,
+    );
+    // Corner arcs. Screen coords are y-down; each (center, start°) pair
+    // sweeps the 90° arc that bulges toward the rect's corner.
+    let centers = [
+        (x0 + r, y0 + r, 180.0f32), // top-left: 180° → 270°
+        (x1 - r, y0 + r, 270.0),    // top-right: 270° → 360°
+        (x1 - r, y1 - r, 0.0),      // bottom-right: 0° → 90°
+        (x0 + r, y1 - r, 90.0),     // bottom-left: 90° → 180°
+    ];
+    let segments = ROUNDED_RECT_SEGMENTS as f32;
+    for (cx, cy, start_deg) in centers {
+        for i in 0..ROUNDED_RECT_SEGMENTS {
+            let a0 = (start_deg + 90.0 * i as f32 / segments).to_radians();
+            let a1 = (start_deg + 90.0 * (i as f32 + 1.0) / segments).to_radians();
+            push_triangle(
+                vertices,
+                [cx, cy],
+                [cx + r * a0.cos(), cy + r * a0.sin()],
+                [cx + r * a1.cos(), cy + r * a1.sin()],
+                color,
+                bg_uv,
+            );
+        }
+    }
+}
+
 /// v1.0 P1.5-B1: Push a single grid-cell instance (16 floats = 64 bytes).
 /// Layout matches the Metal `CellInstance` struct: origin(2) + size(2) +
 /// uv_rect(4) + fg(4) + bg(4). The instance is rendered against a static
@@ -157,6 +245,39 @@ pub(crate) fn color_to_normalized(color: Color) -> [f32; 4] {
         color.b as f32 / 255.0,
         color.a as f32 / 255.0,
     ]
+}
+
+/// v1.14.0 (PLAN_v1140 T1): multiply every overlay vertex's fg AND bg alpha
+/// by `reveal`, uniformly across the whole built vertex buffer.
+///
+/// Why a post-pass instead of per-color multiplication at each push site
+/// (plan: "统一在 push 前 color 构造处乘，逐层核对防漏乘闪烁"): the overlay
+/// builders push quads/lines/triangles in ONE fixed 12-float vertex format
+/// (x, y, u, v, fg rgba, bg rgba), so scaling offsets 7 and 11 per vertex
+/// provably covers every layer — shell, shadow, border, row backgrounds,
+/// text, preedit, underlines and carets — with zero chance of a missed
+/// site flickering between faded and unfaded. Two semantics survive the
+/// pass: the mask trick (fg alpha 0 = "only bg shows") because 0 × reveal
+/// stays 0, and the color-emoji sentinel (fg alpha 2.0) because it is
+/// remapped within the shader's > 1.5 band instead of under it (P2-1).
+pub(crate) fn scale_vertex_alpha(vertices: &mut [f32], reveal: f32) {
+    if reveal >= 1.0 {
+        return;
+    }
+    for v in vertices.chunks_exact_mut(12) {
+        // rust-reviewer P2-1: the color-emoji sentinel (fg alpha 2.0, the
+        // shader's `> 1.5` color-atlas route) must NEVER be scaled below
+        // 1.5 — a masked emoji renders black. Remap the sentinel within its
+        // [1.5, 2.0] band instead; the shader converts the band into the
+        // emoji's own fade factor (`(fg.a - 1.5) / 0.5`), so the emoji still
+        // fades with the surface while staying on the color path.
+        v[7] = if v[7] > 1.5 {
+            1.5 + (v[7] - 1.5) * reveal
+        } else {
+            v[7] * reveal
+        };
+        v[11] *= reveal;
+    }
 }
 
 /// CWD gray: a theme-independent dimmed version of the command foreground.
@@ -391,347 +512,9 @@ pub(crate) fn snap_physical_rect(start: f32, end: f32) -> (f32, f32) {
     (start.round(), end.round())
 }
 
+// Tests live in the gate-exempt sibling module (repo test-module convention,
+// pty/tests.rs precedent) so inline test lines stay out of the production
+// budget.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scaled_alpha_clamps_opacity_without_changing_rgb() {
-        assert_eq!(
-            scale_color_alpha([0.1, 0.2, 0.3, 0.8], 0.5),
-            [0.1, 0.2, 0.3, 0.4]
-        );
-        assert_eq!(scale_color_alpha([0.1, 0.2, 0.3, 0.8], 2.0)[3], 0.8);
-    }
-
-    #[test]
-    fn minimum_contrast_leaves_already_readable_color_exactly_unchanged() {
-        let foreground = [0.9, 0.7, 0.2, 0.8];
-        let background = [0.02, 0.03, 0.04, 1.0];
-        assert_eq!(
-            ensure_minimum_text_contrast(foreground, background, 4.5),
-            foreground
-        );
-    }
-
-    #[test]
-    fn minimum_contrast_brightens_dark_canvas_without_changing_channel_order() {
-        let foreground = [0.35, 0.18, 0.08, 0.75];
-        let background = [0.02, 0.03, 0.04, 1.0];
-        let adjusted = ensure_minimum_text_contrast(foreground, background, 7.0);
-        assert!(text_contrast_ratio(adjusted, background) >= 6.99);
-        assert!(adjusted[0] > adjusted[1] && adjusted[1] > adjusted[2]);
-        assert_eq!(adjusted[3], foreground[3]);
-    }
-
-    #[test]
-    fn minimum_contrast_darkens_on_light_canvas_and_one_is_identity() {
-        let foreground = [0.75, 0.55, 0.35, 1.0];
-        let background = [0.98, 0.97, 0.94, 1.0];
-        assert_eq!(
-            ensure_minimum_text_contrast(foreground, background, 1.0),
-            foreground
-        );
-        let adjusted = ensure_minimum_text_contrast(foreground, background, 7.0);
-        assert!(text_contrast_ratio(adjusted, background) >= 6.99);
-        assert!(adjusted[0] < foreground[0]);
-    }
-
-    #[test]
-    fn derive_cwd_gray_dims_foreground_uniformly_and_theme_independently() {
-        // v1.11.0: 每个主题用同一公式(fg × 0.65)，CWD 不随主题变——原 `output.cwd`
-        // 键已删除（死配置，见 AUDIT_v1.10.39 / PLAN_v111）。
-        for theme in [
-            weft_core::config::Theme::weft_warm(),
-            weft_core::config::Theme::warp_dark(),
-            weft_core::config::Theme::dracula(),
-            weft_core::config::Theme::weft_light(),
-        ] {
-            let fg = color_to_normalized(theme.foreground);
-            let gray = derive_cwd_gray(fg);
-            for i in 0..3 {
-                assert!(
-                    (gray[i] - fg[i] * 0.65).abs() < 1e-5,
-                    "cwd channel must be fg × 0.65"
-                );
-            }
-            assert_eq!(gray[3], 1.0);
-            // CWD 暗于命令色,保持 "CWD 暗 < 命令亮" 层次
-            assert!(gray[0] < fg[0]);
-        }
-    }
-
-    #[test]
-    fn derive_cwd_gray_stays_readable_on_light_theme() {
-        // 浅色主题 fg 本身是深色,×0.65 后仍是深灰,在浅背景上保持可读
-        let light = weft_core::config::Theme::weft_light();
-        let fg = color_to_normalized(light.foreground);
-        let bg = color_to_normalized(light.background);
-        let gray = derive_cwd_gray(fg);
-        assert!(
-            text_contrast_ratio(gray, bg) >= 4.5,
-            "light-theme CWD must stay readable"
-        );
-    }
-
-    #[test]
-    fn translucent_selection_is_composited_before_contrast_measurement() {
-        let canvas = [0.1, 0.2, 0.3, 1.0];
-        let selection = [0.8, 0.4, 0.2, 0.6];
-        let composite = composite_color_over(selection, canvas);
-        for (actual, expected) in composite.into_iter().zip([0.52, 0.32, 0.24, 1.0]) {
-            assert!((actual - expected).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn text_range_uses_selection_background_only_when_ranges_overlap() {
-        let canvas = [0.1, 0.2, 0.3, 1.0];
-        let selected = [0.4, 0.5, 0.6, 1.0];
-        let selection = Some((2, 5, selected));
-        assert_eq!(text_background_for_range(canvas, selection, 1..2), canvas);
-        assert_eq!(text_background_for_range(canvas, selection, 2..3), selected);
-        assert_eq!(text_background_for_range(canvas, selection, 4..6), selected);
-        assert_eq!(text_background_for_range(canvas, selection, 5..6), canvas);
-    }
-
-    #[test]
-    fn selected_text_is_corrected_against_the_composited_selection() {
-        let canvas = color_to_normalized(weft_core::config::Theme::weft_warm().background);
-        let accent = color_to_normalized(weft_core::config::Theme::weft_warm().accent);
-        let selection = [
-            accent[0] * 0.35 + canvas[0] * 0.65,
-            accent[1] * 0.35 + canvas[1] * 0.65,
-            accent[2] * 0.35 + canvas[2] * 0.65,
-            0.60,
-        ];
-        let selected_canvas = composite_color_over(selection, canvas);
-        let failure = color_to_normalized(weft_core::config::Theme::weft_warm().output.failure);
-        let adjusted = ensure_minimum_text_contrast(failure, selected_canvas, 7.0);
-        assert!(text_contrast_ratio(adjusted, selected_canvas) >= 6.99);
-        assert_eq!(adjusted[3], failure[3]);
-    }
-
-    #[test]
-    fn syntax_color_distinct_and_default_fallback() {
-        // v0.8: syntax colors are now theme-driven. Verify the warm theme
-        // produces distinct colors for every token kind, and that
-        // Default/Whitespace resolve to theme.syntax.default.
-        // v1.7.0-B: now includes Argument (9 distinct kinds).
-        let theme = weft_core::config::Theme::weft_warm();
-        let kinds = [
-            TokenKind::Command,
-            TokenKind::Flag,
-            TokenKind::Path,
-            TokenKind::String,
-            TokenKind::Number,
-            TokenKind::Variable,
-            TokenKind::Operator,
-            TokenKind::Comment,
-            TokenKind::Argument,
-        ];
-        let colors: Vec<[f32; 4]> = kinds.iter().map(|&k| syntax_color(k, &theme)).collect();
-        // All 9 should be distinct (no two token kinds share a color).
-        for i in 0..colors.len() {
-            for j in (i + 1)..colors.len() {
-                assert_ne!(colors[i], colors[j], "syntax colors at {i}/{j} collide");
-            }
-        }
-        // Default/Whitespace resolve to theme.syntax.default.
-        let default_c = color_to_normalized(theme.syntax.default);
-        assert_eq!(syntax_color(TokenKind::Default, &theme), default_c);
-        assert_eq!(syntax_color(TokenKind::Whitespace, &theme), default_c);
-    }
-
-    /// v1.7.0-B: V17 §2.4 visual hierarchy contract — in every built-in
-    /// theme, command ≠ argument ≠ default, and output_default ≠ cwd.
-    /// Also verifies success ≠ failure (status colors must be distinguishable).
-    ///
-    /// v1.7.0-E: Extended to also assert metadata ≠ output_default and
-    /// warning ≠ success/failure, closing the §2.5 "角色间满足固定的感知
-    /// 差异门槛" gap for the full OutputSemanticColors role set.
-    ///
-    /// v1.11.0: the `cwd` role assertions were removed with the dead
-    /// `output.cwd` key (AUDIT_v1.10.39 / PLAN_v111) — CWD contrast is now
-    /// structural: `derive_cwd_gray` (fg × 0.65) guarantees the dimming,
-    /// covered by `derive_cwd_gray_dims_foreground_uniformly_and_theme_independently`.
-    #[test]
-    fn all_themes_satisfy_visual_hierarchy_contract() {
-        let themes: Vec<(&str, weft_core::config::Theme)> = vec![
-            ("weft_warm", weft_core::config::Theme::weft_warm()),
-            ("weft_light", weft_core::config::Theme::weft_light()),
-            ("warp_dark", weft_core::config::Theme::warp_dark()),
-            ("dracula", weft_core::config::Theme::dracula()),
-            ("solarized_dark", weft_core::config::Theme::solarized_dark()),
-            ("gruvbox_dark", weft_core::config::Theme::gruvbox_dark()),
-            ("nord", weft_core::config::Theme::nord()),
-            ("tokyo_night", weft_core::config::Theme::tokyo_night()),
-            (
-                "catppuccin_mocha",
-                weft_core::config::Theme::catppuccin_mocha(),
-            ),
-            ("one_dark", weft_core::config::Theme::one_dark()),
-            ("monokai_pro", weft_core::config::Theme::monokai_pro()),
-        ];
-        for (name, theme) in &themes {
-            let s = &theme.syntax;
-            let o = &theme.output;
-            // V17 §2.4: command ≠ argument ≠ default
-            assert_ne!(s.command, s.argument, "{name}: command == argument");
-            assert_ne!(s.command, s.default, "{name}: command == default");
-            assert_ne!(s.argument, s.default, "{name}: argument == default");
-            // V17 §2.4: output_default ≠ cwd ("普通结果不得等于 CWD 色") —
-            // v1.11.0: CWD is derived (fg × 0.65), not a theme role; see
-            // `derive_cwd_gray_dims_foreground_uniformly_and_theme_independently`.
-            assert_ne!(o.success, o.failure, "{name}: success == failure");
-            // v1.7.0-E: metadata must be distinct from output_default
-            // ("label 与 value 可分，但整体弱于命令名" — metadata is a weaker
-            // structural role and must not collapse into default or cwd).
-            assert_ne!(
-                o.metadata, o.output_default,
-                "{name}: metadata == output_default"
-            );
-        }
-    }
-
-    // ── F6: Focus ring ────────────────────────────────────────────────
-
-    #[test]
-    fn build_focus_ring_emits_four_edge_quads() {
-        let mut verts = Vec::new();
-        let color = [0.3, 0.6, 0.9, 0.7];
-        build_focus_ring(&mut verts, [10.0, 20.0, 110.0, 52.0], color, 2.0);
-        // 4 quads × 6 verts × 12 floats = 288 floats.
-        assert_eq!(verts.len(), 288);
-    }
-
-    #[test]
-    fn build_focus_ring_top_edge_starts_at_y0() {
-        let mut verts = Vec::new();
-        let color = [0.3, 0.6, 0.9, 0.7];
-        build_focus_ring(&mut verts, [10.0, 20.0, 110.0, 52.0], color, 2.0);
-        // First quad: top edge → first vertex is (x0, y0) = (10, 20).
-        assert_eq!(verts[0], 10.0); // x0
-        assert_eq!(verts[1], 20.0); // y0
-    }
-
-    #[test]
-    fn build_focus_ring_clamps_thickness_to_minimum() {
-        let mut verts_a = Vec::new();
-        let mut verts_b = Vec::new();
-        let color = [1.0; 4];
-        build_focus_ring(&mut verts_a, [0.0, 0.0, 100.0, 50.0], color, 0.0);
-        build_focus_ring(&mut verts_b, [0.0, 0.0, 100.0, 50.0], color, 0.5);
-        // thickness=0 clamps to 0.5, same as thickness=0.5.
-        assert_eq!(verts_a.len(), verts_b.len());
-    }
-
-    #[test]
-    fn focus_ring_thickness_increases_with_contrast() {
-        assert_eq!(focus_ring_thickness(false), 2.0);
-        assert_eq!(focus_ring_thickness(true), 3.0);
-    }
-
-    #[test]
-    fn focus_ring_alpha_full_when_contrast_increased() {
-        assert!((focus_ring_alpha(false) - 0.70).abs() < 1e-4);
-        assert!((focus_ring_alpha(true) - 1.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn build_focus_ring_with_increase_contrast_uses_more_vertices_area() {
-        // Both emit 4 quads, but the contrast version has thicker edges.
-        let mut verts_normal = Vec::new();
-        let mut verts_contrast = Vec::new();
-        let color = [0.3, 0.6, 0.9, 1.0];
-        let bounds = [10.0, 20.0, 110.0, 52.0];
-        build_focus_ring(
-            &mut verts_normal,
-            bounds,
-            color,
-            focus_ring_thickness(false),
-        );
-        build_focus_ring(
-            &mut verts_contrast,
-            bounds,
-            color,
-            focus_ring_thickness(true),
-        );
-        // Same vertex count (4 quads × 6 verts × 12 floats = 288), but
-        // different edge geometry (thicker edges with contrast).
-        assert_eq!(verts_normal.len(), verts_contrast.len());
-        // Top edge = first quad with dst [x0, y0, x1, y0 + thickness].
-        // push_quad vertex order: (x0,y0), (x0,y1), (x1,y1), ...
-        // Each vertex is 12 floats, so vertex 1's y-coordinate is at
-        // index 12 (vertex 1 offset) + 1 (y slot) = 13.
-        // Normal: thickness=2 → y0+2 = 22; Contrast: thickness=3 → y0+3 = 23.
-        assert_eq!(verts_normal[13], 22.0); // y1 of top edge (vertex 1)
-        assert_eq!(verts_contrast[13], 23.0);
-    }
-
-    // ── v1.4.0: snap_physical helpers ─────────────────────────────────
-
-    #[test]
-    fn snap_physical_rect_returns_integer_edges() {
-        // The contract: both edges must be integers.
-        let (s, e) = snap_physical_rect(10.3, 50.7);
-        assert_eq!(s, 10.0);
-        assert_eq!(e, 51.0);
-        assert!(s.fract() == 0.0);
-        assert!(e.fract() == 0.0);
-    }
-
-    #[test]
-    fn snap_physical_rect_supports_non_integer_widths() {
-        // A 1.4px-wide separator at x=10.3 → [10.3, 11.7] → snap → [10, 12].
-        // Both edges integer; width becomes 2.0 (was 1.4). The 0.6px growth
-        // is sub-pixel and invisible; what matters is no edge lands on x.5.
-        let (s, e) = snap_physical_rect(10.3, 11.7);
-        assert_eq!(s, 10.0);
-        assert_eq!(e, 12.0);
-    }
-
-    #[test]
-    fn snap_physical_rect_does_not_invert_for_ordered_inputs() {
-        // For start < end, the snapped pair must remain ordered (start ≤ end).
-        // This holds because round() is monotonic non-decreasing.
-        for (s_in, e_in) in [(10.0, 20.0), (10.3, 11.7), (-5.5, 5.5), (0.1, 0.9)] {
-            let (s, e) = snap_physical_rect(s_in, e_in);
-            assert!(s <= e, "snapped {s} > {e} for input ({s_in}, {e_in})");
-        }
-    }
-
-    #[test]
-    fn snap_physical_rect_preserves_input_order_for_inverted_inputs() {
-        // When start > end (caller error or intentional), the helper does
-        // NOT swap — it returns (round(start), round(end)) in the same order.
-        // Callers that need ordering must sort first. This contract avoids
-        // surprising silent swaps deep inside the geometry pipeline.
-        let (s, e) = snap_physical_rect(20.6, 10.3);
-        assert_eq!(s, 21.0);
-        assert_eq!(e, 10.0);
-        // Caller is responsible for detecting the inversion:
-        assert!(s > e);
-    }
-
-    #[test]
-    fn snap_physical_rect_handles_extremes() {
-        // Narrow 0.2px interval straddling an integer (10.4, 10.6) → snaps
-        // to (10, 11), width 1px. The helper does not collapse sub-pixel
-        // intervals that straddle a pixel boundary.
-        let (s, e) = snap_physical_rect(10.4, 10.6);
-        assert_eq!(s, 10.0);
-        assert_eq!(e, 11.0);
-        assert_eq!(e - s, 1.0);
-
-        // Large coordinates (4K/8K display ranges) must not lose precision.
-        let (s, e) = snap_physical_rect(3839.7, 3840.3);
-        assert_eq!(s, 3840.0);
-        assert_eq!(e, 3840.0);
-        // Note: a sub-pixel input straddling 3840 collapses to width 0.
-        // Callers must enforce a minimum-thickness invariant themselves
-        // (e.g. `thumb_height.max(2.0)`) before snapping — the snap helper
-        // is geometry-only and does not know the design intent.
-        assert_eq!(e - s, 0.0);
-    }
-}
+#[path = "primitives_tests.rs"]
+mod tests;

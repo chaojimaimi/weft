@@ -23,6 +23,23 @@ impl App {
     }
 
     fn run_redraw(&mut self, forced: bool) {
+        // v1.14.0 (PLAN_v1140 T1): reveal maintenance runs before every
+        // early-return — finished close tweens perform their real teardown
+        // even on frames that end up suppressed, so a Closing overlay can
+        // never get stuck, and finished open tweens release the tick
+        // thread's live count. `frame_now` anchors this frame's reveal
+        // values (Instant injected; no per-site clock reads).
+        let frame_now = std::time::Instant::now();
+        self.maintain_overlay_reveals(frame_now);
+        // v1.14.0 (T2): sidebar width anim — the override write must
+        // precede every `sidebar_width()` consumer in this frame.
+        self.maintain_sidebar_width_anim();
+        // v1.14.0 (T3): drop finished tab-bar tweens (paint fallback equals
+        // the tween target, so the drop never jumps).
+        self.maintain_tab_bar_tweens(frame_now);
+        // v1.14.0 (T4): hover fade sync — one chokepoint before the
+        // draw-state projection (tab_bar_state reads the registry).
+        self.sync_hover_fades(frame_now);
         // v1.12.25 (3-B-2 P2-02): pump/process 段（原 :55-236）外移到
         // redraw/pump_process.rs，方法体逐字平移；段内 4 处早返回转
         // PhaseOutcome::Abort，此处 match 后原样续 return（返回时机不变）。
@@ -353,8 +370,13 @@ impl App {
                                 testing: self.ai_connection_status.is_testing(),
                                 observability: &ai_snap.observability,
                             };
-                            self.settings
-                                .view_params(owned, settings_ai, settings_is_narrow)
+                            self.settings.view_params(
+                                owned,
+                                settings_ai,
+                                settings_is_narrow,
+                                // v1.14.0 (T1): this frame's reveal factor.
+                                self.settings.reveal.value(frame_now),
+                            )
                         })
                     });
                     let overlays = crate::overlay::build_overlay_stack(
@@ -386,6 +408,8 @@ impl App {
                             palette_ime_preedit: &self.palette.ime_preedit,
                             palette_ime_preedit_cursor: self.palette.ime_preedit_cursor,
                             palette_form: palette_form_view.as_ref(),
+                            // v1.14.0 (T1): this frame's reveal factor.
+                            palette_reveal: self.palette.reveal.value(frame_now),
                         },
                         crate::overlay::PromptViewParams {
                             prompt_selection: terminal.editor().buffer.selection_range(),
@@ -503,6 +527,8 @@ impl App {
                             case_sensitive: self.find.case_sensitive,
                             regex_error: self.find.regex_error.clone(),
                             worker_busy: self.find.worker_busy,
+                            // v1.14.0 (T1): this frame's reveal factor.
+                            reveal: self.find.reveal.value(frame_now),
                         })
                     } else {
                         None
@@ -516,6 +542,8 @@ impl App {
                             buffer: self.note_editor.buffer.clone(),
                             cursor: self.note_editor.cursor,
                             ime_preedit: self.note_editor.ime_preedit.clone(),
+                            // v1.14.0 (T1): this frame's reveal factor.
+                            reveal: self.note_editor.reveal.value(frame_now),
                         })
                     } else {
                         None
@@ -529,8 +557,15 @@ impl App {
                     }
                     renderer.panel_highlight = self.panel.highlight;
                     renderer.block_hovered = self.interaction.block_hovered;
+                    // v1.14.0 (T6): the active pane's grid sub-row scroll
+                    // remainder, projected per-frame (consumed by
+                    // build_grid_instances; zero outside the grid px path).
+                    renderer.grid_scroll_px = pane.grid_scroll_px;
                     renderer.block_selected = self.interaction.block_selected;
                     renderer.block_action_hovered = self.interaction.block_action_hovered;
+                    // v1.14.0 (PLAN_v1140 T4): hover fade progress snapshot —
+                    // block buttons + scrollbar thumb read it paint-side.
+                    renderer.hover_fades = self.interaction.hover_fades.project(frame_now);
                     // v1.7.3-C: assign the pre-computed bookmarked-block set.
                     renderer.bookmarked_blocks = bookmarked_blocks;
                     // v1.8.2: assign per-block AI diagnose state for inline panel rendering.
@@ -594,8 +629,9 @@ impl App {
                         &overlays,
                         block_scroll,
                         scroll_metrics,
-                        self.interaction.scrollbar_hovered
-                            || self.interaction.scrollbar_drag.is_some(),
+                        // v1.14.0 (T4): the scrollbar emphasis bool was
+                        // superseded by the ScrollbarThumb hover fade
+                        // progress (renderer.hover_fades projection).
                         &tab_bar,
                         // v1.3 Batch 5.5: `active_pane_rect` is the split-tree-
                         // computed rect for the active pane; `background_panes`

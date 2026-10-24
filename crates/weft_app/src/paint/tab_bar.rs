@@ -87,6 +87,19 @@ pub struct TabBarDrawState {
     /// v1.11.13: Gap slot the pointer currently targets (0..=n-1). Drives
     /// the slide of the non-dragged tabs via `layout::render_slot`.
     pub drag_insert_index: Option<usize>,
+    /// v1.14.0 (PLAN_v1140 T3): active-indicator underline slide position
+    /// (physical px) — `Some` while the 140ms slide tween is in flight;
+    /// `None` draws the underline glued to the active tab's slot.
+    pub indicator: Option<(f32, f32)>,
+    /// v1.14.0 (T3): per-index x-shift (physical px) applied on top of the
+    /// slot position — the eased 让位 of non-dragged tabs during a drag.
+    /// Empty / zero entries draw at the natural slot.
+    pub slot_shifts: Vec<f32>,
+    /// v1.14.0 (PLAN_v1140 T4): per-frame hover fade progress snapshot
+    /// ((key, progress) pairs projected off `TabBarState.hover_fades`) —
+    /// the four elements' hover backgrounds/icon colors lerp their idle and
+    /// hover endpoints by it. Absent key = 0.0 (idle fallback).
+    pub hover_fades: Vec<(crate::app::motion::HoverKey, f32)>,
 }
 
 impl MetalRenderer {
@@ -193,8 +206,12 @@ impl MetalRenderer {
                 },
                 None => i,
             };
-            // Apply scroll offset to x position.
-            let x0 = tabs_start + slot as f32 * tab_w - scroll_offset;
+            // Apply scroll offset to x position, plus the v1.14.0 (T3)
+            // eased 让位 delta (0.0 outside a drag — the tween drives an
+            // x-shift relative to the natural slot so scroll changes are
+            // always tracked).
+            let shift = tab_bar.slot_shifts.get(i).copied().unwrap_or(0.0);
+            let x0 = tabs_start + slot as f32 * tab_w - scroll_offset + shift;
             let x1 = x0 + tab_w;
 
             // CPU-side cull: skip tabs entirely outside the visible region.
@@ -204,6 +221,15 @@ impl MetalRenderer {
 
             let is_active = i == tab_bar.active_tab;
             let is_hovered = tab_bar.hovered_tab == Some(i);
+            // v1.14.0 (T4): hover fade progress for this row and its ×.
+            let row_fade = crate::app::motion::fade_progress(
+                &tab_bar.hover_fades,
+                crate::app::motion::HoverKey::TabRow(i),
+            );
+            let close_fade = crate::app::motion::fade_progress(
+                &tab_bar.hover_fades,
+                crate::app::motion::HoverKey::TabClose(i),
+            );
 
             // Clamp rendering to [vis_left, vis_right] so tab backgrounds
             // don't bleed under the arrows or the "+" button.
@@ -222,25 +248,39 @@ impl MetalRenderer {
                 );
                 // R4 Batch 11试点：active tab 下划线在 hover 时切换到 accent_hover，
                 // 否则使用 accent_normal。这是 InteractionState 的首个消费点。
-                let underline = if is_hovered {
-                    accent_hover
-                } else {
-                    accent_normal
-                };
-                push_quad(
-                    &mut vertices,
-                    [draw_x0, y1 - 2.0, draw_x1, y1],
-                    [0.0; 4],
-                    [0.0; 4],
-                    underline,
-                );
-            } else if is_hovered {
+                // v1.14.0 (T3): while the indicator slide tween is in flight
+                // the underline draws at the projected position AFTER the
+                // loop instead — drawing here too would double it.
+                if tab_bar.indicator.is_none() {
+                    let underline = if is_hovered {
+                        accent_hover
+                    } else {
+                        accent_normal
+                    };
+                    push_quad(
+                        &mut vertices,
+                        [draw_x0, y1 - 2.0, draw_x1, y1],
+                        [0.0; 4],
+                        [0.0; 4],
+                        underline,
+                    );
+                }
+            } else if is_hovered || row_fade > 0.0 {
                 // v1.2: hover highlight — a subtle light overlay on inactive
                 // tabs when the mouse is over them (matches demo behavior).
-                let hover_bg = [
+                // v1.14.0 (T4): 100ms ease-out between the bar bg (idle) and
+                // the 8% highlight (hover) — a fading-out row keeps drawing
+                // until the fade lands on the idle color.
+                let highlight = [
                     fg[0] * 0.08 + bar_bg[0] * 0.92,
                     fg[1] * 0.08 + bar_bg[1] * 0.92,
                     fg[2] * 0.08 + bar_bg[2] * 0.92,
+                    1.0,
+                ];
+                let hover_bg = [
+                    bar_bg[0] + (highlight[0] - bar_bg[0]) * row_fade,
+                    bar_bg[1] + (highlight[1] - bar_bg[1]) * row_fade,
+                    bar_bg[2] + (highlight[2] - bar_bg[2]) * row_fade,
                     1.0,
                 ];
                 push_quad(
@@ -303,12 +343,15 @@ impl MetalRenderer {
             let close_cy = y0 + bar_h * 0.5;
             let close_r = if is_active { ch * 0.16 } else { ch * 0.13 };
             let cx_in_view = close_cx - close_r >= vis_left && close_cx + close_r <= vis_right;
-            let show_close = cx_in_view && (is_active || is_hovered);
+            // v1.14.0 (T4): a fading-out × keeps drawing until its fade lands.
+            let show_close = cx_in_view && (is_active || is_hovered || close_fade > 0.0);
             if show_close {
+                // v1.14.0 (T4): the inactive × fades in/out (idle alpha 0 →
+                // the 50% dimmed icon); the active tab's × stays steady.
                 let close_color = if is_active {
                     fg
                 } else {
-                    [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0]
+                    [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0 * close_fade]
                 };
                 let line_w = crate::ui_tokens::UiMetrics::for_scale(self.scale).stroke;
                 push_line(
@@ -333,6 +376,28 @@ impl MetalRenderer {
 
             // Hit rect: close_rect registered only when cx is in view.
             // Hit regions now live in the TabBar Scene (tab_bar_component.rs).
+        }
+
+        // ── v1.14.0 (T3): sliding indicator underline ──
+        // While the 140ms slide tween is in flight the accent underline
+        // draws at the projected x0/x1 (clamped into the visible strip like
+        // the in-slot path). The tween's target equals the new active tab's
+        // rect, so dropping it at land never jumps. The hover-derived accent
+        // follows the ACTIVE tab's hover state (same rule as in-slot).
+        if let Some((ix0, ix1)) = tab_bar.indicator {
+            let active_hovered = tab_bar.hovered_tab == Some(tab_bar.active_tab);
+            let underline = if active_hovered {
+                accent_hover
+            } else {
+                accent_normal
+            };
+            push_quad(
+                &mut vertices,
+                [ix0.max(vis_left), y1 - 2.0, ix1.min(vis_right), y1],
+                [0.0; 4],
+                [0.0; 4],
+                underline,
+            );
         }
 
         // ── Ghost pill (v1.11.13) ──
@@ -450,11 +515,27 @@ impl MetalRenderer {
             let la_r = ch * 0.14;
             let la_w = 1.5 * self.scale as f32;
             // Background: bar_bg + hover highlight if the mouse is over it.
-            let la_bg = if tab_bar.arrow_left_hovered && scroll_offset > 0.0 {
-                [
+            // v1.14.0 (T4): 100ms fade; the scroll>0 gate stays a hard
+            // condition (a hover at scroll 0 never highlights, as before).
+            let la_fade = if scroll_offset > 0.0 {
+                crate::app::motion::fade_progress(
+                    &tab_bar.hover_fades,
+                    crate::app::motion::HoverKey::TabArrowLeft,
+                )
+            } else {
+                0.0
+            };
+            let la_bg = if tab_bar.arrow_left_hovered || la_fade > 0.0 {
+                let highlight = [
                     fg[0] * 0.12 + bar_bg[0] * 0.88,
                     fg[1] * 0.12 + bar_bg[1] * 0.88,
                     fg[2] * 0.12 + bar_bg[2] * 0.88,
+                    1.0,
+                ];
+                [
+                    bar_bg[0] + (highlight[0] - bar_bg[0]) * la_fade,
+                    bar_bg[1] + (highlight[1] - bar_bg[1]) * la_fade,
+                    bar_bg[2] + (highlight[2] - bar_bg[2]) * la_fade,
                     1.0,
                 ]
             } else {
@@ -494,11 +575,26 @@ impl MetalRenderer {
             let ra_cy = bar_h * 0.5;
             let ra_r = ch * 0.14;
             let ra_w = 1.5 * self.scale as f32;
-            let ra_bg = if tab_bar.arrow_right_hovered && scroll_offset < max_scroll {
-                [
+            // v1.14.0 (T4): fade (left-arrow twin; scroll<max gate).
+            let ra_fade = if scroll_offset < max_scroll {
+                crate::app::motion::fade_progress(
+                    &tab_bar.hover_fades,
+                    crate::app::motion::HoverKey::TabArrowRight,
+                )
+            } else {
+                0.0
+            };
+            let ra_bg = if tab_bar.arrow_right_hovered || ra_fade > 0.0 {
+                let highlight = [
                     fg[0] * 0.12 + bar_bg[0] * 0.88,
                     fg[1] * 0.12 + bar_bg[1] * 0.88,
                     fg[2] * 0.12 + bar_bg[2] * 0.88,
+                    1.0,
+                ];
+                [
+                    bar_bg[0] + (highlight[0] - bar_bg[0]) * ra_fade,
+                    bar_bg[1] + (highlight[1] - bar_bg[1]) * ra_fade,
+                    bar_bg[2] + (highlight[2] - bar_bg[2]) * ra_fade,
                     1.0,
                 ]
             } else {
@@ -542,12 +638,23 @@ impl MetalRenderer {
         let plus_cy = bar_h * 0.5;
         let plus_r = ch * 0.22;
         let plus_line_w = 1.5 * self.scale as f32;
-        // v1.2: hover highlight.
-        if tab_bar.plus_hovered {
-            let hover_bg = [
+        // v1.2: hover highlight. v1.14.0 (T4): 100ms fade between the bar bg
+        // (idle) and the 12% highlight (hover).
+        let plus_fade = crate::app::motion::fade_progress(
+            &tab_bar.hover_fades,
+            crate::app::motion::HoverKey::TabPlus,
+        );
+        if tab_bar.plus_hovered || plus_fade > 0.0 {
+            let highlight = [
                 fg[0] * 0.12 + bar_bg[0] * 0.88,
                 fg[1] * 0.12 + bar_bg[1] * 0.88,
                 fg[2] * 0.12 + bar_bg[2] * 0.88,
+                1.0,
+            ];
+            let hover_bg = [
+                bar_bg[0] + (highlight[0] - bar_bg[0]) * plus_fade,
+                bar_bg[1] + (highlight[1] - bar_bg[1]) * plus_fade,
+                bar_bg[2] + (highlight[2] - bar_bg[2]) * plus_fade,
                 1.0,
             ];
             push_quad(

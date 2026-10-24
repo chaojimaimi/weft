@@ -211,6 +211,10 @@ pub(crate) struct PaletteState {
     /// current input buffer so the candidate window stays visually attached.
     pub(crate) ime_preedit: String,
     pub(crate) ime_preedit_cursor: Option<(usize, usize)>,
+    /// v1.14.0 (PLAN_v1140 T1): open/close reveal tween. `open` stays true
+    /// through the Closing phase so drawing readers are unchanged; input
+    /// readers consult [`Self::interactive`].
+    pub(crate) reveal: crate::app::motion::Reveal,
 }
 
 impl PaletteState {
@@ -231,7 +235,15 @@ impl PaletteState {
             runbook_entries: Vec::new(),
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
+            reveal: crate::app::motion::Reveal::default(),
         }
+    }
+
+    /// v1.14.0 (T1): the input-routing predicate — true only while the
+    /// palette is open AND not fading out. Closing surfaces must stop
+    /// capturing keyboard/mouse/IME so clicks and keys fall through.
+    pub(crate) fn interactive(&self) -> bool {
+        self.open && !self.reveal.is_closing()
     }
 
     pub(crate) fn open_search(&mut self) {

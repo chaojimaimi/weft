@@ -14,11 +14,22 @@ pub(crate) mod action;
 pub(crate) mod cursor_anim;
 pub(crate) mod effect_dispatch;
 pub(crate) mod focus;
+// v1.14.0 (PLAN_v1140 T4): per-frame hover fade sync — one chokepoint
+// retargeting both HoverFades registries (tab bar + block/scrollbar).
 pub(crate) mod helpers;
+pub(crate) mod hover_fades;
 pub(crate) mod keyboard;
+// v1.14.0 (PLAN_v1140 T0): the motion hub — Tween (RAII live counter) +
+// ease_out_cubic + the Reduce Motion gate. Declared here (not main.rs) so
+// the MAIN_RS_MAX ceiling is untouched; the tick thread wires in
+// app_runtime.rs beside the blink/spinner/autoscroll timers.
+pub(crate) mod motion;
 // v1.13.6 T10 P2 (PLAN_v1136 §1 D2): the per-pane parse worker — one
 // `weft-parse-<session_id>` thread feeding the pane's FairMutex terminal
 // directly; the main thread keeps only control events + the post pass.
+// v1.14.0 (PLAN_v1140 batch splits): the theme-picker keyboard handler,
+// moved verbatim out of lifecycle_controller.rs (800-line gate).
+pub(crate) mod palette_theme_key;
 pub(crate) mod parse_worker;
 pub(crate) mod parse_worker_stats;
 // v1.12.25 (3-B-2 P2-01): per-frame session I/O core (`spawn_pty` /

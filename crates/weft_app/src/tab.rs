@@ -46,6 +46,9 @@ mod pane_pump;
 mod primary_history;
 mod resize;
 mod scroll;
+// v1.14.0 (T6): the pure grid sub-row accumulator is consumed from the
+// App-level scroll controller (mouse_controller/scroll.rs) too.
+pub(crate) use scroll::accumulate_grid_scroll_px;
 mod snapshot;
 mod tui_scroll;
 

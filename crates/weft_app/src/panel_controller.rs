@@ -4,6 +4,176 @@ use super::*;
 use crate::block_component::{completed_block_layout_rows, completed_block_output_rows};
 
 impl App {
+    /// v1.14.0 (PLAN_v1140 T2): true when the sidebar width animation may
+    /// run — expanded (non-Compact) windows only. Compact overlay drawers
+    /// ignore `sidebar_width_override` entirely (ui_tokens::sidebar_visual_
+    /// width returns the fixed metrics width), so their toggle stays instant.
+    fn sidebar_anim_allowed(&self) -> bool {
+        crate::app::motion::gated(self.window_runtime.reduce_motion)
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| r.sidebar_push_width() != 0.0)
+            // rust-reviewer P3: a drag owns the width channel — starting a
+            // tween under it would give the per-frame override write and the
+            // drag's set_sidebar_width a double-writer race.
+            && self.interaction.sidebar_drag.is_none()
+    }
+
+    /// v1.14.0 (T2): start the sidebar OPEN width animation (0→target,
+    /// 180ms ease-out). The pre-animation override state is captured and
+    /// restored when the tween lands (`sidebar_width_restore`) so a
+    /// responsive-default user (`None`) is never frozen into a fixed width.
+    /// Called with `panel.open` already true; Reduce Motion / Compact callers
+    /// keep the instant path (no tween, override untouched).
+    pub(super) fn animate_sidebar_open(&mut self) {
+        if !self.sidebar_anim_allowed() {
+            return;
+        }
+        if self.panel.sidebar_width_anim.is_some() && self.panel.sidebar_width_opening {
+            return; // already opening/open — the tween keeps driving
+        }
+        let now = std::time::Instant::now();
+        // Start value: a mid-close reverse resumes from the animated width;
+        // a closed sidebar sweeps from 0.
+        let current = match self.panel.sidebar_width_anim.as_ref() {
+            Some(anim) => anim.value_at(now),
+            None => 0.0,
+        };
+        let Some(r) = &self.renderer else {
+            return;
+        };
+        // Target = the width the sidebar settles at AFTER the animation —
+        // the pre-animation override's effective logical width (None
+        // resolves to the responsive default). While a close tween runs the
+        // capture already holds the original value (keep it); otherwise it
+        // is the live override, read before the first frame clobbers it.
+        let restore = self
+            .panel
+            .sidebar_width_restore
+            .unwrap_or(r.sidebar_width_override);
+        let logical_viewport = r.viewport().0 / r.scale() as f32;
+        let target = crate::ui_tokens::sidebar_visual_width(logical_viewport, restore);
+        self.panel.sidebar_width_restore = Some(restore);
+        self.panel.sidebar_width_opening = true;
+        self.panel.sidebar_width_anim = Some(crate::app::motion::Tween::new(
+            current,
+            target,
+            crate::app::motion::SIDEBAR_OPEN_DUR,
+            now,
+        ));
+    }
+
+    /// v1.14.0 (T2): start the sidebar CLOSE width animation (current→0,
+    /// 150ms ease-out). `panel.open` stays true while the sidebar shrinks;
+    /// the real close runs when the tween lands (先动画后状态 — plan §3).
+    /// Reduce Motion / Compact callers keep the instant path.
+    pub(super) fn animate_sidebar_close(&mut self) {
+        if !self.sidebar_anim_allowed() {
+            self.panel.close();
+            return;
+        }
+        if self.panel.sidebar_width_anim.is_some() && !self.panel.sidebar_width_opening {
+            return; // already closing — let the tween land
+        }
+        let Some(r) = &self.renderer else {
+            self.panel.close();
+            return;
+        };
+        let current = r.sidebar_width() / r.scale() as f32;
+        // rust-reviewer P1-3: the close must capture the restore SYMMETRICALLY
+        // with the open. Without this, the per-frame tween writes clobber
+        // `sidebar_width_override` and the land step restores… the captured
+        // value from a possibly-ancient open — a drag-persisted 300pt width
+        // was lost forever on close, and a mid-close reopen re-opened the
+        // animation channel with the OVERRIDDEN intermediate value baked in.
+        let restore = self
+            .panel
+            .sidebar_width_restore
+            .take()
+            .unwrap_or(r.sidebar_width_override);
+        self.panel.sidebar_width_restore = Some(restore);
+        self.panel.sidebar_width_opening = false;
+        self.panel.sidebar_width_anim = Some(crate::app::motion::Tween::new(
+            current,
+            0.0,
+            crate::app::motion::SIDEBAR_CLOSE_DUR,
+            std::time::Instant::now(),
+        ));
+    }
+
+    /// v1.14.0 (T2): per-frame sidebar width animation maintenance, run at
+    /// the top of `run_redraw` (before every `sidebar_width()` consumer).
+    /// In-flight frames write the tween value STRAIGHT into
+    /// `renderer.sidebar_width_override` (bypassing `set_sidebar_width`'s
+    /// `[240, 360]` clamp and `sidebar_visual_width`'s second clamp — the
+    /// plan's 直写通道) and recompute layout so the terminal reflows each
+    /// frame (per-frame SIGWINCH; the zoom 220ms per-frame resize is the
+    /// accepted precedent). Landing restores the pre-animation override and
+    /// performs the real close for a closing animation.
+    pub(super) fn maintain_sidebar_width_anim(&mut self) {
+        let now = std::time::Instant::now();
+        let (value, finished) = match self.panel.sidebar_width_anim.as_ref() {
+            Some(anim) => (anim.value_at(now), anim.finished(now)),
+            None => return,
+        };
+        if !finished {
+            if let Some(r) = &mut self.renderer {
+                r.sidebar_width_override = Some(value);
+            }
+            self.recompute_layout();
+            return;
+        }
+        // Land: restore the pre-animation override state, then finish.
+        let opening = self.panel.sidebar_width_opening;
+        let restore = self.panel.sidebar_width_restore.take().unwrap_or(None);
+        self.panel.sidebar_width_anim = None;
+        self.panel.sidebar_width_opening = false;
+        if let Some(r) = &mut self.renderer {
+            r.sidebar_width_override = restore;
+        }
+        if !opening {
+            self.panel.close();
+        }
+        self.recompute_layout();
+        self.request_redraw();
+    }
+
+    /// v1.14.0 (T2): cancel an in-flight sidebar width animation, freezing
+    /// the current animated value into the override (拖拽起始取消动画取当前
+    /// 值 — plan §3). The drag channel owns the width from here on; the
+    /// restore capture is dropped (the drag release persists its own value).
+    pub(super) fn cancel_sidebar_width_anim(&mut self) {
+        let Some(anim) = self.panel.sidebar_width_anim.take() else {
+            return;
+        };
+        let current = anim.value_at(std::time::Instant::now());
+        self.panel.sidebar_width_restore = None;
+        self.panel.sidebar_width_opening = false;
+        if let Some(r) = &mut self.renderer {
+            r.sidebar_width_override = Some(current);
+        }
+    }
+
+    /// v1.14.0 (T2): Reduce Motion flip — snap an in-flight sidebar width
+    /// animation to its end value immediately (lifecycle 1Hz bridge).
+    pub(super) fn snap_sidebar_width_anim(&mut self) {
+        if self.panel.sidebar_width_anim.is_none() {
+            return;
+        }
+        let opening = self.panel.sidebar_width_opening;
+        let restore = self.panel.sidebar_width_restore.take().unwrap_or(None);
+        self.panel.sidebar_width_anim = None;
+        self.panel.sidebar_width_opening = false;
+        if let Some(r) = &mut self.renderer {
+            r.sidebar_width_override = restore;
+        }
+        if !opening {
+            self.panel.close();
+        }
+        self.recompute_layout();
+    }
+
     pub(super) fn update_sidebar_drag(&mut self, pointer_x: f64) -> bool {
         let Some(drag) = self.interaction.sidebar_drag else {
             return false;

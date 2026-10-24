@@ -91,6 +91,9 @@ impl App {
         }
         info!(tab_idx = idx, "new tab created");
         self.refresh_find_for_active_tab();
+        // v1.14.0 (PLAN_v1140 T3): the new tab is active — index instability
+        // snaps the tab-bar tweens (close_tab twin).
+        self.clear_tab_bar_tweens();
         self.scroll_active_tab_into_view();
         self.request_redraw();
     }
@@ -148,6 +151,9 @@ impl App {
         // a stale hovered_tab would point at the wrong tab. The next
         // CursorMoved will recompute it.
         self.tab_bar.hovered_tab = None;
+        // v1.14.0 (PLAN_v1140 T3): index instability — the indicator/slot
+        // tweens point at stale px; snap (吸附) and draw in-slot.
+        self.clear_tab_bar_tweens();
         info!(closed = removed_idx, active = new_active, "tab closed");
         self.clamp_tab_scroll();
         self.scroll_active_tab_into_view();
@@ -270,6 +276,9 @@ impl App {
         info!(active = new, "switched to next tab");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();
+        // v1.14.0 (PLAN_v1140 T3): the amber underline slides to the new
+        // tab (after the scroll settles so the tween uses the final offset).
+        self.begin_tab_indicator_slide(prev, new);
         vec![
             Effect::TabSwitched {
                 new_idx: new,
@@ -292,6 +301,8 @@ impl App {
         info!(active = new, "switched to prev tab");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();
+        // v1.14.0 (PLAN_v1140 T3): indicator slide (next_tab twin).
+        self.begin_tab_indicator_slide(prev, new);
         vec![
             Effect::TabSwitched {
                 new_idx: new,
@@ -336,6 +347,11 @@ impl App {
         if let Some(layout) = self.tab_strip_layout() {
             self.tab_bar.scroll_offset = layout.scroll_offset;
         }
+        // v1.14.0 (PLAN_v1140 T3): scroll-offset change snaps the indicator
+        // tween (absolute px coordinates would trail the strip — 防拖影).
+        // Every scroll write path (arrows / wheel / clamp) funnels here;
+        // the switch path uses scroll_active_tab_into_view instead.
+        self.tab_bar.indicator = None;
     }
 
     /// v1.2: Scroll the tab bar so the active tab is visible. Called after
@@ -364,6 +380,26 @@ impl App {
             .collect();
         let labels = titles.iter().map(|title| title.compact.clone()).collect();
         let tooltips = titles.into_iter().map(|title| title.tooltip).collect();
+        // v1.14.0 (PLAN_v1140 T3): project the tab-bar animation tweens into
+        // draw values — the paint fn has no App access (DrawState is this
+        // library's established projection pattern).
+        let now = std::time::Instant::now();
+        let indicator = self
+            .tab_bar
+            .indicator
+            .as_ref()
+            .map(|(t0, t1)| (t0.value_at(now), t1.value_at(now)));
+        let slot_shifts: Vec<f32> = self
+            .tab_bar
+            .tab_slot_shifts
+            .iter()
+            .map(|entry| match entry {
+                Some(t) => t.value_at(now),
+                None => 0.0,
+            })
+            .collect();
+        // v1.14.0 (PLAN_v1140 T4): project the tab-bar hover fade registry.
+        let hover_fades = self.tab_bar.hover_fades.project(now);
         // v1.11.13: ghost-drag draw state. Only engaged past the threshold
         // and while the dragged index is still valid; the ghost x is the
         // pointer minus the grip captured at lift (clamped by the renderer
@@ -397,6 +433,9 @@ impl App {
             drag_index,
             drag_ghost_x,
             drag_insert_index,
+            indicator,
+            slot_shifts,
+            hover_fades,
         }
     }
 
@@ -552,136 +591,6 @@ impl App {
         }
     }
 
-    /// v0.9 W2+: Handle keyboard input in the theme picker sub-mode.
-    ///
-    /// - Up/Down: navigate the filtered theme list.
-    /// - Enter: apply the selected theme (dark heuristic: name ends with
-    ///   `-dark`/`-night` or contains "dracula"/"nord"/"tokyo"/"monokai"
-    ///   → dark; otherwise treat as light). The palette closes after apply.
-    /// - Escape: return to Search sub-mode (does not close the palette).
-    /// - Backspace: pop the filter buffer; if empty, return to Search.
-    /// - Printable char: append to the filter buffer and refresh.
-    pub(super) fn handle_palette_select_theme_key(
-        &mut self,
-        key: KeyCode,
-        mods: Modifiers,
-        text: Option<&str>,
-    ) -> bool {
-        let (buffer, themes) = match &self.palette.submode {
-            PaletteSubMode::SelectTheme { buffer, themes } => (buffer.clone(), themes.clone()),
-            _ => return false,
-        };
-
-        // Helper: given the current filtered selection index, resolve back to
-        // the actual theme name from the full `themes` list.
-        let selected_name = |sel: usize, buf: &str| -> Option<String> {
-            let q = buf.to_lowercase();
-            themes
-                .iter()
-                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
-                .nth(sel)
-                .cloned()
-        };
-        let filtered_len = themes
-            .iter()
-            .filter(|name| {
-                buffer.is_empty() || name.to_lowercase().contains(&buffer.to_lowercase())
-            })
-            .count();
-
-        match key {
-            KeyCode::Escape => {
-                // Return to search mode (keep palette open).
-                self.palette.submode = PaletteSubMode::Search;
-                self.palette.query.clear();
-                self.palette.selection = 0;
-                self.refresh_palette_results();
-                self.request_redraw();
-                true
-            }
-            KeyCode::Up => {
-                if self.palette.selection > 0 {
-                    self.palette.selection -= 1;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Down => {
-                if self.palette.selection + 1 < filtered_len {
-                    self.palette.selection += 1;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::PageUp | KeyCode::PageDown => {
-                self.palette.selection = crate::paint::command_surface::apply_page_selection(
-                    self.palette.selection,
-                    filtered_len,
-                    self.interaction.popup_max_rows,
-                    key == KeyCode::PageDown,
-                );
-                self.request_redraw();
-                true
-            }
-            KeyCode::Tab => {
-                self.palette.selection = crate::input_router::cycle_list_selection(
-                    self.palette.selection,
-                    filtered_len,
-                    !mods.contains(Modifiers::SHIFT),
-                );
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                if let Some(name) = selected_name(self.palette.selection, &buffer) {
-                    // v1.12: 按解析后背景的相对亮度判定，不再猜名字。
-                    let dark =
-                        crate::palette_state::theme_is_dark(&name, &self.config_state.config.theme);
-                    self.apply_theme_by_name(&name, dark);
-                    self.palette.submode = PaletteSubMode::Search;
-                    self.palette.query.clear();
-                    self.close_palette();
-                    self.request_redraw();
-                }
-                true
-            }
-            KeyCode::Backspace => {
-                if buffer.is_empty() {
-                    // Exit sub-mode back to search.
-                    self.palette.submode = PaletteSubMode::Search;
-                    self.palette.query.clear();
-                    self.palette.selection = 0;
-                    self.refresh_palette_results();
-                } else {
-                    // Pop filter char.
-                    if let PaletteSubMode::SelectTheme { buffer, .. } = &mut self.palette.submode {
-                        buffer.pop();
-                        let buf = buffer.clone();
-                        self.palette.selection = 0;
-                        self.refresh_theme_picker_results();
-                        // refresh_theme_picker_results reads buffer from self.
-                        let _ = buf; // silence unused
-                    }
-                }
-                self.request_redraw();
-                true
-            }
-            _ => {
-                let c = resolve_text_char(text, '\0', false);
-                if c == '\0' || c.is_control() {
-                    return false;
-                }
-                if let PaletteSubMode::SelectTheme { buffer, .. } = &mut self.palette.submode {
-                    buffer.push(c);
-                    self.palette.selection = 0;
-                    self.refresh_theme_picker_results();
-                }
-                self.request_redraw();
-                true
-            }
-        }
-    }
-
     /// v0.9 U-D1: Poll the macOS system appearance and switch theme if it
     /// has changed since the last poll. Throttled to one query per second
     /// to avoid per-frame `NSUserDefaults` overhead. No-op when
@@ -705,6 +614,12 @@ impl App {
             // v1.13.17 S4: the zoom: IMP has no App access — bridge the same
             // value at the same update point (single source of truth).
             crate::macos_zoom::set_zoom_reduce_motion(reduce);
+            // v1.14.0 (PLAN_v1140 T1): the SAME-point Reduce Motion bridge
+            // for the overlay reveals — in-flight tweens snap to their end
+            // values (Closing surfaces run their real teardown immediately).
+            self.apply_overlay_reduce_motion(reduce);
+            // v1.14.0 (T2): the sidebar width animation snaps the same way.
+            self.snap_sidebar_width_anim();
         }
 
         // F6: Poll macOS Increase Contrast setting (always, regardless of

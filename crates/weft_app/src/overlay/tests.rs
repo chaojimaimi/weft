@@ -184,6 +184,7 @@ fn overlay_warmup_palette_collects_query_and_entries() {
         submode_input: "",
         ime_preedit: "",
         ime_preedit_cursor: None,
+        reveal: 1.0,
     };
     let mut missing = HashSet::new();
     OverlayContent::CommandPalette(p).warm_chars(&mut missing);
@@ -302,6 +303,7 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         blocks_history_max_age_days: 90,
         blocks_history_max_db_mb: 512,
         update_tier: weft_core::config::UpdateCheckTier::Daily,
+        reveal: 1.0,
     };
     let mut missing = HashSet::new();
     OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -372,6 +374,7 @@ fn settings_overlay_is_modal_and_highest_z() {
                     blocks_history_max_age_days: 90,
                     blocks_history_max_db_mb: 512,
                     update_tier: weft_core::config::UpdateCheckTier::Daily,
+                    reveal: 1.0,
                 }),
             },
         ],
@@ -417,6 +420,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         palette_ime_preedit: "",
         palette_ime_preedit_cursor: None,
         palette_form: None,
+        palette_reveal: 1.0,
     };
     let prompt = PromptViewParams {
         prompt_selection: None,
@@ -444,6 +448,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         palette_ime_preedit: "",
         palette_ime_preedit_cursor: None,
         palette_form: None,
+        palette_reveal: 1.0,
     };
     let owned = SettingsOwnedSnapshot {
         themes: vec![SettingsThemeView {
@@ -460,7 +465,7 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         profile_names: vec!["work".to_string()],
     };
     let settings_state = crate::app_state::SettingsState::new();
-    let settings_params = settings_state.view_params(&owned, test_ai_view(), false);
+    let settings_params = settings_state.view_params(&owned, test_ai_view(), false, 1.0);
     let open = build_overlay_stack(
         &terminal,
         panel,

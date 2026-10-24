@@ -43,7 +43,8 @@ fn build_attr_cell(cell: &Cell, cursor: &Cursor, show: bool) -> super::GridRowIn
         0.0,
         0.0,
         false,
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     )
 }
 
@@ -73,7 +74,8 @@ fn terminal_grid_applies_minimum_contrast_without_touching_background() {
         0.0,
         0.0,
         false,
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     );
     assert_eq!(result.bg_instances[0].bg, BACKGROUND);
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
@@ -133,7 +135,8 @@ fn grid_explicit_terminal_color_preserves_application_hierarchy() {
         0.0,
         0.0,
         false,
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     );
     let GlyphInstance::Text { fg, .. } = &instances.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -310,7 +313,8 @@ fn build_high_contrast_cell(cell: &Cell) -> super::GridRowInstances {
         0.0,
         0.0,
         false,
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     )
 }
 
@@ -544,7 +548,8 @@ fn grid_bold_is_bright_on_maps_ansi_to_bright_variant() {
         0.0,
         0.0,
         true,                    // bold_is_bright
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     );
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -586,7 +591,8 @@ fn grid_bold_is_bright_leaves_high_index_and_rgb_alone() {
             0.0,
             0.0,
             true,
-            [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+            [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+            None,
         );
         let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
             panic!("expected text glyph");
@@ -620,7 +626,8 @@ fn grid_bold_is_bright_leaves_high_index_and_rgb_alone() {
         0.0,
         0.0,
         true,
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     );
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -661,7 +668,8 @@ fn grid_bold_is_bright_reverse_dim_order_stable() {
         0.0,
         0.0,
         true,
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     );
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -708,7 +716,8 @@ fn build_row_instances_snaps_text_y_to_integer_pixels_keeps_bg_fractional() {
         origin_x,
         origin_y,
         false,
-        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6),
+        None,
     );
 
     // Text glyph: both Y edges are integers; X untouched (fractional ok).

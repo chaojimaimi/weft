@@ -138,6 +138,70 @@ fn alt_screen_cursor_color(
     }
 }
 
+/// v1.14.0 (P1-1): scrollback index of the row just ABOVE the visible
+/// viewport top (the row whose tail `px` band must fill the top gap of a
+/// sub-row-shifted frame). `None` when there is no such row: the viewport
+/// is already at the history top (`offset == scrollback_len`) or there is
+/// no scrollback at all. Pure — unit-testable without a renderer.
+pub(crate) fn subrow_extra_row_index(scrollback_len: usize, scroll_offset: usize) -> Option<usize> {
+    let offset = scroll_offset.min(scrollback_len);
+    scrollback_len.checked_sub(offset + 1)
+}
+
+/// v1.14.0 (P1-1): build the extra top-row instances for a sub-row-shifted
+/// grid frame. Baked one full row ABOVE `origin_y_base` so that a `+px`
+/// push_row shift lands its bottom `px` band inside the viewport top gap
+/// (the pre-fix hole the reviewer flagged); the shifted-down bottom row's
+/// overflow is accepted (per-pane scissor clipping). The row renders with
+/// cursor/selection disabled — both are viewport-indexed and cannot reach
+/// a row above the top. Pure — unit-testable without a renderer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_subrow_extra_top_row(
+    grid: &weft_core::grid::Grid,
+    palette: &[Color; 256],
+    default_fg: [f32; 4],
+    default_bg: [f32; 4],
+    opacity: f32,
+    minimum_contrast: f32,
+    cw: f32,
+    ch: f32,
+    origin_x: f32,
+    origin_y_base: f32,
+    bold_is_bright: bool,
+    hyperlink_color: [f32; 4],
+) -> Option<GridRowInstances> {
+    let idx = subrow_extra_row_index(grid.scrollback.len(), grid.scroll_offset())?;
+    let row = grid.scrollback.get(idx)?;
+    let cursor = weft_core::grid::Cursor::default();
+    let selection = SelectionHandler::new();
+    Some(build_row_instances(
+        grid,
+        palette,
+        0,
+        default_fg,
+        default_bg,
+        default_fg,
+        default_bg,
+        default_bg,
+        &cursor,
+        CursorStyle::Block,
+        false,
+        &selection,
+        opacity,
+        minimum_contrast,
+        cw,
+        ch,
+        // rust-reviewer R1: the extra row must carry the REAL content origin
+        // (chrome-left/sidebar/split inset) — a hardcoded 0.0 misaligned it
+        // horizontally exactly when ctx.left() != 0.
+        origin_x,
+        origin_y_base - ch,
+        bold_is_bright,
+        hyperlink_color,
+        Some(&row),
+    ))
+}
+
 impl MetalRenderer {
     /// v1.0 P1.5-B1: Build per-cell instance data for the grid. Each cell
     /// becomes a single 64-byte instance (origin/size/uv_rect/fg/bg) drawn
@@ -297,7 +361,15 @@ impl MetalRenderer {
             }
         }
 
-        if rows_to_rebuild.is_empty() {
+        // v1.14.0 (PLAN_v1140 T6): a non-zero sub-row scroll offset bypasses
+        // the instances_unchanged early-return — the visible rows must be
+        // re-flattened with the px shift every frame (the per-row INSTANCE
+        // cache itself stays valid; only the serialization shifts). px == 0
+        // keeps the zero-cost idle path exactly as before. The GPU blit fast
+        // path keys off instances_unchanged, so a shifted frame correctly
+        // re-renders instead of blitting stale content.
+        let grid_scroll_px = self.grid_scroll_px;
+        if rows_to_rebuild.is_empty() && grid_scroll_px == 0.0 {
             drop(cache);
             self.instances_unchanged.set(true);
             return (GridInstanceBatch::default(), 0);
@@ -336,6 +408,7 @@ impl MetalRenderer {
                 origin_y_base + row as f32 * ch,
                 self.bold_is_bright,
                 self.theme.link,
+                None,
             );
         }
         drop(cache);
@@ -344,9 +417,33 @@ impl MetalRenderer {
         // are resolved here (needs `self.atlas`) via the closure passed to
         // `GridInstanceBatch::push_row`.
         let cache = self.grid_row_cache.borrow();
-        let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
+        let mut batch = GridInstanceBatch::with_capacity(num_rows + 1, num_cols);
+        // P1-1: a px≠0 shift moves every cached row DOWN, leaving the
+        // viewport-top band [origin_y, origin_y + px) empty. Fill it with
+        // the scrollback row above the visible top, pushed with the SAME
+        // shift after being baked one row above the viewport.
+        if grid_scroll_px != 0.0 {
+            if let Some(extra) = build_subrow_extra_top_row(
+                grid,
+                palette,
+                default_fg,
+                default_bg,
+                self.opacity,
+                self.minimum_contrast,
+                cw,
+                ch,
+                origin_x,
+                origin_y_base,
+                self.bold_is_bright,
+                self.theme.link,
+            ) {
+                batch.push_row(&extra, grid_scroll_px, &|ch, cluster, style| {
+                    self.resolve_glyph_uv(ch, cluster, style)
+                });
+            }
+        }
         for row_inst in cache.iter() {
-            batch.push_row(row_inst, &|ch, cluster, style| {
+            batch.push_row(row_inst, grid_scroll_px, &|ch, cluster, style| {
                 self.resolve_glyph_uv(ch, cluster, style)
             });
         }
@@ -479,12 +576,15 @@ impl MetalRenderer {
                 origin_y_base + row as f32 * ch,
                 self.bold_is_bright,
                 self.theme.link,
+                None,
             );
         }
 
         let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
         for row_inst in entry.rows.iter() {
-            batch.push_row(row_inst, &|ch, cluster, style| {
+            // v1.14.0 (T6): background panes carry no sub-row scroll offset
+            // (the accumulator is active-pane-only) — plan-mandated 0.0.
+            batch.push_row(row_inst, 0.0, &|ch, cluster, style| {
                 self.resolve_glyph_uv(ch, cluster, style)
             });
         }

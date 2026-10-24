@@ -27,16 +27,26 @@ impl App {
                 let Some(index) = self.sessions.tab_index_by_session_id(session_id) else {
                     return;
                 };
+                // rust-reviewer P3: AX switching rides the same indicator
+                // slide as click/next/prev — the slide starts after the
+                // scroll settles (a local captures the pre-switch index;
+                // no state field needed).
+                let mut slide: Option<(usize, usize)> = None;
                 if self.sessions.active_idx() != index {
                     self.reset_ime_context("accessibility tab action");
+                    let prev_active = self.sessions.active_idx();
                     self.sessions.switch_to(index);
                     self.refresh_find_for_active_tab();
+                    slide = Some((prev_active, index));
                 }
                 self.tab_bar.hovered_tab = None;
                 self.interaction.block_hovered = None;
                 self.interaction.block_selected = None;
                 self.interaction.block_action_hovered = None;
                 self.scroll_active_tab_into_view();
+                if let Some((from, to)) = slide.take() {
+                    self.begin_tab_indicator_slide(from, to);
+                }
                 self.request_redraw();
             }
             AccessibilityAction::ContextMenuItem { session_id, index } => {
@@ -58,7 +68,12 @@ impl App {
                 }
             }
             AccessibilityAction::PaletteEntry(key) => {
-                if !self.palette.open || !matches!(self.palette.submode, PaletteSubMode::Search) {
+                // rust-reviewer P2-3: a Closing palette has already handed
+                // input off — activating an entry mid-fade would run a
+                // stale command (interactive gate, T1 contract).
+                if !self.palette.interactive()
+                    || !matches!(self.palette.submode, PaletteSubMode::Search)
+                {
                     return;
                 }
                 let entry = self
@@ -72,8 +87,10 @@ impl App {
                 }
             }
             AccessibilityAction::PaletteTheme(name) => {
+                // rust-reviewer P2-3: Closing 期不得应用主题——
+                // palette_theme_action 通过后会真实 apply_theme_by_name。
                 let Some(dark) = palette_theme_action(
-                    self.palette.open,
+                    self.palette.interactive(),
                     &self.palette,
                     &name,
                     &self.config_state.config.theme,

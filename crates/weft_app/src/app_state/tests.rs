@@ -21,6 +21,11 @@ fn tab_bar_clear_hover_preserves_scroll_and_click_history() {
         arrow_left_hovered: true,
         arrow_right_hovered: true,
         last_titlebar_click: Some(now),
+        // v1.14.0 (T3/T4): animation state defaults to "no tween / no
+        // fade" — the clear-hover contract must not depend on them.
+        indicator: None,
+        tab_slot_shifts: Vec::new(),
+        hover_fades: crate::app::motion::HoverFades::default(),
     };
     state.clear_hover();
     assert_eq!(state.hovered_tab, None);
@@ -47,6 +52,32 @@ fn closing_panel_clears_only_transient_ownership() {
     assert!(state.last_click.is_none());
     assert_eq!(state.query, "git");
     assert_eq!(state.selection, 3);
+}
+
+// v1.14.0 (PLAN_v1140 T2): the toggle-side predicate — a closing width
+// animation keeps `open` true (visible) until it lands, but the toggle must
+// treat it as "not stably open" so the next Cmd+Shift+B reverses the tween.
+#[test]
+fn sidebar_stable_open_only_while_not_shrinking() {
+    use std::time::Duration;
+    let mut state = PanelState::default();
+    // Closed: not stable-open (the toggle opens).
+    assert!(!state.sidebar_stable_open());
+    // Steady open: stable.
+    state.open = true;
+    assert!(state.sidebar_stable_open());
+    // Mid-OPEN tween: still stable-open (the toggle closes/reverses).
+    state.sidebar_width_opening = true;
+    state.sidebar_width_anim = Some(crate::app::motion::Tween::new(
+        10.0,
+        240.0,
+        Duration::from_millis(180),
+        Instant::now(),
+    ));
+    assert!(state.sidebar_stable_open());
+    // Mid-CLOSE tween: not stable-open — the toggle reopens.
+    state.sidebar_width_opening = false;
+    assert!(!state.sidebar_stable_open());
 }
 
 #[test]

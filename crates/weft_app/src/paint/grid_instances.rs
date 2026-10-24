@@ -20,7 +20,7 @@
 
 use crate::paint::primitives::{push_cell_instance, resolve_cell_color};
 use crate::paint::underline::underline_color;
-use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
+use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid, Row};
 use weft_core::selection::SelectionHandler;
 
 #[cfg(test)]
@@ -163,14 +163,29 @@ impl GridInstanceBatch {
     /// glyphs stored in the RGBA color atlas (color emoji); their `fg` is
     /// replaced by an alpha=2.0 sentinel so the fragment shader can route
     /// them to the color texture. Normal glyphs keep their own `fg`.
+    /// Extend both streams with a row's instances, resolving glyph UVs via
+    /// `resolve_uv`. Returns the float offsets occupied by this row.
+    ///
+    /// `y_offset_px` is the v1.14.0 (PLAN_v1140 T6) sub-row scroll shift:
+    /// - bg instances shift by the EXACT px (continuous background motion);
+    /// - glyph instances shift by `floor(px)` whole physical pixels (px is
+    ///   already physical — accumulated from PixelDelta ÷ physical cell
+    ///   height — and the integer floor prevents sub-pixel glyph smear).
+    ///
+    /// The caller passes `0.0` for every non-scrolling surface (background
+    /// panes, block view); `0.0` reproduces the pre-T6 output bit-for-bit.
     pub(crate) fn push_row(
         &mut self,
         row: &GridRowInstances,
+        y_offset_px: f32,
         resolve_uv: &ResolveUv<'_>,
     ) -> PaneInstanceRanges {
+        let glyph_floor = y_offset_px.floor();
         let bg_start = self.bg_stream.len();
         for bi in &row.bg_instances {
-            bi.push(&mut self.bg_stream);
+            let mut shifted = *bi;
+            shifted.y0 += y_offset_px;
+            shifted.push(&mut self.bg_stream);
         }
         let bg_end = self.bg_stream.len();
 
@@ -186,16 +201,22 @@ impl GridInstanceBatch {
                 } => {
                     let (uv, is_color) = resolve_uv(*ch, cluster.as_deref(), *style);
                     // fg.a = 2.0 sentinel (normal fg alpha ≤ 1.0): the shader
-                    // detects color-atlas glyphs via `fg.a > 1.5` and samples
+                    // detects color-atlas glyphs via `fg.a >= 1.5` and samples
                     // color_atlas instead of tinting the mask with fg.
                     let fg = if is_color { [0.0, 0.0, 0.0, 2.0] } else { *fg };
-                    push_cell_instance(&mut self.glyph_stream, *dst, uv, fg, [0.0; 4]);
+                    let mut shifted = *dst;
+                    shifted[1] += glyph_floor;
+                    shifted[3] += glyph_floor;
+                    push_cell_instance(&mut self.glyph_stream, shifted, uv, fg, [0.0; 4]);
                 }
                 GlyphInstance::Decoration { dst, color } => {
                     // UV [0,0,0,1] → mask=0 → only bg (color) shows.
+                    let mut shifted = *dst;
+                    shifted[1] += glyph_floor;
+                    shifted[3] += glyph_floor;
                     push_cell_instance(
                         &mut self.glyph_stream,
-                        *dst,
+                        shifted,
                         [0.0, 0.0, 0.0, 1.0],
                         [0.0; 4],
                         *color,
@@ -279,9 +300,18 @@ pub(crate) fn build_row_instances(
     // v1.11.6 (M6/D-f): OSC 8 hyperlink underline color — `Theme::link`
     // from the caller (this is a free function, no &self.theme here).
     hyperlink_color: [f32; 4],
+    // v1.14.0 (P1-1): content override for the sub-row scroll's extra top
+    // row — the scrollback row just above the visible top has NO viewport
+    // index (`Grid::cell` only resolves 0..num_rows), so its `Row` is handed
+    // in directly. `None` renders the grid's own `row` (every pre-P1-1
+    // caller).
+    row_override: Option<&Row>,
 ) -> GridRowInstances {
     let num_cols = grid.num_cols;
     let mut result = GridRowInstances::default();
+    // Blank fallback mirrors `Grid::cell`'s own out-of-range guard for the
+    // (non-load-bearing) narrower-history-row resize edge.
+    let blank_cell = weft_core::grid::Cell::default();
 
     let y0 = origin_y;
     let y1 = origin_y + ch;
@@ -293,7 +323,10 @@ pub(crate) fn build_row_instances(
     let mut run_bg: [f32; 4] = default_bg;
 
     for col in 0..num_cols {
-        let cell = grid.cell(row, col);
+        let cell = match row_override {
+            Some(overridden) => overridden.cells.get(col).unwrap_or(&blank_cell),
+            None => grid.cell(row, col),
+        };
 
         // Skip wide-char spacers — rendered as part of the preceding wide cell.
         if cell.flags.contains(CellFlags::WIDE_SPACER) {

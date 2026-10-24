@@ -15,8 +15,9 @@ impl App {
         button: winit::event::MouseButton,
     ) -> PressOutcome {
         match crate::input_router::route_modal_mouse(
-            self.palette.open,
-            self.settings.open,
+            // v1.14.0 (T1): interactive — a Closing modal is click-through.
+            self.palette.interactive(),
+            self.settings.interactive(),
             self.interaction.context_menu.is_some(),
             button,
         ) {
