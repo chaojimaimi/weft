@@ -49,6 +49,28 @@ pub(crate) fn delta_up(delta: MouseScrollDelta) -> bool {
     }
 }
 
+/// v1.13.18 P2: panel scroll step — the DELTA to apply to the history
+/// panel's `scroll_offset` (newest-first list: offset 0 = newest visible).
+/// The panel obeys the same content-follows-finger invariant as the main
+/// view: wheel-up / a downward content move (natural scrolling) walks the
+/// viewport toward NEWER rows → negative; wheel-down → positive (toward
+/// older). The magnitude keeps the panel branch's existing ceil/floor
+/// quantization of [`delta_to_lines`] (moved verbatim from
+/// mouse_controller/scroll.rs, zero-magnitude preserved).
+pub(crate) fn panel_scroll_step(delta: MouseScrollDelta) -> isize {
+    let lines = delta_to_lines(delta);
+    let magnitude = if lines > 0.0 {
+        lines.ceil() as isize
+    } else {
+        lines.floor().abs() as isize
+    };
+    if delta_up(delta) {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
 /// Convert a terminal scroll event to signed cell rows.
 ///
 /// Positive rows reveal older content (wheel-up); negative rows reveal newer
@@ -139,6 +161,43 @@ mod tests {
         assert!(delta_up(pixels(1.0)));
         assert!(!delta_up(pixels(0.0)));
         assert!(!delta_up(pixels(-1.0)));
+    }
+
+    // ── v1.13.18 (P2): panel scroll step — newest-first, content follows
+    // finger. Wheel-up / downward content move reveals NEWER rows → the
+    // offset DECREASES (negative step); wheel-down → positive.
+
+    #[test]
+    fn panel_scroll_step_wheel_up_moves_toward_newer() {
+        assert_eq!(panel_scroll_step(lines(1.0)), -1);
+        assert_eq!(panel_scroll_step(lines(3.0)), -3);
+        assert_eq!(panel_scroll_step(pixels(40.0)), -1);
+        assert_eq!(panel_scroll_step(pixels(80.0)), -2);
+    }
+
+    #[test]
+    fn panel_scroll_step_wheel_down_moves_toward_older() {
+        assert_eq!(panel_scroll_step(lines(-1.0)), 1);
+        assert_eq!(panel_scroll_step(lines(-2.5)), 3);
+        assert_eq!(panel_scroll_step(pixels(-40.0)), 1);
+        assert_eq!(panel_scroll_step(pixels(-100.0)), 3);
+    }
+
+    #[test]
+    fn panel_scroll_step_zero_delta_is_zero() {
+        assert_eq!(panel_scroll_step(lines(0.0)), 0);
+        assert_eq!(panel_scroll_step(pixels(0.0)), 0);
+    }
+
+    #[test]
+    fn panel_scroll_step_keeps_ceil_floor_magnitude() {
+        // Same quantization the panel branch used pre-P2: positive deltas
+        // ceil, negative deltas floor-of-absolute. One trackpad notch never
+        // quantizes to zero.
+        assert_eq!(panel_scroll_step(lines(0.4)), -1);
+        assert_eq!(panel_scroll_step(lines(-0.4)), 1);
+        assert_eq!(panel_scroll_step(lines(2.2)), -3);
+        assert_eq!(panel_scroll_step(pixels(10.0)), -1);
     }
 
     #[test]

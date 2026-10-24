@@ -58,31 +58,28 @@ impl App {
 
         // F3-4: When the scroll event is over the history sidebar, adjust the
         // panel's block-level scroll offset instead of scrolling the terminal.
-        // Up (toward older history) → scroll_offset increases; Down → decreases.
+        // v1.13.18 P2: the panel list is newest-first (`panel_display`), and
+        // the invariant is content-follows-finger — the SAME gesture that
+        // moves the main view's content down moves the panel's rows down.
+        // Wheel-up / downward content → the viewport walks toward NEWER rows
+        // → scroll_offset decreases; wheel-down → increases (toward older).
         let over_panel = self.panel.open
             && self
                 .renderer
                 .as_ref()
                 .is_some_and(|r| x < r.sidebar_width() as f64);
         if over_panel {
-            // v1.12.27a (P1-03): the two inline `match MouseScrollDelta`
-            // arms (line count + direction) moved to scroll_input's
-            // delta_to_lines / delta_up. The tab-bar branch above keeps its
+            // v1.12.27a (P1-03) + v1.13.18 (P2): line count, direction and
+            // sign all come from scroll_input's panel_scroll_step (pure,
+            // unit-tested). The tab-bar branch above keeps its
             // horizontal-semantics match, and the PixelDelta type guard
             // further below stays — both are out of scope by plan.
-            let lines = crate::scroll_input::delta_to_lines(delta);
-            let panel_lines = if lines > 0.0 {
-                lines.ceil() as usize
-            } else {
-                lines.floor().abs() as usize
-            };
-            if panel_lines > 0 {
-                let up = crate::scroll_input::delta_up(delta);
-                if up {
-                    self.panel.scroll_offset = self.panel.scroll_offset.saturating_add(panel_lines);
-                } else {
-                    self.panel.scroll_offset = self.panel.scroll_offset.saturating_sub(panel_lines);
-                }
+            let step = crate::scroll_input::panel_scroll_step(delta);
+            if step != 0 {
+                // Floor at 0 here (newest end); the older end is bounded by
+                // the existing clamp_panel_scroll.
+                self.panel.scroll_offset =
+                    (self.panel.scroll_offset as isize + step).max(0) as usize;
                 self.clamp_panel_scroll();
                 self.clamp_panel_selection();
                 self.request_redraw();
