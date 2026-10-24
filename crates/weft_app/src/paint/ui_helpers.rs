@@ -74,6 +74,35 @@ pub fn clamp_panel_scroll(total: usize, visible: usize, offset: usize) -> usize 
     offset.min(total.saturating_sub(visible))
 }
 
+/// v1.13.18 P3: clamp the panel's list-space selection to the filtered list
+/// length (0 = newest). An empty list collapses every selection to 0. Pure
+/// so the controller and tests share one source of truth.
+pub(crate) fn clamp_panel_list_selection(selection: usize, total: usize) -> usize {
+    selection.min(total.saturating_sub(1))
+}
+
+/// v1.13.18 P3: keep-visible scroll-offset math for the panel's list-space
+/// selection. Returns the window start (`scroll_offset`) that keeps
+/// `selection` inside the visible window `[offset, offset + visible)`:
+/// the selection above the window pulls the window up to itself, a
+/// selection below the window pins the window's end to itself, and a
+/// selection already inside leaves the offset unchanged. Pure — unit-tested
+/// against the four plan boundaries; the caller clamps via
+/// [`clamp_panel_scroll`] afterwards.
+pub(crate) fn panel_keep_visible_offset(
+    selection: usize,
+    scroll_offset: usize,
+    visible: usize,
+) -> usize {
+    if selection < scroll_offset {
+        selection
+    } else if selection >= scroll_offset.saturating_add(visible) {
+        selection.saturating_add(1).saturating_sub(visible)
+    } else {
+        scroll_offset
+    }
+}
+
 /// Newest-first, query-filtered block list with `scroll_offset` blocks
 /// skipped, capped to `max` entries. Shared by the warm-up pass and
 /// `build_panel_vertices` so they render the same set.
@@ -92,13 +121,9 @@ pub(crate) fn panel_display<'a>(
         .collect()
 }
 
-/// How many block rows fit below the title (in whole grid rows).
-pub(crate) fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
-    if cell_h == 0 {
-        return 0;
-    }
-    ((viewport_h / cell_h as f32) as usize).saturating_sub(2)
-}
+// v1.13.18 P4: `visible_panel_rows`（`(vp_h/ch) − 2` 近似）已删除——面板
+// 可见行预算的唯一事实源是 `layout::panel_visible_row_budget`（从
+// PanelLayout 几何推导，含 footer 带让位），五处消费方全部改调。
 
 /// Abbreviate an absolute path for display: replace a `$HOME` prefix with `~`
 /// (e.g. `/Users/andylee/proj` → `~/proj`). Falls back to the raw path when
@@ -640,6 +665,55 @@ mod tests {
         assert_eq!(clamp_panel_scroll(3, 5, 2), 0);
         // offset = 0 → 0 (newest visible).
         assert_eq!(clamp_panel_scroll(10, 5, 0), 0);
+    }
+
+    // ── v1.13.18 (P3): list-space selection helpers ─────────────────────
+
+    #[test]
+    fn clamp_list_selection_pins_selection_to_list_length() {
+        // Within the list → unchanged.
+        assert_eq!(clamp_panel_list_selection(3, 10), 3);
+        // Past the end → the last row.
+        assert_eq!(clamp_panel_list_selection(9, 5), 4);
+        // Empty list → 0 (saturating, never 0-1).
+        assert_eq!(clamp_panel_list_selection(7, 0), 0);
+        assert_eq!(clamp_panel_list_selection(0, 0), 0);
+    }
+
+    #[test]
+    fn keep_visible_offset_pulls_window_up_when_selection_above() {
+        // Selection moved above the window → window starts at the selection.
+        assert_eq!(panel_keep_visible_offset(2, 5, 10), 2);
+        assert_eq!(panel_keep_visible_offset(0, 3, 10), 0);
+    }
+
+    #[test]
+    fn keep_visible_offset_pins_window_end_when_selection_below() {
+        // Selection moved below the window → window ends at the selection
+        // (offset = selection − visible + 1).
+        assert_eq!(panel_keep_visible_offset(15, 5, 10), 6);
+        assert_eq!(panel_keep_visible_offset(10, 0, 10), 1);
+    }
+
+    #[test]
+    fn keep_visible_offset_leaves_selection_inside_window() {
+        assert_eq!(panel_keep_visible_offset(7, 5, 10), 5);
+        // Selection exactly on the last visible row stays.
+        assert_eq!(panel_keep_visible_offset(14, 5, 10), 5);
+        // Selection exactly on the first visible row stays.
+        assert_eq!(panel_keep_visible_offset(5, 5, 10), 5);
+    }
+
+    #[test]
+    fn keep_visible_offset_tolerates_list_shorter_than_window() {
+        // List shorter than the window: a top selection keeps offset 0.
+        assert_eq!(panel_keep_visible_offset(0, 0, 10), 0);
+        assert_eq!(panel_keep_visible_offset(3, 0, 10), 0);
+        // Degenerate zero-height window: the math never underflows — an
+        // above-window selection anchors to itself, a below-window one pins
+        // just past it (the caller's clamp_panel_scroll bounds the result).
+        assert_eq!(panel_keep_visible_offset(4, 9, 0), 4);
+        assert_eq!(panel_keep_visible_offset(4, 0, 0), 5);
     }
 
     /// CI performance gate for F3 history virtualization. Kept ignored in the

@@ -269,3 +269,113 @@ pub fn layout_panel(
         footer_rect,
     }
 }
+
+/// v1.13.18 P4: bottom edge of the panel's list-row area. When the
+///「加载更早」footer band is shown (criterion at call sites: the tab has
+/// ANY finished block — `!blocks.is_empty()`, the same test
+/// `paint/panel.rs` and the panel scene builders use; NOT the query-filtered
+/// count, so paint and hit-test cannot fork) the rows must stop at the
+/// band's hairline separator: its top edge sits `0.25ch` above
+/// `footer_rect[1]`. Without a footer the rows may run to the viewport
+/// bottom. Single source for every `rows_bottom` consumer.
+pub fn panel_rows_bottom(
+    layout: &PanelLayout,
+    viewport_h: f32,
+    footer_shown: bool,
+    cell_h: f32,
+) -> f32 {
+    if footer_shown {
+        layout.footer_rect[1] - cell_h * 0.25
+    } else {
+        viewport_h
+    }
+}
+
+/// v1.13.18 P4: the ONE panel visible-row budget, derived from PanelLayout
+/// geometry — replaces `visible_panel_rows`'s `(vp_h/ch) − 2` approximation,
+/// which ignored `chrome_top` and the 1.1ch row pitch and could never
+/// reconcile with the drawn geometry. Row `i` spans
+/// `[list_top + i*row_height, +ch]`; the count is the largest `i + 1` whose
+/// bottom edge clears `rows_bottom` (from [`panel_rows_bottom`]). Pure —
+/// shared by the paint loop, the scroll clamp, the hit-test scene, the
+/// accessibility scene and the atlas warm-up.
+pub fn panel_visible_row_budget(
+    list_top: f32,
+    row_height: f32,
+    ch: f32,
+    rows_bottom: f32,
+) -> usize {
+    if row_height <= 0.0 || ch <= 0.0 {
+        return 0;
+    }
+    let room = rows_bottom - list_top - ch;
+    if room < 0.0 {
+        return 0;
+    }
+    (room / row_height).floor() as usize + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{layout_panel, panel_rows_bottom, panel_visible_row_budget};
+
+    // ── v1.13.18 (P4): panel_visible_row_budget ──────────────────────────
+
+    /// A reference PanelLayout matching the snapshot geometry (ch=18).
+    fn ref_layout(ch: f32, viewport_h: f32) -> super::PanelLayout {
+        layout_panel(36.0, 9.0, ch, 240.0, viewport_h)
+    }
+
+    #[test]
+    fn row_budget_reserves_footer_band_when_shown() {
+        let ch = 18.0;
+        let layout = ref_layout(ch, 600.0);
+        let bottom = panel_rows_bottom(&layout, 600.0, true, ch);
+        let with_footer = panel_visible_row_budget(layout.list_top, layout.row_height, ch, bottom);
+        let free = panel_visible_row_budget(layout.list_top, layout.row_height, ch, 600.0);
+        // The footer band (1.6ch + 0.5ch margin + 0.25ch separator inset)
+        // must cost rows — a footer-bearing budget is strictly smaller.
+        assert!(
+            with_footer < free,
+            "footer {with_footer} must free rows from {free}"
+        );
+        // And rows must clear the footer band's top edge: the last row's
+        // bottom edge stays at or above (smaller y than) footer_rect[1].
+        let last_bottom = layout.list_top + (with_footer - 1) as f32 * layout.row_height + ch;
+        assert!(last_bottom <= bottom + 0.01);
+        assert!(last_bottom + layout.row_height > bottom);
+    }
+
+    #[test]
+    fn row_budget_runs_to_viewport_without_footer() {
+        let ch = 18.0;
+        let layout = ref_layout(ch, 600.0);
+        let budget = panel_visible_row_budget(layout.list_top, layout.row_height, ch, 600.0);
+        // First row fits (list_top + ch ≤ 600), the next one does not.
+        assert!(layout.list_top + (budget - 1) as f32 * layout.row_height + ch <= 600.0);
+        assert!(layout.list_top + budget as f32 * layout.row_height + ch > 600.0);
+    }
+
+    #[test]
+    fn row_budget_is_zero_for_an_extremely_short_viewport() {
+        let ch = 18.0;
+        let layout = ref_layout(ch, 200.0);
+        // rows_bottom below the first row's bottom edge → 0 rows.
+        let budget = panel_visible_row_budget(layout.list_top, layout.row_height, ch, 100.0);
+        assert_eq!(budget, 0);
+        // Degenerate geometry (zero pitch / zero cell) never panics.
+        assert_eq!(panel_visible_row_budget(10.0, 0.0, 18.0, 600.0), 0);
+        assert_eq!(panel_visible_row_budget(10.0, 11.0, 0.0, 600.0), 0);
+    }
+
+    #[test]
+    fn rows_bottom_tracks_the_separator_edge_only_when_shown() {
+        let ch = 18.0;
+        let layout = ref_layout(ch, 600.0);
+        // Shown: the hairline separator's top edge above the footer band.
+        let shown = panel_rows_bottom(&layout, 600.0, true, ch);
+        assert!((shown - (layout.footer_rect[1] - ch * 0.25)).abs() < 0.001);
+        // Hidden: the plain viewport bottom.
+        assert_eq!(panel_rows_bottom(&layout, 600.0, false, ch), 600.0);
+    }
+}

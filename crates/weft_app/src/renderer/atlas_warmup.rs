@@ -20,7 +20,7 @@ use crate::paint::preedit::TuiPreeditDrawParams;
 use crate::paint::prompt::PromptDrawParams;
 use crate::paint::tab_bar::TabBarDrawState;
 use crate::paint::ui_helpers::{
-    block_duration_str, live_context_label, live_elapsed_label, panel_display, visible_panel_rows,
+    block_duration_str, live_context_label, live_elapsed_label, panel_display,
 };
 use crate::renderer::MetalRenderer;
 use unicode_segmentation::UnicodeSegmentation;
@@ -275,7 +275,22 @@ impl MetalRenderer {
         if let Some(p) = panel {
             missing.extend("Search:".chars());
             missing.extend(p.query.chars());
-            let max_blocks = visible_panel_rows(viewport_h, atlas.cell_height);
+            // v1.13.18 P4: the warm-up row estimate reads the shared budget
+            // function. This associated fn has no renderer state, so
+            // chrome_top reads 0.0 — the WIDEST (superset) window, exactly
+            // what a warm-up wants. Warm-up estimate only, NOT the viewport
+            // fact source: paint / scroll clamp / hit-test / a11y read the
+            // budget from the real geometry.
+            let ch = atlas.cell_height as f32;
+            let layout = crate::layout::layout_panel(0.0, 0.0, ch, 0.0, viewport_h);
+            let rows_bottom =
+                crate::layout::panel_rows_bottom(&layout, viewport_h, !p.blocks.is_empty(), ch);
+            let max_blocks = crate::layout::panel_visible_row_budget(
+                layout.list_top,
+                layout.row_height,
+                ch,
+                rows_bottom,
+            );
             for b in panel_display(p.blocks, p.query, p.scroll_offset, max_blocks) {
                 missing.extend(b.command.chars());
                 missing.extend(block_duration_str(b).chars());

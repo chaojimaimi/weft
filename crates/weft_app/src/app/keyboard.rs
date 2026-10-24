@@ -331,19 +331,28 @@ impl crate::App {
                 true
             }
             KeyCode::Up => {
+                // v1.13.18 P3: selection is list-space (0 = newest); Up walks
+                // toward older and the window must follow (keep-visible).
                 self.panel.selection = self.panel.selection.saturating_sub(1);
                 self.clamp_panel_selection();
+                self.keep_panel_selection_visible();
                 self.request_redraw();
                 true
             }
             KeyCode::Down => {
                 self.panel.selection = self.panel.selection.saturating_add(1);
                 self.clamp_panel_selection();
+                self.keep_panel_selection_visible();
                 self.request_redraw();
                 true
             }
             KeyCode::Backspace => {
                 self.panel.query.pop();
+                // v1.13.18 P3 (评审 P2c): a query change re-anchors the list —
+                // reset selection AND window to the newest row, otherwise the
+                // freshly-selected top row can sit above the window.
+                self.panel.selection = 0;
+                self.panel.scroll_offset = 0;
                 self.clamp_panel_scroll();
                 self.clamp_panel_selection();
                 self.request_redraw();
@@ -357,6 +366,10 @@ impl crate::App {
             }
             KeyCode::Char(c) if !c.is_control() => {
                 self.panel.query.push(c);
+                // v1.13.18 P3 (评审 P2c): same re-anchor as Backspace — the
+                // filtered list restarts at its newest row.
+                self.panel.selection = 0;
+                self.panel.scroll_offset = 0;
                 self.clamp_panel_scroll();
                 self.clamp_panel_selection();
                 self.request_redraw();

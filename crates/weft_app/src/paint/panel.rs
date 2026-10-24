@@ -3,7 +3,6 @@
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::ui_helpers::{
     block_duration_str, panel_display, panel_filtered_count, strip_prompt_prefix, truncate_str,
-    visible_panel_rows,
 };
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::continuation::{classify_exit, ExitClass};
@@ -18,7 +17,10 @@ pub struct PanelDrawParams<'a> {
     pub width_px: f32,
     /// Live search filter (matches command or output, case-insensitive).
     pub query: &'a str,
-    /// Index of the selected row within the newest-first filtered list.
+    /// v1.13.18 P3: LIST-space index of the selected row within the
+    /// newest-first filtered list (0 = newest; the paint loop maps it to
+    /// viewport row `scroll_offset + i`). Only `hovered_row` below is
+    /// viewport-space (mouse geometry).
     pub selection: usize,
     /// v1.13.17 S2: mouse-hovered row (topmost visible = 0, the same space
     /// the paint loop's `i` iterates). Drawn only when it isn't the selected
@@ -278,7 +280,18 @@ impl MetalRenderer {
 
         // Display list: newest-first, filtered by query, virtualized via
         // scroll_offset (skip + take).
-        let max_rows = visible_panel_rows(vp_h, self.cell_height());
+        // v1.13.18 P4: the row budget AND the loop's bottom edge both come
+        // from the shared PanelLayout geometry — when the「加载更早」footer
+        // band is shown (tab has any block), rows end at its separator's
+        // top edge instead of overrunning the button.
+        let footer_shown = !p.blocks.is_empty();
+        let rows_bottom = crate::layout::panel_rows_bottom(&panel_layout, vp_h, footer_shown, ch);
+        let max_rows = crate::layout::panel_visible_row_budget(
+            panel_layout.list_top,
+            panel_layout.row_height,
+            ch,
+            rows_bottom,
+        );
         let total_filtered = panel_filtered_count(p.blocks, p.query);
         let max_scroll = total_filtered.saturating_sub(max_rows);
         // Batch 5 Step 2: cache metrics for active_panel_scrollbar_layout
@@ -293,10 +306,16 @@ impl MetalRenderer {
         let mut drawn = 0usize;
 
         for (i, block) in display.iter().enumerate() {
-            if drawn >= max_rows || y + ch > vp_h {
+            // v1.13.18 P4: rows stop at the footer band's separator (see
+            // rows_bottom above) instead of the raw viewport bottom.
+            if drawn >= max_rows || y + ch > rows_bottom {
                 break;
             }
-            let selected = i == p.selection;
+            // v1.13.18 P3: list-space selection — the visible row `i` IS the
+            // selected one iff its list index (`scroll_offset + i`) matches.
+            // Uses the CLAMPED local `scroll_offset` above, not the raw
+            // `p.scroll_offset` (a stale offset would highlight the wrong row).
+            let selected = scroll_offset + i == p.selection;
             // v1.13.17 S2: hover feedback (same token as the command-surface
             // rows: 4% lift toward white). Selection wins when both hit the
             // same row (CommandSurfaceRowState branch order).
@@ -359,7 +378,7 @@ impl MetalRenderer {
             if Some(block.id) == p.expanded_id {
                 let out_cols = panel_cols.saturating_sub(2).max(1);
                 for line in block.output.lines().take(8) {
-                    if drawn >= max_rows || y + ch > vp_h {
+                    if drawn >= max_rows || y + ch > rows_bottom {
                         break;
                     }
                     let rendered = truncate_str(line, out_cols);
@@ -435,8 +454,9 @@ impl MetalRenderer {
         // history out of SQLite when retention has evicted older blocks.
         // Hidden entirely when the tab has no blocks (PLAN_v1112 §8: the
         // button must not render for an empty list). Shares footer_rect with
-        // the scene builder so paint and hit-testing cannot drift.
-        if !p.blocks.is_empty() {
+        // the scene builder so paint and hit-testing cannot drift, and the
+        // footer_shown criterion with the row budget above (v1.13.18 P4).
+        if footer_shown {
             let [fx0, fy0, fx1, fy1] = panel_layout.footer_rect;
             // Hairline separator above the footer so it reads as a distinct
             // action zone, not a stray row.

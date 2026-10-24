@@ -202,24 +202,32 @@ impl App {
         }
         let renderer = self.renderer.as_ref()?;
         let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
+        let ch = renderer.cell_height() as f32;
         let layout = crate::layout::layout_panel(
             chrome_top,
             renderer.cell_width() as f32,
-            renderer.cell_height() as f32,
+            ch,
             renderer.sidebar_width(),
             renderer.viewport().1,
         );
-        let max_rows = crate::paint::ui_helpers::visible_panel_rows(
+        // v1.13.18 P4: the hit-test row range reads the ONE row budget from
+        // the PanelLayout geometry (same number as paint / scroll clamp /
+        // a11y — no second approximation).
+        let rows_bottom = crate::layout::panel_rows_bottom(
+            &layout,
             renderer.viewport().1,
-            renderer.cell_height(),
+            self.panel_footer_visible(),
+            ch,
         );
-        // v1.11.2 X4: the footer button exists only when this tab has blocks.
-        let footer = self
-            .sessions
-            .active()
-            .and_then(|tab| tab.with_terminal(|t| !t.block_tracker().blocks().is_empty()))
-            .unwrap_or(false)
-            .then_some(layout.footer_rect);
+        let max_rows = crate::layout::panel_visible_row_budget(
+            layout.list_top,
+            layout.row_height,
+            ch,
+            rows_bottom,
+        );
+        // v1.11.2 X4: the footer button exists only when this tab has blocks
+        // (panel_footer_visible — the shared `!blocks.is_empty()` criterion).
+        let footer = self.panel_footer_visible().then_some(layout.footer_rect);
         let scene = crate::panel_component::build_panel_scene(
             layout.panel_rect,
             layout.search_field_rect,

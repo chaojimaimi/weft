@@ -130,7 +130,7 @@ use macos_system::{
 use macos_window::configure_titlebar;
 use paint::overlays::FindDrawState;
 use paint::tab_bar::TabBarDrawState;
-use paint::ui_helpers::{block_matches_query, panel_filtered_count, visible_panel_rows};
+use paint::ui_helpers::{block_matches_query, panel_filtered_count};
 use palette_state::{
     BuiltinCmd, CreateStep, PaletteEntry, PaletteState, PaletteSubMode, WorkflowForm,
 };

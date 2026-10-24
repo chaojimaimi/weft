@@ -208,8 +208,8 @@ mod terminal;
 // result type is currently only named inside its owning submodule.
 #[allow(unused_imports)]
 pub use chrome::{
-    layout_panel, layout_tab_strip, layout_tab_tooltip, tab_strip_right_edge, PanelLayout,
-    TabStripInput, TabStripLayout,
+    layout_panel, layout_tab_strip, layout_tab_tooltip, panel_rows_bottom,
+    panel_visible_row_budget, tab_strip_right_edge, PanelLayout, TabStripInput, TabStripLayout,
 };
 #[allow(unused_imports)]
 pub use drag::{insertion_index_for_x, is_noop, render_slot};

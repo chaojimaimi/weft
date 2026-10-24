@@ -88,9 +88,33 @@ impl App {
     /// F3-4: Maximum number of block rows that fit in the panel's visible list
     /// area, based on the renderer's actual viewport and cell height. Falls
     /// back to the grid row count when the renderer isn't available yet.
+    /// v1.13.18 P4: derived from the shared PanelLayout geometry
+    /// (`layout::panel_visible_row_budget`) instead of the removed
+    /// `(vp_h/ch) − 2` approximation, so paint, scroll clamp, hit-test and
+    /// accessibility all read ONE number.
     fn panel_max_visible(&self) -> usize {
         if let Some(r) = self.renderer.as_ref() {
-            return visible_panel_rows(r.viewport.1, r.cell_height());
+            let chrome_top = r.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
+            let ch = r.cell_height() as f32;
+            let layout = crate::layout::layout_panel(
+                chrome_top,
+                r.cell_width() as f32,
+                ch,
+                r.sidebar_width(),
+                r.viewport().1,
+            );
+            let rows_bottom = crate::layout::panel_rows_bottom(
+                &layout,
+                r.viewport().1,
+                self.panel_footer_visible(),
+                ch,
+            );
+            return crate::layout::panel_visible_row_budget(
+                layout.list_top,
+                layout.row_height,
+                ch,
+                rows_bottom,
+            );
         }
         self.sessions
             .active()
@@ -121,45 +145,52 @@ impl App {
             crate::paint::ui_helpers::clamp_panel_scroll(total, visible, self.panel.scroll_offset);
     }
 
-    /// Count of blocks visible in the current panel window (after
-    /// `scroll_offset` skip, newest-first, query-filtered).
-    pub(super) fn panel_visible_count(&self) -> usize {
-        let Some(terminal) = self.sessions.active().and_then(|tab| tab.lock_terminal()) else {
-            return 0;
-        };
-        let blocks = terminal.block_tracker().blocks();
-        let visible = self.panel_max_visible();
-        blocks
-            .iter()
-            .rev()
-            .filter(|b| block_matches_query(b, &self.panel.query))
-            .skip(self.panel.scroll_offset)
-            .take(visible)
-            .count()
+    /// v1.13.18 P4: the「加载更早」footer band shows iff the tab has ANY
+    /// finished block — the same criterion `paint/panel.rs` and the panel
+    /// scene builders already use. Query filtering is deliberately NOT
+    /// applied (a `panel_total_filtered()`-based criterion would fork the
+    /// paint vs hit-test footer visibility).
+    pub(super) fn panel_footer_visible(&self) -> bool {
+        self.sessions
+            .active()
+            .and_then(|tab| tab.with_terminal(|t| !t.block_tracker().blocks().is_empty()))
+            .unwrap_or(false)
     }
 
-    /// Keep the selection inside the filtered, visible list.
+    /// Keep the selection inside the filtered list. v1.13.18 P3:
+    /// `panel.selection` is LIST-space (0 = newest), so the bound is the
+    /// filtered total — no longer the per-window visible count.
     pub(super) fn clamp_panel_selection(&mut self) {
-        let max = self.panel_visible_count();
-        if max == 0 {
-            self.panel.selection = 0;
-        } else {
-            self.panel.selection = self.panel.selection.min(max - 1);
-        }
+        let total = self.panel_total_filtered();
+        self.panel.selection =
+            crate::paint::ui_helpers::clamp_panel_list_selection(self.panel.selection, total);
+    }
+
+    /// v1.13.18 P3: after a list-space selection move, slide the viewport
+    /// window so the selection stays visible (keep-visible), then clamp the
+    /// offset. Pure math lives in `ui_helpers::panel_keep_visible_offset`.
+    pub(super) fn keep_panel_selection_visible(&mut self) {
+        let visible = self.panel_max_visible();
+        self.panel.scroll_offset = crate::paint::ui_helpers::panel_keep_visible_offset(
+            self.panel.selection,
+            self.panel.scroll_offset,
+            visible,
+        );
+        self.clamp_panel_scroll();
     }
 
     /// The [`BlockId`] of the currently selected panel row, if any.
+    /// v1.13.18 P3: list-space `nth(selection)` over the newest-first
+    /// filtered list — no `scroll_offset` window, so the selection follows
+    /// one command while the list scrolls.
     pub(super) fn panel_selected_block_id(&self) -> Option<BlockId> {
         let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
-        let visible = self.panel_max_visible();
         terminal
             .block_tracker()
             .blocks()
             .iter()
             .rev()
             .filter(|b| block_matches_query(b, &self.panel.query))
-            .skip(self.panel.scroll_offset)
-            .take(visible)
             .nth(self.panel.selection)
             .map(|b| b.id)
     }

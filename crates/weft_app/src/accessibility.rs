@@ -477,16 +477,26 @@ impl App {
         }
 
         if self.panel.open {
+            let ch = renderer.cell_height() as f32;
             let layout = crate::layout::layout_panel(
                 ctx.chrome_top,
                 renderer.cell_width() as f32,
-                renderer.cell_height() as f32,
+                ch,
                 renderer.sidebar_width(),
                 renderer.viewport().1,
             );
-            let max_rows = crate::paint::ui_helpers::visible_panel_rows(
-                renderer.viewport().1,
-                renderer.cell_height(),
+            // v1.13.18 P4: the scene's row set reads the ONE row budget from
+            // the PanelLayout geometry (same number as paint / scroll clamp /
+            // hit-test — no second approximation). The footer criterion must
+            // be known first because the band bounds the rows.
+            let has_blocks = self.panel_footer_visible();
+            let rows_bottom =
+                crate::layout::panel_rows_bottom(&layout, renderer.viewport().1, has_blocks, ch);
+            let max_rows = crate::layout::panel_visible_row_budget(
+                layout.list_top,
+                layout.row_height,
+                ch,
+                rows_bottom,
             );
             // T10 P1: panel_display lends &Block from the terminal, so the
             // rows are down-owned to (id, command) inside the guard scope.
@@ -507,12 +517,8 @@ impl App {
                     })
                 })
                 .unwrap_or_default();
-            // v1.11.2 X4: footer button only when the tab actually has blocks.
-            let has_blocks = self
-                .sessions
-                .active()
-                .and_then(|tab| tab.with_terminal(|t| !t.block_tracker().blocks().is_empty()))
-                .unwrap_or(false);
+            // v1.11.2 X4: footer button only when the tab actually has blocks
+            // (has_blocks = panel_footer_visible above).
             let mut scene = crate::panel_component::build_panel_scene(
                 layout.panel_rect,
                 layout.search_field_rect,
@@ -527,7 +533,18 @@ impl App {
             for (node, block) in scene.semantics.iter_mut().skip(1).zip(&display) {
                 node.label = crate::paint::ui_helpers::strip_prompt_prefix(&block.1);
             }
-            if let Some(selected) = scene.semantics.get_mut(self.panel.selection + 1) {
+            // v1.13.18 P3: the selection is list-space; the scene rows are
+            // viewport-space (semantics[0] = search, [1..] = visible rows).
+            // `checked_sub` skips the marker when the selection is scrolled
+            // out ABOVE the window (a bare subtraction would panic on
+            // usize underflow); `get_mut`'s None covers below-the-window /
+            // past-the-row-count.
+            if let Some(selected) = self
+                .panel
+                .selection
+                .checked_sub(self.panel.scroll_offset)
+                .and_then(|row| scene.semantics.get_mut(row + 1))
+            {
                 selected.state = "selected".into();
             }
             if let Some(search) = scene.semantics.first() {

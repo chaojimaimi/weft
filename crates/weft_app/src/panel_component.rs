@@ -22,9 +22,10 @@ pub(crate) enum PanelTarget {
 }
 
 /// Build the panel Scene from a shared layout product. Row hit regions are
-/// only generated for visible rows (`row_count` is already capped by
-/// `visible_panel_rows`). `footer_rect` is `Some` only when the active tab
-/// has at least one block — no blocks means no button (PLAN_v1112 §8).
+/// only generated for visible rows (`row_count` is already capped by the
+/// shared `layout::panel_visible_row_budget`). `footer_rect` is `Some` only
+/// when the active tab has at least one block — no blocks means no button
+/// (PLAN_v1112 §8).
 pub(crate) fn build_panel_scene(
     panel_rect: Rect,
     search_field_rect: Rect,

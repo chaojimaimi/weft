@@ -103,7 +103,10 @@ impl App {
                         })
                         .unwrap_or(false);
                     self.panel.last_click = Some((now, clicked));
-                    self.panel.selection = clicked;
+                    // v1.13.18 P3: `clicked` is a viewport row; the selection
+                    // is list-space, so it maps to scroll_offset + clicked
+                    // (then clamps to the filtered list length).
+                    self.panel.selection = self.panel.scroll_offset + clicked;
                     self.clamp_panel_selection();
                     self.scroll_to_panel_selection();
                     if is_double {

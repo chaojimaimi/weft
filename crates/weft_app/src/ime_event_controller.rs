@@ -236,6 +236,11 @@ impl App {
                             // contract as the find bar.
                             self.panel.ime_preedit.clear();
                             self.panel.ime_preedit_cursor = None;
+                            // v1.13.18 P3 (评审 P2c): a query commit re-anchors
+                            // the list — selection AND window back to the
+                            // newest row (same contract as the keyboard path).
+                            self.panel.selection = 0;
+                            self.panel.scroll_offset = 0;
                             self.clamp_panel_scroll();
                             self.clamp_panel_selection();
                             self.request_redraw();
