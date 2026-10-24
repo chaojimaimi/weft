@@ -341,7 +341,7 @@ pub struct PaletteDrawParams<'a> {
     /// Variable-fill form (Some = form mode, None = search mode).
     pub form: Option<&'a PaletteFormView<'a>>,
     /// Sub-mode banner text (e.g. "New workflow — name:", "Edit deploy:",
-    /// "Delete 'sync'? (y/n)"). Empty string = normal search mode.
+    /// "Delete 'sync'? (Enter/Esc)"). Empty string = normal search mode.
     pub banner: &'a str,
     /// Input buffer content for sub-modes (create/edit).
     pub submode_input: &'a str,

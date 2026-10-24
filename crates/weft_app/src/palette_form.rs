@@ -42,7 +42,9 @@ pub(crate) fn workflow_save_failure_message(err: &WorkflowStoreError) -> &'stati
 impl App {
     // ── Settings panel (v1.0 S1, Cmd+,) ────────────────────────────────
 
-    /// Handle a single-key palette action (create/edit/delete/export).
+    /// Handle a manage-verb palette action (create/edit/delete/export/ai),
+    /// dispatched by the Option+chord layer (v1.13.18 P1) or AI/creation
+    /// flows. Store verbs re-check the selected entry's type below.
     pub(super) fn handle_palette_action(&mut self, action: &str) -> bool {
         match action {
             "create" => {

@@ -284,7 +284,10 @@ impl App {
                             (format!("Edit '{name}':"), buffer.clone())
                         }
                         PaletteSubMode::ConfirmDelete { name, .. } => {
-                            (format!("Delete '{name}'? (y/n)"), String::new())
+                            // v1.13.18 P1: the confirm banner now matches the
+                            // actual keys (`handle_palette_delete_key` handles
+                            // Enter = confirm, Esc = cancel; y/n were no-ops).
+                            (format!("Delete '{name}'? (Enter/Esc)"), String::new())
                         }
                         PaletteSubMode::SelectTheme { buffer, .. } => {
                             ("Select theme:".to_string(), buffer.clone())
