@@ -337,6 +337,7 @@
     }
   },
   "command_surface": {
+    "ambient_alpha": 0.06,
     "background": [
       0.172,
       0.154,
@@ -347,17 +348,19 @@
       0.5,
       0.5,
       0.5,
-      0.20000000298023224
+      1.0
     ],
+    "border_alpha": 0.2,
+    "key_alpha": 0.14,
     "popup": [
       180.0,
       120.0,
       620.0,
       420.0
     ],
+    "radius": 10.0,
     "resize_handles": true,
-    "shadow_pad": 6.0,
-    "vertex_floats": 720
+    "vertex_floats": 5184
   },
   "geometry": [
     {
