@@ -120,6 +120,46 @@ fn fork_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "fork worker panicked".to_string())
 }
 
+/// v1.14.3 (T3, PLAN_v1143 §2): the grid text written into a
+/// resource-exhausted diagnostic pane (`Terminal::process`, \r\n line
+/// discipline — plain text, no OSC). The pane stays open; the user closes
+/// idle tabs or reboots, then Cmd+T retries.
+const RESOURCE_EXHAUSTED_DIAGNOSTIC: &str =
+    "系统终端资源(PTY)已耗尽，无法启动 shell。请关闭空闲的终端标签页或重启系统后，再用 Cmd+T 新建。";
+
+/// The diagnostic bytes as fed to `Terminal::process` — a leading blank line
+/// plus a trailing newline so the message renders as its own paragraph on
+/// the placeholder's empty grid.
+pub(crate) fn resource_exhausted_diagnostic_bytes() -> Vec<u8> {
+    format!("\r\n{RESOURCE_EXHAUSTED_DIAGNOSTIC}\r\n").into_bytes()
+}
+
+/// v1.14.3 (T3): failure classification, fork arm — a `forkpty` errno from
+/// the kernel PTY/process pool means the system is out of terminal
+/// resources (the user machine's PTY pool exhaustion manifests as ENXIO).
+/// No string re-parsing: the errno is still typed (`PtyError::Fork(Errno)`)
+/// at this point. Pure — truth-table tested.
+pub(crate) fn fork_error_is_resource_exhausted(error: &weft_core::pty::PtyError) -> bool {
+    use weft_core::pty::PtyError;
+    matches!(
+        error,
+        PtyError::Fork(
+            nix::errno::Errno::ENXIO
+                | nix::errno::Errno::EMFILE
+                | nix::errno::Errno::ENFILE
+                | nix::errno::Errno::EAGAIN
+        )
+    )
+}
+
+/// v1.14.3 (T3): failure classification, worker-thread arm — thread creation
+/// failing with EAGAIN (mapped to `ErrorKind::WouldBlock`) is the same
+/// resource-exhaustion signal; every other io::Error is not. Pure.
+pub(crate) fn worker_spawn_error_is_resource_exhausted(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == Some(nix::libc::EAGAIN)
+}
+
 /// Hand a spawn request to a `weft-fork-<id>` worker thread. Fire-and-forget:
 /// the outcome comes back through the event loop as `SpawnCompleted` /
 /// `SpawnFailed`. A worker-spawn failure (resource exhaustion) is reported
@@ -171,9 +211,14 @@ pub(crate) fn dispatch_spawn_request(request: SpawnRequest, proxy: &EventLoopPro
                     }
                     Err(error) => {
                         tracing::error!(pane_session_id, %error, "async PTY fork failed");
+                        // v1.14.3 (T3): classify while the errno is still
+                        // typed — ENXIO/EMFILE/ENFILE/EAGAIN → the resource
+                        // branch keeps a diagnostic tab instead of closing.
+                        let resource_exhausted = fork_error_is_resource_exhausted(&error);
                         let _ = worker_proxy.send_event(AppEvent::SpawnFailed {
                             pane_session_id,
                             error: error.to_string(),
+                            resource_exhausted,
                         });
                     }
                 }
@@ -181,17 +226,23 @@ pub(crate) fn dispatch_spawn_request(request: SpawnRequest, proxy: &EventLoopPro
             if let Err(payload) = worker_outcome {
                 let error = fork_panic_message(payload);
                 tracing::error!(pane_session_id, %error, "fork worker panicked");
+                // v1.14.3 (T3): a panic is NOT a resource signal — false.
                 let _ = worker_proxy.send_event(AppEvent::SpawnFailed {
                     pane_session_id,
                     error,
+                    resource_exhausted: false,
                 });
             }
         });
     if let Err(error) = spawned {
         tracing::error!(pane_session_id, %error, "failed to spawn fork worker thread");
+        // v1.14.3 (T3): EAGAIN-class thread-creation failure = resource
+        // exhaustion; anything else = not.
+        let resource_exhausted = worker_spawn_error_is_resource_exhausted(&error);
         let _ = proxy.send_event(AppEvent::SpawnFailed {
             pane_session_id,
             error: error.to_string(),
+            resource_exhausted,
         });
     }
 }
@@ -238,6 +289,25 @@ pub(crate) fn spawn_failure_tab_close(
     let (tab_idx, _) = find_pane_location(sessions.tabs(), pane_session_id)?;
     let was_last = sessions.remove_dead(tab_idx);
     Some((tab_idx, was_last))
+}
+
+/// v1.14.3 (T3) resource-exhaustion keep-kernel: locate the failed
+/// placeholder's pane, clear its `pending_spawn` (防后续误 adopt — the fork
+/// will never complete, and `can_adopt_spawn` must never accept this pane
+/// again), and hand back the owning tab index + pane id + the diagnostic
+/// text. The tab STAYS — including the last-tab case (应用不退出; the old
+/// `close_tab_effects` → Exit tail is gone for this branch). Pure over
+/// SessionManager so the keep wiring is testable without an event loop / App;
+/// the caller does `pane_mut → lock_terminal → Terminal::process` +
+/// `request_redraw`.
+pub(crate) fn spawn_failure_resource_keep(
+    sessions: &mut crate::app_state::SessionManager,
+    pane_session_id: u64,
+) -> Option<(usize, weft_core::pane_layout::PaneId, &'static str)> {
+    let (tab_idx, pane_id) = find_pane_location(sessions.tabs(), pane_session_id)?;
+    let pane = sessions.tab_mut(tab_idx)?.pane_mut(pane_id)?;
+    pane.pending_spawn = None;
+    Some((tab_idx, pane_id, RESOURCE_EXHAUSTED_DIAGNOSTIC))
 }
 
 impl Pane {
@@ -400,7 +470,51 @@ impl App {
     /// placeholder would sit in the strip as a "Tab N" ghost. Mirrors
     /// `close_tab`'s synchronous tail (tween snap, scroll, find refresh,
     /// close effects — including Exit when it was the last tab).
-    pub(crate) fn handle_spawn_failed(&mut self, pane_session_id: u64, error: &str) {
+    ///
+    /// v1.14.3 (T3, PLAN_v1143 §2) `resource_exhausted` branch — BEHAVIOR
+    /// CHANGE: KEEP the placeholder as a diagnostic tab. `Terminal::process`
+    /// writes the diagnostic text into its grid (the placeholder has no parse
+    /// worker, so the main-thread lock is uncontended; the grid view renders
+    /// it because a placeholder's `bootstrap_ready=false` keeps
+    /// `show_block_view()` false), then `request_redraw` (SpawnFailed arrives
+    /// through the event loop — without a wake the text would wait for the
+    /// next frame), the pending spawn is cleared (防误 adopt), and the last
+    /// tab does NOT exit the app. Snapshot persistence excludes the
+    /// diagnostic tab per-pane (`Tab::is_persist_excluded`).
+    pub(crate) fn handle_spawn_failed(
+        &mut self,
+        pane_session_id: u64,
+        error: &str,
+        resource_exhausted: bool,
+    ) {
+        if resource_exhausted {
+            let Some((tab_idx, pane_id, diagnostic)) =
+                spawn_failure_resource_keep(&mut self.sessions, pane_session_id)
+            else {
+                tracing::debug!(
+                    pane_session_id,
+                    "resource-exhausted spawn failed for a gone pane; nothing to diagnose"
+                );
+                return;
+            };
+            tracing::warn!(
+                pane_session_id,
+                tab = tab_idx,
+                error,
+                diagnostic,
+                "PTY pool exhausted; keeping the diagnostic tab (应用继续运行)"
+            );
+            let pane = self
+                .sessions
+                .tab_mut(tab_idx)
+                .and_then(|tab| tab.pane_mut(pane_id))
+                .expect("keep-kernel located this pane");
+            if let Some(mut terminal) = pane.lock_terminal() {
+                terminal.process(&resource_exhausted_diagnostic_bytes());
+            }
+            self.request_redraw();
+            return;
+        }
         let Some((tab_idx, was_last)) =
             spawn_failure_tab_close(&mut self.sessions, pane_session_id)
         else {
@@ -433,6 +547,13 @@ impl App {
         self.drain_effects(crate::effect::close_tab_effects(tab_idx, new_active, false));
     }
 }
+
+// v1.14.3 (T3): classification / resource-keep / capture-timing tests live in
+// the gate-exempt sibling module (repo test-module convention,
+// block_component/tests.rs precedent) — this file stays within its budget.
+#[cfg(test)]
+#[path = "pane_spawn/tests.rs"]
+mod resource_tests;
 
 #[cfg(test)]
 mod tests {

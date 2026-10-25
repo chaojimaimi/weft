@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
+use nix::unistd::Pid;
 use parking_lot::{ArcMutexGuard, FairMutex, RawFairMutex};
 use weft_core::input::{new_flag, InputHandler, MouseSuppressFlag};
 use weft_core::persistence::TabSnapshot;
@@ -198,6 +199,13 @@ pub struct Pane {
     /// Capped at 64 KiB (`buffer_pending_stdin`); flushed to the writer at
     /// adoption so the first keystrokes before the fork lands are not lost.
     pub(crate) pending_stdin: Vec<u8>,
+    /// v1.14.3 (T3): the forked shell's pid, captured at
+    /// `begin_close_teardown` BEFORE `release_pty` (whose Drop SIGHUPs); the
+    /// pump watchdog reads it for the +500ms SIGKILL upgrade.
+    pub(crate) child_pid: Option<Pid>,
+    /// v1.14.3 (T2): Pane 级对账判重 memo (`app::reconcile_scroll`); dies
+    /// with the pane.
+    pub(crate) reconcile_memo: crate::app::reconcile_scroll::ReconcileMemo,
 }
 
 impl Pane {
@@ -294,6 +302,8 @@ impl Pane {
             alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
             pending_spawn: None,
             pending_stdin: Vec::new(),
+            child_pid: None,
+            reconcile_memo: None,
         }
     }
 
@@ -337,6 +347,8 @@ impl Pane {
             alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
             pending_spawn: None,
             pending_stdin: Vec::new(),
+            child_pid: None,
+            reconcile_memo: None,
         }
     }
 
@@ -382,6 +394,8 @@ impl Pane {
             alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
             pending_spawn: None,
             pending_stdin: Vec::new(),
+            child_pid: None,
+            reconcile_memo: None,
         }
     }
 
@@ -555,6 +569,10 @@ impl Pane {
     /// initiators (`Tab::begin_close`, `Tab::close_active_pane`).
     pub(crate) fn begin_close_teardown(&mut self) {
         self.close_deadline = Some(std::time::Instant::now() + Self::CLOSE_WATCHDOG_DELAY);
+        // v1.14.3 (T3): capture BEFORE release_pty (its Drop SIGHUPs); the
+        // pump watchdog upgrades the HUP to a SIGKILL on this pid past the
+        // deadline (the HUP only reaches the foreground process GROUP).
+        self.child_pid = self.pty.as_ref().map(|pty| pty.child_pid());
         self.release_pty();
     }
 

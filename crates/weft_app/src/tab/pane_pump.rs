@@ -26,7 +26,30 @@ use std::collections::HashMap;
 
 use super::Tab;
 use crate::AppMsg;
+use nix::unistd::Pid;
 use weft_core::pane_layout::PaneId;
+
+/// v1.14.3 (T3): watchdog SIGKILL upgrade — take the child pid captured at
+/// `begin_close_teardown` (BEFORE `release_pty`, so it survives the Pty
+/// Drop) and SIGKILL it. Returns the pid actually targeted so tests can
+/// record the kill without forking a real PTY (plan: 假 pid 记录验证);
+/// `None` = nothing to kill (never captured, or already taken).
+pub(crate) fn sigkill_captured_child(pane: &mut crate::pane::Pane) -> Option<Pid> {
+    sigkill_captured_child_with(pane, |pid| {
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    })
+}
+
+/// The kill-sink seam of [`sigkill_captured_child`] — production sinks the
+/// syscall, tests sink a recording closure.
+pub(crate) fn sigkill_captured_child_with(
+    pane: &mut crate::pane::Pane,
+    mut kill: impl FnMut(Pid),
+) -> Option<Pid> {
+    let pid = pane.child_pid.take()?;
+    kill(pid);
+    Some(pid)
+}
 
 impl Tab {
     /// Process worker control events into the panes and drain finished
@@ -178,6 +201,15 @@ impl Tab {
                             .is_some_and(|deadline| std::time::Instant::now() >= deadline)
                 });
                 if watchdog_due {
+                    // v1.14.3 (T3): HUP + 500ms 仍存活 → SIGKILL 补杀 shell
+                    // 本体. `kill(pid, sig)` only reaches the SINGLE process —
+                    // the process group's HUP was delivered by the kernel at
+                    // master close; the upgrade's win is a shell body that
+                    // ignores fd close (nohup/setsid). take() fires at most
+                    // once per pane.
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        sigkill_captured_child(pane);
+                    }
                     if !self.finalize_dead_pane(
                         pane_id,
                         "close watchdog: PtyExited timed out after PTY teardown; finalizing pane",
@@ -549,6 +581,39 @@ mod tests {
             drained.is_empty(),
             "no double settlement: nothing left to drain"
         );
+    }
+
+    /// v1.14.3 (T3): watchdog SIGKILL upgrade — the recorded-kill seam. The
+    /// captured pid is delivered to the sink EXACTLY once; a pane without a
+    /// captured pid (PTY-less / already killed) never invokes the sink.
+    #[test]
+    fn watchdog_sigkill_delivers_the_captured_pid_once() {
+        use super::sigkill_captured_child_with;
+        let mut pane = Pane::with_terminal_only(100);
+        let mut sink_runs = 0;
+        assert_eq!(
+            sigkill_captured_child_with(&mut pane, |_| sink_runs += 1),
+            None,
+            "no captured pid → nothing to kill"
+        );
+        assert_eq!(sink_runs, 0, "the sink must not run without a pid");
+
+        let pid = nix::unistd::Pid::from_raw(4_242);
+        pane.child_pid = Some(pid);
+        let mut killed: Vec<nix::unistd::Pid> = Vec::new();
+        assert_eq!(
+            sigkill_captured_child_with(&mut pane, |p| killed.push(p)),
+            Some(pid),
+            "the kill target is the pid captured at begin_close_teardown"
+        );
+        assert_eq!(killed, vec![pid]);
+        assert!(pane.child_pid.is_none(), "take-once semantics");
+        assert_eq!(
+            sigkill_captured_child_with(&mut pane, |_| killed.push(pid)),
+            None,
+            "the watchdog never SIGKILLs the same pane twice"
+        );
+        assert_eq!(killed.len(), 1);
     }
 
     /// §二.4 (2): a BACKGROUND pane's alt-screen flip arms the tab-level

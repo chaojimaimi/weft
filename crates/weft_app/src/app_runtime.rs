@@ -113,7 +113,8 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::SpawnFailed {
                 pane_session_id,
                 error,
-            } => self.handle_spawn_failed(pane_session_id, &error),
+                resource_exhausted,
+            } => self.handle_spawn_failed(pane_session_id, &error, resource_exhausted),
             AppEvent::TabsAutoSave => {
                 // v1.10.23: while the recovery prompt is up (deferred
                 // runModal keeps this runloop alive), the 1 Hz autosave

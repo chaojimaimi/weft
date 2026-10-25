@@ -9,6 +9,25 @@ use weft_core::pane_layout::{PaneId, PaneTree};
 use weft_core::persistence::{PaneTreeSnapshot, SnapshotPaneNode, TabSnapshot};
 
 impl Tab {
+    /// v1.14.3 (T3, PLAN_v1143 §2): PersistTabs pane 级排除 — true when EVERY
+    /// pane is a spawn-failed diagnostic placeholder: the PTY was never
+    /// installed (`pty.is_none()`) and the pending spawn is already cleared
+    /// (`pending_spawn.is_none()`). Such a tab has no shell to restore and
+    /// must not be persisted (a restore would reopen a dead "Tab N" ghost).
+    ///
+    /// Pane-level, not tab-level: a diagnostic pane sharing a tab with
+    /// healthy panes keeps the tab persisted (R2 P3 — the healthy panes are
+    /// live; the dead leaf serializes via the existing PTY-dead semantics of
+    /// `pane_leaf_snapshot`). The extra `close_deadline` term guards the N-2
+    /// pre-removal save (session_pump:100): a MID-CLOSE pane is also
+    /// pty-less/spawn-less, but its final snapshot must still land — only a
+    /// diagnostic pane never went through `begin_close_teardown`.
+    pub fn is_persist_excluded(&self) -> bool {
+        self.panes().all(|(_, pane)| {
+            pane.pty.is_none() && pane.pending_spawn.is_none() && pane.close_deadline.is_none()
+        })
+    }
+
     /// v1.12.28 (P1-02 ②): serialize one leaf pane for the split-tree
     /// snapshot. A live leaf carries its live terminal state (same field
     /// semantics as the single-pane path). A PTY-dead leaf keeps its tree

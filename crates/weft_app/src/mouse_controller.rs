@@ -72,7 +72,12 @@ impl App {
             let pending = self.panel.pending_drag_width.take();
             self.panel.sidebar_drag_last_apply = None;
             let new_width = crate::panel_controller::drag_release_width(pending, applied);
-            if new_width != applied {
+            // v1.14.3 (T1): the release's final write IS an application — it
+            // draws SAME-TICK (forced) and the trailing `request_redraw` is
+            // dropped (强制与异步请求互斥); a zero-move release (no parked
+            // width, cursor restore only) keeps the existing trailing redraw.
+            let final_applied = new_width != applied;
+            if final_applied {
                 if let Some(r) = &mut self.renderer {
                     r.set_sidebar_width(new_width);
                 }
@@ -97,30 +102,20 @@ impl App {
             if let Some(window) = &self.window {
                 window.set_cursor(icon);
             }
-            self.request_redraw();
+            if final_applied {
+                self.handle_redraw_requested_forced();
+            } else {
+                self.request_redraw();
+            }
             return;
         }
         // v1.3.2: pane divider resize drag end — clear state, restore cursor.
         // No persistence (ratio is in-memory only, per V13 non-goal).
-        if button == winit::event::MouseButton::Left
-            && self.interaction.pane_divider_drag.take().is_some()
-        {
-            let icon = if let Some(d) = self.pane_divider_hit_test(_x as f32, _y as f32) {
-                match d.axis {
-                    crate::paint::pane_dividers::DividerAxis::Vertical => {
-                        winit::window::CursorIcon::EwResize
-                    }
-                    crate::paint::pane_dividers::DividerAxis::Horizontal => {
-                        winit::window::CursorIcon::NsResize
-                    }
-                }
-            } else {
-                winit::window::CursorIcon::Default
-            };
-            if let Some(window) = &self.window {
-                window.set_cursor(icon);
-            }
-            self.request_redraw();
+        // v1.14.3 (T2): 终值必写 — the ratio parked by the drag's 8ms gate
+        // lands here; T1: a landed final ratio draws same-tick (forced), a
+        // zero-move release keeps the trailing async redraw. (Body in
+        // `app::divider_drag` — this file is at its line budget.)
+        if button == winit::event::MouseButton::Left && self.finish_pane_divider_drag(_x, _y) {
             return;
         }
         if button == winit::event::MouseButton::Left && self.finish_panel_scrollbar_drag() {
@@ -208,15 +203,26 @@ impl App {
         // the drag early-returns below) so an active drag can clear it —
         // update_surface_row_hover guards on drag state internally.
         self.update_surface_row_hover(x, y);
-        // F3-3: sidebar resize drag — update the renderer's sidebar width
-        // from the pointer delta. The drag persists on release.
-        if self.update_sidebar_drag(x) {
+        // F3-3: sidebar resize drag + v1.3.2 pane divider drag. The drag
+        // persists on release.
+        // v1.14.3 (T1): three-state dispatch (`App::drag_move_consumed`) —
+        // an Applied drag draws SAME-TICK (forced, the `Resized`-branch
+        // precedent) so the pointer never leads the frame by one vsync; a
+        // Consumed (throttle-parked) event draws NOTHING (the next Applied
+        // event produces the frame); NotConsumed falls through. 强制与异步
+        // 请求互斥: the Applied arm never also `request_redraw`.
+        // v1.14.3 (T2): the divider ratio write is throttled by the NEW 8ms
+        // gate (`update_pane_divider_drag` → `drag_apply_step`, state on
+        // `InteractionState.divider_drag_last_apply`/`pending_divider_ratio`,
+        // 终值必写 at release); the PTY resize throttle inside
+        // recompute_layout (30ms active / 100ms background) still applies
+        // underneath — the comment this replaces pointed only at that.
+        let sidebar = self.update_sidebar_drag(x);
+        if self.drag_move_consumed(sidebar) {
             return;
         }
-        // v1.3.2: pane divider resize drag — update the split ratio from the
-        // pointer position. PTY resize is throttled by the existing mechanism
-        // in recompute_layout (30ms active / 100ms background).
-        if self.update_pane_divider_drag(x as f32, y as f32) {
+        let divider = self.update_pane_divider_drag(x as f32, y as f32);
+        if self.drag_move_consumed(divider) {
             return;
         }
         if self.update_panel_scrollbar_drag(y as f32) {

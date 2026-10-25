@@ -279,6 +279,15 @@ pub struct InteractionState {
     /// v1.3.2: Active pane divider resize drag. Set on press at a pane
     /// divider; cleared on release. Not persisted (ratio is in-memory only).
     pub pane_divider_drag: Option<PaneDividerDragState>,
+    /// v1.14.3 (T2, PLAN_v1143 §2): divider-drag 8ms throttle state — the
+    /// InteractionState twin of PanelState's sidebar A2 fields (内聚性: the
+    /// gate rides the drag state it throttles). Cleared on release (终值必写
+    /// consumed the park) and on the `set_ratio` abort arm.
+    pub divider_drag_last_apply: Option<Instant>,
+    /// v1.14.3 (T2): pointer ratio seen inside the 8ms throttle window —
+    /// parked here instead of applied, then written by the next due event or
+    /// by the release (`app::divider_drag::release_ratio`, 终值必写).
+    pub pending_divider_ratio: Option<f32>,
     /// v1.11: Active tab drag-to-reorder. Set on press at a tab label;
     /// cleared on release. Live-reorders tabs once the drag threshold is
     /// exceeded.
@@ -327,6 +336,8 @@ impl InteractionState {
             block_action_hovered: None,
             sidebar_drag: None,
             pane_divider_drag: None,
+            divider_drag_last_apply: None,
+            pending_divider_ratio: None,
             tab_drag: None,
             selection_drag_pos: None,
             selection_autoscroll_carry: 0.0,

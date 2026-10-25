@@ -204,13 +204,7 @@ impl App {
         let Some(store) = self.sessions.block_store() else {
             return;
         };
-        let snaps: Vec<_> = self
-            .sessions
-            .tabs()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tab)| tab.to_snapshot(i, i == self.sessions.active_idx()))
-            .collect();
+        let snaps = self.persistable_tab_snapshots();
         if let Err(e) = store.save_tabs(&snaps) {
             tracing::warn!(error = %e, "failed to save tab snapshots");
         } else {
@@ -219,16 +213,25 @@ impl App {
     }
 
     pub(super) fn save_changed_tabs(&mut self) {
-        let snapshots: Vec<_> = self
-            .sessions
-            .tabs()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tab)| tab.to_snapshot(i, i == self.sessions.active_idx()))
-            .collect();
+        let snapshots = self.persistable_tab_snapshots();
         if self.window_runtime.tab_snapshots.should_save(&snapshots) {
             self.save_all_tabs();
         }
+    }
+
+    /// v1.14.3 (T3, PLAN_v1143 §2): the PersistTabs snapshot enumeration —
+    /// shared by both save paths so the change-detection comparison sees the
+    /// same filtered set `record_saved` stored. Pane 级排除: a tab made only
+    /// of spawn-failed diagnostic placeholders is never persisted
+    /// (`Tab::is_persist_excluded`); a mixed multi-pane tab stays.
+    fn persistable_tab_snapshots(&self) -> Vec<weft_core::persistence::TabSnapshot> {
+        self.sessions
+            .tabs()
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| !tab.is_persist_excluded())
+            .filter_map(|(i, tab)| tab.to_snapshot(i, i == self.sessions.active_idx()))
+            .collect()
     }
 
     /// v1.12.24 (N-2): pre-removal final save for a dying tab, called from

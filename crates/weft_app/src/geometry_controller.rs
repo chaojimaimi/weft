@@ -214,16 +214,25 @@ impl App {
                     })
                     .unwrap_or(layout_ctx);
                 let previous = tab.block_scroll();
-                let reconciliation = tab
-                    .with_terminal(|terminal| {
-                        crate::block_component::reconciled_terminal_block_scroll(
-                            terminal,
-                            &pane_layout_ctx,
-                            header_rows,
-                            previous,
-                        )
-                    })
-                    .flatten();
+                // v1.14.3 (T2): the reconcile goes through the pane-level
+                // memo (`app::reconcile_scroll`) — a same-key repeat (the
+                // per-8ms drag recomputes with unchanged content/geometry)
+                // reuses the previous UNCACHED metrics instead of re-scanning
+                // O(blocks) per event. The owned `lock_terminal` guard is the
+                // D9-blessed shape that lets `tab.reconcile_memo` be mutated
+                // beside the guard (the guard carries no borrow of the pane).
+                // The `Resized` call site (window_event/resized.rs) keeps the
+                // direct UNCACHED path by design — its key would mismatch
+                // anyway (fresh geometry), and plan §T2-2 freezes it.
+                let reconciliation = tab.lock_terminal().and_then(|terminal| {
+                    crate::app::reconcile_scroll::reconciled_with_memo(
+                        &mut tab.reconcile_memo,
+                        &terminal,
+                        &pane_layout_ctx,
+                        header_rows,
+                        previous,
+                    )
+                });
                 if let Some((reconciled, total, visible)) = reconciliation {
                     if previous != reconciled {
                         info!(

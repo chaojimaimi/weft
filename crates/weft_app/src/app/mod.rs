@@ -11,7 +11,11 @@
 //! and `new()`.
 
 pub(crate) mod action;
+// v1.14.3 (T2/T1, PLAN_v1143 §2): pane-divider drag throttle kernels + the
+// shared three-state DragConsume verdict (panel_controller stays within its
+// line budget; the 8ms gate itself reuses panel_controller::drag_apply_step).
 pub(crate) mod cursor_anim;
+pub(crate) mod divider_drag;
 pub(crate) mod effect_dispatch;
 pub(crate) mod focus;
 // v1.14.0 (PLAN_v1140 T4): per-frame hover fade sync — one chokepoint
@@ -36,6 +40,9 @@ pub(crate) mod parse_worker_stats;
 // worker, and the main-thread adoption step (placeholder panes, pending
 // stdin, SpawnCompleted/SpawnFailed handling).
 pub(crate) mod pane_spawn;
+// v1.14.3 (T2, PLAN_v1143 §2): Pane 级对账判重 — the memoized
+// `reconciled_terminal_block_scroll` twin for the recompute-layout call site.
+pub(crate) mod reconcile_scroll;
 // v1.12.25 (3-B-2 P2-01): per-frame session I/O core (`spawn_pty` /
 // `pump_pty` / `process_messages` / `request_redraw`) moved verbatim out of
 // `main.rs`; bodies zero-rewritten, visibility `pub(crate)`.

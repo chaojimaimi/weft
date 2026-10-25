@@ -192,12 +192,15 @@ impl App {
         self.recompute_layout();
     }
 
-    pub(super) fn update_sidebar_drag(&mut self, pointer_x: f64) -> bool {
+    pub(super) fn update_sidebar_drag(
+        &mut self,
+        pointer_x: f64,
+    ) -> crate::app::divider_drag::DragConsume {
         let Some(drag) = self.interaction.sidebar_drag else {
-            return false;
+            return crate::app::divider_drag::DragConsume::NotConsumed;
         };
         let Some(renderer) = &mut self.renderer else {
-            return true;
+            return crate::app::divider_drag::DragConsume::Consumed;
         };
         let width = crate::ui_tokens::sidebar_width_after_drag(
             drag.start_width,
@@ -220,21 +223,33 @@ impl App {
             width,
         );
         if due.is_none() {
-            return true;
+            // v1.14.3 (T1): throttled park — consumed, but the caller must
+            // NOT draw (the next Applied event produces the frame).
+            return crate::app::divider_drag::DragConsume::Consumed;
         }
         renderer.set_sidebar_width(Some(width));
         self.recompute_layout();
-        self.request_redraw();
-        true
+        // v1.14.3 (T1): Applied — the caller draws same-tick via
+        // `handle_redraw_requested_forced`; the trailing `request_redraw`
+        // is GONE (强制与异步请求互斥).
+        crate::app::divider_drag::DragConsume::Applied
     }
 
     /// v1.3.2: Update the pane divider ratio from the pointer position during
     /// a drag. Computes `new_ratio` from the drag state's `bounds` + the
-    /// current pointer, calls `tab.set_pane_ratio`, then `recompute_layout`
-    /// (which handles the throttled PTY resize). No-op if no drag is active.
-    pub(super) fn update_pane_divider_drag(&mut self, x: f32, y: f32) -> bool {
+    /// current pointer, applies it through the v1.14.3 (T2) 8ms gate (the
+    /// sidebar A2 twin — `drag_apply_step`, ratio-shaped f32), then
+    /// `recompute_layout` (which handles the throttled PTY resize). No-op if
+    /// no drag is active. (The release-side helpers — `apply_divider_ratio` /
+    /// `finish_pane_divider_drag` — live in `app::divider_drag`: this file is
+    /// at its line budget.)
+    pub(super) fn update_pane_divider_drag(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> crate::app::divider_drag::DragConsume {
         let Some(drag) = self.interaction.pane_divider_drag else {
-            return false;
+            return crate::app::divider_drag::DragConsume::NotConsumed;
         };
         let [bx0, _by0, bx1, _by1] = drag.bounds;
         let new_ratio = match drag.axis {
@@ -246,23 +261,43 @@ impl App {
                 ((y - by0) / (by1 - by0).max(1.0)).clamp(0.0, 1.0)
             }
         };
-        // v1.12.25 (audit 3-B, P1-01): empty-tabs transient — nothing to
-        // re-ratio; keep consuming the drag (same as the no-divider arm).
+        // v1.14.3 (T2): the divider previously re-ratioed + reflowed on EVERY
+        // CursorMoved (zero throttle — the pointer-lead root cause). An
+        // in-window event parks its ratio in `pending_divider_ratio`; a due
+        // event applies and clears the park. The release writes the parked
+        // final ratio (`handle_mouse_release`, 终值必写).
+        let due = drag_apply_step(
+            &mut self.interaction.divider_drag_last_apply,
+            &mut self.interaction.pending_divider_ratio,
+            std::time::Instant::now(),
+            new_ratio,
+        );
+        let Some(ratio) = due else {
+            return crate::app::divider_drag::DragConsume::Consumed;
+        };
         match self
             .sessions
             .active_mut()
-            .map(|tab| tab.set_pane_ratio(drag.first, drag.second, new_ratio))
+            .map(|tab| tab.set_pane_ratio(drag.first, drag.second, ratio))
         {
             Some(Ok(true)) => {
                 self.recompute_layout();
-                self.request_redraw();
-                true
+                // v1.14.3 (T1): Applied — same-tick forced draw at the
+                // caller; the trailing `request_redraw` is gone (互斥).
+                crate::app::divider_drag::DragConsume::Applied
             }
-            Some(Ok(false)) | None => true, // no divider / no tab; keep consuming
+            // v1.12.25 (audit 3-B, P1-01): empty-tabs transient / no divider
+            // / no tab — nothing to re-ratio; keep consuming the drag.
+            Some(Ok(false)) | None => crate::app::divider_drag::DragConsume::Consumed,
             Some(Err(e)) => {
                 tracing::warn!(error = ?e, "pane divider drag: set_ratio failed; aborting drag");
                 self.interaction.pane_divider_drag = None;
-                false // release the drag so subsequent moves don't re-log
+                // v1.14.3 (T2): the aborted drag's throttle state dies with
+                // it — a stale park must never land at a future release.
+                self.interaction.divider_drag_last_apply = None;
+                self.interaction.pending_divider_ratio = None;
+                // Release the drag so subsequent moves don't re-log.
+                crate::app::divider_drag::DragConsume::NotConsumed
             }
         }
     }

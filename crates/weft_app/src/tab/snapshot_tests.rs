@@ -582,3 +582,73 @@ fn synchronized_output_suppresses_partial_frame_until_commit() {
         .row_text(0)
         .contains("partial frame"));
 }
+
+// ── v1.14.3 (T3, PLAN_v1143 §2): PersistTabs pane 级排除 ────────────────
+
+/// A tab whose every pane is a spawn-failed diagnostic placeholder
+/// (`pty` never installed + `pending_spawn` cleared + never began closing)
+/// is excluded from persistence — a restore would reopen a dead "Tab N"
+/// ghost.
+#[test]
+fn diagnostic_only_tab_is_persist_excluded() {
+    let tab = tab_with_terminal(); // Tab::empty pane: pty-less, spawn-less, not closing
+    assert!(
+        tab.is_persist_excluded(),
+        "a diagnostic placeholder tab must not be persisted"
+    );
+}
+
+/// A placeholder mid-spawn (`pending_spawn` armed — the fork may still land)
+/// is NOT excluded; the save must not race an in-flight adoption.
+#[test]
+fn pending_spawn_pane_stays_persistable() {
+    let mut tab = tab_with_terminal();
+    tab.active_mut().pending_spawn = Some(crate::app::pane_spawn::SpawnRequest::for_new_pane(
+        tab.active_pane_id().0,
+        24,
+        80,
+        None,
+        weft_core::input::new_flag(),
+    ));
+    assert!(
+        !tab.is_persist_excluded(),
+        "an in-flight spawn must stay persistable"
+    );
+}
+
+/// 多 pane 场景 (R2 P3): a diagnostic pane sharing a tab with an in-flight /
+/// healthy pane keeps the whole tab persisted — tab 级过滤 would wrongly drop
+/// the mixed tab.
+#[test]
+fn mixed_multi_pane_tab_is_not_persist_excluded() {
+    use weft_core::pane_layout::SplitDirection;
+    let mut tab = tab_with_terminal(); // diagnostic-shaped active pane
+    tab.split_active_pane_test(SplitDirection::Vertical, 0.5, 100)
+        .expect("test split succeeds");
+    let background = tab.active_pane_id();
+    tab.pane_mut(background).unwrap().pending_spawn =
+        Some(crate::app::pane_spawn::SpawnRequest::for_new_pane(
+            background.0,
+            24,
+            80,
+            None,
+            weft_core::input::new_flag(),
+        ));
+    assert!(
+        !tab.is_persist_excluded(),
+        "a healthy sibling keeps the mixed tab persistable"
+    );
+}
+
+/// A MID-CLOSE pane is also pty-less/spawn-less, but its final snapshot must
+/// still land (the N-2 pre-removal save at session_pump) — `close_deadline`
+/// carves it out of the exclusion.
+#[test]
+fn mid_close_pane_stays_persistable() {
+    let mut tab = tab_with_terminal();
+    tab.active_mut().begin_close_teardown();
+    assert!(
+        !tab.is_persist_excluded(),
+        "the N-2 pre-removal save must still see a closing tab"
+    );
+}

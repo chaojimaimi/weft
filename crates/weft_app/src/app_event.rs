@@ -75,8 +75,16 @@ pub(crate) enum AppEvent {
     /// vs the pre-B3 synchronous branch (pane.rs `Self::empty()` kept an
     /// empty pane): the handler CLOSES the tab that owns the placeholder
     /// pane — a permanently PTY-less tab has no way to ever come alive.
+    /// v1.14.3 (T3, PLAN_v1143 §2): `resource_exhausted` classifies the
+    /// failure — the fork hit the kernel PTY/process pool (ENXIO/EMFILE/
+    /// ENFILE/EAGAIN), or the fork-worker thread itself could not be created
+    /// (EAGAIN class). The handler keeps a diagnostic placeholder tab for
+    /// these instead of closing it (see `pane_spawn::handle_spawn_failed`);
+    /// every other failure is false. The fork-worker panic arm is false by
+    /// definition (a panic is not a resource signal).
     SpawnFailed {
         pane_session_id: u64,
         error: String,
+        resource_exhausted: bool,
     },
 }
