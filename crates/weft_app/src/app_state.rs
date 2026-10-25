@@ -412,6 +412,10 @@ pub struct PanelState {
     /// v1.14.0 (T2): true while an OPEN tween runs; false while closing
     /// (the real `panel.close()` runs when the tween lands — 先动画后状态).
     pub sidebar_width_opening: bool,
+    /// v1.14.1 (F3): last instant the in-flight tween applied its override
+    /// write + reflow (`app::motion::should_apply` 8ms throttle). `None` on
+    /// a fresh tween = the next maintenance frame applies immediately.
+    pub sidebar_width_anim_last_apply: Option<Instant>,
 }
 
 impl PanelState {

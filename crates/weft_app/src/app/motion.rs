@@ -121,6 +121,21 @@ pub(crate) const REVEAL_CLOSE_DUR: Duration = Duration::from_millis(100);
 pub(crate) const SIDEBAR_OPEN_DUR: Duration = Duration::from_millis(180);
 pub(crate) const SIDEBAR_CLOSE_DUR: Duration = Duration::from_millis(150);
 
+/// v1.14.1 (F3): 8ms apply-gate for the sidebar width animation's per-frame
+/// override write + reflow (PLAN_v1141 §3.2.2). Aligns the animation-driven
+/// reflow cadence with the drag path's PTY-commit throttle by reusing
+/// effect.rs's [`crate::effect::RESIZE_COMMIT_MIN_INTERVAL`] (常量复用 — no
+/// second magic number). The tween VALUE is still computed every frame; only
+/// the apply is gated. `last == None` (fresh tween) applies immediately; a
+/// finished tween always applies (终值必写) so landing never stalls. Pure —
+/// unit-tested without App state.
+pub(crate) fn should_apply(now: Instant, last: Option<Instant>, finished: bool) -> bool {
+    finished
+        || last.map_or(true, |stamp| {
+            now.saturating_duration_since(stamp) >= crate::effect::RESIZE_COMMIT_MIN_INTERVAL
+        })
+}
+
 /// T3 tab indicator timings (PLAN_v1140 §4): the amber underline slides to
 /// the new active tab over 140ms; a non-dragged tab yields its slot over
 /// 100ms.
@@ -414,6 +429,30 @@ mod tests {
         // Out of range clamps to the endpoints.
         assert_eq!(ease_out_cubic(-0.4), 0.0);
         assert_eq!(ease_out_cubic(1.4), 1.0);
+    }
+
+    /// v1.14.1 (F3): the sidebar width animation's apply gate — inside the
+    /// 8ms window an in-flight tween is throttled; a finished tween always
+    /// applies so the landing (终值) is written.
+    #[test]
+    fn sidebar_anim_should_apply_truth_table() {
+        let now = Instant::now();
+        // Fresh tween (never applied): applies immediately.
+        assert!(should_apply(now, None, false));
+        // <8ms since the last apply, not finished: throttled.
+        assert!(!should_apply(
+            now,
+            Some(now - Duration::from_millis(4)),
+            false
+        ));
+        // ≥8ms (boundary inclusive, same as the drag-path commit gate): applies.
+        assert!(should_apply(
+            now,
+            Some(now - crate::effect::RESIZE_COMMIT_MIN_INTERVAL),
+            false
+        ));
+        // Finished always applies (终值必写) even inside the window.
+        assert!(should_apply(now, Some(now), true));
     }
 
     #[test]

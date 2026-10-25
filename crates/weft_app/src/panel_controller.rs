@@ -56,6 +56,8 @@ impl App {
         let target = crate::ui_tokens::sidebar_visual_width(logical_viewport, restore);
         self.panel.sidebar_width_restore = Some(restore);
         self.panel.sidebar_width_opening = true;
+        // v1.14.1 (F3): a fresh tween applies its first frame immediately.
+        self.panel.sidebar_width_anim_last_apply = None;
         self.panel.sidebar_width_anim = Some(crate::app::motion::Tween::new(
             current,
             target,
@@ -94,6 +96,8 @@ impl App {
             .unwrap_or(r.sidebar_width_override);
         self.panel.sidebar_width_restore = Some(restore);
         self.panel.sidebar_width_opening = false;
+        // v1.14.1 (F3): a fresh tween applies its first frame immediately.
+        self.panel.sidebar_width_anim_last_apply = None;
         self.panel.sidebar_width_anim = Some(crate::app::motion::Tween::new(
             current,
             0.0,
@@ -117,6 +121,20 @@ impl App {
             Some(anim) => (anim.value_at(now), anim.finished(now)),
             None => return,
         };
+        // v1.14.1 (F3): 8ms apply-throttle (PLAN_v1141 §3.2.2) — the
+        // override write + recompute_layout run at most once per
+        // RESIZE_COMMIT_MIN_INTERVAL (the drag path's PTY-commit cadence;
+        // the tween value is still computed every frame above). A finished
+        // tween always applies so the landing below is never stalled
+        // (终值必写).
+        if !crate::app::motion::should_apply(
+            now,
+            self.panel.sidebar_width_anim_last_apply,
+            finished,
+        ) {
+            return;
+        }
+        self.panel.sidebar_width_anim_last_apply = Some(now);
         if !finished {
             if let Some(r) = &mut self.renderer {
                 r.sidebar_width_override = Some(value);

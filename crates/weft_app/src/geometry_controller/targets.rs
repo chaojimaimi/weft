@@ -100,28 +100,28 @@ impl App {
     ///   - the point is within the viewport's vertical extent.
     ///
     /// `tolerance` is in physical pixels (≈4 px each side of the edge). The
-    /// pure geometry lives in `ui_tokens::sidebar_edge_hit` (unit-tested
+    /// pure geometry lives in `ui_tokens::sidebar_edge_hit` and the gate
+    /// chain in `sidebar_resize_hit_decision` (both unit-tested
     /// independently of the renderer/App state).
+    ///
+    /// v1.14.1 (F3) 抓取即接管: a running width tween no longer dead-zones
+    /// the hit — the press path's `cancel_sidebar_width_anim()` (which runs
+    /// before the drag state is recorded) cancels the tween, freezes the
+    /// width at the current value and hands the drag the width channel.
     pub(crate) fn sidebar_resize_hit(&self, x: f32, y: f32, tolerance: f32) -> bool {
-        if !self.panel.open {
-            return false;
-        }
-        // v1.14.0 (PLAN_v1140 T2): animation/drag mutual exclusion — the
-        // animated edge hit-test is ignored (命中忽略) so a tween can never
-        // start a resize drag from a stale animated width.
-        if self.panel.sidebar_width_anim.is_some() {
-            return false;
-        }
         let Some(renderer) = &self.renderer else {
             return false;
         };
-        // Compact windows don't support sidebar resize (overlay drawer).
-        if renderer.sidebar_push_width() == 0.0 {
-            return false;
-        }
-        let edge = renderer.sidebar_width();
-        let vp_h = renderer.viewport().1;
-        crate::ui_tokens::sidebar_edge_hit(x, edge, tolerance, vp_h, y)
+        sidebar_resize_hit_decision(
+            self.panel.open,
+            self.panel.sidebar_width_anim.is_some(),
+            renderer.sidebar_push_width(),
+            renderer.sidebar_width(),
+            renderer.viewport().1,
+            x,
+            y,
+            tolerance,
+        )
     }
 
     /// Hit-test the find popup's clickable buttons. Returns the action the
@@ -276,5 +276,76 @@ impl App {
             self.panel.scroll_offset,
             renderer.cell_height() as f32 * 0.8,
         )
+    }
+}
+
+/// v1.14.1 (F3): pure decision core of `App::sidebar_resize_hit` — the
+/// `App`/renderer shell is not constructible in unit tests (main.rs owns the
+/// struct), so the gate chain lives here (the `ui_tokens::sidebar_edge_hit`
+/// extraction precedent).
+///
+/// 抓取即接管 (PLAN_v1141 §3.2.1): `width_anim_active` is deliberately NOT a
+/// gate — the v1.14.0 mid-tween dead zone is gone; a press during the
+/// animation is routed to the existing `cancel_sidebar_width_anim()` chain
+/// (`mouse_press/panel.rs`), which freezes the animated width and hands the
+/// drag the width channel. The flag is logged so grab-takeover frames stay
+/// identifiable in forensics.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sidebar_resize_hit_decision(
+    panel_open: bool,
+    width_anim_active: bool,
+    push_width: f32,
+    edge: f32,
+    viewport_h: f32,
+    x: f32,
+    y: f32,
+    tolerance: f32,
+) -> bool {
+    tracing::debug!(width_anim_active, "sidebar resize hit decision");
+    if !panel_open {
+        return false;
+    }
+    // Compact windows don't support sidebar resize (overlay drawer).
+    if push_width == 0.0 {
+        return false;
+    }
+    crate::ui_tokens::sidebar_edge_hit(x, edge, tolerance, viewport_h, y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sidebar_resize_hit_decision;
+
+    /// v1.14.1 (F3): a running width tween must NOT dead-zone the edge hit —
+    /// the grab takes over via the press path's cancel chain. The verdict
+    /// with the tween live equals the settled verdict, and a point on the
+    /// edge hits in both frames.
+    #[test]
+    fn sidebar_resize_hit_during_animation_matches_settled_verdict() {
+        let hit = |anim: bool| {
+            sidebar_resize_hit_decision(true, anim, 300.0, 300.0, 600.0, 302.0, 100.0, 4.0)
+        };
+        assert!(hit(true), "hit during the width animation must stay live");
+        assert_eq!(
+            hit(true),
+            hit(false),
+            "the animation state must not change the verdict"
+        );
+    }
+
+    #[test]
+    fn sidebar_resize_hit_still_gated_by_open_drawer_and_edge() {
+        // Closed panel: never a hit (animation state irrelevant).
+        assert!(!sidebar_resize_hit_decision(
+            false, true, 300.0, 300.0, 600.0, 302.0, 100.0, 4.0
+        ));
+        // Compact overlay drawer (push_width 0): never a hit.
+        assert!(!sidebar_resize_hit_decision(
+            true, false, 0.0, 260.0, 600.0, 261.0, 100.0, 4.0
+        ));
+        // Point off the edge: no hit.
+        assert!(!sidebar_resize_hit_decision(
+            true, false, 300.0, 300.0, 600.0, 320.0, 100.0, 4.0
+        ));
     }
 }
