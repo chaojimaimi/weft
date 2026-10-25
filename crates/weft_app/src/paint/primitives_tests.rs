@@ -203,36 +203,172 @@ fn all_themes_satisfy_visual_hierarchy_contract() {
     }
 }
 
-// ── F6: Focus ring ────────────────────────────────────────────────
+// ── F1 (v1.14.1): rounded focus ring + rounded left stripe ────────
 
 #[test]
-fn build_focus_ring_emits_four_edge_quads() {
+fn push_rounded_rect_ring_emits_straight_bands_and_corner_arc_bands() {
+    // 4 straight quads (4×6 verts×12 floats = 288) + 4 corners × 6
+    // segments × 2 triangles (4×432 = 1728) = 2016 floats.
     let mut verts = Vec::new();
-    let color = [0.3, 0.6, 0.9, 0.7];
-    build_focus_ring(&mut verts, [10.0, 20.0, 110.0, 52.0], color, 2.0);
-    // 4 quads × 6 verts × 12 floats = 288 floats.
-    assert_eq!(verts.len(), 288);
+    push_rounded_rect_ring(
+        &mut verts,
+        [10.0, 20.0, 110.0, 52.0],
+        10.0,
+        2.0,
+        [0.3, 0.6, 0.9, 0.7],
+        [0.0; 4],
+    );
+    assert_eq!(verts.len(), 2016);
 }
 
 #[test]
-fn build_focus_ring_top_edge_starts_at_y0() {
+fn push_rounded_rect_ring_pins_outer_and_inner_top_edges() {
+    // First band = top edge: outer y == rect.y0, inner y == rect.y0 + t.
     let mut verts = Vec::new();
-    let color = [0.3, 0.6, 0.9, 0.7];
-    build_focus_ring(&mut verts, [10.0, 20.0, 110.0, 52.0], color, 2.0);
-    // First quad: top edge → first vertex is (x0, y0) = (10, 20).
-    assert_eq!(verts[0], 10.0); // x0
-    assert_eq!(verts[1], 20.0); // y0
+    push_rounded_rect_ring(
+        &mut verts,
+        [10.0, 20.0, 110.0, 52.0],
+        10.0,
+        2.0,
+        [0.3, 0.6, 0.9, 0.7],
+        [0.0; 4],
+    );
+    assert_eq!(verts[1], 20.0); // outer top edge
+    assert_eq!(verts[13], 22.0); // inner top edge (vertex 1 y slot)
 }
 
 #[test]
-fn build_focus_ring_clamps_thickness_to_minimum() {
-    let mut verts_a = Vec::new();
-    let mut verts_b = Vec::new();
-    let color = [1.0; 4];
-    build_focus_ring(&mut verts_a, [0.0, 0.0, 100.0, 50.0], color, 0.0);
-    build_focus_ring(&mut verts_b, [0.0, 0.0, 100.0, 50.0], color, 0.5);
-    // thickness=0 clamps to 0.5, same as thickness=0.5.
-    assert_eq!(verts_a.len(), verts_b.len());
+fn push_rounded_rect_ring_corner_midpoint_rides_the_concentric_arc() {
+    // The top-left corner band's quadrant bisector (225° for a 180° start)
+    // carries an outer vertex at radius r and an inner vertex at r − t;
+    // their midpoint must sit at radius r − t/2 from the corner center.
+    let (x0, y0, r, t) = (10.0f32, 20.0f32, 10.0f32, 2.0f32);
+    let mut verts = Vec::new();
+    push_rounded_rect_ring(
+        &mut verts,
+        [x0, y0, 110.0, 52.0],
+        r,
+        t,
+        [0.3, 0.6, 0.9, 0.7],
+        [0.0; 4],
+    );
+    // TL corner starts after the 4 straight quads (288 floats); segment 2
+    // ends at 225°. Its vertices: o0@0, o1@12, i1@24 (floats, ×12 each).
+    let seg2 = 288 + 2 * 72;
+    let (center_x, center_y) = (x0 + r, y0 + r);
+    let outer = (verts[seg2 + 12], verts[seg2 + 13]);
+    let inner = (verts[seg2 + 24], verts[seg2 + 25]);
+    let mid = ((outer.0 + inner.0) * 0.5, (outer.1 + inner.1) * 0.5);
+    let dist = ((mid.0 - center_x).powi(2) + (mid.1 - center_y).powi(2)).sqrt();
+    assert!((dist - (r - t * 0.5)).abs() < 1e-4, "mid radius {dist}");
+    // The outer vertex itself sits exactly on the outer arc.
+    let outer_dist = ((outer.0 - center_x).powi(2) + (outer.1 - center_y).powi(2)).sqrt();
+    assert!((outer_dist - r).abs() < 1e-4, "outer radius {outer_dist}");
+}
+
+#[test]
+fn push_rounded_rect_ring_clamps_radius_and_degrades_to_square() {
+    // radius ≥ min(w,h)/2 clamps: 100×30 with radius 40 → 15; the top band
+    // starts at x0 + 15.
+    let mut verts = Vec::new();
+    push_rounded_rect_ring(
+        &mut verts,
+        [0.0, 0.0, 100.0, 30.0],
+        40.0,
+        2.0,
+        [1.0; 4],
+        [0.0; 4],
+    );
+    assert_eq!(verts[0], 15.0);
+    // Sub-half-pixel radius degrades to the square 4-band ring (4 quads =
+    // 288 floats, the old build_focus_ring geometry, corners inclusive).
+    let mut square = Vec::new();
+    push_rounded_rect_ring(
+        &mut square,
+        [5.0, 5.0, 55.0, 25.0],
+        0.2,
+        2.0,
+        [1.0; 4],
+        [0.0; 4],
+    );
+    assert_eq!(square.len(), 288);
+    assert_eq!(square[0], 5.0); // top band spans the full width
+    assert_eq!(square[216 + 1], 5.0); // left band (quad 3) starts at y0
+                                      // Zero-area rect emits nothing.
+    let mut empty = Vec::new();
+    push_rounded_rect_ring(
+        &mut empty,
+        [5.0, 5.0, 5.0, 25.0],
+        4.0,
+        2.0,
+        [1.0; 4],
+        [0.0; 4],
+    );
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn push_rounded_left_stripe_emits_straight_band_and_two_corner_sectors() {
+    // 1 straight quad (72) + 2 corners × 6 segments × 2 triangles
+    // (2×432 = 864) = 936 floats.
+    let mut verts = Vec::new();
+    push_rounded_left_stripe(&mut verts, [10.0, 20.0, 110.0, 84.0], 8.0, 3.0, [1.0; 4], 6);
+    assert_eq!(verts.len(), 936);
+}
+
+#[test]
+fn push_rounded_left_stripe_pins_the_passed_rect_arc() {
+    // Corner-sector vertices must ride the arc of the rect AS PASSED
+    // (caller contract: the stripe's own outer geometry).
+    let mut verts = Vec::new();
+    push_rounded_left_stripe(&mut verts, [10.0, 20.0, 110.0, 84.0], 8.0, 3.0, [1.0; 4], 6);
+    // Straight band first: [x0, y0+r, x0+w, y1−r] → width pinned at 3px.
+    assert_eq!(verts[0], 10.0);
+    assert_eq!(verts[1], 28.0); // y0 + radius
+    assert_eq!(verts[24], 13.0); // x0 + stripe_w
+                                 // TL sector opens at 180° = the left point of the top-left arc:
+                                 // (rect.x0, rect.y0 + radius) — float offset 72.
+    assert!((verts[72] - 10.0).abs() < 1e-4);
+    assert!((verts[73] - 28.0).abs() < 1e-4);
+    // BL sector opens at 90° = the bottom point of the bottom-left arc:
+    // (rect.x0 + radius, rect.y1) — float offset 72 + 432.
+    assert!((verts[504] - 18.0).abs() < 1e-4);
+    assert!((verts[505] - 84.0).abs() < 1e-4);
+}
+
+#[test]
+fn push_rounded_left_stripe_clamps_stripe_width() {
+    // stripe_w ≥ rect width clamps to the width; the inner radius floors
+    // at 0 (sector degenerates to a fan) and the geometry stays consistent.
+    let mut verts = Vec::new();
+    push_rounded_left_stripe(&mut verts, [0.0, 0.0, 20.0, 60.0], 6.0, 50.0, [1.0; 4], 6);
+    assert_eq!(verts[24], 20.0); // straight band spans the full width
+                                 // Zero-area rect or non-positive width emits nothing.
+    let mut empty = Vec::new();
+    push_rounded_left_stripe(&mut empty, [5.0, 5.0, 5.0, 25.0], 4.0, 3.0, [1.0; 4], 6);
+    assert!(empty.is_empty());
+    push_rounded_left_stripe(&mut empty, [0.0, 0.0, 20.0, 60.0], 4.0, 0.0, [1.0; 4], 6);
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn push_rounded_left_stripe_subpixel_radius_spans_full_height() {
+    // 0 < radius < 0.5 snaps to the square path (the push_rounded_rect_ring
+    // convention), so the straight band covers [y0, y1] exactly — no 2r
+    // height shortfall from a sub-half-pixel radius.
+    let (y0, y1) = (20.0f32, 84.0f32);
+    let mut verts = Vec::new();
+    push_rounded_left_stripe(&mut verts, [10.0, y0, 110.0, y1], 0.3, 3.0, [1.0; 4], 6);
+    // Square path emits the straight quad only.
+    assert_eq!(verts.len(), 72);
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
+    for v in verts.chunks_exact(12) {
+        min_y = min_y.min(v[1]);
+        max_y = max_y.max(v[1]);
+    }
+    assert_eq!(min_y, y0);
+    assert_eq!(max_y, y1);
 }
 
 #[test]
@@ -245,37 +381,6 @@ fn focus_ring_thickness_increases_with_contrast() {
 fn focus_ring_alpha_full_when_contrast_increased() {
     assert!((focus_ring_alpha(false) - 0.70).abs() < 1e-4);
     assert!((focus_ring_alpha(true) - 1.0).abs() < 1e-4);
-}
-
-#[test]
-fn build_focus_ring_with_increase_contrast_uses_more_vertices_area() {
-    // Both emit 4 quads, but the contrast version has thicker edges.
-    let mut verts_normal = Vec::new();
-    let mut verts_contrast = Vec::new();
-    let color = [0.3, 0.6, 0.9, 1.0];
-    let bounds = [10.0, 20.0, 110.0, 52.0];
-    build_focus_ring(
-        &mut verts_normal,
-        bounds,
-        color,
-        focus_ring_thickness(false),
-    );
-    build_focus_ring(
-        &mut verts_contrast,
-        bounds,
-        color,
-        focus_ring_thickness(true),
-    );
-    // Same vertex count (4 quads × 6 verts × 12 floats = 288), but
-    // different edge geometry (thicker edges with contrast).
-    assert_eq!(verts_normal.len(), verts_contrast.len());
-    // Top edge = first quad with dst [x0, y0, x1, y0 + thickness].
-    // push_quad vertex order: (x0,y0), (x0,y1), (x1,y1), ...
-    // Each vertex is 12 floats, so vertex 1's y-coordinate is at
-    // index 12 (vertex 1 offset) + 1 (y slot) = 13.
-    // Normal: thickness=2 → y0+2 = 22; Contrast: thickness=3 → y0+3 = 23.
-    assert_eq!(verts_normal[13], 22.0); // y1 of top edge (vertex 1)
-    assert_eq!(verts_contrast[13], 23.0);
 }
 
 // ── v1.4.0: snap_physical helpers ─────────────────────────────────

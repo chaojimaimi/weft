@@ -2,9 +2,10 @@
 //!
 //! Batch 7 (v1.3.1) visual polish. Drawn after the background panes and
 //! before the overlay tail in `MetalRenderer::draw()`. Pure vertex emitter —
-//! no renderer state dependency. Reuses `build_focus_ring` for the focus
-//! indicator so Increase Contrast / focus-ring-thickness behavior stays
-//! consistent with the panel + prompt focus rings.
+//! no renderer state dependency. Reuses `push_rounded_rect_ring` (radius 0 →
+//! its square-ring degradation path) for the focus indicator so Increase
+//! Contrast / focus-ring-thickness behavior stays consistent with the panel
+//! + prompt focus rings.
 //!
 //! Divider derivation: given the split-tree-computed `pane_layouts` (one
 //! `[x0,y0,x1,y1]` rect per pane), find the shared edges between adjacent
@@ -15,7 +16,7 @@
 //! (`y0`). Each such shared edge contributes one divider line.
 
 use crate::layout::Rect;
-use crate::paint::primitives::{build_focus_ring, push_quad, snap_physical_rect};
+use crate::paint::primitives::{push_quad, push_rounded_rect_ring, snap_physical_rect};
 use weft_core::pane_layout::PaneId;
 
 /// Divider line axis.
@@ -139,8 +140,10 @@ pub(crate) fn push_pane_dividers(
     }
 }
 
-/// Draw the active-pane focus ring. Reuses `build_focus_ring` so thickness
-/// and Increase Contrast behavior match the panel + prompt rings.
+/// Draw the active-pane focus ring. Reuses `push_rounded_rect_ring` (radius
+/// 0 square-degradation path — the split panes are flat rects, no rounded
+/// shell) so thickness and Increase Contrast behavior match the panel +
+/// prompt rings.
 pub(crate) fn push_active_pane_focus_ring(
     verts: &mut Vec<f32>,
     active_rect: Rect,
@@ -152,19 +155,21 @@ pub(crate) fn push_active_pane_focus_ring(
     // and is usually integer-aligned, but the snap guards against fractional
     // split ratios (e.g. a 3-way split at 33.33% of an 800px content width
     // would land on x=266.67). All four edges are snapped so the ring's
-    // top/bottom/left/right edges drawn by `build_focus_ring` all land on
-    // integer pixels — no smearing at 1× Retina.
+    // top/bottom/left/right edges all land on integer pixels — no smearing
+    // at 1× Retina.
     let [x0, y0, x1, y1] = active_rect;
     let (sx0, sx1) = snap_physical_rect(x0, x1);
     let (sy0, sy1) = snap_physical_rect(y0, y1);
     let snapped = [sx0, sy0, sx1, sy1];
     let mut color = accent_color;
     color[3] *= pane_focus_ring_alpha(increase_contrast);
-    build_focus_ring(
+    push_rounded_rect_ring(
         verts,
         snapped,
-        color,
+        0.0,
         pane_focus_ring_thickness(increase_contrast),
+        color,
+        [0.0; 4],
     );
 }
 
@@ -423,7 +428,8 @@ mod tests {
             [0.2, 0.5, 0.9, 1.0],
             false,
         );
-        // build_focus_ring pushes 4 quads (top/bottom/left/right) = 4 × 72 floats.
+        // push_rounded_rect_ring (square degenerate path) pushes 4 quads
+        // (top/bottom/left/right) = 4 × 72 floats.
         assert_eq!(verts.len(), 4 * 72);
     }
 

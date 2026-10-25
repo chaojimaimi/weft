@@ -412,36 +412,176 @@ pub(crate) fn syntax_color(kind: TokenKind, theme: &Theme) -> [f32; 4] {
     }
 }
 
-/// F6: Draw a focus ring (accent-colored border) around a semantic bounds
-/// rect. Emits 4 edge quads (top/bottom/left/right) into `verts`. The ring
-/// is drawn *inside* the bounds so it doesn't overflow into adjacent elements.
-///
-/// - `bounds`: `[x0, y0, x1, y1]` of the focused element.
-/// - `color`: accent/focus color (normalized RGBA). Alpha is applied as-is;
-///   callers should pre-multiply for the desired translucency.
-/// - `thickness`: border width in physical pixels (typically 2.0, or 3.0
-///   when Increase Contrast is on).
-///
-/// Pure vertex emitter — no renderer dependency. The caller passes the
-/// resulting `verts` to the same vertex buffer used by other overlay quads.
-pub(crate) fn build_focus_ring(
-    verts: &mut Vec<f32>,
-    bounds: [f32; 4],
+/// One 90° concentric arc band: `segments` quads between the outer arc
+/// (radius `r_out`) and the inner arc (radius `r_in`), sweeping from
+/// `start_deg` with the same y-down angle convention as
+/// [`push_rounded_rect`]'s corner fans. Shared by
+/// [`push_rounded_rect_ring`] and [`push_rounded_left_stripe`]. Pure vertex
+/// emitter; `color` reaches the fragment shader through both the fg and bg
+/// slots so the sampled `bg_uv` mask cannot tint the band.
+#[allow(clippy::too_many_arguments)]
+fn push_arc_band(
+    vertices: &mut Vec<f32>,
+    center: [f32; 2],
+    start_deg: f32,
+    r_out: f32,
+    r_in: f32,
+    segments: usize,
     color: [f32; 4],
-    thickness: f32,
+    bg_uv: [f32; 4],
 ) {
-    let [x0, y0, x1, y1] = bounds;
+    let (cx, cy) = (center[0], center[1]);
+    let span = segments as f32;
+    for i in 0..segments {
+        let a0 = (start_deg + 90.0 * i as f32 / span).to_radians();
+        let a1 = (start_deg + 90.0 * (i as f32 + 1.0) / span).to_radians();
+        let (o0x, o0y) = (cx + r_out * a0.cos(), cy + r_out * a0.sin());
+        let (o1x, o1y) = (cx + r_out * a1.cos(), cy + r_out * a1.sin());
+        let (i1x, i1y) = (cx + r_in * a1.cos(), cy + r_in * a1.sin());
+        let (i0x, i0y) = (cx + r_in * a0.cos(), cy + r_in * a0.sin());
+        push_triangle(vertices, [o0x, o0y], [o1x, o1y], [i1x, i1y], color, bg_uv);
+        push_triangle(vertices, [o0x, o0y], [i1x, i1y], [i0x, i0y], color, bg_uv);
+    }
+}
+
+/// v1.14.1 (F1): rounded-rectangle ring (outline band) — the rounded-shell
+/// successor of the removed square `build_focus_ring` (palette query ring /
+/// find·note focus rings now follow the T5 rounded surface corners).
+///
+/// Semantics: `rect` is the ring's OUTER edge; `radius` the outer corner
+/// radius (clamped to `min(w, h) / 2` like [`push_rounded_rect`]);
+/// `thickness` shrinks INWARD — the inner edge is the outer edge inset by
+/// `thickness` on every side, with inner corner radius `radius - thickness`
+/// concentric with the outer arc. Emission: 4 straight edge bands + 4 corner
+/// arc bands (`ROUNDED_RECT_SEGMENTS` quads per corner, same
+/// parameterization as [`push_rounded_rect`]) — pure vertices, no
+/// stencil/shader. A sub-half-pixel radius degrades to the exact square
+/// 4-band ring (the old `build_focus_ring` geometry), so degenerate callers
+/// keep their square outline. `bg_uv` must sample a blank atlas cell: the
+/// ring color is typically translucent (`focus_ring_alpha`), and the mask
+/// path would otherwise force alpha to 1.
+pub(crate) fn push_rounded_rect_ring(
+    vertices: &mut Vec<f32>,
+    rect: Rect,
+    radius: f32,
+    thickness: f32,
+    color: [f32; 4],
+    bg_uv: [f32; 4],
+) {
+    let [x0, y0, x1, y1] = rect;
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = radius.clamp(0.0, w.min(h) * 0.5);
+    // Sub-half-pixel radius degrades to the EXACT square ring (full-edge
+    // bands, no corner arcs) — the removed `build_focus_ring`'s geometry, so
+    // square call sites (panel search field, split panes) keep it byte-exact.
+    let r = if r < 0.5 { 0.0 } else { r };
     let t = thickness.max(0.5);
     let uv = [0.0f32; 4];
     let fg = [0.0f32; 4];
-    // Top edge
-    push_quad(verts, [x0, y0, x1, y0 + t], uv, fg, color);
-    // Bottom edge
-    push_quad(verts, [x0, y1 - t, x1, y1], uv, fg, color);
-    // Left edge
-    push_quad(verts, [x0, y0, x0 + t, y1], uv, fg, color);
-    // Right edge
-    push_quad(verts, [x1 - t, y0, x1, y1], uv, fg, color);
+    // Straight bands (at r == 0 these become the full square edges).
+    push_quad(vertices, [x0 + r, y0, x1 - r, y0 + t], uv, fg, color);
+    push_quad(vertices, [x0 + r, y1 - t, x1 - r, y1], uv, fg, color);
+    push_quad(vertices, [x0, y0 + r, x0 + t, y1 - r], uv, fg, color);
+    push_quad(vertices, [x1 - t, y0 + r, x1, y1 - r], uv, fg, color);
+    if r < 0.5 {
+        return; // square ring: corner bands would be zero-area.
+    }
+    // Corner arc bands. Screen coords are y-down; each (center, start°)
+    // pair sweeps the 90° arc that bulges toward the rect's corner.
+    let r_in = (r - t).max(0.0);
+    let centers = [
+        (x0 + r, y0 + r, 180.0f32), // top-left: 180° → 270°
+        (x1 - r, y0 + r, 270.0),    // top-right: 270° → 360°
+        (x1 - r, y1 - r, 0.0),      // bottom-right: 0° → 90°
+        (x0 + r, y1 - r, 90.0),     // bottom-left: 90° → 180°
+    ];
+    for (cx, cy, start_deg) in centers {
+        push_arc_band(
+            vertices,
+            [cx, cy],
+            start_deg,
+            r,
+            r_in,
+            ROUNDED_RECT_SEGMENTS,
+            color,
+            bg_uv,
+        );
+    }
+}
+
+/// v1.14.1 (F1): left accent stripe that follows a rounded card's left
+/// contour — a straight `stripe_w` band for `y ∈ [y0+radius, y1−radius]`
+/// plus two concentric quarter-annulus sectors wrapping the top-left /
+/// bottom-left corner arcs (outer radius `radius`, inner
+/// `radius − stripe_w`), meeting the straight band seamlessly at the corner
+/// centers' height. A sub-half-pixel radius snaps to 0 (the
+/// [`push_rounded_rect_ring`] convention) and degrades to the exact square
+/// straight band spanning the full `[y0, y1]` height.
+///
+/// Caller contract (plan P2-2): `rect` + `radius` describe the STRIPE's own
+/// outer edge — find passes the card rect inset by its 1px border with
+/// `radius − 1`; note passes the card rect + radius verbatim. The band's uv
+/// must sample a blank atlas cell (the mask path would otherwise force
+/// alpha to 1); the caller passing a fully opaque `color` is defensive
+/// redundancy — the corner sectors carry the color through BOTH the fg and
+/// bg slots, so the sampled mask cannot tint them. `stripe_w ≥ rect width`
+/// clamps to the width (inner radius floors at 0). Pure function —
+/// unit-testable without a renderer.
+pub(crate) fn push_rounded_left_stripe(
+    vertices: &mut Vec<f32>,
+    rect: Rect,
+    radius: f32,
+    stripe_w: f32,
+    color: [f32; 4],
+    segments: usize,
+) {
+    let [x0, y0, x1, y1] = rect;
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 0.0 || h <= 0.0 || stripe_w <= 0.0 {
+        return;
+    }
+    let r = radius.clamp(0.0, w.min(h) * 0.5);
+    // Snap-first-then-emit (the [`push_rounded_rect_ring`] convention): a
+    // sub-half-pixel radius degrades to the square path, so the straight
+    // band truly spans `[y0, y1]` — a bare `0 < r < 0.5` would leave the
+    // band short by `2r` and contradict the full-height contract.
+    let r = if r < 0.5 { 0.0 } else { r };
+    let sw = stripe_w.min(w);
+    let r_in = (r - sw).max(0.0);
+    let uv = [0.0f32; 4];
+    let fg = [0.0f32; 4];
+    // Straight section between the two corner centers.
+    push_quad(vertices, [x0, y0 + r, x0 + sw, y1 - r], uv, fg, color);
+    if r < 0.5 {
+        return; // square card: the straight band already spans full height.
+    }
+    // Top-left corner sector: 180° → 270° (left point → top point).
+    push_arc_band(
+        vertices,
+        [x0 + r, y0 + r],
+        180.0,
+        r,
+        r_in,
+        segments,
+        color,
+        uv,
+    );
+    // Bottom-left corner sector: 90° → 180° (bottom point → left point).
+    push_arc_band(
+        vertices,
+        [x0 + r, y1 - r],
+        90.0,
+        r,
+        r_in,
+        segments,
+        color,
+        uv,
+    );
 }
 
 /// F6: Resolve the focus ring thickness based on the Increase Contrast

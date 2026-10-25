@@ -108,14 +108,16 @@ impl MetalRenderer {
 
         // F4: shared shell (shadow + bg + border + resize handles).
         // v1.14.0 (T5): token-driven material (modal radius + dual-layer
-        // soft shadow).
+        // soft shadow). v1.14.1 (F1): tokens hoisted so the focus ring
+        // below reads the SAME radius source (no second magic number).
+        let surface_tokens = crate::ui_tokens::SurfaceTokens::modal()
+            .scaled(self.scale as f32)
+            .for_environment(self.theme.is_dark(), self.increase_contrast);
         build_command_surface_shell(
             &mut verts,
             CommandSurfaceShell::canonical(
                 [popup_x0, popup_top, popup_x1, popup_bottom],
-                crate::ui_tokens::SurfaceTokens::modal()
-                    .scaled(self.scale as f32)
-                    .for_environment(self.theme.is_dark(), self.increase_contrast),
+                surface_tokens,
                 true,
                 theme_bg,
                 bg_uv,
@@ -128,27 +130,28 @@ impl MetalRenderer {
         // accent color, alpha/thickness follow the Increase Contrast tier).
         // Geometry reuses existing layout values (popup x-range + query row
         // band down to the separator); no new layout constants.
+        // v1.14.1 (F1): the ring follows the modal shell's rounded corners
+        // (was the square build_focus_ring) — outer edge = the query band
+        // outer-expanded 1px (v1.13.17 convention), radius = shell radius
+        // + 1; the bottom corners round to the same radius so the ring
+        // reads as a rounded focus frame.
         {
             use crate::paint::primitives::{
-                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+                focus_ring_alpha, focus_ring_thickness, push_rounded_rect_ring,
             };
-            let ring_rect = [popup_x0, popup_top, popup_x1, sep_y];
             let ring_color = [
                 accent[0],
                 accent[1],
                 accent[2],
                 focus_ring_alpha(self.increase_contrast),
             ];
-            build_focus_ring(
+            push_rounded_rect_ring(
                 &mut verts,
-                [
-                    ring_rect[0] - 1.0,
-                    ring_rect[1] - 1.0,
-                    ring_rect[2] + 1.0,
-                    ring_rect[3] + 1.0,
-                ],
-                ring_color,
+                [popup_x0 - 1.0, popup_top - 1.0, popup_x1 + 1.0, sep_y + 1.0],
+                surface_tokens.radius + 1.0,
                 focus_ring_thickness(self.increase_contrast),
+                ring_color,
+                bg_uv,
             );
         }
 

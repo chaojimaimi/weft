@@ -182,9 +182,13 @@ impl MetalRenderer {
         // F6: Focus ring — an additional accessibility indicator drawn
         // slightly outside the field bounds when the search input has
         // keyboard focus. Thickness/alpha scale with Increase Contrast.
+        // v1.14.1 (F1): build_focus_ring was removed in favor of the
+        // rounded-ring primitive; the panel search field is a SQUARE field
+        // on a flat panel (no T5 rounded shell), so it passes radius 0 and
+        // gets the primitive's byte-identical square-ring degradation path.
         if p.search_focused {
             use crate::paint::primitives::{
-                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+                focus_ring_alpha, focus_ring_thickness, push_rounded_rect_ring,
             };
             let accent = color_to_normalized(self.theme.accent);
             let ring_color = [
@@ -193,7 +197,7 @@ impl MetalRenderer {
                 accent[2],
                 focus_ring_alpha(self.increase_contrast),
             ];
-            build_focus_ring(
+            push_rounded_rect_ring(
                 &mut vertices,
                 [
                     field_x0 - 2.0,
@@ -201,8 +205,10 @@ impl MetalRenderer {
                     field_x1 + 2.0,
                     field_y1 + 2.0,
                 ],
-                ring_color,
+                0.0,
                 focus_ring_thickness(self.increase_contrast),
+                ring_color,
+                bg_uv,
             );
         }
 

@@ -51,14 +51,16 @@ impl MetalRenderer {
         );
 
         // Shell (shadow + bg + border). v1.14.0 (T5): token-driven material
-        // (compact radius + dual-layer soft shadow).
+        // (compact radius + dual-layer soft shadow). v1.14.1 (F1): tokens
+        // hoisted so the ring + stripe below read the SAME radius source.
+        let surface_tokens = crate::ui_tokens::SurfaceTokens::compact()
+            .scaled(self.scale as f32)
+            .for_environment(self.theme.is_dark(), self.increase_contrast);
         build_command_surface_shell(
             &mut verts,
             CommandSurfaceShell::canonical(
                 [popup_x0, popup_y0, popup_x1, popup_y1],
-                crate::ui_tokens::SurfaceTokens::compact()
-                    .scaled(self.scale as f32)
-                    .for_environment(self.theme.is_dark(), self.increase_contrast),
+                surface_tokens,
                 false,
                 theme_bg,
                 bg_uv,
@@ -66,9 +68,12 @@ impl MetalRenderer {
         );
 
         // Focus ring — the note editor captures keyboard input.
+        // v1.14.1 (F1): rounded ring following the compact shell's corners
+        // (was the square build_focus_ring) — outer edge = the card rect
+        // outer-expanded 1px (v1.13.17 convention), radius = card radius + 1.
         {
             use crate::paint::primitives::{
-                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+                focus_ring_alpha, focus_ring_thickness, push_rounded_rect_ring,
             };
             let ring_color = [
                 accent[0],
@@ -76,7 +81,7 @@ impl MetalRenderer {
                 accent[2],
                 focus_ring_alpha(self.increase_contrast),
             ];
-            build_focus_ring(
+            push_rounded_rect_ring(
                 &mut verts,
                 [
                     popup_x0 - 1.0,
@@ -84,19 +89,26 @@ impl MetalRenderer {
                     popup_x1 + 1.0,
                     popup_y1 + 1.0,
                 ],
-                ring_color,
+                surface_tokens.radius + 1.0,
                 focus_ring_thickness(self.increase_contrast),
+                ring_color,
+                bg_uv,
             );
         }
 
-        // Accent left stripe — branded accent.
+        // Accent left stripe — branded accent. v1.14.1 (F1): the stripe
+        // follows the card's rounded left contour (concentric corner
+        // sectors) — per the caller contract it receives the stripe's own
+        // outer geometry: the card rect + card radius verbatim (no border
+        // inset on the note card).
         let stripe_w = NOTE_CARD_ACCENT_STRIPE_W;
-        push_quad(
+        crate::paint::primitives::push_rounded_left_stripe(
             &mut verts,
-            [popup_x0, popup_y0, popup_x0 + stripe_w, popup_y1],
-            bg_uv,
-            [0.0; 4],
+            [popup_x0, popup_y0, popup_x1, popup_y1],
+            surface_tokens.radius,
+            stripe_w,
             accent,
+            crate::paint::primitives::ROUNDED_RECT_SEGMENTS,
         );
 
         // Input line: "Note: " + buffer + caret.

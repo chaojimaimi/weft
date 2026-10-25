@@ -37,7 +37,7 @@ impl MetalRenderer {
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv]; // V-flipped for layer
 
-        let [popup_x0, popup_y0, _popup_x1, popup_y1] = layout.popup_rect;
+        let [popup_x0, popup_y0, popup_x1, popup_y1] = layout.popup_rect;
 
         let theme_bg = color_to_normalized(self.theme.background);
         let accent = color_to_normalized(self.theme.accent);
@@ -53,14 +53,16 @@ impl MetalRenderer {
         // F4: shared shell (shadow + bg + border). No resize handles (it's
         // a utility bar, not a resizable popup). v1.14.0 (T5): token-driven
         // material (compact radius + dual-layer soft shadow) — unified with
-        // Palette, Completion and ContextMenu.
+        // Palette, Completion and ContextMenu. v1.14.1 (F1): tokens hoisted
+        // so the ring + stripe below read the SAME radius source.
+        let surface_tokens = crate::ui_tokens::SurfaceTokens::compact()
+            .scaled(self.scale as f32)
+            .for_environment(self.theme.is_dark(), self.increase_contrast);
         build_command_surface_shell(
             &mut verts,
             CommandSurfaceShell::canonical(
                 layout.popup_rect,
-                crate::ui_tokens::SurfaceTokens::compact()
-                    .scaled(self.scale as f32)
-                    .for_environment(self.theme.is_dark(), self.increase_contrast),
+                surface_tokens,
                 false,
                 theme_bg,
                 bg_uv,
@@ -69,42 +71,51 @@ impl MetalRenderer {
 
         // F6: Focus ring — the Find popup captures keyboard input while open,
         // so draw a focus ring to indicate it's the active input target.
+        // v1.14.1 (F1): rounded ring following the compact shell's corners
+        // (was the square build_focus_ring) — outer edge = the card rect
+        // outer-expanded 1px (v1.13.17 convention), radius = card radius + 1.
         {
             use crate::paint::primitives::{
-                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+                focus_ring_alpha, focus_ring_thickness, push_rounded_rect_ring,
             };
             let [px0, py0, px1, py1] = layout.popup_rect;
-            let accent = color_to_normalized(self.theme.accent);
             let ring_color = [
                 accent[0],
                 accent[1],
                 accent[2],
                 focus_ring_alpha(self.increase_contrast),
             ];
-            build_focus_ring(
+            push_rounded_rect_ring(
                 &mut verts,
                 [px0 - 1.0, py0 - 1.0, px1 + 1.0, py1 + 1.0],
-                ring_color,
+                surface_tokens.radius + 1.0,
                 focus_ring_thickness(self.increase_contrast),
+                ring_color,
+                bg_uv,
             );
         }
 
         // ── Accent-colored left stripe (3px) — v0.8 signature accent ────
         // Replaces the previous top accent stripe so the popup still reads
         // as branded without occupying vertical space at the card edge.
+        // v1.14.1 (F1): the stripe follows the card's rounded left contour
+        // (concentric corner sectors) — per the caller contract it receives
+        // the stripe's own outer geometry: the card rect inset by the 1px
+        // border with radius − 1.
         let stripe_w = 3.0;
         let border_w = 1.0;
-        push_quad(
+        crate::paint::primitives::push_rounded_left_stripe(
             &mut verts,
             [
                 popup_x0 + border_w,
                 popup_y0 + border_w,
-                popup_x0 + border_w + stripe_w,
+                popup_x1 - border_w,
                 popup_y1 - border_w,
             ],
-            bg_uv,
-            [0.0; 4],
+            surface_tokens.radius - border_w,
+            stripe_w,
             [accent[0], accent[1], accent[2], 1.0],
+            crate::paint::primitives::ROUNDED_RECT_SEGMENTS,
         );
 
         // ── Match highlight (yellow translucent overlay on grid cells) ──
