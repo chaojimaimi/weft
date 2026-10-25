@@ -4,10 +4,11 @@
 //! `paint/grid_instances/{contrast,style,startup_replay}_tests.rs`.
 
 use super::{
-    alt_screen_cursor_color, grid_content_origin_x, primary_screen_mask_changed,
-    primary_screen_row_hidden, GridViewPolicy,
+    alt_screen_cursor_color, grid_content_origin_x, grid_pane_clip_rect, grid_scissor_bottom,
+    primary_screen_mask_changed, primary_screen_row_hidden, GridViewPolicy,
 };
 use crate::layout::LayoutCtx;
+use crate::paint::prompt::PromptDrawParams;
 use weft_core::grid::CursorStyle;
 
 #[test]
@@ -440,4 +441,68 @@ fn background_pane_alt_exit_rebuilds_stale_alt_content() {
     // Steady again on the restored primary screen.
     let (_, rebuilt) = build(&renderer, &terminal);
     assert_eq!(rebuilt, 0);
+}
+
+// ── v1.14.1 (F2): sub-row scroll bottom scissor ───────────────────────
+
+#[test]
+fn grid_scissor_bottom_keeps_pane_bottom_when_not_subrow() {
+    // px == 0 → zero behavior change: the bottom stays the pane edge even
+    // when a clip line is available.
+    assert_eq!(grid_scissor_bottom(600.0, Some(500.0), false), 600.0);
+}
+
+#[test]
+fn grid_scissor_bottom_clips_to_higher_clip_line() {
+    // px ≠ 0 and the clip line (editor box top) sits above the pane edge:
+    // the bottom is the clip line — the shifted bottom rows cannot paint
+    // into the prompt box.
+    assert_eq!(grid_scissor_bottom(600.0, Some(500.0), true), 500.0);
+}
+
+#[test]
+fn grid_scissor_bottom_keeps_pane_bottom_when_clip_below() {
+    // px ≠ 0 but the clip line is at/below the pane edge (no editor box
+    // intruding): min() keeps the pane edge.
+    assert_eq!(grid_scissor_bottom(600.0, Some(650.0), true), 600.0);
+    assert_eq!(grid_scissor_bottom(600.0, Some(600.0), true), 600.0);
+}
+
+#[test]
+fn grid_scissor_bottom_keeps_pane_bottom_without_clip_line() {
+    assert_eq!(grid_scissor_bottom(600.0, None, true), 600.0);
+}
+
+#[test]
+fn grid_pane_clip_rect_bakes_editor_box_top_only_when_subrow() {
+    let ctx = LayoutCtx::new((800.0, 600.0), 8.0, 16.0, 4.0, 4.0);
+    let pane_rect = [0.0, 20.0, 800.0, 596.0];
+    let lines = ["draft".to_string()];
+    let prompt = PromptDrawParams {
+        focused: true,
+        cwd: None,
+        lines: &lines,
+        cursor: (0, 5),
+        preedit: None,
+        preedit_cursor: None,
+        search: None,
+        selection: None,
+        scroll_offset: 0,
+        submit_on_ctrl_enter: true,
+    };
+    // px ≠ 0 with an editor: bottom = the editor box top.
+    let clipped = grid_pane_clip_rect(pane_rect, &ctx, Some(&prompt), 30, true);
+    let box_top = crate::paint::prompt::prompt_layout_for_buffer(&ctx, &lines, (0, 5))
+        .1
+        .box_rect[1];
+    assert_eq!(clipped[3], box_top);
+    assert_eq!(clipped[3], 548.0); // box = 3 rows (1 line + 2 pad) below the 596 bottom
+                                   // px == 0: the rect passes through untouched (zero behavior change).
+    assert_eq!(
+        grid_pane_clip_rect(pane_rect, &ctx, Some(&prompt), 30, false),
+        pane_rect
+    );
+    // No editor fallback: the grid content bottom (top + rows × cell_h).
+    let content = grid_pane_clip_rect(pane_rect, &ctx, None, 30, true);
+    assert_eq!(content[3], ctx.top() + 30.0 * ctx.cell_h);
 }

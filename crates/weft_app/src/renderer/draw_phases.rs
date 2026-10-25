@@ -206,7 +206,8 @@ impl crate::renderer::MetalRenderer {
         selection: &mut SelectionHandler,
         grid: &weft_core::grid::Grid,
         fx: &FrameOverlays<'_>,
-        background_panes: &[PaneRenderInfo<'_>],
+        // v1.14.1 (F2): kept for signature symmetry; its no-op reader is gone.
+        _background_panes: &[PaneRenderInfo<'_>],
         bg_stream: &mut Vec<f32>,
         glyph_stream: &mut Vec<f32>,
     ) -> ActivePaneOutput {
@@ -376,13 +377,8 @@ impl crate::renderer::MetalRenderer {
             }
 
             // v1.3 Batch 5: background panes are rendered above (before the
-            // if/else) so both block view and grid view show them. Here we
-            // only need to ensure `layout_ctx` has the active pane's origin
-            // set (it was set above if background_panes is non-empty; for
-            // single-pane tabs it was never changed).
-            if !background_panes.is_empty() {
-                // layout_ctx already restored to active pane's origin above.
-            }
+            // if/else) so both block view and grid view show them; the
+            // layout_ctx was restored to the active pane's origin above.
 
             let cursor_visible_this_frame = crate::terminal_geometry::grid_cursor_visible(
                 terminal.cursor_style,
@@ -415,8 +411,18 @@ impl crate::renderer::MetalRenderer {
             glyph_stream.extend(&grid_batch.glyph_stream);
             let active_bg_end = bg_stream.len();
             let active_glyph_end = glyph_stream.len();
-            self.pane_instance_ranges.borrow_mut().push((
+            // v1.14.1 (F2): bake the sub-row scroll clip into the stored rect
+            // (px≠0 frames scissor at the editor box top; px==0 is identity).
+            // zoom_render's replay copies this segment, so it inherits.
+            let grid_pane_rect = crate::paint::grid::grid_pane_clip_rect(
                 active_pane_rect,
+                &draw_ctx,
+                prompt,
+                grid.num_rows,
+                self.grid_scroll_px != 0.0,
+            );
+            self.pane_instance_ranges.borrow_mut().push((
+                grid_pane_rect,
                 crate::paint::grid_instances::PaneInstanceRanges {
                     bg_range: (active_bg_start, active_bg_end),
                     glyph_range: (active_glyph_start, active_glyph_end),

@@ -150,8 +150,20 @@ impl MetalRenderer {
                 glyph_stream.extend(pane_batch.glyph_stream);
                 let bg_end = bg_stream.len();
                 let glyph_end = glyph_stream.len();
-                self.pane_instance_ranges.borrow_mut().push((
+                // v1.14.1 (F2): the clip decision is per-pane at segment
+                // construction — background panes bake rows at a 0 px shift
+                // (grid.rs), so no sub-row clip (identity rect; the active
+                // pane's px must not clip this pane). No prompt is passed:
+                // a background grid pane paints no editor box.
+                let pane_clip_rect = crate::paint::grid::grid_pane_clip_rect(
                     pane.rect,
+                    &self.layout_ctx.expect("background pane LayoutCtx"),
+                    None,
+                    pane.terminal.grid().num_rows,
+                    false,
+                );
+                self.pane_instance_ranges.borrow_mut().push((
+                    pane_clip_rect,
                     crate::paint::grid_instances::PaneInstanceRanges {
                         bg_range: (bg_start, bg_end),
                         glyph_range: (glyph_start, glyph_end),

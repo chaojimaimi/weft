@@ -10,6 +10,7 @@
 //! cache into a `GridInstanceBatch` (bg_stream + glyph_stream) for the
 //! Metal dual-stream pipeline.
 
+use crate::layout::Rect;
 use crate::paint::grid_instances::{build_row_instances, GridInstanceBatch, GridRowInstances};
 use crate::paint::primitives::color_to_normalized;
 use crate::renderer::MetalRenderer;
@@ -200,6 +201,50 @@ pub(crate) fn build_subrow_extra_top_row(
         hyperlink_color,
         Some(&row),
     ))
+}
+
+/// v1.14.1 (F2): pure bottom-edge scissor for a sub-row-shifted grid pane.
+/// `subrow == false` (px == 0) or no clip line → `pane_bottom` unchanged;
+/// otherwise the bottom is the minimum of the pane edge and the clip line.
+/// Pure — unit-testable without a renderer.
+pub(crate) fn grid_scissor_bottom(pane_bottom: f32, clip_line: Option<f32>, subrow: bool) -> f32 {
+    match (subrow, clip_line) {
+        (true, Some(line)) => pane_bottom.min(line),
+        _ => pane_bottom,
+    }
+}
+
+/// v1.14.1 (F2): the pane rect stored into `PaneInstanceRanges` with the
+/// sub-row scroll clip baked into its bottom edge (`grid_scissor_bottom`).
+///
+/// Clip line = the integrated prompt editor's box top
+/// (`prompt_layout_for_buffer(..).1.box_rect[1]` — the block-view
+/// `region_bottom_y` precedent in `renderer/panes.rs`): PTY rows are laid
+/// out over the FULL content height without subtracting the editor
+/// (`terminal_geometry.rs`), so a px≠0 frame's shifted-down bottom rows
+/// would otherwise overrun into the prompt box. Without an editor the line
+/// falls back to the grid content bottom (`ctx.top() + num_rows × cell_h`,
+/// the same origin the rows are baked at). `subrow == false` (px == 0)
+/// leaves `pane_rect` untouched — zero behavior change on the idle path.
+/// Baking at segment construction means the zoom_render replay (which
+/// copies the stored segments) inherits the clip automatically.
+pub(crate) fn grid_pane_clip_rect(
+    pane_rect: Rect,
+    ctx: &crate::layout::LayoutCtx,
+    prompt: Option<&crate::paint::prompt::PromptDrawParams<'_>>,
+    num_rows: usize,
+    subrow: bool,
+) -> Rect {
+    let clip_line = match prompt {
+        Some(p) => {
+            crate::paint::prompt::prompt_layout_for_buffer(ctx, p.lines, p.cursor)
+                .1
+                .box_rect[1]
+        }
+        None => ctx.top() + num_rows as f32 * ctx.cell_h,
+    };
+    let bottom = grid_scissor_bottom(pane_rect[3], Some(clip_line), subrow);
+    [pane_rect[0], pane_rect[1], pane_rect[2], bottom]
 }
 
 impl MetalRenderer {
