@@ -10,6 +10,9 @@ use crate::renderer::MetalRenderer;
 mod actions;
 #[cfg(test)]
 mod bench;
+// v1.14.2 (A1): crate-visible — paint/text.rs's clipped text emitters reuse
+// the shared crop kernels. Items inside keep their own visibility.
+pub(crate) mod clip;
 mod find;
 // v1.13.11: crate-visible so the renderer's warmup can reuse the shared
 // layout-pass height bounds (the visible-window computation's source of

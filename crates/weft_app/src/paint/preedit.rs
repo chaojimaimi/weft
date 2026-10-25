@@ -32,6 +32,10 @@ pub(crate) struct BlockTuiPreeditParams<'a> {
     pub(crate) bg_uv: [f32; 4],
     pub(crate) theme_bg: [f32; 4],
     pub(crate) accent: [f32; 4],
+    /// v1.14.2 (A1): the live row's hard bottom clip line — a TUI caret row
+    /// straddling `content_bottom_y` must not bleed its preedit band/text
+    /// past the block view's boundary.
+    pub(crate) clip_bottom: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,6 +303,7 @@ impl MetalRenderer {
             bg_uv,
             theme_bg,
             accent,
+            clip_bottom,
         } = params;
         if text.is_empty() {
             return;
@@ -307,12 +312,14 @@ impl MetalRenderer {
         let ch = self.cell_height() as f32;
         let preedit_cols = Self::text_col_width(text);
         let preedit_w = (preedit_cols as f32 * cw).max(1.0);
-        push_quad(
+        // v1.14.2 (A1): every emission carries the row's hard bottom clip.
+        crate::paint::block_view::clip::push_quad_clipped(
             verts,
             [x, y, (x + preedit_w).min(right), y + ch],
             bg_uv,
             [0.0; 4],
             [theme_bg[0], theme_bg[1], theme_bg[2], 0.96],
+            clip_bottom,
         );
         if let Some((start, end)) = cursor {
             let (start, end) = crate::paint::prompt::normalize_preedit_range(text, start, end);
@@ -320,15 +327,16 @@ impl MetalRenderer {
             let selected_cols = Self::text_col_width(&text[start..end]);
             let marker_x = x + prefix_cols as f32 * cw;
             if start == end {
-                push_quad(
+                crate::paint::block_view::clip::push_quad_clipped(
                     verts,
                     [marker_x, y + ch - 2.0, marker_x + 2.0, y + ch],
                     bg_uv,
                     [0.0; 4],
                     accent,
+                    clip_bottom,
                 );
             } else if selected_cols > 0 {
-                push_quad(
+                crate::paint::block_view::clip::push_quad_clipped(
                     verts,
                     [
                         marker_x,
@@ -339,12 +347,21 @@ impl MetalRenderer {
                     bg_uv,
                     [0.0; 4],
                     accent,
+                    clip_bottom,
                 );
             }
         }
         // Reviewer MEDIUM-1: max_cols budgets columns FROM the text origin
         // (the caret), so the remaining row width is `cols - cursor_col`.
-        self.push_text(verts, x, y, text, accent, cols.saturating_sub(cursor_col));
+        self.push_text_clipped(
+            verts,
+            x,
+            y,
+            text,
+            accent,
+            cols.saturating_sub(cursor_col),
+            clip_bottom,
+        );
     }
 }
 

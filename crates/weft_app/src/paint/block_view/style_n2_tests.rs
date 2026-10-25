@@ -76,6 +76,7 @@ fn info_cluster_is_one_width_two_cell_and_post_fe0f_style_stays_aligned() {
         max_cols: 10,
         palette: &palette,
         row_pitch: 16.0,
+        clip_bottom: f32::INFINITY,
     };
     let mut verts = Vec::new();
     renderer.push_block_output_text(&mut verts, paint);
@@ -178,6 +179,7 @@ fn selection_boundary_at_fe0f_index_does_not_shift_cluster_highlight() {
             max_cols: 10,
             palette: &palette,
             row_pitch: 16.0,
+            clip_bottom: f32::INFINITY,
         };
         let mut verts = Vec::new();
         renderer.push_block_output_text(&mut verts, paint);
@@ -215,4 +217,90 @@ fn selection_boundary_at_fe0f_index_does_not_shift_cluster_highlight() {
         "base-scalar selection lifts the cluster bg: {quads:?}"
     );
     assert!((quads[0].0 - 2.0 * cw).abs() < 1e-3);
+}
+
+/// v1.14.2 (A1 ②, PLAN_v1142 §2): the styled-line cache stores unclipped
+/// LOCAL-origin vertices, so the cached wrapper must (a) serve in-band rows
+/// from the cache as before, (b) BYPASS on a row band crossing the hard
+/// clip line (zero cache pollution — the counters never move), and (c)
+/// emit nothing for a row fully below the line.
+#[test]
+fn crossing_or_below_rows_bypass_the_styled_line_cache() {
+    let Some(renderer) = warmed_cluster_renderer() else {
+        eprintln!("skipping cache bypass test: no Metal device available");
+        return;
+    };
+    let palette = Color::standard_palette();
+    let paint_at = |y: f32, clip_bottom: f32| BlockOutputTextPaint {
+        x: 20.0,
+        y,
+        text: "abc",
+        semantic_text: "abc",
+        style: None,
+        char_offset: 0,
+        fallback: [0.9, 0.9, 0.9, 1.0],
+        canvas: [0.1, 0.1, 0.2, 1.0],
+        selection: None,
+        selection_painted: [0.0; 4],
+        max_cols: 10,
+        palette: &palette,
+        row_pitch: 16.0,
+        clip_bottom,
+    };
+    // One shared source Arc: the cache's identity guard keys on the Arc
+    // pointer, so the hit-path control below must reuse the SAME Arc
+    // (mirrors the production block_arc_identity flow).
+    let source = std::sync::Arc::<str>::from("abc");
+    let key_at = |line_idx: usize| super::CacheKeyInput {
+        pane_session_id: 1,
+        block_id: 1,
+        line_idx,
+        chunk_idx: 0,
+        render_generation: 0,
+        palette_fingerprint: 0,
+        source: Some(std::sync::Arc::clone(&source)),
+        styled: None,
+    };
+    let cache = std::cell::RefCell::new(crate::paint::styled_line_cache::StyledLineCache::new());
+
+    // (a) In-band row: first call = miss+insert, second = hit (the cache
+    // path still works exactly as before inside the visible band).
+    let mut verts = Vec::new();
+    renderer.push_block_output_text_cached(&mut verts, paint_at(100.0, 600.0), key_at(0), &cache);
+    let (hits, misses) = cache.borrow_mut().take_hit_miss_counts();
+    assert_eq!((hits, misses), (0, 1), "first in-band call inserts");
+    verts.clear();
+    renderer.push_block_output_text_cached(&mut verts, paint_at(100.0, 600.0), key_at(0), &cache);
+    let (hits, misses) = cache.borrow_mut().take_hit_miss_counts();
+    assert_eq!((hits, misses), (1, 0), "second in-band call hits");
+    assert!(!verts.is_empty());
+
+    // (b) Crossing row (band [594, 610) against clip 600): bypasses the
+    // cache — counters untouched — and the direct path clips to the line.
+    let mut verts = Vec::new();
+    renderer.push_block_output_text_cached(&mut verts, paint_at(594.0, 600.0), key_at(1), &cache);
+    let (hits, misses) = cache.borrow_mut().take_hit_miss_counts();
+    assert_eq!(
+        (hits, misses),
+        (0, 0),
+        "a crossing row must never touch the styled-line cache"
+    );
+    assert!(!verts.is_empty(), "the crossing row still paints its top");
+    let max_y = verts
+        .iter()
+        .skip(1)
+        .step_by(12)
+        .copied()
+        .fold(f32::MIN, f32::max);
+    assert!(
+        max_y <= 600.0 + 1e-3,
+        "crossing-row vertices must stop at the clip line, got {max_y}"
+    );
+
+    // (c) Below row: nothing at all, cache untouched.
+    let mut verts = Vec::new();
+    renderer.push_block_output_text_cached(&mut verts, paint_at(601.0, 600.0), key_at(2), &cache);
+    let (hits, misses) = cache.borrow_mut().take_hit_miss_counts();
+    assert_eq!((hits, misses), (0, 0));
+    assert!(verts.is_empty(), "a fully-below row paints nothing");
 }

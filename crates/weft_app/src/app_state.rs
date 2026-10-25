@@ -362,6 +362,12 @@ pub struct TabBarState {
     /// v1.14.0 (PLAN_v1140 T4): hover color fades for the tab bar's four
     /// elements (row / "+" / ‹› / ×) — Tab* keys only.
     pub hover_fades: crate::app::motion::HoverFades,
+    /// v1.14.2 (B1, PLAN_v1142 §3): generation-keyed tab-title snapshots —
+    /// `tab_bar_state` and the A4 fingerprint reuse these instead of taking
+    /// every tab's FairMutex per frame (tab 风暴债①). `RefCell` because both
+    /// consumers run with `&self` on the main thread; the refresh/probe
+    /// kernel lives in `app/tab_title_cache.rs`.
+    pub(crate) title_cache: std::cell::RefCell<Vec<crate::app::tab_title_cache::TabTitleCached>>,
 }
 
 impl TabBarState {
@@ -416,6 +422,14 @@ pub struct PanelState {
     /// write + reflow (`app::motion::should_apply` 8ms throttle). `None` on
     /// a fresh tween = the next maintenance frame applies immediately.
     pub sidebar_width_anim_last_apply: Option<Instant>,
+    /// v1.14.2 (A2/PLAN §2): last instant the sidebar DRAG applied its width
+    /// write + reflow (same `app::motion::should_apply` 8ms gate as the
+    /// tween path). Cleared on release.
+    pub sidebar_drag_last_apply: Option<Instant>,
+    /// v1.14.2 (A2): pointer width seen inside the 8ms throttle window —
+    /// parked here instead of applied, then written by the next due frame
+    /// or by the release (终值必写).
+    pub pending_drag_width: Option<f32>,
 }
 
 impl PanelState {

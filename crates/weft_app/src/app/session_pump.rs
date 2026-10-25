@@ -46,8 +46,16 @@ impl App {
         // first_run_welcome() so this only fires once ever.
         if let Some(cmd) = first_run_welcome() {
             // T10 P2 (D4): through the shared write half.
-            if let Some(writer) = tab.writer.as_ref() {
-                let _ = writer.write_sync(cmd.as_bytes());
+            // v1.14.2 (B3): the fresh pane is a placeholder (no writer
+            // until adoption) — the banner rides the pending-stdin buffer
+            // and is flushed to the PTY at adoption.
+            match tab.writer.as_ref() {
+                Some(writer) => {
+                    let _ = writer.write_sync(cmd.as_bytes());
+                }
+                None => {
+                    tab.active_mut().buffer_pending_stdin(cmd.as_bytes());
+                }
             }
         }
         self.sessions.push_tab(tab);

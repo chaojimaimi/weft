@@ -79,8 +79,8 @@ pub struct Pane {
     /// v1.13.6 T10 P2 (D4): the shared PTY write half. The main thread
     /// (user input / paste / Ctrl+C) and the parse worker (VT query
     /// replies) each hold an `Arc` clone; the single write mutex lives
-    /// inside [`PtyWriter`]. `None` together with `pty` (spawn failure /
-    /// test panes).
+    /// inside [`PtyWriter`]. `None` together with `pty` (B3 placeholder
+    /// panes before adoption / test panes).
     pub writer: Option<Arc<PtyWriter>>,
     /// v1.13.6 T10 P2 (D6): lock-free "the parse worker produced output
     /// for this pane since the main pump last looked". The retired
@@ -189,10 +189,24 @@ pub struct Pane {
     /// and ≥2-row net-travel threshold; see `crate::alt_peek`). Lives on the
     /// pane, alongside the peek flag it guards on this pane's Terminal.
     pub(crate) alt_peek_gate: crate::alt_peek::PeekEntryGate,
+    /// v1.14.2 (B3, PLAN_v1142 §3): the pending async spawn for a PLACEHOLDER
+    /// pane — set by `spawn` (the fork moved off the main thread), consumed
+    /// by the main-thread adoption (`app/pane_spawn.rs`). `None` for every
+    /// non-placeholder pane.
+    pub(crate) pending_spawn: Option<crate::app::pane_spawn::SpawnRequest>,
+    /// v1.14.2 (B3-4): user input received while the PTY was still pending.
+    /// Capped at 64 KiB (`buffer_pending_stdin`); flushed to the writer at
+    /// adoption so the first keystrokes before the fork lands are not lost.
+    pub(crate) pending_stdin: Vec<u8>,
 }
 
 impl Pane {
-    /// Create a new pane with a PTY + Terminal pair at the given size.
+    /// Create a new pane with a live Terminal at the given size and an
+    /// ASYNC PTY spawn (v1.14.2 B3): the fork runs on a worker thread, this
+    /// returns a placeholder immediately, and the PTY is installed on
+    /// `AppEvent::SpawnCompleted` (`app/pane_spawn.rs`). A fork failure
+    /// closes the owning tab (behavior change vs the old synchronous
+    /// `Self::empty()` fallback).
     ///
     /// `cwd` — if `Some(path)`, the shell starts in that directory (via
     /// `chdir` in the child process before exec). Pass `None` to inherit
@@ -206,39 +220,40 @@ impl Pane {
         proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
         cwd: Option<&str>,
     ) -> Self {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let env = crate::shell_integration_env(&shell);
-        let env_refs: Vec<(&str, &str)> =
-            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-
-        // v1.11.15 (FIX A): one flag per pane — the PTY reader thread and the
-        // Terminal parser share it (see the field doc).
-        let mouse_suppress = new_flag();
-        // v1.13.6 T10 P2 (D3): no wake closure any more — the parse worker
-        // owns UI wakes; this proxy clone is handed to it below.
-        let mut pty = match Pty::spawn_with_args(
-            &shell,
-            &[],
-            (rows as u16, cols as u16),
-            &env_refs,
+        // v1.14.2 (B3, PLAN_v1142 §3): the fork/exec moved OFF the main
+        // thread. This builds the PLACEHOLDER pane — live Terminal (empty
+        // shell grid), no PTY/writer/parse worker — and hands the spawn
+        // request to a `weft-fork-<id>` worker. The main thread adopts on
+        // `AppEvent::SpawnCompleted` (assembly/adoption in
+        // `app/pane_spawn.rs`); a fork failure closes the owning tab
+        // (behavior change vs the old `Self::empty()` empty-pane fallback,
+        // recorded in the delivery report).
+        let mut pane = Self::placeholder(rows, cols, scrollback_lines);
+        let request = crate::app::pane_spawn::SpawnRequest::for_new_pane(
+            pane.pane_session_id,
+            rows,
+            cols,
             cwd,
-            mouse_suppress.clone(),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("Failed to spawn PTY: {e}");
-                return Self::empty();
-            }
-        };
-        // D2 split: the receive half belongs to the parse worker.
-        let event_rx = pty
-            .take_event_rx()
-            .expect("a freshly spawned Pty holds its receiver");
-        let writer = pty.writer();
+            pane.mouse_suppress.clone(),
+        );
+        crate::app::pane_spawn::dispatch_spawn_request(request.clone(), proxy);
+        pane.pending_spawn = Some(request);
+        pane
+    }
 
+    /// B3 placeholder shell: live Terminal + channels + flags, NO PTY /
+    /// writer / parse worker. The shell renders an empty grid immediately
+    /// (the cwd-None look); the parse worker is spawned at adoption, when
+    /// the forked PTY's event receiver actually exists.
+    pub(crate) fn placeholder(rows: usize, cols: usize, scrollback_lines: usize) -> Self {
+        // v1.11.15 (FIX A): one flag per pane — the PTY read loop and the
+        // Terminal parser share it (set here; the same flag rides the
+        // spawn request to the read loop).
+        let mouse_suppress = new_flag();
         // v1.11.2 X3 defensive clamp (PLAN_v1112 §5): config values are
-        // normalized at load time, but Pane can also be built from programmatic
-        // paths — never let an out-of-range depth reach the Terminal.
+        // normalized at load time, but Pane can also be built from
+        // programmatic paths — never let an out-of-range depth reach the
+        // Terminal.
         let scrollback_lines = scrollback_lines.clamp(
             weft_core::config::SCROLLBACK_MIN_LINES,
             weft_core::config::SCROLLBACK_MAX_LINES,
@@ -246,33 +261,14 @@ impl Pane {
         let mut terminal = Terminal::with_scrollback(rows, cols, scrollback_lines);
         terminal.set_mouse_suppress_flag(mouse_suppress.clone());
         tracing::info!(rows, cols, "initial terminal size");
-
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
-        let terminal = Arc::new(FairMutex::new(terminal));
-        let pane_session_id = NEXT_PANE_SESSION.fetch_add(1, Ordering::Relaxed);
-        let had_output = Arc::new(AtomicBool::new(false));
-        // D2: spawn this pane's parse worker (Pane::empty — PTY spawn
-        // failure — reaches neither this code nor a worker: no receiver
-        // ⇒ no worker).
-        let wake_proxy = proxy.clone();
-        crate::app::parse_worker::spawn(
-            pane_session_id,
-            event_rx,
-            Arc::clone(&terminal),
-            Arc::clone(&writer),
-            msg_tx.clone(),
-            Arc::clone(&had_output),
-            Box::new(move || {
-                let _ = wake_proxy.send_event(AppEvent::Wake);
-            }),
-        );
         Self {
-            pane_session_id,
+            pane_session_id: NEXT_PANE_SESSION.fetch_add(1, Ordering::Relaxed),
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
-            terminal: Some(terminal),
-            pty: Some(pty),
-            writer: Some(writer),
-            had_output,
+            terminal: Some(Arc::new(FairMutex::new(terminal))),
+            pty: None,
+            writer: None,
+            had_output: Arc::new(AtomicBool::new(false)),
             mouse_suppress,
             msg_rx,
             msg_tx,
@@ -296,12 +292,16 @@ impl Pane {
             tui_scroll_wake_scheduled: false,
             primary_history_refresh: PrimaryHistoryRefresh::default(),
             alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
+            pending_spawn: None,
+            pending_stdin: Vec::new(),
         }
     }
 
-    /// Empty pane — terminal/pty stay None. Production fallback when PTY
-    /// spawn fails (see `spawn`); also the base of the test-only
-    /// `Tab::empty` constructor.
+    /// Empty pane — terminal/pty stay None. v1.14.2 (B3): no longer a
+    /// production fallback (a failed fork now closes the owning tab —
+    /// see `spawn`); the base of the test-only `Tab::empty` constructor.
+    /// Test-only since v1.12.23 audit batch 2 precedent (Tab::empty twin).
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
@@ -335,6 +335,8 @@ impl Pane {
             tui_scroll_wake_scheduled: false,
             primary_history_refresh: PrimaryHistoryRefresh::default(),
             alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
+            pending_spawn: None,
+            pending_stdin: Vec::new(),
         }
     }
 
@@ -378,6 +380,8 @@ impl Pane {
             tui_scroll_wake_scheduled: false,
             primary_history_refresh: PrimaryHistoryRefresh::default(),
             alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
+            pending_spawn: None,
+            pending_stdin: Vec::new(),
         }
     }
 
@@ -454,6 +458,14 @@ impl Pane {
     /// the test builds may obtain the Arc.
     #[cfg(test)]
     pub(crate) fn terminal_arc_for_test(&self) -> Option<Arc<FairMutex<Terminal>>> {
+        self.terminal.clone()
+    }
+
+    /// v1.14.2 (B3): Arc clone of the terminal for the ADOPTION step only
+    /// (`app/pane_spawn.rs` wires the parse worker with it). Same
+    /// controlled-access contract as `terminal_arc_for_test`: D9 rule 1
+    /// stands — consumers may only hand the Arc to the parse worker.
+    pub(crate) fn terminal_arc_for_adopt(&self) -> Option<Arc<FairMutex<Terminal>>> {
         self.terminal.clone()
     }
 

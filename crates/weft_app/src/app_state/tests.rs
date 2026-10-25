@@ -26,6 +26,8 @@ fn tab_bar_clear_hover_preserves_scroll_and_click_history() {
         indicator: None,
         tab_slot_shifts: Vec::new(),
         hover_fades: crate::app::motion::HoverFades::default(),
+        // v1.14.2 (B1): title snapshots default to the empty cache.
+        title_cache: std::cell::RefCell::new(Vec::new()),
     };
     state.clear_hover();
     assert_eq!(state.hovered_tab, None);

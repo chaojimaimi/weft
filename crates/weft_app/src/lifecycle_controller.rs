@@ -365,21 +365,19 @@ impl App {
 
     /// Build the `TabBarDrawState` for the renderer from the current tab list.
     /// Tab labels are the cwd basename (or "Tab N" when no cwd is set).
+    ///
+    /// v1.14.2 (B1, PLAN_v1142 §3): titles come from the generation-keyed
+    /// snapshot cache (`app/tab_title_cache.rs`) — one short lock probe per
+    /// tab per frame, and only a tab whose tracker generation changed
+    /// re-takes the lock to rebuild (tab 风暴债①; the old code took every
+    /// tab's FairMutex twice per frame and built two Strings per tab). The
+    /// cwd path stays live: OSC 7 (`set_cwd`) bumps the generation, so a
+    /// `cd` still updates the title on the next frame.
     pub(super) fn tab_bar_state(&self) -> TabBarDrawState {
-        let titles: Vec<_> = self
-            .sessions
-            .tabs()
-            .iter()
-            .enumerate()
-            .map(|(i, tab)| {
-                let command = tab
-                    .with_terminal(|t| t.block_tracker().in_flight().map(|f| f.command.to_string()))
-                    .flatten();
-                crate::paint::tab_bar::tab_title(i, tab.launch_cwd().as_deref(), command.as_deref())
-            })
-            .collect();
-        let labels = titles.iter().map(|title| title.compact.clone()).collect();
-        let tooltips = titles.into_iter().map(|title| title.tooltip).collect();
+        let titles = self.tab_titles();
+        let labels = titles.iter().map(|t| t.title.compact.clone()).collect();
+        let tooltips = titles.iter().map(|t| t.title.tooltip.clone()).collect();
+        drop(titles);
         // v1.14.0 (PLAN_v1140 T3): project the tab-bar animation tweens into
         // draw values — the paint fn has no App access (DrawState is this
         // library's established projection pattern).

@@ -205,6 +205,23 @@ impl App {
             pointer_x,
             renderer.scale() as f32,
         );
+        // v1.14.2 (A2/PLAN §2): the drag path previously ran
+        // set_sidebar_width + recompute_layout on EVERY CursorMoved (zero
+        // throttle) — the defect-two firehose. It now shares the F3 tween
+        // gate's 8ms cadence (`app::motion::should_apply` =
+        // RESIZE_COMMIT_MIN_INTERVAL): an in-window event only parks its
+        // width in `pending_drag_width`; a due event applies the current
+        // width and clears the park. `handle_mouse_release` writes the
+        // parked final width (终值必写).
+        let due = drag_apply_step(
+            &mut self.panel.sidebar_drag_last_apply,
+            &mut self.panel.pending_drag_width,
+            std::time::Instant::now(),
+            width,
+        );
+        if due.is_none() {
+            return true;
+        }
         renderer.set_sidebar_width(Some(width));
         self.recompute_layout();
         self.request_redraw();
@@ -642,5 +659,100 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+}
+
+// ── v1.14.2 (A2/PLAN §2): sidebar drag throttle — pure decision kernels ──
+//
+// Extracted from `update_sidebar_drag` / `handle_mouse_release` so the
+// throttle window and the release-time final write are unit-testable
+// without App/winit state (the plan's 应用决策提为纯函数测试).
+
+/// One CursorMoved during a sidebar drag. Returns `Some(width)` when the
+/// caller must write + reflow NOW (≥8ms since the last apply, per
+/// `app::motion::should_apply` — the F3 tween gate's shared cadence), or
+/// `None` inside the window: the width parks in `pending` and lands on a
+/// due frame or at release.
+pub(crate) fn drag_apply_step(
+    last_apply: &mut Option<std::time::Instant>,
+    pending: &mut Option<f32>,
+    now: std::time::Instant,
+    width: f32,
+) -> Option<f32> {
+    if !crate::app::motion::should_apply(now, *last_apply, false) {
+        *pending = Some(width);
+        return None;
+    }
+    *last_apply = Some(now);
+    *pending = None;
+    Some(width)
+}
+
+/// The drag release's landing width (终值必写): a parked in-window width
+/// wins over the last applied override; with nothing parked the applied
+/// value stands.
+pub(crate) fn drag_release_width(pending: Option<f32>, applied: Option<f32>) -> Option<f32> {
+    pending.or(applied)
+}
+
+#[cfg(test)]
+mod drag_throttle_tests {
+    use super::{drag_apply_step, drag_release_width};
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = crate::effect::RESIZE_COMMIT_MIN_INTERVAL;
+
+    /// 节流窗口内多事件只落一次 recompute: events at t0 / +3ms / +6ms
+    /// apply once (the first); the in-window widths park instead.
+    #[test]
+    fn throttle_window_coalesces_burst_events() {
+        let mut last = None;
+        let mut pending = None;
+        let t0 = Instant::now();
+        assert_eq!(
+            drag_apply_step(&mut last, &mut pending, t0, 240.0),
+            Some(240.0)
+        );
+        assert_eq!(pending, None);
+        assert_eq!(
+            drag_apply_step(
+                &mut last,
+                &mut pending,
+                t0 + Duration::from_millis(3),
+                250.0
+            ),
+            None,
+            "inside the 8ms window the event must not apply"
+        );
+        assert_eq!(pending, Some(250.0));
+        assert_eq!(
+            drag_apply_step(
+                &mut last,
+                &mut pending,
+                t0 + Duration::from_millis(6),
+                260.0
+            ),
+            None
+        );
+        assert_eq!(pending, Some(260.0), "the newest width parks (latest-wins)");
+        // First event past the window applies again and clears the park.
+        assert_eq!(
+            drag_apply_step(&mut last, &mut pending, t0 + WINDOW, 270.0),
+            Some(270.0)
+        );
+        assert_eq!(pending, None);
+    }
+
+    /// 释放必应用终值: a parked width wins over the last applied override;
+    /// with nothing parked the applied value stands (zero-move release).
+    #[test]
+    fn release_lands_pending_over_applied() {
+        assert_eq!(
+            drag_release_width(Some(260.0), Some(240.0)),
+            Some(260.0),
+            "终值必写 — the parked width must land"
+        );
+        assert_eq!(drag_release_width(None, Some(240.0)), Some(240.0));
+        assert_eq!(drag_release_width(None, None), None);
     }
 }

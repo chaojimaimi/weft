@@ -111,6 +111,12 @@ pub(crate) struct AccessibilityBridge {
     pub(super) previous_height: f32,
     pub(super) block_text_key: Option<BlockTextKey>,
     pub(super) block_text: String,
+    /// v1.14.2 (A4): fingerprint of the tree currently installed in AppKit
+    /// and the instant it was built — the two `accessibility/key.rs` gates
+    /// compare against these. Updated ONLY on an actual build (a throttled
+    /// change must stay pending so a later frame rebuilds).
+    pub(super) ax_key: Option<super::key::AccessibilityKey>,
+    pub(super) ax_built_at: Option<std::time::Instant>,
 }
 
 impl AccessibilityBridge {

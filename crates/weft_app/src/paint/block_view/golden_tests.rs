@@ -744,3 +744,8 @@ fn block_view_golden_env_flags_exactly_one() {
 // precedent); it sees every fixture/helper above through `use super::*`.
 #[path = "golden_underlines.rs"]
 mod underlines;
+
+// v1.14.2 (PLAN_v1142 §2 A1): the bottom-clip boundary scene — same #[path]
+// precedent; golden_tests.rs is close to the module-size gate.
+#[path = "golden_clip.rs"]
+mod clip_golden;

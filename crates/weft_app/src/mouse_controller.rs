@@ -61,10 +61,23 @@ impl App {
         if button == winit::event::MouseButton::Left
             && self.interaction.sidebar_drag.take().is_some()
         {
-            let new_width = self
+            // v1.14.2 (A2): 终值必写 — a width parked by the drag throttle
+            // lands before persistence, then the throttle state clears
+            // (panel_controller::drag_apply_step parks in-window widths;
+            // without this the release could persist a stale value).
+            let applied = self
                 .renderer
                 .as_ref()
                 .and_then(|r| r.sidebar_width_override);
+            let pending = self.panel.pending_drag_width.take();
+            self.panel.sidebar_drag_last_apply = None;
+            let new_width = crate::panel_controller::drag_release_width(pending, applied);
+            if new_width != applied {
+                if let Some(r) = &mut self.renderer {
+                    r.set_sidebar_width(new_width);
+                }
+                self.recompute_layout();
+            }
             // v1.5.0: persist via SOURCE config so an active profile's
             // overrides aren't flattened into base on save. Effective is
             // also updated so runtime reads see the new value.

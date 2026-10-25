@@ -1,5 +1,3 @@
-use crate::paint::primitives::push_quad;
-
 /// Map a find hit (char range into the prompt-stripped command) onto the
 /// rendered command chunks. Mirrors `block_match_visual_ranges` but takes
 /// the actual rendered chunks (dual-capacity wrapping) instead of
@@ -45,6 +43,8 @@ pub(super) struct FindHighlightCanvas {
     pub(super) color: [f32; 4],
 }
 
+/// v1.14.2 (A1): `clip_bottom` applies the row's hard bottom clip.
+#[allow(clippy::too_many_arguments)] // canvas + hit + origin + clip; mirrors the chunk-site quads
 pub(super) fn push_find_highlight(
     vertices: &mut Vec<f32>,
     canvas: FindHighlightCanvas,
@@ -53,6 +53,7 @@ pub(super) fn push_find_highlight(
     cols: usize,
     chunk_index: usize,
     origin: [f32; 2],
+    clip_bottom: f32,
 ) {
     let Some((_, display_col, display_len)) =
         crate::block_component::block_match_visual_ranges(text, hit.0, hit.1, cols)
@@ -63,12 +64,14 @@ pub(super) fn push_find_highlight(
     };
     let x0 = origin[0] + display_col as f32 * canvas.cell_width;
     let x1 = x0 + display_len as f32 * canvas.cell_width;
-    push_quad(
+    // v1.14.2 (A1): the highlight band shares the row's hard bottom clip.
+    super::clip::push_quad_clipped(
         vertices,
         [x0, origin[1], x1, origin[1] + canvas.cell_height],
         canvas.background_uv,
         [0.0; 4],
         canvas.color,
+        clip_bottom,
     );
 }
 

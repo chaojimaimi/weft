@@ -6,6 +6,9 @@
 //! sent back through the winit event loop and reuse the normal mouse router.
 
 mod bridge;
+// v1.14.2 (A4/PLAN §2): the rebuild fingerprint + throttle kernels — kept in
+// a sibling file so this module stays clear of the module-size gate.
+mod key;
 pub(crate) use bridge::{install_event_proxy, AccessibilityBridge};
 
 #[cfg(test)]
@@ -37,6 +40,25 @@ fn push_semantic(
 
 impl App {
     pub(super) fn update_accessibility_tree(&mut self) {
+        // v1.14.2 (A4/PLAN §2): gate before the expensive snapshot + ObjC
+        // bridge sync — the 50ms rebuild throttle caps drag/output-storm
+        // rebuilds at ≤20Hz (the cap also bounds anything the fingerprint
+        // cannot see). The per-frame AccessibilityKey fingerprint is
+        // collected and recorded on each build; its equality kernels +
+        // truth tables live in `accessibility/key.rs` (batch B flips it
+        // into the decision once collection turns cheap). The key is
+        // recorded ONLY on an actual build, so a throttled change stays
+        // pending (由后续帧补建).
+        let key = key::AccessibilityKey::collect(self);
+        let now = std::time::Instant::now();
+        let last_built = self
+            .accessibility
+            .ax_key
+            .as_ref()
+            .zip(self.accessibility.ax_built_at);
+        if key::should_skip(last_built, &key, now) {
+            return;
+        }
         let nodes = self.accessibility_snapshot();
         if !tree_is_valid(&nodes) {
             tracing::error!(node_count = nodes.len(), "invalid accessibility tree");
@@ -50,6 +72,8 @@ impl App {
         };
         self.accessibility
             .update(window, nodes, renderer.scale(), renderer.viewport().1);
+        self.accessibility.ax_key = Some(key);
+        self.accessibility.ax_built_at = Some(now);
     }
 
     fn accessibility_snapshot(&mut self) -> Vec<AccessibilityNode> {

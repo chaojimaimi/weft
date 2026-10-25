@@ -32,12 +32,19 @@ pub(crate) mod motion;
 pub(crate) mod palette_theme_key;
 pub(crate) mod parse_worker;
 pub(crate) mod parse_worker_stats;
+// v1.14.2 (B3, PLAN_v1142 §3): async PTY spawn — request assembly, fork
+// worker, and the main-thread adoption step (placeholder panes, pending
+// stdin, SpawnCompleted/SpawnFailed handling).
+pub(crate) mod pane_spawn;
 // v1.12.25 (3-B-2 P2-01): per-frame session I/O core (`spawn_pty` /
 // `pump_pty` / `process_messages` / `request_redraw`) moved verbatim out of
 // `main.rs`; bodies zero-rewritten, visibility `pub(crate)`.
 // v1.13.6 T10 P2 (D6): `pump_pty` is retired — the parse worker owns the
 // byte path; `process_messages` drains control events only.
 pub(crate) mod session_pump;
+// v1.14.2 (B1, PLAN_v1142 §3): the generation-keyed tab-title snapshot
+// cache (tab 风暴债①).
+pub(crate) mod tab_title_cache;
 // v1.11.5 (PLAN_v1115 §M2): UI-event dispatch table + Dock badge debounce.
 pub(crate) mod ui_events;
 // v1.13.5 (T16d, PLAN_v11217 §3.11): memory-pressure response —

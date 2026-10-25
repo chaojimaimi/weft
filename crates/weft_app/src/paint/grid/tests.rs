@@ -506,3 +506,58 @@ fn grid_pane_clip_rect_bakes_editor_box_top_only_when_subrow() {
     let content = grid_pane_clip_rect(pane_rect, &ctx, None, 30, true);
     assert_eq!(content[3], ctx.top() + 30.0 * ctx.cell_h);
 }
+
+/// v1.14.2 (A3/PLAN §2): with the lightweight `recompute_layout` path
+/// skipping `renderer.resize` on drag/tween frames (unchanged window size),
+/// a sidebar move reaches the paint ONLY through the layout-origin
+/// fingerprint. chrome_left — the sidebar push, moved on every drag frame —
+/// shifts `ctx.left()` → `grid_content_origin_x` → origin_x, so the next
+/// frame must full-rebuild exactly once and then return to incremental.
+/// Same harness as `active_pane_cache_invalidates_on_layout_origin_move`
+/// (which moves padding_x; the sidebar moves chrome_left — the A3 field).
+#[test]
+fn active_pane_cache_invalidates_on_chrome_left_move() {
+    let Some(mut renderer) = headless_renderer_or_skip() else {
+        eprintln!("skipping chrome_left origin test: no Metal device available");
+        return;
+    };
+    let mut terminal = weft_core::vt::Terminal::new(4, 20);
+    let build = |renderer: &crate::renderer::MetalRenderer, terminal: &weft_core::vt::Terminal| {
+        let grid = terminal.grid();
+        renderer.build_grid_instances(
+            grid,
+            terminal.palette(),
+            &grid.cursor,
+            &weft_core::selection::SelectionHandler::new(),
+            GridViewPolicy {
+                show_cursor: false,
+                cursor_style: terminal.cursor_style,
+                hidden_before_row: None,
+                owned_rows: None,
+                is_alt_screen: false,
+                inset_block_gutter: false,
+            },
+        )
+    };
+
+    let (_, rebuilt) = build(&renderer, &terminal);
+    assert_eq!(rebuilt, 4, "first build for a fresh renderer is full");
+    terminal.grid_mut().clear_all_dirty();
+    let (_, rebuilt) = build(&renderer, &terminal);
+    assert_eq!(rebuilt, 0, "idle active pane must not rebuild any row");
+
+    // Sidebar drag frame: chrome_left moves, window size (viewport) does
+    // not — the A3 path skips renderer.resize, and this fingerprint is the
+    // only invalidation left. One full rebuild, then incremental again.
+    if let Some(ctx) = renderer.layout_ctx.as_mut() {
+        ctx.chrome_left += 5.0;
+    }
+    let (_, rebuilt) = build(&renderer, &terminal);
+    assert_eq!(
+        rebuilt, 4,
+        "chrome_left move must trigger one full rebuild via the origin fingerprint"
+    );
+    terminal.grid_mut().clear_all_dirty();
+    let (_, rebuilt) = build(&renderer, &terminal);
+    assert_eq!(rebuilt, 0, "post-move steady state is incremental");
+}

@@ -599,12 +599,22 @@ impl Tab {
         pane.with_terminal(|t| t.cancel_primary_screen_interrupt_capture());
         // T10 P2 (D4): through the shared write half — this lock serializes
         // against the parse worker's VT replies at the fd boundary.
-        let writer = pane.writer.as_ref().ok_or_else(|| {
-            PtyError::Write(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "tab has no PTY",
-            ))
-        })?;
+        // v1.14.2 (B3-4, PLAN_v1142 §3): a placeholder pane (async spawn in
+        // flight) has no writer yet — buffer the input (64 KiB cap, flushed
+        // at adoption) so first keystrokes into a brand-new tab are not
+        // lost. A permanently PTY-less pane (test panes) keeps the old
+        // NotConnected error.
+        if pane.writer.is_none() {
+            return if pane.pending_spawn.is_some() {
+                Ok(pane.buffer_pending_stdin(data))
+            } else {
+                Err(PtyError::Write(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "tab has no PTY",
+                )))
+            };
+        }
+        let writer = pane.writer.as_ref().expect("writer checked non-None above");
         writer.write_sync_reported(data)
     }
 

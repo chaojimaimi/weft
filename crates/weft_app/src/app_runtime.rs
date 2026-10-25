@@ -12,61 +12,16 @@ mod retention_tests;
 // precedent).
 mod diagnostics;
 mod hydrate;
+// v1.14.2 (B3 备料处置): the runloop timer/wake scheduling helpers moved
+// verbatim to scheduling.rs (file-budget disposition, same precedent).
+mod scheduling;
 // `terminal_capability_env` and `install_runtime_diagnostics` moved to
 // `diagnostics.rs`; re-exported so the `crate::app_runtime::` paths in
 // app/helpers.rs and main.rs keep resolving.
 pub(crate) use diagnostics::{install_runtime_diagnostics, terminal_capability_env};
 use resize_transaction::commit_pty_resize_result;
+use scheduling::{schedule_primary_history_refresh_wakes, schedule_synchronized_output_watchdog};
 use std::time::Duration;
-
-fn schedule_synchronized_output_watchdog(
-    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    delay: std::time::Duration,
-    wake: impl FnOnce() + Send + 'static,
-) -> bool {
-    if pending.swap(true, Ordering::AcqRel) {
-        return false;
-    }
-    // v1.12.23 audit batch 1 (bespoke): failure must reset the armed flag or
-    // the watchdog stays latched; `pending` moves into the closure, so clone.
-    let rearm = pending.clone();
-    if let Err(e) = std::thread::Builder::new()
-        .name(String::from("weft-timer"))
-        .spawn(move || {
-            std::thread::sleep(delay);
-            pending.store(false, Ordering::Release);
-            wake();
-        })
-    {
-        // Re-arm so a future request can retry; today's wake is lost but the
-        // watchdog is not permanently disabled (audit S-3).
-        rearm.store(false, Ordering::Release);
-        tracing::warn!(error = ?e, "weft-timer spawn failed");
-    }
-    true
-}
-
-fn schedule_primary_history_refresh_wakes(
-    tabs: &mut [Tab],
-    proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
-) {
-    // v1.11.12 (PLAN_v11112 M-C): shared note for ALL wakeup-class send_event
-    // sites (12×: app_runtime 154/234/260/681, mouse:943, config:445,
-    // palette_search_worker:276, main.rs 463/466/472, app_state:673, pane:141)
-    // plus the 5 timer sites below and the probe thread:
-    // EventLoopClosed = loop exited, by design silent — no wake can ever be
-    // delivered after exit, so a warn would be pure teardown noise.
-    for delay in tabs
-        .iter_mut()
-        .flat_map(Tab::take_primary_history_refresh_wake_delays)
-    {
-        let proxy = proxy.clone();
-        spawn_named("weft-tab-wake", move || {
-            std::thread::sleep(delay);
-            let _ = proxy.send_event(AppEvent::Wake);
-        });
-    }
-}
 
 impl ApplicationHandler<AppEvent> for App {
     /// Cross-thread wake-up (PTY output or blink timer): pump + process
@@ -150,6 +105,15 @@ impl ApplicationHandler<AppEvent> for App {
                 // cache, and reloads never touch path_bins (swap persists).
                 self.config_state.path_bins = bins;
             }
+            // v1.14.2 (B3): async PTY spawn — bodies in pane_spawn.rs.
+            AppEvent::SpawnCompleted {
+                pane_session_id,
+                forked,
+            } => self.handle_spawn_completed(pane_session_id, forked),
+            AppEvent::SpawnFailed {
+                pane_session_id,
+                error,
+            } => self.handle_spawn_failed(pane_session_id, &error),
             AppEvent::TabsAutoSave => {
                 // v1.10.23: while the recovery prompt is up (deferred
                 // runModal keeps this runloop alive), the 1 Hz autosave

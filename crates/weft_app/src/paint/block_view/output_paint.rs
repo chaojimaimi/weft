@@ -13,7 +13,7 @@ use crate::paint::block_view::find;
 use crate::paint::block_view::row_paint::RowPaintCtx;
 use crate::paint::block_view::style;
 use crate::paint::block_view::surfaces::canvas_for;
-use crate::paint::primitives::{composite_color_over, push_quad};
+use crate::paint::primitives::composite_color_over;
 use weft_core::blocks::BlockId;
 
 /// v1.10.26 (FIX_IME_PREEDIT): B-path diagnostic — record the visible
@@ -107,6 +107,7 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
             ce,
             ctx.selection_bg,
             ctx.bg_uv,
+            ctx.clip_bottom,
         );
     }
     if let Some(bh) = ctx.find_block_highlight {
@@ -119,6 +120,7 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
                 ctx.cols,
                 chunk_idx,
                 [ctx.left, y],
+                ctx.clip_bottom,
             );
         }
     }
@@ -149,6 +151,8 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
             max_cols: ctx.cols,
             palette: ctx.palette,
             row_pitch: ctx.pitch,
+            // v1.14.2 (A1): the row's hard bottom clip line.
+            clip_bottom: ctx.clip_bottom,
         },
         style::CacheKeyInput {
             pane_session_id: ctx.cache_namespace,
@@ -183,7 +187,16 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
                 crate::ime::block_view_tui_caret_geometry(caret_x, y, ctx.cw, ctx.ch);
             renderer.block_view_tui_caret_area.set(Some(caret_area));
             // Steady-on: blink timer only wakes for AtPrompt, so cursor_blink_on is stale.
-            push_quad(&mut *ctx.verts, caret_quad, ctx.bg_uv, [0.0; 4], ctx.accent);
+            // v1.14.2 (A1): the drawn quad carries the row's hard bottom
+            // clip; the IME anchor area above stays the logical caret rect.
+            crate::paint::block_view::clip::push_quad_clipped(
+                &mut *ctx.verts,
+                caret_quad,
+                ctx.bg_uv,
+                [0.0; 4],
+                ctx.accent,
+                ctx.clip_bottom,
+            );
             if let Some((preedit, preedit_cursor)) = ctx.tui_preedit {
                 // v1.10.26 (FIX_IME_PREEDIT): the caret
                 // matched — the preedit was drawn on a
@@ -206,6 +219,7 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
                         bg_uv: ctx.bg_uv,
                         theme_bg: ctx.theme_bg,
                         accent: ctx.accent,
+                        clip_bottom: ctx.clip_bottom,
                     },
                 );
             }

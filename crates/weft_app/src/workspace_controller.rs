@@ -428,6 +428,10 @@ impl App {
         if is_active {
             self.sessions.set_active(tab_idx);
         }
+        // v1.14.2 (B1-3): workspace restore flipped `restored_cwd_fallback`
+        // on the root pane + split leaves (main thread, invisible to the
+        // tracker generation) — invalidate the title cache once.
+        self.invalidate_tab_title_cache();
     }
 
     // ── Interactive save / open ───────────────────────────────────────

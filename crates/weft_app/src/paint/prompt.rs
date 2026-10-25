@@ -481,6 +481,8 @@ impl MetalRenderer {
     /// `text`, honoring CJK double-width so the highlight exactly covers the
     /// selected glyphs. Called before `push_text` so the text renders on top
     /// of the highlight (matching grid-view selection rendering).
+    /// v1.14.2 (A1): `clip_bottom` applies the block view's hard bottom clip
+    /// — a boundary-row highlight keeps its upper part like the glyphs.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_block_view_highlight(
         &self,
@@ -493,6 +495,7 @@ impl MetalRenderer {
         c_end: usize,
         bg_color: [f32; 4],
         bg_uv: [f32; 4],
+        clip_bottom: f32,
     ) {
         if c_end <= c_start || text.is_empty() {
             return;
@@ -507,12 +510,13 @@ impl MetalRenderer {
         let x_start = x_left + weft_core::grid::terminal_text_width(&prefix) as f32 * cw;
         let cell_w = weft_core::grid::terminal_text_width(&selected) as f32 * cw;
         if cell_w > 0.0 {
-            push_quad(
+            crate::paint::block_view::clip::push_quad_clipped(
                 vertices,
                 [x_start, y_top, x_start + cell_w, y_top + height],
                 bg_uv,
                 [0.0; 4], // fg mask: no text contribution (pure background)
                 bg_color,
+                clip_bottom,
             );
         }
     }

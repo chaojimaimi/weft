@@ -16,14 +16,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use super::clip;
 use crate::block_component::{spinner_char_for_phase, BlockTone};
 use crate::paint::block_view::actions::{
     block_header_text_cols, push_block_header_actions, BlockHeaderActionPaint,
 };
 use crate::paint::block_view::find::{self, FindHighlightCanvas};
-use crate::paint::primitives::{
-    color_to_normalized, derive_cwd_gray, push_quad, snap_physical_rect,
-};
+use crate::paint::primitives::{color_to_normalized, derive_cwd_gray, snap_physical_rect};
 use crate::paint::ui_helpers::strip_prompt_prefix;
 use crate::renderer::MetalRenderer;
 use crate::selection::SelectionDocSource;
@@ -138,20 +137,32 @@ pub(super) fn paint_command(
     y: f32,
 ) {
     let renderer = ctx.renderer;
+    // v1.14.2 (A1): every text emission below rides the row's hard bottom
+    // clip (boundary rows keep their upper part instead of bleeding past
+    // content_bottom).
     let (chev_w, avail_sub) = if foldable {
         let chev = if collapsed { "▸" } else { "▾" };
-        renderer.push_text(&mut *ctx.verts, ctx.left, y, chev, ctx.prompt_c, ctx.cols);
+        renderer.push_text_clipped(
+            &mut *ctx.verts,
+            ctx.left,
+            y,
+            chev,
+            ctx.prompt_c,
+            ctx.cols,
+            ctx.clip_bottom,
+        );
         (ctx.cw, 3)
     } else {
         (0.0, 2)
     };
-    renderer.push_text(
+    renderer.push_text_clipped(
         &mut *ctx.verts,
         ctx.left + chev_w,
         y,
         "> ",
         ctx.prompt_c,
         ctx.cols,
+        ctx.clip_bottom,
     );
     let cmd_x = ctx.left + chev_w + 2.0 * ctx.cw;
     let first_avail = ctx.cols.saturating_sub(avail_sub).max(1);
@@ -183,6 +194,7 @@ pub(super) fn paint_command(
                 chunk.chars().count(),
                 ctx.selection_bg,
                 ctx.bg_uv,
+                ctx.clip_bottom,
             );
         }
         if let Some(bh) = ctx.find_block_highlight {
@@ -197,18 +209,27 @@ pub(super) fn paint_command(
                             continue;
                         }
                         let x0 = lx + dcol as f32 * ctx.cw;
-                        push_quad(
+                        clip::push_quad_clipped(
                             &mut *ctx.verts,
                             [x0, cy, x0 + dlen as f32 * ctx.cw, cy + ctx.ch],
                             ctx.bg_uv,
                             [0.0; 4],
                             ctx.find_hl_bg,
+                            ctx.clip_bottom,
                         );
                     }
                 }
             }
         }
-        renderer.push_text(&mut *ctx.verts, lx, cy, chunk, cmd_color, lavail);
+        renderer.push_text_clipped(
+            &mut *ctx.verts,
+            lx,
+            cy,
+            chunk,
+            cmd_color,
+            lavail,
+            ctx.clip_bottom,
+        );
     }
     if foldable {
         ctx.hit_regions.push(crate::overlay::HitRegion {
@@ -234,12 +255,14 @@ pub(super) fn paint_header(
 ) {
     let renderer = ctx.renderer;
     if ctx.row_in_selection(Some(block_id.0), None) {
-        push_quad(
+        // v1.14.2 (A1): header bands clip like every row emission.
+        clip::push_quad_clipped(
             &mut *ctx.verts,
             [ctx.left, y, ctx.right, y + ctx.header_height],
             ctx.bg_uv,
             [0.0; 4],
             ctx.selection_bg,
+            ctx.clip_bottom,
         );
     }
     let ui = crate::ui_tokens::UiColors::from_theme(&renderer.theme)
@@ -258,7 +281,15 @@ pub(super) fn paint_header(
     let bookmarked = renderer.bookmarked_blocks.contains(&block_id);
     let (text_x, text_cols) = if bookmarked {
         let star_color = color_to_normalized(renderer.theme.accent);
-        renderer.push_text(&mut *ctx.verts, ctx.left, text_y, "★", star_color, 1);
+        renderer.push_text_clipped(
+            &mut *ctx.verts,
+            ctx.left,
+            text_y,
+            "★",
+            star_color,
+            1,
+            ctx.clip_bottom,
+        );
         (
             ctx.left + 2.0 * ctx.cw,
             block_header_text_cols(
@@ -294,6 +325,7 @@ pub(super) fn paint_header(
         cwd,
         cwd_c,
         ctx.cw,
+        ctx.clip_bottom,
     );
     if !duration.is_empty() {
         push_header_segment(
@@ -305,6 +337,7 @@ pub(super) fn paint_header(
             " · ",
             meta_c,
             ctx.cw,
+            ctx.clip_bottom,
         );
         push_header_segment(
             renderer,
@@ -315,6 +348,7 @@ pub(super) fn paint_header(
             duration,
             meta_c,
             ctx.cw,
+            ctx.clip_bottom,
         );
     }
     if !status.is_empty() {
@@ -327,6 +361,7 @@ pub(super) fn paint_header(
             " · ",
             meta_c,
             ctx.cw,
+            ctx.clip_bottom,
         );
         push_header_segment(
             renderer,
@@ -337,6 +372,7 @@ pub(super) fn paint_header(
             status,
             status_c,
             ctx.cw,
+            ctx.clip_bottom,
         );
     }
 
@@ -367,23 +403,25 @@ pub(super) fn paint_live_header(ctx: &mut RowPaintCtx<'_>, text: &str, y: f32) {
     // v1.10.26: banded whole-row when the live segment
     // intersects (parity with the old row-index highlight).
     if ctx.row_in_selection(None, None) {
-        push_quad(
+        clip::push_quad_clipped(
             &mut *ctx.verts,
             [ctx.left, y, ctx.right, y + ctx.pitch],
             ctx.bg_uv,
             [0.0; 4],
             ctx.selection_bg,
+            ctx.clip_bottom,
         );
     }
     let ui = crate::ui_tokens::UiColors::from_theme(&renderer.theme)
         .with_increase_contrast(renderer.increase_contrast);
-    renderer.push_text(
+    renderer.push_text_clipped(
         &mut *ctx.verts,
         ctx.left,
         y,
         text,
         color_to_normalized(ui.focus),
         ctx.cols,
+        ctx.clip_bottom,
     );
 }
 
@@ -392,22 +430,25 @@ pub(super) fn paint_live_header(ctx: &mut RowPaintCtx<'_>, text: &str, y: f32) {
 /// resolved by the caller and passed in.
 pub(super) fn paint_separator(ctx: &mut RowPaintCtx<'_>, key: Option<u64>, y: f32) {
     if ctx.row_in_selection(key, None) {
-        push_quad(
+        clip::push_quad_clipped(
             &mut *ctx.verts,
             [ctx.left, y, ctx.right, y + ctx.pitch],
             ctx.bg_uv,
             [0.0; 4],
             ctx.selection_bg,
+            ctx.clip_bottom,
         );
     }
     let ly = y + ctx.pitch * 0.5;
     let (sep_y0, sep_y1) = snap_physical_rect(ly, ly + 1.5);
-    push_quad(
+    // v1.14.2 (A1): the 1.5px line crops at the boundary like text bands.
+    clip::push_quad_clipped(
         &mut *ctx.verts,
         [ctx.frame_left, sep_y0, ctx.frame_right, sep_y1],
         ctx.bg_uv,
         [0.0; 4],
         ctx.separator,
+        ctx.clip_bottom,
     );
 }
 
@@ -420,7 +461,15 @@ pub(super) fn paint_live_command(
     y: f32,
 ) {
     let renderer = ctx.renderer;
-    renderer.push_text(&mut *ctx.verts, ctx.left, y, "> ", ctx.prompt_c, ctx.cols);
+    renderer.push_text_clipped(
+        &mut *ctx.verts,
+        ctx.left,
+        y,
+        "> ",
+        ctx.prompt_c,
+        ctx.cols,
+        ctx.clip_bottom,
+    );
     let cmd_x = ctx.left + 2.0 * ctx.cw;
     let first_avail = ctx.cols.saturating_sub(2).max(1);
     let cmd_color = color_to_normalized(renderer.theme.foreground);
@@ -450,6 +499,7 @@ pub(super) fn paint_live_command(
                 chunk.chars().count(),
                 ctx.selection_bg,
                 ctx.bg_uv,
+                ctx.clip_bottom,
             );
         }
         if let Some(bh) = ctx.find_block_highlight {
@@ -464,18 +514,27 @@ pub(super) fn paint_live_command(
                             continue;
                         }
                         let x0 = lx + dcol as f32 * ctx.cw;
-                        push_quad(
+                        clip::push_quad_clipped(
                             &mut *ctx.verts,
                             [x0, cy, x0 + dlen as f32 * ctx.cw, cy + ctx.ch],
                             ctx.bg_uv,
                             [0.0; 4],
                             ctx.find_hl_bg,
+                            ctx.clip_bottom,
                         );
                     }
                 }
             }
         }
-        renderer.push_text(&mut *ctx.verts, lx, cy, chunk, cmd_color, lavail);
+        renderer.push_text_clipped(
+            &mut *ctx.verts,
+            lx,
+            cy,
+            chunk,
+            cmd_color,
+            lavail,
+            ctx.clip_bottom,
+        );
     }
 
     if ctx.spinner_phase >= 0.0 {
@@ -501,13 +560,14 @@ pub(super) fn paint_live_command(
             .with_increase_contrast(renderer.increase_contrast);
         let spinner_color = color_to_normalized(ui.focus);
         let last_y = y + chunks.len().saturating_sub(1) as f32 * ctx.pitch;
-        renderer.push_text(
+        renderer.push_text_clipped(
             &mut *ctx.verts,
             spinner_x,
             last_y,
             &spinner_char.to_string(),
             spinner_color,
             1,
+            ctx.clip_bottom,
         );
     }
 }
@@ -573,12 +633,15 @@ pub(super) fn paint_diagnose_panel(
             1.0,
         ]
     };
-    push_quad(
+    // v1.14.2 (A1): all diagnose-panel emissions carry the row's hard
+    // bottom clip (bg band, text, close button, bottom border).
+    clip::push_quad_clipped(
         &mut *ctx.verts,
         [ctx.frame_left, y, ctx.frame_right, y + ctx.pitch],
         ctx.bg_uv,
         [0.0; 4],
         panel_bg,
+        ctx.clip_bottom,
     );
     // Panel text with a 1-cell left indent for visual hierarchy.
     let text_color = if is_error {
@@ -587,19 +650,28 @@ pub(super) fn paint_diagnose_panel(
         ctx.fg
     };
     let avail_cols = ctx.cols.saturating_sub(2).max(1);
-    renderer.push_text(
+    renderer.push_text_clipped(
         &mut *ctx.verts,
         ctx.left + ctx.cw,
         y,
         text,
         text_color,
         avail_cols,
+        ctx.clip_bottom,
     );
     // Close button (×) on the first row, right-aligned.
     if is_first {
         let close_x = ctx.right - ctx.cw * 1.5;
         let close_color = [ctx.fg[0], ctx.fg[1], ctx.fg[2], ctx.fg[3] * 0.6];
-        renderer.push_text(&mut *ctx.verts, close_x, y, "×", close_color, 1);
+        renderer.push_text_clipped(
+            &mut *ctx.verts,
+            close_x,
+            y,
+            "×",
+            close_color,
+            1,
+            ctx.clip_bottom,
+        );
         ctx.hit_regions.push(crate::overlay::HitRegion {
             x0: close_x,
             y0: y,
@@ -611,17 +683,19 @@ pub(super) fn paint_diagnose_panel(
     // Bottom border on the last row.
     if is_last {
         let (by0, by1) = snap_physical_rect(y + ctx.pitch - 1.0, y + ctx.pitch);
-        push_quad(
+        clip::push_quad_clipped(
             &mut *ctx.verts,
             [ctx.frame_left, by0, ctx.frame_right, by1],
             ctx.bg_uv,
             [0.0; 4],
             ctx.separator,
+            ctx.clip_bottom,
         );
     }
 }
 
 /// Header 分段着色:推进 x/remaining,消除 4 段重复样板。
+/// v1.14.2 (A1): header text rides the row's hard bottom clip.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn push_header_segment(
     renderer: &MetalRenderer,
@@ -632,12 +706,13 @@ pub(super) fn push_header_segment(
     seg: &str,
     color: [f32; 4],
     cw: f32,
+    clip_bottom: f32,
 ) {
     if *remaining == 0 {
         return;
     }
     let w = weft_core::grid::terminal_text_width(seg).min(*remaining);
-    renderer.push_text(verts, *x, y, seg, color, *remaining);
+    renderer.push_text_clipped(verts, *x, y, seg, color, *remaining, clip_bottom);
     *x += w as f32 * cw;
     *remaining = remaining.saturating_sub(w);
 }

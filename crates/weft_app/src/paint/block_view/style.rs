@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use super::clip;
 use crate::paint::primitives::{
-    color_to_normalized, ensure_minimum_text_contrast, push_quad, resolve_cell_color,
+    color_to_normalized, ensure_minimum_text_contrast, resolve_cell_color,
 };
 use crate::paint::styled_line_cache::{
     palette_fingerprint, translate_and_append_shifts_only_xy, StyledLineCache, StyledLineCacheKey,
@@ -30,6 +31,13 @@ pub(super) struct BlockOutputTextPaint<'a> {
     pub(super) max_cols: usize,
     pub(super) palette: &'a [Color; 256],
     pub(super) row_pitch: f32,
+    /// v1.14.2 (A1): hard bottom clip line (physical px, =
+    /// `content_bottom_y`). Quads fully below are culled; bands crossing it
+    /// keep their upper part (`block_view::clip`). The styled-line cache
+    /// stores LOCAL-origin vertices — the cache path bypasses on crossing
+    /// rows (§A1-2) and the local rebuild passes `f32::INFINITY`, so cached
+    /// content is never clipped.
+    pub(super) clip_bottom: f32,
 }
 
 fn semantic_role_at(spans: &[SemanticSpan], index: usize) -> Option<OutputSemanticRole> {
@@ -192,6 +200,19 @@ impl MetalRenderer {
             return;
         };
 
+        // v1.14.2 (A1 ②): the cache stores unclipped LOCAL-origin vertices,
+        // so a row band that crosses the hard clip line must NOT use it —
+        // bypass to the direct path (which carries the clip). Zero cache
+        // pollution: crossing rows bypass, in-band rows cache as before.
+        // A row fully below the line paints nothing at all.
+        if paint.y >= paint.clip_bottom {
+            return;
+        }
+        if paint.clip_bottom < paint.y + paint.row_pitch {
+            self.push_block_output_text(vertices, paint);
+            return;
+        }
+
         let key = StyledLineCacheKey {
             pane_session_id: key_input.pane_session_id,
             block_id: key_input.block_id,
@@ -227,6 +248,8 @@ impl MetalRenderer {
         // Miss: build into a local Vec at origin (0, 0). We construct a
         // paint copy with x=0, y=0 so the existing push_block_output_text
         // writes vertices in local coordinates suitable for caching.
+        // clip_bottom = INFINITY: the caller already screened this row into
+        // the visible band (§A1-2 above), and cached content is unclipped.
         let mut local = Vec::new();
         self.push_block_output_text(
             &mut local,
@@ -244,6 +267,7 @@ impl MetalRenderer {
                 max_cols: paint.max_cols,
                 palette: paint.palette,
                 row_pitch: paint.row_pitch,
+                clip_bottom: f32::INFINITY,
             },
         );
 
@@ -380,12 +404,14 @@ impl MetalRenderer {
                 .is_some_and(|(start, end, _)| source_index < end && source_index + 1 > start);
             if let Some(background) = bg_final.filter(|_| !in_selection) {
                 let cell_width = width as f32 * cw;
-                push_quad(
+                // v1.14.2 (A1): hard bottom clip — same semantics as glyphs.
+                clip::push_quad_clipped(
                     vertices,
                     [x, paint.y, x + cell_width, paint.y + paint.row_pitch],
                     [0.0; 4],
                     [0.0; 4],
                     background,
+                    paint.clip_bottom,
                 );
             }
 
@@ -401,7 +427,9 @@ impl MetalRenderer {
                 // `resolve_grapheme` ladder (cluster atlas first, FFFD/FF1F
                 // lead as the transient fallback), so a warmed ℹ️ renders as
                 // the wide color emoji instead of a split narrow base char.
-                self.push_text_with_height(
+                // v1.14.2 (A1): clipped variant — the boundary row keeps its
+                // upper part instead of bleeding past content_bottom.
+                self.push_text_with_height_clipped(
                     vertices,
                     [x, paint.y],
                     grapheme,
@@ -411,6 +439,7 @@ impl MetalRenderer {
                     // v1.10.12: bold/italic SGR styles select the atlas face
                     // in block history, matching the live grid path.
                     crate::glyph::GlyphStyle::from_flags(flags),
+                    paint.clip_bottom,
                 );
             }
 
@@ -456,17 +485,27 @@ impl MetalRenderer {
                     fg_final,
                 );
                 for rect in rects.iter().take(n) {
-                    push_quad(vertices, *rect, [0.0; 4], [0.0; 4], underline_color);
+                    // v1.14.2 (A1): underline bars sit at the band's bottom —
+                    // exactly where the boundary row crops.
+                    clip::push_quad_clipped(
+                        vertices,
+                        *rect,
+                        [0.0; 4],
+                        [0.0; 4],
+                        underline_color,
+                        paint.clip_bottom,
+                    );
                 }
             }
             if flags.contains(CellFlags::STRIKETHROUGH) {
                 let strike_y = paint.y + paint.row_pitch * 0.5 - 1.0;
-                push_quad(
+                clip::push_quad_clipped(
                     vertices,
                     [x, strike_y, x + cell_width, strike_y + 2.0],
                     [0.0; 4],
                     [0.0; 4],
                     fg_final,
+                    paint.clip_bottom,
                 );
             }
 
@@ -656,6 +695,7 @@ mod tests {
             max_cols: 10,
             palette: &Color::standard_palette(),
             row_pitch: 16.0,
+            clip_bottom: f32::INFINITY,
         };
         let key = CacheKeyInput {
             pane_session_id: 1,

@@ -124,7 +124,19 @@ impl App {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
-        renderer.resize(window, size);
+        // v1.14.2 (A3/PLAN §2): lightweight path — when the window size
+        // already matches the renderer viewport, skip `renderer.resize`
+        // (no set_drawable_size, no force_full_grid_redraw, no nested
+        // request_redraw). This is the drag/tween hot path (A2's 8ms
+        // cadence): chrome_left moves, the size does not. Failure safety
+        // rides the existing per-frame fingerprints — active grid
+        // prev_grid_origin (paint/grid.rs), background grid entry
+        // origin/dims, BgBlockFingerprint.rect — so a sidebar-driven
+        // origin_x change still full-redraws exactly once, then resumes
+        // incrementally. A REAL window resize still passes (size differs).
+        if (size.width as f32, size.height as f32) != renderer.viewport {
+            renderer.resize(window, size);
+        }
         let chrome_left = if self.panel.open {
             renderer.sidebar_push_width() as f64
         } else {

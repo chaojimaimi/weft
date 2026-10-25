@@ -95,6 +95,10 @@ impl App {
                 }
                 let active = weft_core::persistence::TabSnapshot::restored_active_index(&snaps);
                 self.sessions.set_active(active);
+                // v1.14.2 (B1-3): the restore flipped `restored_cwd_fallback`
+                // on the main thread — a title input the tracker generation
+                // cannot see. Invalidate the whole title cache once.
+                self.invalidate_tab_title_cache();
                 info!(restored = total, "tab snapshots restored");
             }
             Ok(_) => {}
@@ -256,5 +260,9 @@ impl App {
             total_tabs = self.sessions.tabs().len(),
             "attached block_ids from TabSnapshots after recovery restore"
         );
+        // v1.14.2 (B1-3): restore-attach completion — whole-cache
+        // invalidation (same `restored_cwd_fallback` flip rationale as
+        // `restore_tab_snapshots`).
+        self.invalidate_tab_title_cache();
     }
 }
