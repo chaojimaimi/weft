@@ -444,6 +444,47 @@ fn command_output_start_is_harmless_noop() {
     assert_eq!(t.blocks().last().unwrap().output.as_ref(), "x");
 }
 
+// ── v1.14.2 (B1): title_generation bump-point contract ─────────────────
+//
+// The app's tab-title cache keys its entries on this counter; the bump
+// points ARE the invalidation contract (a missed point = a frozen title).
+
+#[test]
+fn title_generation_bumps_at_every_title_input_point() {
+    let mut t = BlockTracker::new();
+    let g0 = t.title_generation();
+    // OSC 7 landing — the `cd` freeze regression.
+    t.set_cwd(Some("/tmp".to_string()));
+    let g1 = t.title_generation();
+    assert_ne!(g0, g1, "set_cwd must bump (title shows the cwd)");
+    // 133;B — the in-flight command enters the title.
+    t.on_command_start("cargo build".to_string());
+    let g2 = t.title_generation();
+    assert_ne!(g1, g2, "on_command_start must bump (▶ suffix appears)");
+    // Streaming output is NOT a title input — no bump (else the cache
+    // would rebuild per chunk during storms).
+    t.on_print_ascii_run(b"hello", CapturedStyle::default());
+    assert_eq!(t.title_generation(), g2, "output must not bump");
+    // 133;D / finalize — the suffix drops.
+    t.on_command_end(0);
+    assert_ne!(
+        t.title_generation(),
+        g2,
+        "finalize must bump (suffix drops)"
+    );
+}
+
+#[test]
+fn title_generation_bumps_on_finalize_paths_without_pending_command() {
+    // The interrupted-133;A path (on_prompt_start → finalize(None)) and the
+    // orphan path both run finalize — the bump lives there, not at 133;D.
+    let mut t = BlockTracker::new();
+    t.on_command_start("ghost".to_string());
+    let before = t.title_generation();
+    t.on_prompt_start(); // interrupted → finalize(None)
+    assert_ne!(t.title_generation(), before);
+}
+
 // ── T1: additional BlockTracker coverage ──────────────────────────
 
 #[test]

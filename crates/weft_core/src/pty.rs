@@ -101,6 +101,35 @@ pub struct Pty {
     writer: std::sync::Arc<crate::pty::writer::PtyWriter>,
 }
 
+/// v1.14.2 (B3, PLAN_v1142 §3): the product of a successful `forkpty` —
+/// fd assembly done, read loop NOT yet started.
+///
+/// The fork/read-loop two-segment contract: `fork_pty` is pure fork + fd
+/// work with NO tokio involvement, so it is callable from ANY thread (the
+/// B3 spawn worker). The read loop's `tokio::spawn` lives only in
+/// [`ForkedPty::start_read_loop`], which MUST be called on the main thread
+/// where the runtime is `enter`ed (main.rs) — a worker-thread call would
+/// panic after the fork succeeded (orphan child + uncleaned master fd).
+/// `Send` by construction: plain fds + pid + channel halves.
+#[derive(Debug)]
+pub struct ForkedPty {
+    /// Master side of the PTY (owned fd) — handed to the [`Pty`].
+    master: OwnedFd,
+    /// PID of the forked child.
+    child_pid: Pid,
+    /// Event channel producing half (the read loop's sink + the Flush
+    /// marker's source).
+    event_tx: mpsc::Sender<PtyEvent>,
+    /// Event channel consuming half — handed to the parse worker via
+    /// [`Pty::take_event_rx`].
+    event_rx: Option<mpsc::Receiver<PtyEvent>>,
+    /// Independent dup of the master for the tokio read loop (non-blocking
+    /// already set).
+    read_fd: OwnedFd,
+    /// Independent dup of the master for the [`PtyWriter`].
+    writer_fd: OwnedFd,
+}
+
 impl Pty {
     /// Spawn a new shell process inside a PTY.
     ///
@@ -118,6 +147,13 @@ impl Pty {
     }
 
     /// Spawn a process inside a PTY with additional arguments and env overrides.
+    ///
+    /// v1.14.2 (B3): now the SYNC convenience composition of the two-segment
+    /// contract — [`fork_pty`] + [`ForkedPty::start_read_loop`]. Behavior is
+    /// unchanged for every existing caller (fork, fd assembly, and the read
+    /// loop are the same code, same order); only the seam moved. Callers
+    /// that must fork OFF the main thread use `fork_pty` directly and defer
+    /// `start_read_loop` to a main-thread adoption step.
     ///
     /// `extra_env` are `KEY=VALUE`-style overrides merged on top of the current
     /// environment for the child. When non-empty the child is launched with
@@ -144,6 +180,21 @@ impl Pty {
         cwd: Option<&str>,
         mouse_suppress: MouseSuppressFlag,
     ) -> Result<Self> {
+        Ok(Self::fork_pty(program, args, size, extra_env, cwd)?.start_read_loop(mouse_suppress))
+    }
+
+    /// Fork the child and assemble the PTY fds. Pure fork — NO tokio, NO
+    /// read loop, callable from any thread (see [`ForkedPty`] for the
+    /// contract). The winsize comes straight from `size`; env/argv CString
+    /// pre-building (the multi-threaded-fork discipline) happens here in
+    /// the CALLING thread, before the fork, exactly as before.
+    pub fn fork_pty(
+        program: &str,
+        args: &[&str],
+        size: (u16, u16),
+        extra_env: &[(&str, &str)],
+        cwd: Option<&str>,
+    ) -> Result<ForkedPty> {
         let winsize = Winsize {
             ws_row: size.0,
             ws_col: size.1,
@@ -215,8 +266,6 @@ impl Pty {
                 // suspends when full and kernel flow control takes over.
                 let (event_tx, event_rx) = mpsc::channel(PTY_CHANNEL_CAP);
 
-                // Start async read loop
-                let tx = event_tx.clone();
                 let fd = master.as_raw_fd();
                 // Set master to non-blocking for tokio async I/O.
                 let raw = fcntl(fd, FcntlArg::F_GETFL).expect("F_GETFL failed");
@@ -227,7 +276,7 @@ impl Pty {
                 // Convert OwnedFd to tokio-compatible async file.
                 // We dup the fd so tokio can own it independently.
                 // SAFETY: dup returns a new fd that we wrap in OwnedFd.
-                let duped = unsafe {
+                let read_fd = unsafe {
                     let new_fd = nix::libc::dup(master.as_raw_fd());
                     if new_fd < 0 {
                         return Err(PtyError::Read(io::Error::last_os_error()));
@@ -247,45 +296,13 @@ impl Pty {
                     OwnedFd::from_raw_fd(new_fd)
                 };
 
-                let child_pid = child;
-                let read_child_pid = child;
-
-                tokio::spawn(async move {
-                    // v1.12.25 (audit S-2): a panicking reader task used to vanish silently
-                    // (tokio swallows it; the channel stays open because Pty holds another
-                    // tx clone) — the tab froze forever with no Exit and no log. Await the
-                    // inner task's JoinHandle and convert its panic payload into a
-                    // synthetic Exit so the existing teardown path runs.
-                    let reader = tx.clone();
-                    let handle = tokio::spawn(read_loop::read_loop(
-                        duped,
-                        read_child_pid,
-                        reader,
-                        mouse_suppress,
-                    ));
-                    if let Err(join_err) = handle.await {
-                        let msg = if join_err.is_panic() {
-                            panic_exit_reason(join_err.into_panic())
-                        } else {
-                            // Defensive: nothing aborts the inner task, so this arm is
-                            // unreachable in practice (review P3) — kept distinct from the
-                            // panic wording above.
-                            "reader task cancelled".to_string()
-                        };
-                        tracing::error!(
-                            error = %msg,
-                            "pty reader task failed; emitting synthetic Exit"
-                        );
-                        let _ = tx.send(PtyEvent::Exit(Err(msg))).await;
-                    }
-                });
-
-                Ok(Self {
+                Ok(ForkedPty {
                     master,
-                    child_pid,
+                    child_pid: child,
                     event_tx,
                     event_rx: Some(event_rx),
-                    writer: std::sync::Arc::new(writer::PtyWriter::new(writer_fd)),
+                    read_fd,
+                    writer_fd,
                 })
             }
         }
@@ -349,6 +366,85 @@ impl Pty {
     /// Get the master file descriptor (raw).
     pub fn master_fd(&self) -> std::os::unix::io::RawFd {
         self.master.as_raw_fd()
+    }
+}
+
+impl ForkedPty {
+    /// Detached assembly: wrap existing fds + a live event channel WITHOUT
+    /// forking. Injection seam for weft_app's spawn-ADOPTION tests (plan
+    /// §3-B3: “采纳 wiring 假件测试，ForkedPty 可注入假件”) — the fake uses
+    /// a /dev/null master and a real already-exiting child pid so the Drop
+    /// SIGHUP and the read loop's waitpid both behave like the real thing.
+    /// Production only ever builds a `ForkedPty` via [`Pty::fork_pty`].
+    pub fn from_parts(
+        master: OwnedFd,
+        child_pid: Pid,
+        read_fd: OwnedFd,
+        writer_fd: OwnedFd,
+    ) -> Self {
+        let (event_tx, event_rx) = mpsc::channel(PTY_CHANNEL_CAP);
+        Self {
+            master,
+            child_pid,
+            event_tx,
+            event_rx: Some(event_rx),
+            read_fd,
+            writer_fd,
+        }
+    }
+
+    /// Start the async read loop and assemble the [`Pty`]. MAIN THREAD
+    /// ONLY — the `tokio::spawn` below requires the runtime to be entered
+    /// on the calling thread (main.rs `rt.enter()`); this is the second
+    /// half of the B3 fork/read-loop contract and the only legal place the
+    /// read loop is ever started (the spawn-adoption step).
+    pub fn start_read_loop(self, mouse_suppress: MouseSuppressFlag) -> Pty {
+        let ForkedPty {
+            master,
+            child_pid,
+            event_tx,
+            event_rx,
+            read_fd: duped,
+            writer_fd,
+        } = self;
+
+        let tx = event_tx.clone();
+        let read_child_pid = child_pid;
+
+        tokio::spawn(async move {
+            // v1.12.25 (audit S-2): a panicking reader task used to vanish silently
+            // (tokio swallows it; the channel stays open because Pty holds another
+            // tx clone) — the tab froze forever with no Exit and no log. Await the
+            // inner task's JoinHandle and convert its panic payload into a
+            // synthetic Exit so the existing teardown path runs.
+            let reader = tx.clone();
+            let handle = tokio::spawn(read_loop::read_loop(
+                duped,
+                read_child_pid,
+                reader,
+                mouse_suppress,
+            ));
+            if let Err(join_err) = handle.await {
+                let msg = if join_err.is_panic() {
+                    panic_exit_reason(join_err.into_panic())
+                } else {
+                    // Defensive: nothing aborts the inner task, so this arm is
+                    // unreachable in practice (review P3) — kept distinct from the
+                    // panic wording above.
+                    "reader task cancelled".to_string()
+                };
+                tracing::error!(error = %msg, "pty reader task failed; emitting synthetic Exit");
+                let _ = tx.send(PtyEvent::Exit(Err(msg))).await;
+            }
+        });
+
+        Pty {
+            master,
+            child_pid,
+            event_tx,
+            event_rx,
+            writer: std::sync::Arc::new(writer::PtyWriter::new(writer_fd)),
+        }
     }
 }
 

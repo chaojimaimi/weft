@@ -118,6 +118,13 @@ impl BlockTracker {
     /// proves it replayed a substantial portion of that block. A failed or
     /// unrelated launch restores the old block and records a separate command.
     pub(super) fn finalize(&mut self, exit_code: Option<i32>) {
+        // v1.14.2 (B1): the in-flight command disappearing is a tab-title
+        // input change (the "▶ … • cmd" suffix drops). One bump here covers
+        // every finalize caller: 133;D, the interrupted-133;A prompt path,
+        // the deferred screen-exit finish, and the orphan-command path. The
+        // `pending_command = None` early-return below is title-neutral (the
+        // live command was already gone).
+        self.title_generation = self.title_generation.wrapping_add(1);
         let Some(command) = self.pending_command.take() else {
             self.clear_pending_capture();
             return;
