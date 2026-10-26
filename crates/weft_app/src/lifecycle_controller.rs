@@ -524,6 +524,8 @@ impl App {
             // v1.15: "warp" is the default — it leads the curated order
             // (defaults first), weft-warm demotes to a legacy choice.
             "warp",
+            // v1.15.1: Warp's real light theme.
+            "warp-light",
             "weft-warm",
             "weft-light",
             "dracula",
@@ -653,7 +655,9 @@ impl App {
                     .theme
                     .light_name
                     .clone()
-                    .unwrap_or_else(|| "weft-light".to_string())
+                    // v1.15.1: light fallback follows Warp's real light
+                    // theme, mirroring the dark-side "warp" fallback.
+                    .unwrap_or_else(|| "warp-light".to_string())
             };
             self.apply_theme_by_name(&name, dark);
         }

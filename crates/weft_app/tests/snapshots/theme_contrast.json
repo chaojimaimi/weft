@@ -278,6 +278,97 @@
       "indicators": [
         {
           "pair": "find_match_composited",
+          "ratio": 3.202
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.322
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 5.918
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.093
+        }
+      ],
+      "name": "warp-light",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 18.883
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 18.883
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 18.883
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 16.57
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 7.114
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 7.114
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 7.114
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 6.243
+        },
+        {
+          "pair": "focus",
+          "ratio": 5.158
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 4.526
+        },
+        {
+          "pair": "success",
+          "ratio": 5.46
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 4.791
+        },
+        {
+          "pair": "warning",
+          "ratio": 5.338
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 4.684
+        },
+        {
+          "pair": "error",
+          "ratio": 6.261
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.494
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.357
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
           "ratio": 3.336
         },
         {

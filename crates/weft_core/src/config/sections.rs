@@ -60,7 +60,7 @@ pub struct ThemeConfig {
     /// this is enabled (the system overrides it on the next poll).
     pub follow_system: bool,
     /// v0.9 U-D1: theme name to use when system appearance is Light.
-    /// Defaults to "weft-light" when None.
+    /// Defaults to "warp-light" when None (v1.15.1; was "weft-light").
     pub light_name: Option<String>,
     /// v0.9 U-D1: theme name to use when system appearance is Dark.
     /// Defaults to "warp" when None (v1.15; was "weft-warm").

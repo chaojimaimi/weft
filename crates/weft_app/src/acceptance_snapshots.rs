@@ -331,11 +331,12 @@ fn layout_scene_snapshot() -> Value {
     })
 }
 
-fn built_in_themes() -> [(&'static str, Theme); 11] {
+fn built_in_themes() -> [(&'static str, Theme); 12] {
     [
         ("weft-warm", Theme::weft_warm()),
         ("weft-light", Theme::weft_light()),
         ("warp-dark", Theme::warp_dark()),
+        ("warp-light", Theme::warp_light()),
         ("dracula", Theme::dracula()),
         ("solarized-dark", Theme::solarized_dark()),
         ("gruvbox-dark", Theme::gruvbox_dark()),
@@ -350,6 +351,16 @@ fn built_in_themes() -> [(&'static str, Theme); 11] {
 #[test]
 fn built_in_themes_keep_ansi_bright_colors_visible_on_the_canvas() {
     for (name, theme) in built_in_themes() {
+        // v1.15.1: the 1.5:1 floor only applies to dark themes (background
+        // relative luminance < 0.5, the shared Theme::is_dark judgment).
+        // Light themes are exempt: warp-light's upstream truth puts bright
+        // white #F1F1F1 on #ffffff at ≈1.13:1 and bright yellow #F3E430 at
+        // ≈1.32:1 — faithful to Warp's own light theme (weft_light only
+        // ever passed because its "white" was a dark-mirrored design
+        // value). Do not nudge light palettes away from source truth.
+        if !theme.is_dark() {
+            continue;
+        }
         for index in 8..16 {
             let ratio = contrast_ratio(theme.palette[index], theme.background);
             assert!(

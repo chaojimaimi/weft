@@ -229,7 +229,9 @@ impl ApplicationHandler<AppEvent> for App {
                     .theme
                     .light_name
                     .clone()
-                    .unwrap_or_else(|| "weft-light".to_string())
+                    // v1.15.1: light fallback follows Warp's real light
+                    // theme, mirroring the dark-side "warp" fallback.
+                    .unwrap_or_else(|| "warp-light".to_string())
             };
             weft_core::config::Theme::resolve_named(&name, &self.config_state.config.theme)
         } else {

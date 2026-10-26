@@ -319,7 +319,7 @@ impl App {
         //
         // v0.9 U-D1: when `[theme] follow_system = true`, the system
         // appearance picks the theme (via `light_name` / `dark_name`,
-        // defaulting to `weft-light` / `warp`). The `name` field is
+        // defaulting to `warp-light` / `warp`). The `name` field is
         // ignored in this mode.
         let theme = if config.theme.follow_system {
             // SAFETY: `system_appearance_is_dark` reads NSUserDefaults
@@ -339,7 +339,9 @@ impl App {
                     .theme
                     .light_name
                     .clone()
-                    .unwrap_or_else(|| "weft-light".to_string())
+                    // v1.15.1: light fallback follows Warp's real light
+                    // theme, mirroring the dark-side "warp" fallback.
+                    .unwrap_or_else(|| "warp-light".to_string())
             };
             weft_core::config::Theme::resolve_named(&name, &config.theme)
         } else {

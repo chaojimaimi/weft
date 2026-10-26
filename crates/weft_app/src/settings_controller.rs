@@ -941,11 +941,13 @@ impl App {
     /// 面板进入，两处行为不一致。
     pub(super) fn settings_theme_views(&self) -> Vec<crate::overlay::SettingsThemeView> {
         use crate::overlay::SettingsThemeView;
-        const BUILTINS: [(&str, &str); 11] = [
+        const BUILTINS: [(&str, &str); 12] = [
             ("weft-warm", "Weft Warm"),
             ("weft-light", "Weft Light"),
             // v1.15: the (default) marker moved with the default flip.
             ("warp", "Warp (default)"),
+            // v1.15.1: Warp's real light theme (follow_system light fallback).
+            ("warp-light", "Warp Light"),
             ("dracula", "Dracula"),
             ("solarized-dark", "Solarized Dark"),
             ("gruvbox-dark", "Gruvbox Dark"),

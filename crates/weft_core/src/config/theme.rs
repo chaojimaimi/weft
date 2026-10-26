@@ -1,6 +1,7 @@
 // arch-gate: allow-over-800
-// Theme + impl Theme: 11 built-in theme constructors (weft_warm/dracula/
-// nord/etc.), each ~50-80 lines of palette literals. Intrinsic volume.
+// Theme + impl Theme: 12 built-in theme constructors (warp/warp_light/
+// weft_warm/dracula/nord/etc.), each ~50-80 lines of palette literals.
+// Intrinsic volume.
 // ── Theme (resolved colors the renderer needs) ─────────────────────────
 
 use std::path::PathBuf;
@@ -343,6 +344,69 @@ impl Theme {
                 metadata: Color::rgb(0x8e, 0x8e, 0x8e),       // == ANSI 8 (muted)
                 success: Color::rgb(0xb4, 0xfa, 0x72),        // ANSI 2 green
                 failure: Color::rgb(0xff, 0x82, 0x72),        // ANSI 1 red
+            },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
+        }
+    }
+
+    /// v1.15.1: Warp's real "Light" theme — verbatim source truth from the
+    /// local Warp checkout (`light_theme()` + `LIGHT_MODE_*`,
+    /// app/src/themes/default_themes.rs:275-283 / :33-48), pinned value by
+    /// value by the config tests below. Upstream quirk kept faithfully:
+    /// bright black == normal black (#212121) is Warp's own value, NOT a
+    /// Weft bug. Set `name = "warp-light"` in `[theme]` to use it; it is
+    /// also the `follow_system` light-side fallback (mirrors dark "warp").
+    pub fn warp_light() -> Self {
+        let mut palette = Color::standard_palette();
+        // ANSI 0-15 — Warp source truth (default_themes.rs light_theme()).
+        let ansi = [
+            (0x21, 0x21, 0x21), // 0 black
+            (0xc3, 0x07, 0x71), // 1 red
+            (0x10, 0xa7, 0x78), // 2 green
+            (0xa8, 0x9c, 0x14), // 3 yellow
+            (0x00, 0x8e, 0xc4), // 4 blue
+            (0x52, 0x3c, 0x79), // 5 magenta
+            (0x20, 0xa5, 0xba), // 6 cyan
+            (0xe0, 0xe0, 0xe0), // 7 white
+            (0x21, 0x21, 0x21), // 8 bright black (upstream == normal black)
+            (0xfb, 0x00, 0x7a), // 9 bright red
+            (0x5f, 0xd7, 0xaf), // 10 bright green
+            (0xf3, 0xe4, 0x30), // 11 bright yellow
+            (0x20, 0xbb, 0xfc), // 12 bright blue
+            (0x68, 0x55, 0xde), // 13 bright magenta
+            (0x4f, 0xb8, 0xcc), // 14 bright cyan
+            (0xf1, 0xf1, 0xf1), // 15 bright white
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0x11, 0x11, 0x11), // == upstream foreground
+            background: Color::rgb(0xff, 0xff, 0xff), // == upstream background
+            cursor: Color::rgb(0x00, 0xc2, 0xff),     // Warp truth: cursor None → accent fallback
+            selection: Color::rgb(0x9f, 0xe0, 0xf5),  // derived: accent lifted toward white
+            palette,
+            accent: Color::rgb(0x00, 0xc2, 0xff), // Warp source truth
+            accent_dim: Color::rgb(0x00, 0x91, 0xc2), // derived dim accent
+            separator: Color::rgb(0xe0, 0xe0, 0xe0), // derived barely-visible light gray
+            syntax: SyntaxColors {
+                command: Color::rgb(0x10, 0xa7, 0x78),  // == ANSI 2 green
+                flag: Color::rgb(0x00, 0x8e, 0xc4),     // == ANSI 4 blue
+                path: Color::rgb(0x1a, 0x86, 0xa8),     // derived deepened cyan-blue (readability)
+                string: Color::rgb(0xa8, 0x9c, 0x14),   // == ANSI 3 yellow
+                number: Color::rgb(0xfb, 0x00, 0x7a),   // == ANSI 9 bright red
+                variable: Color::rgb(0x68, 0x55, 0xde), // == ANSI 13 bright magenta
+                operator: Color::rgb(0xc3, 0x07, 0x71), // == ANSI 1 red
+                comment: Color::rgb(0x8a, 0x8a, 0x8a),  // derived mid gray
+                argument: Color::rgb(0x4a, 0x5a, 0x66), // derived mid-luma slate
+                default: Color::rgb(0x11, 0x11, 0x11),  // == foreground
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0x11, 0x11, 0x11), // == syntax.default
+                metadata: Color::rgb(0x6a, 0x6a, 0x6a),       // derived muted gray
+                success: Color::rgb(0x10, 0xa7, 0x78),        // ANSI 2 green
+                failure: Color::rgb(0xc3, 0x07, 0x71),        // ANSI 1 red
             },
             link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
             ui: ThemeUi::default(),
@@ -835,8 +899,8 @@ impl Theme {
     /// then apply any inline hex overrides.
     ///
     /// Recognized names: `weft-warm` / `weft-dark` (alias) / `weft-light` /
-    /// `warp` / `warp-dark` / `dracula` / `solarized-dark` / `gruvbox-dark`.
-    /// Unknown names fall back to `warp` (the v1.15 default).
+    /// `warp` / `warp-dark` / `warp-light` / `dracula` / `solarized-dark` /
+    /// `gruvbox-dark`. Unknown names fall back to `warp` (the v1.15 default).
     pub fn resolve(cfg: &ThemeConfig) -> Self {
         Self::resolve_named(&cfg.name, cfg)
     }
@@ -858,6 +922,8 @@ impl Theme {
             "weft-warm" | "weft-dark" | "weft_dark" => Self::weft_warm(),
             // v0.9 W2+: Warp-style dark theme.
             "warp" | "warp-dark" | "warp_dark" => Self::warp_dark(),
+            // v1.15.1: Warp's real light theme (follow_system light fallback).
+            "warp-light" | "warp_light" => Self::warp_light(),
             // v0.9 W2+: Classic community themes.
             "dracula" => Self::dracula(),
             "solarized-dark" | "solarized_dark" | "solarized" => Self::solarized_dark(),

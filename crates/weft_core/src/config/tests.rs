@@ -274,6 +274,58 @@ fn warp_theme_pins_warp_source_truth() {
 }
 
 #[test]
+fn warp_light_theme_pins_warp_source_truth() {
+    // v1.15.1 真值回归锁：warp_light 逐值钉死 Warp 默认 "Light" 主题 —— 取自
+    // 本地 Warp 源码 app/src/themes/default_themes.rs（light_theme()
+    // :275-283 + LIGHT_MODE_* :33-48）。改动任何一个值 = 偏离 Warp 上游，
+    // 须在方案中重新备案（bright-visible 豁免不构成偏离源值的理由：
+    // bright white #F1F1F1 ≈1.13:1 / bright yellow #F3E430 ≈1.32:1 on
+    // #ffffff 系上游本值；b.black == normal black #212121 亦上游本值）。
+    let t = Theme::warp_light();
+    // bg/fg/accent/cursor — Warp 真值（light_theme() cursor 传 None，
+    // weft_core 回落 unwrap_or(accent)，故 cursor == accent）。
+    assert_eq!(t.background, Color::rgb(0xff, 0xff, 0xff));
+    assert_eq!(t.foreground, Color::rgb(0x11, 0x11, 0x11));
+    assert_eq!(t.accent, Color::rgb(0x00, 0xc2, 0xff));
+    assert_eq!(t.cursor, t.accent);
+    // 16 个 ANSI 槽逐值（0-7 普通，8-15 bright）。
+    let expected: [(u8, u8, u8); 16] = [
+        (0x21, 0x21, 0x21),
+        (0xc3, 0x07, 0x71),
+        (0x10, 0xa7, 0x78),
+        (0xa8, 0x9c, 0x14),
+        (0x00, 0x8e, 0xc4),
+        (0x52, 0x3c, 0x79),
+        (0x20, 0xa5, 0xba),
+        (0xe0, 0xe0, 0xe0),
+        (0x21, 0x21, 0x21), // upstream: bright black == normal black
+        (0xfb, 0x00, 0x7a),
+        (0x5f, 0xd7, 0xaf),
+        (0xf3, 0xe4, 0x30),
+        (0x20, 0xbb, 0xfc),
+        (0x68, 0x55, 0xde),
+        (0x4f, 0xb8, 0xcc),
+        (0xf1, 0xf1, 0xf1),
+    ];
+    for (i, (r, g, b)) in expected.iter().enumerate() {
+        assert_eq!(t.palette[i], Color::rgb(*r, *g, *b), "ANSI slot {i}");
+    }
+    // 按名解析：两个别名都落到 warp_light()。
+    for name in ["warp-light", "warp_light"] {
+        let cfg = ThemeConfig {
+            name: name.into(),
+            ..Default::default()
+        };
+        assert_eq!(Theme::resolve(&cfg), Theme::warp_light(), "name = {name}");
+    }
+    // 亮色主题判定：白底必须被 is_dark() 判为亮（bright-visible 豁免的
+    // 依据 —— 该豁免复用同一判定）。
+    assert!(!t.is_dark());
+    // default == foreground.
+    assert_eq!(t.syntax.default, t.foreground);
+}
+
+#[test]
 fn warp_theme_supports_inline_overrides() {
     // v0.9 W2+: inline overrides apply on top of the warp base, just like
     // weft-warm. Verifies resolve_named() applies cfg overrides to warp.
