@@ -29,6 +29,17 @@ mod contrast_tests;
 mod startup_replay_tests;
 mod style_tests;
 
+/// v1.15.1 (T4, PLAN_v1151 — kitty semantics, user ruling 2026-10-26):
+/// does THIS cell's background take the window-opacity fade? Pure
+/// predicate over the RESOLVED (post-REVERSE-swap) cell background —
+/// true only when its RGB equals the default background exactly (alpha
+/// exempt; the fade multiplies it). Explicit SGR/ANSI backgrounds stay
+/// opaque; one that numerically equals the default color fades (kitty's
+/// documented semantics). Truth-table tested below.
+pub(crate) fn should_fade_background(bg: [f32; 4], default_bg: [f32; 4]) -> bool {
+    bg[0] == default_bg[0] && bg[1] == default_bg[1] && bg[2] == default_bg[2]
+}
+
 // ── Data structures ───────────────────────────────────────────────────
 
 /// Background-stream instance: one per run of same-bg cells.
@@ -347,18 +358,23 @@ pub(crate) fn build_row_instances(
             std::mem::swap(&mut fg, &mut bg);
         }
 
-        // Weft's OWN semantics (v1.13.13 G.1 ruling, deliberate): window
-        // opacity fades EVERY cell background — REVERSE bars and explicit
-        // SGR/ANSI backgrounds included — so a transparent window shows the
-        // desktop through all of them; chrome (cursor/selection) stays fully
-        // opaque (it overrides bg below). This DIFFERS from kitty's default,
-        // where background_opacity fades only cells whose background equals
-        // the default background (colored/reverse cells render opaque).
-        // Verified against kitty's docs 2026-10-17. The difference is
-        // self-consistent and shipped for several versions, but is flagged
-        // for reconsideration — preferring kitty semantics would be a small
-        // standalone behavior change on top of this line.
-        bg[3] *= opacity;
+        // v1.15.1 (T4, PLAN_v1151 — user ruling 2026-10-26): kitty semantics
+        // REPLACE the v1.13.13 G.1 "Weft-owned, fade every background"
+        // ruling. Window opacity now fades ONLY cells whose resolved
+        // background equals the default background — kitty's documented
+        // contract ("cells whose background equals the default background").
+        // An explicit SGR/ANSI color that happens to equal the default color
+        // fades too (same predicate — kitty's own semantics). The judgment
+        // runs on the POST-REVERSE-swap bg (the swap above precedes this
+        // line), so a REVERSE cell showing the default FOREGROUND in `bg`
+        // is not the default background and stays opaque.
+        // Chrome exception (备案): the block-view tint surfaces
+        // (paint/block_view/surfaces.rs:93 zebra/error/warning) keep their
+        // own deliberate whole-surface fade — pinned by
+        // block_surface_uses_window_opacity, untouched here.
+        if should_fade_background(bg, default_bg) {
+            bg[3] *= opacity;
+        }
 
         // ── Determine cell state ───────────────────────────────────
         let is_cursor = show_cursor && row == cursor.row && col == cursor.col;

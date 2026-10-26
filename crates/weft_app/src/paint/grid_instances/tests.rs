@@ -378,6 +378,45 @@ fn opacity_scales_background_alpha() {
     assert!((result_half.bg_instances[0].bg[3] - BG[3] * 0.5).abs() < 1e-6);
 }
 
+// ── v1.15.1 (T4): kitty 语义 — should_fade_background 真值表 ──────────
+
+#[test]
+fn should_fade_background_truth_table() {
+    let default_bg = BG;
+    let default_fg = FG;
+    // ① Default 背景 → 淡。
+    assert!(should_fade_background(default_bg, default_bg));
+    // ② SGR 41（红底，resolve 后）→ 不淡。
+    let sgr_red_bg = [1.0, 0.0, 0.0, 1.0];
+    assert!(!should_fade_background(sgr_red_bg, default_bg));
+    // ③ REVERSE：默认前景换入 bg（换向发生在乘之前，判定点见到的 bg 是
+    // 前景色）→ 不淡。
+    assert!(!should_fade_background(default_fg, default_bg));
+    // ④ 显式色恰等默认色 → 淡（kitty 文档口径：背景等于默认背景即淡）。
+    let explicit_equal = [default_bg[0], default_bg[1], default_bg[2], 1.0];
+    assert!(should_fade_background(explicit_equal, default_bg));
+    // ⑤（边界）仅 alpha 不同不算差 —— 谓词只比 RGB 三分量。
+    let alpha_only_diff = [default_bg[0], default_bg[1], default_bg[2], 0.42];
+    assert!(should_fade_background(alpha_only_diff, default_bg));
+}
+
+#[test]
+fn explicit_sgr_background_stays_opaque_under_opacity() {
+    // 构建级复核：SGR 41 红底格在 opacity 0.5 下 alpha 保持 1.0（kitty
+    // 语义下显式色不淡出）；同网格的默认背景格照常淡出。
+    let mut red = Cell::with_char('A');
+    red.bg = CellColor::Palette(1);
+    let grid = make_grid(&[red, Cell::with_char('B')]);
+    let cursor = Cursor::default();
+    let sel = SelectionHandler::new();
+    let result = build(&grid, &cursor, CursorStyle::Block, false, &sel, 0.5);
+    // Run 0 = SGR 红底格（palette slot 1 → resolve 后 ≠ 默认 bg）→ alpha 不变。
+    assert_eq!(result.bg_instances[0].bg[3], 1.0);
+    // Run 1 = 默认背景格 → alpha 减半（Test 14 同语义）。
+    let last = result.bg_instances.last().expect("default bg run");
+    assert!((last.bg[3] - BG[3] * 0.5).abs() < 1e-6);
+}
+
 // ── Serialization smoke test ───────────────────────────────────
 
 #[test]
