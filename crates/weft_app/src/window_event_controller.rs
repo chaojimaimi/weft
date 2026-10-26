@@ -22,6 +22,23 @@ enum DispatchOutcome {
     Abort,
 }
 
+/// v1.14.5 R1: the single place translating the headless `ZoomControlFlow`
+/// decision into winit's enum (policy.rs stays winit-free so its truth
+/// table stays testable without an event loop).
+fn set_zoom_control_flow(
+    event_loop: &ActiveEventLoop,
+    flow: crate::paint::zoom_render::ZoomControlFlow,
+) {
+    match flow {
+        crate::paint::zoom_render::ZoomControlFlow::WaitUntil(deadline) => {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+        }
+        crate::paint::zoom_render::ZoomControlFlow::Wait => {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        }
+    }
+}
+
 impl App {
     /// v1.12.27b (P1-04): dispatch keeps only the event-class match skeleton
     /// plus the `should_exit` tail (:559-568 at baseline); each arm's body
@@ -507,15 +524,28 @@ impl App {
     pub(crate) fn zoom_wait_policy(&mut self, event_loop: &ActiveEventLoop) {
         let hot = self.window_runtime.zoom_jump_hot();
         let pending = self.window_runtime.zoom_flush_pending;
-        match crate::paint::zoom_render::zoom_flush_action(hot, pending) {
+        // v1.14.5 R1: every branch routes through the pure `zoom_control_flow`
+        // truth table, which composes the step-pacing wake deadline
+        // (`step_wait`, armed by step_self_zoom) with the hot-window deadline
+        // into ONE determined flow per pass.
+        let action = crate::paint::zoom_render::zoom_flush_action(hot, pending);
+        let step_wait = crate::paint::zoom_render::zoom_step_wait();
+        match action {
             crate::paint::zoom_render::ZoomFlushAction::Arm => {
                 // Hot implies zoom_jump_until is Some (the predicate is
                 // `now < until`); the guard keeps the invariant explicit.
-                if let Some(until) = self.window_runtime.zoom_jump_until {
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                        until + std::time::Duration::from_millis(2),
-                    ));
-                }
+                // The +2ms grace past expiry is preserved (baseline
+                // :515-517); zoom_control_flow takes min(step_wait,
+                // hot_flush) so the denser step wake is never squashed by
+                // the ≤300 ms hot deadline.
+                let hot_flush = self
+                    .window_runtime
+                    .zoom_jump_until
+                    .map(|until| until + std::time::Duration::from_millis(2));
+                set_zoom_control_flow(
+                    event_loop,
+                    crate::paint::zoom_render::zoom_control_flow(action, step_wait, hot_flush),
+                );
                 self.window_runtime.zoom_flush_pending = true;
             }
             crate::paint::zoom_render::ZoomFlushAction::Flush => {
@@ -525,12 +555,28 @@ impl App {
                 // on every pass (EventLoopWaker::start_at -> start()), a
                 // permanent post-zoom busy loop. Arm re-covers it on the
                 // next hot window, so resetting here is race-free.
+                // v1.14.5 R1: clear the step-wake deadline too — the flush
+                // is terminal for the whole zoom sequence (belt-and-braces
+                // alongside the step paths' own resets).
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                crate::paint::zoom_render::set_zoom_step_wait(None);
                 self.window_runtime.zoom_flush_pending = false;
                 crate::paint::zoom_render::zoom_window_finished();
                 self.request_redraw();
             }
-            crate::paint::zoom_render::ZoomFlushAction::None => {}
+            crate::paint::zoom_render::ZoomFlushAction::None => {
+                // v1.14.5 R1 (P1 fix core): set the flow EXPLICITLY here.
+                // This arm was empty and left any WaitUntil an earlier pass
+                // armed in place; if the anim vanished between passes the
+                // stale deadline re-fired immediately every pass — the same
+                // H1 busy-loop shape. zoom_control_flow maps
+                // step_wait=Some -> WaitUntil(d) (the anim's first pass's
+                // only wake source) and None -> Wait (the explicit reset).
+                set_zoom_control_flow(
+                    event_loop,
+                    crate::paint::zoom_render::zoom_control_flow(action, step_wait, None),
+                );
+            }
         }
     }
 
@@ -552,28 +598,39 @@ impl App {
             crate::macos_zoom::self_zoom_test_tick(window);
         }
         let Some(anim) = crate::macos_zoom::zoom_anim_peek() else {
+            // v1.14.5 R1: no animation — the step wake must not outlive it
+            // (a stale deadline would re-fire immediately every pass, the
+            // H1 busy-loop shape).
+            crate::paint::zoom_render::set_zoom_step_wait(None);
             return;
         };
         let Some(window) = self.window.as_ref() else {
             crate::macos_zoom::zoom_anim_cancel();
+            crate::paint::zoom_render::set_zoom_step_wait(None);
             return;
         };
         // Cancel semantics (review P1-3): a live resize gesture owns the
         // geometry; the animation must not fight the user's drag.
         if crate::macos_window::window_in_live_resize(window) {
             crate::macos_zoom::zoom_anim_cancel();
+            crate::paint::zoom_render::set_zoom_step_wait(None);
             tracing::debug!("self-zoom cancelled: live resize in progress");
             return;
         }
-        // Pacing floor (PLAN_zoom_drawable_stall B): refuse to apply a step
-        // sooner than STEP_MIN_INTERVAL after the previous one. The refusal
-        // MUST keep the sustain chain alive — request_redraw here — or the
-        // loop would sleep until the 300 ms hot-window expiry (the exact
-        // field-freeze shape this plan fixes). Each refused pass costs one
+        // Pacing floor (PLAN_zoom_drawable_stall B; timer semantics since
+        // v1.14.5 R1): refuse to apply a step sooner than STEP_MIN_INTERVAL
+        // after the previous one. The refusal used to keep the chain alive
+        // via request_redraw — which woke the loop into a FULL frame draw
+        // (same geometry, same content) per refusal, 1-2 wasted 5-9 ms
+        // frames per step. It now arms a WaitUntil deadline at the next
+        // step boundary: the loop sleeps and the deadline wakes it for
+        // exactly one bracket draw per step. Each refused pass costs one
         // anim peek + one flag check; the due pass then folds the skipped
         // interval in (time-driven interpolation).
         if !crate::macos_zoom::zoom_step_due(anim.last_step.elapsed()) {
-            self.request_redraw();
+            crate::paint::zoom_render::set_zoom_step_wait(Some(
+                anim.last_step + crate::macos_zoom::STEP_MIN_INTERVAL,
+            ));
             return;
         }
         let progress = (anim.start.elapsed().as_secs_f64() / anim.duration.as_secs_f64()).min(1.0);
@@ -601,6 +658,7 @@ impl App {
         };
         if drifted {
             crate::macos_zoom::zoom_anim_cancel();
+            crate::paint::zoom_render::set_zoom_step_wait(None);
             tracing::warn!("self-zoom cancelled: window moved externally mid-animation");
             return;
         }
@@ -625,7 +683,22 @@ impl App {
             renderer.set_zoom_atomic_present(true);
             tracing::debug!("zoom step atomic present on");
         }
+        // v1.14.5 R4: bracket-timing observability — the step's stretch
+        // window IS this draw's duration (the wake below is
+        // last_step + 12ms, already past when the draw ran longer), so a
+        // slow draw both holds the main thread and stretches the step
+        // interval. >50 ms = the reload-session stall class (v1.14.4
+        // post-audit residual); the warn supplies forensics data without a
+        // debug reproduction run.
+        let draw_started = std::time::Instant::now();
         self.handle_redraw_requested_forced();
+        let draw_ms = draw_started.elapsed().as_millis();
+        if draw_ms > 50 {
+            tracing::warn!(
+                draw_ms,
+                "zoom step draw slow — stretch window = draw duration"
+            );
+        }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_zoom_atomic_present(false);
         }
@@ -638,8 +711,26 @@ impl App {
             // this request the final-geometry frame waits for the ≤300 ms
             // flush (the F.0 final-adjustment defect).
             self.request_redraw();
+            // v1.14.5 R1: the animation is over — clear the step wake (the
+            // terminal redraw above stays the Phase F final-content safety
+            // net, untouched).
+            crate::paint::zoom_render::set_zoom_step_wait(None);
         } else {
-            self.request_redraw();
+            // v1.14.5 R1: timer wake replaces the old request_redraw spin —
+            // that spin drew a SECOND full frame per step (double supply
+            // beside the bracket draw). Re-peek for the wake basis so it
+            // shares ONE reference with the not-due path and zoom_step_due
+            // (zoom_anim_mark_stepped above advanced last_step): step
+            // distance = max(12 ms floor, this draw's duration) — a draw
+            // slower than the floor leaves the deadline already past, so
+            // the next pass falls straight through: denser AND more even
+            // than a now+12 ms guess. Exactly one bracket draw per step.
+            // The anim vanishing between here and the peek naturally maps
+            // to None (no wake).
+            crate::paint::zoom_render::set_zoom_step_wait(
+                crate::macos_zoom::zoom_anim_peek()
+                    .map(|a| a.last_step + crate::macos_zoom::STEP_MIN_INTERVAL),
+            );
         }
     }
 }

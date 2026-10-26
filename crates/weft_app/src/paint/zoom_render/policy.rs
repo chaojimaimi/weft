@@ -5,6 +5,9 @@
 //! (`super::`); the main-thread-exclusivity discipline documented there
 //! applies unchanged.
 
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
 use super::{lock, pull_enabled, pull_in_progress, watermark_requests_pull};
 
 /// The tightened animation-suppression gate (F-3B): `zoom_jump_hot`, checked
@@ -44,6 +47,93 @@ pub(crate) fn zoom_flush_action(hot: bool, pending: bool) -> ZoomFlushAction {
         (true, _) => ZoomFlushAction::Arm,
         (false, true) => ZoomFlushAction::Flush,
         (false, false) => ZoomFlushAction::None,
+    }
+}
+
+/// Process-level step-wake deadline (v1.14.5 R1, PLAN_v1145): armed by
+/// `step_self_zoom` with `last_step + STEP_MIN_INTERVAL`, consumed by
+/// `zoom_wait_policy` through `zoom_control_flow`. Replaces the retired
+/// request_redraw spin chain — a pacing refusal now arms a deadline instead
+/// of forcing a full frame. House pattern = the parent module's FRAME_CACHE
+/// (`OnceLock<Mutex<_>>`, mod.rs:180): the Mutex only crosses Rust's
+/// static/borrow boundary; usage stays main-thread-exclusive like
+/// everything zoom-related.
+static STEP_WAIT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+fn step_wait_slot() -> &'static Mutex<Option<Instant>> {
+    STEP_WAIT.get_or_init(|| Mutex::new(None))
+}
+
+/// Arm (Some) or clear (None) the step-wake deadline. `None` is the reset
+/// path for every early-exit / cancel / finish / Flush route — a stale
+/// deadline must never outlive the animation (the H1 busy-loop shape).
+pub(crate) fn set_zoom_step_wait(deadline: Option<Instant>) {
+    *step_wait_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+}
+
+/// The currently armed step-wake deadline, if any.
+pub(crate) fn zoom_step_wait() -> Option<Instant> {
+    *step_wait_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The composed control flow for one `about_to_wait` pass (v1.14.5 R1):
+/// winit's `ControlFlow` is translated at the call site so this type — and
+/// the truth table producing it — stay headless-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZoomControlFlow {
+    /// Sleep until the (earliest relevant) deadline.
+    WaitUntil(Instant),
+    /// Resting flow; also the explicit stale-deadline reset.
+    Wait,
+}
+
+/// Compose the step-pacing wake with the zoom-window decision into ONE
+/// determined control flow per pass (truth-table tested; review R1-P1: every
+/// branch terminates in a known state, closing the stale-WaitUntil busy
+/// loop — the shape H1 already fixed at the Flush arm). `step_wait` is the
+/// step-wake deadline (`None` = not armed); `hot_flush` is the hot-window
+/// deadline passed in as `zoom_jump_until + 2ms` (the caller
+/// (`zoom_wait_policy`) keeps that grace).
+///
+/// - Arm (window hot): `WaitUntil(min(step_wait, hot_flush))` — the ≤300 ms
+///   hot-window deadline must NOT squash the denser step wake. Null
+///   semantics: whichever deadline exists (min when both); both `None` ->
+///   `Wait` as the safe default (unreachable in practice — hot implies
+///   `zoom_jump_until` is Some, the caller's Arm guard keeps that
+///   invariant explicit).
+/// - None (nothing zoom-related this tick): `step_wait = Some(d)` ->
+///   `WaitUntil(d)` — the anim's first pass's ONLY wake source, because at
+///   that moment `hot` is not yet armed by the first step's Resized (review
+///   P2 correction; while the window is hot the flow always walks Arm).
+///   `None` -> `Wait`: the EXPLICIT reset — a stale deadline left armed
+///   would busy-loop (winit WaitUntil(past) maps to
+///   CFRunLoopTimerSetNextFireDate(f64::MIN), firing immediately forever).
+/// - Flush: `Wait` regardless of step_wait — terminal for the whole zoom
+///   sequence; the caller clears the global alongside.
+pub(crate) fn zoom_control_flow(
+    action: ZoomFlushAction,
+    step_wait: Option<Instant>,
+    hot_flush: Option<Instant>,
+) -> ZoomControlFlow {
+    match action {
+        ZoomFlushAction::Arm => match (step_wait, hot_flush) {
+            (Some(step), Some(hot)) => ZoomControlFlow::WaitUntil(step.min(hot)),
+            (Some(step), None) => ZoomControlFlow::WaitUntil(step),
+            (None, Some(hot)) => ZoomControlFlow::WaitUntil(hot),
+            // Safe default; unreachable (hot => zoom_jump_until is Some).
+            (None, None) => ZoomControlFlow::Wait,
+        },
+        ZoomFlushAction::None => match step_wait {
+            Some(deadline) => ZoomControlFlow::WaitUntil(deadline),
+            // Explicit reset — the P1 fix core; see the contract above.
+            None => ZoomControlFlow::Wait,
+        },
+        // Terminal: nothing may re-arm behind the flush verdict.
+        ZoomFlushAction::Flush => ZoomControlFlow::Wait,
     }
 }
 

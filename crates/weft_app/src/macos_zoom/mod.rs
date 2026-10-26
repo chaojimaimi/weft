@@ -624,6 +624,7 @@ mod tests;
 pub(crate) use anim::{
     ease_in_out_quad, install_zoom_override_hook, lerp, self_zoom_test_tick,
     set_zoom_reduce_motion, zoom_anim_active, zoom_anim_advance, zoom_anim_cancel,
-    zoom_anim_finish, zoom_anim_mark_stepped, zoom_anim_peek, zoom_step_due, ZOOM_EPSILON_PT,
+    zoom_anim_finish, zoom_anim_mark_stepped, zoom_anim_peek, zoom_step_due, STEP_MIN_INTERVAL,
+    ZOOM_EPSILON_PT,
 };
 use anim::{set_zoom_restore_frame, should_refresh_restore};

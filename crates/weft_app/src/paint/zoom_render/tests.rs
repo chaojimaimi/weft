@@ -328,3 +328,89 @@ fn self_zoom_window_flag_lifecycle() {
     set_self_zoom_window(false);
     assert!(!self_zoom_window(), "cancel/flush closes the window");
 }
+
+/// v1.14.5 R1 step-pacing control-flow truth table (PLAN_v1145 §2): every
+/// branch terminates in a determined flow — Arm takes
+/// min(step_wait, hot_flush) (the ≤300 ms hot deadline must not squash the
+/// denser step wake), None passes the step wake through or resets to Wait
+/// explicitly (a stale armed deadline would busy-loop: winit
+/// WaitUntil(past) = CFRunLoopTimerSetNextFireDate(f64::MIN)), Flush is
+/// terminal Wait regardless of step_wait. Instants are built RELATIVE to
+/// now (`Instant` has no arbitrary constructor) and compared by equality.
+#[test]
+fn zoom_control_flow_truth_table() {
+    let now = std::time::Instant::now();
+    let step = now + std::time::Duration::from_millis(12);
+    let hot = now + std::time::Duration::from_millis(300);
+
+    // Arm x both Some: min(step_wait, hot_flush) — the step wake wins.
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::Arm, Some(step), Some(hot)),
+        ZoomControlFlow::WaitUntil(step)
+    );
+    // Arm x hot only: the hot deadline (with its +2ms grace) stands.
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::Arm, None, Some(hot)),
+        ZoomControlFlow::WaitUntil(hot)
+    );
+    // Arm x step only: the step wake stands (contract-safe form; the real
+    // caller never reaches it — hot implies zoom_jump_until is Some).
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::Arm, Some(step), None),
+        ZoomControlFlow::WaitUntil(step)
+    );
+    // Arm x both None: contract-safe Wait default (unreachable in practice
+    // — hot implies zoom_jump_until is Some, the caller's guard).
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::Arm, None, None),
+        ZoomControlFlow::Wait
+    );
+    // None x Some(step_wait): the anim's first pass's ONLY wake source
+    // (hot is not yet armed by the first step's Resized at that moment).
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::None, Some(step), None),
+        ZoomControlFlow::WaitUntil(step)
+    );
+    // None x None: the explicit Wait reset — the P1 stale-deadline fix.
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::None, None, None),
+        ZoomControlFlow::Wait
+    );
+    // Flush: terminal Wait, ignoring step_wait entirely.
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::Flush, Some(step), Some(hot)),
+        ZoomControlFlow::Wait
+    );
+    assert_eq!(
+        zoom_control_flow(ZoomFlushAction::Flush, None, None),
+        ZoomControlFlow::Wait
+    );
+}
+
+/// v1.14.5 R1: the process-level step-wake deadline round-trips through the
+/// global (Some -> read back equal; None -> read back None). GLOBAL_
+/// ZOOM_STATE_LOCK discipline: the deadline is process-global state, so the
+/// test must hold the shared lock like every other zoom-global test in this
+/// crate and in macos_zoom.
+#[test]
+fn zoom_step_wait_global_round_trip() {
+    let _guard = super::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Clean slate: a prior test may have left a deadline armed.
+    set_zoom_step_wait(None);
+    assert_eq!(zoom_step_wait(), None, "None must read back as None");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    set_zoom_step_wait(Some(deadline));
+    assert_eq!(
+        zoom_step_wait(),
+        Some(deadline),
+        "the armed deadline must round-trip unchanged"
+    );
+
+    // Explicit reset clears it (the cancel/finish/Flush path's contract).
+    set_zoom_step_wait(None);
+    assert_eq!(zoom_step_wait(), None, "the reset must stick");
+}
