@@ -116,6 +116,21 @@ pub(crate) fn paste_toast_expired(shown_at: std::time::Instant, now: std::time::
     now.duration_since(shown_at) >= PASTE_TOAST_TTL
 }
 
+/// v1.15.0 (T3): the footer feedback's TTL — same 3s feel as the paste toast
+/// (own constant so the two policies can diverge without touching call
+/// sites).
+pub(crate) const FOOTER_FEEDBACK_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// v1.15.0 (T3): pure expiry judgment for the footer feedback
+/// (`paste_toast_expired` precedent — one shared boundary for tests and the
+/// 1 Hz tick).
+pub(crate) fn footer_feedback_expired(
+    shown_at: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    now.duration_since(shown_at) >= FOOTER_FEEDBACK_TTL
+}
+
 impl crate::App {
     /// Fan out `effects` to their side effects. Each effect is dispatched
     /// exactly once; a failed dispatch logs but does not abort the remaining
@@ -436,14 +451,35 @@ impl crate::App {
     /// v1.11.1 (PLAN_v1111 §4.5): expire the paste toast on the 1 Hz
     /// autosave tick — deliberately rides the existing timer (granularity
     /// may extend visibility ~1s past the 3s TTL) instead of a new one.
+    /// v1.15.0 (T3): the active tab's footer feedback rides the same tick —
+    /// a background tab's stale feedback clears within one tick (≤1s) after
+    /// reactivation, since only the active tab is swept.
     pub(crate) fn expire_paste_toast_tick(&mut self) {
         let expired = self
             .renderer
             .as_mut()
             .is_some_and(|renderer| renderer.clear_expired_paste_toast(std::time::Instant::now()));
-        if expired {
+        let footer_expired = self.expire_active_tab_footer_feedback();
+        if expired || footer_expired {
             self.request_redraw();
         }
+    }
+
+    /// v1.15.0 (T3): drop the ACTIVE tab's footer feedback once its TTL
+    /// elapsed (paste-toast expiry precedent). Returns whether an entry was
+    /// removed so the caller requests a redraw.
+    fn expire_active_tab_footer_feedback(&mut self) -> bool {
+        let Some(tab) = self.sessions.active_mut() else {
+            return false;
+        };
+        let Some((_, shown_at)) = &tab.footer_feedback else {
+            return false;
+        };
+        let due = footer_feedback_expired(*shown_at, std::time::Instant::now());
+        if due {
+            tab.footer_feedback = None;
+        }
+        due
     }
 
     /// The 1 Hz `AppEvent::TabsAutoSave` body, extracted from app_runtime.rs

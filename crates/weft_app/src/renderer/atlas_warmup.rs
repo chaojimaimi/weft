@@ -274,12 +274,15 @@ impl MetalRenderer {
         }
         if let Some(p) = panel {
             missing.extend("Search:".chars());
-            // v1.14.4 (批A): footer label + scrollbar indicators share the
-            // panel warm-up list — none of them is reachable from grid cell
-            // content, and push_text silently skips unwarmed glyphs (the
-            // lone-「更」footer artifact). ▲/▼ (paint/panel.rs:444/:452) sit
-            // outside the ASCII warm line and appear in no other warm list.
+            // v1.14.4/v1.15.0: panel-only strings (footer label, ▲/▼, and
+            // the three one-shot footer feedback messages) have no other
+            // warm source — push_text silently skips unwarmed glyphs.
             missing.extend(crate::panel_component::FOOTER_LABEL.chars());
+            missing.extend(crate::panel_component::FOOTER_FEEDBACK_LOADED_PREFIX.chars());
+            missing.extend(crate::panel_component::FOOTER_FEEDBACK_LOADED_SUFFIX.chars());
+            missing.extend(crate::panel_component::FOOTER_FEEDBACK_EXHAUSTED.chars());
+            missing.extend(crate::panel_component::FOOTER_FEEDBACK_ERROR.chars());
+            missing.extend(crate::panel_component::FOOTER_FEEDBACK_DIGITS.chars());
             missing.extend(['▲', '▼']);
             missing.extend(p.query.chars());
             // v1.13.18 P4: the warm-up row estimate reads the shared budget

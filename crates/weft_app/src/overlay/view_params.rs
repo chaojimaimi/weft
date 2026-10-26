@@ -36,6 +36,14 @@ pub struct PanelViewParams<'a> {
     pub panel_expanded: Option<BlockId>,
     pub panel_search_focused: bool,
     pub panel_scroll_offset: usize,
+    /// v1.15.0 (T3): one-shot footer feedback — the message plus the instant
+    /// it was raised (expiry driven by the 1 Hz tick). Borrowed projection
+    /// off the frame-local snapshot (`panel_query: &'a str` precedent) to
+    /// keep this struct `Copy`.
+    pub panel_footer_feedback: Option<(&'a str, std::time::Instant)>,
+    /// v1.15.0 (T3): the active pane's tracker ruled "no older history" —
+    /// the footer label paints dimmed (still visible, still hit-testable).
+    pub panel_footer_exhausted: bool,
 }
 
 /// IME preedit overlay inputs (TUI passthrough preedit + ownership gate).

@@ -53,6 +53,10 @@ pub fn build_overlay_stack<'a>(
                 expanded_id: panel.panel_expanded,
                 search_focused: panel.panel_search_focused,
                 scroll_offset: panel.panel_scroll_offset,
+                // v1.15.0 (T3): footer feedback passthrough (label swap +
+                // exhausted dim decided by the shared pure fn at paint time).
+                footer_feedback: panel.panel_footer_feedback,
+                footer_exhausted: panel.panel_footer_exhausted,
             }),
         });
     }

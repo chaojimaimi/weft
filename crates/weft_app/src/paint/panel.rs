@@ -37,6 +37,14 @@ pub struct PanelDrawParams<'a> {
     /// F3-4: Block-level scroll offset (number of filtered blocks skipped
     /// from the newest end). 0 = newest visible.
     pub scroll_offset: usize,
+    /// v1.15.0 (T3): one-shot footer feedback — shown in place of the
+    /// static FOOTER_LABEL for 3s after a load-older action; expiry rides
+    /// the 1 Hz tick. `None` = the plain label.
+    pub footer_feedback: Option<(&'a str, std::time::Instant)>,
+    /// v1.15.0 (T3): the tracker ruled "no older history" — the footer
+    /// label paints one notch dimmer (muted) but stays visible and
+    /// hit-testable; the dim state is permanent until an eviction resets it.
+    pub footer_exhausted: bool,
 }
 
 impl MetalRenderer {
@@ -481,7 +489,19 @@ impl MetalRenderer {
             // v1.14.4 (批A): the label literal moved to the shared constant —
             // the atlas warm-up must rasterize exactly the glyphs painted here
             // (unwarmed glyphs are silently skipped by push_text).
-            let label = crate::panel_component::FOOTER_LABEL;
+            // v1.15.0 (T3): fresh feedback swaps the label in place for 3s;
+            // an exhausted ruling dims one notch (muted) but still paints.
+            // The a11y button name stays FOOTER_LABEL (panel_component) — the
+            // visible text is transient state, the button semantic is not.
+            let (label, footer_dim) = crate::panel_component::footer_label_and_dim(
+                p.footer_feedback.map(|(text, _)| text),
+                p.footer_exhausted,
+            );
+            let label_color = if footer_dim {
+                color_to_normalized(ui.text_muted)
+            } else {
+                dim
+            };
             // Reviewer Minor-7: CJK glyphs render at double cell width —
             // count terminal columns, not chars, or the label centers
             // ~one CJK width off to the right.
@@ -497,7 +517,7 @@ impl MetalRenderer {
                 center_x,
                 center_y,
                 label,
-                dim,
+                label_color,
                 ((fx1 - fx0) / cw) as usize,
             );
         }

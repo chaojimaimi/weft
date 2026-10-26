@@ -17,6 +17,31 @@ use crate::scene::{HitRegion, Scene, SemanticNode, SemanticRole};
 /// artifact (footer-label-glyph-warmup-forensics).
 pub(crate) const FOOTER_LABEL: &str = "加载更早";
 
+/// v1.15.0 (T3, PLAN_v1150): the footer's one-shot feedback messages.
+/// `block_persist.rs` writes them into `Tab::footer_feedback`; paint/panel.rs
+/// shows them in place of [`FOOTER_LABEL`] for 3s. The success form is
+/// prefix + count + suffix ("已加载 12 条"). The atlas warm-up must
+/// rasterize ALL of these glyphs plus [`FOOTER_FEEDBACK_DIGITS`] — 读/取/失/败
+/// appear in no other warm list, and an unwarmed glyph is silently skipped
+/// by push_text (the lone-「更」footer artifact,
+/// footer-label-glyph-warmup-forensics).
+pub(crate) const FOOTER_FEEDBACK_LOADED_PREFIX: &str = "已加载 ";
+pub(crate) const FOOTER_FEEDBACK_LOADED_SUFFIX: &str = " 条";
+pub(crate) const FOOTER_FEEDBACK_EXHAUSTED: &str = "没有更早的历史";
+pub(crate) const FOOTER_FEEDBACK_ERROR: &str = "读取历史失败";
+/// Digit coverage for the "已加载 N 条" count (warm-up list, not paint).
+pub(crate) const FOOTER_FEEDBACK_DIGITS: &str = "0123456789";
+
+/// v1.15.0 (T3): footer label + dim-state policy, pure so the truth table is
+/// unit-testable. Fresh feedback replaces the visible label; the exhausted
+/// ruling dims the label one notch (permanent until an eviction resets it) —
+/// the button keeps rendering either way. The a11y button name stays
+/// [`FOOTER_LABEL`]: the visible text is transient state feedback, the
+/// button semantic never changes.
+pub(crate) fn footer_label_and_dim(feedback: Option<&str>, exhausted: bool) -> (&str, bool) {
+    (feedback.unwrap_or(FOOTER_LABEL), exhausted)
+}
+
 /// A clickable region of the history panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PanelTarget {
@@ -103,7 +128,9 @@ pub(crate) fn panel_target_at(scene: &Scene<PanelTarget>, x: f32, y: f32) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{build_panel_scene, panel_target_at, PanelTarget};
+    use super::{
+        build_panel_scene, footer_label_and_dim, panel_target_at, PanelTarget, FOOTER_LABEL,
+    };
 
     const PANEL_RECT: [f32; 4] = [0.0, 28.0, 240.0, 700.0];
     const SEARCH_RECT: [f32; 4] = [4.0, 50.0, 236.0, 70.0];
@@ -148,5 +175,36 @@ mod tests {
         // No blocks → no footer region → same point misses entirely.
         let scene = build_panel_scene(PANEL_RECT, SEARCH_RECT, LIST_TOP, ROW_H, 5, None);
         assert_eq!(panel_target_at(&scene, 100.0, 650.0), None);
+    }
+
+    // ── v1.15.0 (T3): footer label + dim policy truth table ──────────
+
+    /// Plain state (no feedback, not exhausted): static label, no dim.
+    #[test]
+    fn footer_label_plain_state() {
+        let (label, dim) = footer_label_and_dim(None, false);
+        assert_eq!(label, FOOTER_LABEL);
+        assert!(!dim);
+    }
+
+    /// Fresh feedback swaps the visible label; dim unaffected by feedback.
+    #[test]
+    fn footer_label_feedback_swaps_visible_text() {
+        let (label, dim) = footer_label_and_dim(Some("已加载 12 条"), false);
+        assert_eq!(label, "已加载 12 条");
+        assert!(!dim);
+        // The exhausted ruling dims whatever is on the label (feedback and
+        // exhausted can co-occur: the empty-store click sets both).
+        let (label, dim) = footer_label_and_dim(Some("没有更早的历史"), true);
+        assert_eq!(label, "没有更早的历史");
+        assert!(dim);
+    }
+
+    /// Exhausted with expired feedback: static label but persistent dim.
+    #[test]
+    fn footer_label_exhausted_dims_after_feedback_expires() {
+        let (label, dim) = footer_label_and_dim(None, true);
+        assert_eq!(label, FOOTER_LABEL, "expired feedback falls back");
+        assert!(dim, "the dim ruling outlives the 3s feedback");
     }
 }

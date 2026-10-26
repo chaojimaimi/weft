@@ -334,3 +334,73 @@ fn retention_never_evicts_user_pinned_load_older_pages() {
     assert!(produced.contains(&1) && produced.contains(&2));
     assert!(!produced.contains(&90) && !produced.contains(&91));
 }
+
+// ── v1.15.0 (T3): footer exhausted ruling reset on eviction ─────────
+
+/// The exhausted ruling must NOT survive an eviction: an eviction moves the
+/// memory-front, so the store regains reachable older history. Without the
+/// reset, a 1900-block session that exhausted the footer stays permanently
+/// dimmed even though new commands make SQLite history reachable again
+/// (PLAN_v1150 T3 R2 P2 repro).
+#[test]
+fn eviction_resets_the_footer_exhausted_ruling() {
+    let mut t = BlockTracker::new();
+    t.set_retained_limit(3);
+    for i in 0..2 {
+        finish_cmd(&mut t, &format!("c{i}"));
+    }
+    // The app's load-older effect burned the ruling (store answered empty).
+    t.footer_exhausted = true;
+
+    // Still under the cap: this finalize evicts nothing, the ruling stands.
+    finish_cmd(&mut t, "under-cap");
+    assert!(t.evicted_ids().is_empty(), "fixture check: no eviction yet");
+    assert!(
+        t.footer_exhausted,
+        "a non-evicting finalize keeps the exhausted dim"
+    );
+
+    // The next finalize crosses the cap → eviction → the ruling is stale.
+    finish_cmd(&mut t, "evicting");
+    assert_eq!(t.blocks().len(), 3, "cap enforced");
+    assert!(
+        !t.evicted_ids().is_empty(),
+        "this finalize actually evicted"
+    );
+    assert!(
+        !t.footer_exhausted,
+        "eviction invalidates the no-older-history verdict"
+    );
+}
+
+/// The exhausted flag must also reset when retention is tightened
+/// retroactively (`set_retained_limit` re-enforces immediately) — same
+/// memory-front argument, different trigger.
+#[test]
+fn lowering_limit_resets_footer_exhausted_via_enforce() {
+    let mut t = BlockTracker::new();
+    for i in 0..5 {
+        finish_cmd(&mut t, &format!("c{i}"));
+    }
+    t.footer_exhausted = true;
+    t.set_retained_limit(2);
+    assert_eq!(t.blocks().len(), 2);
+    assert!(
+        !t.footer_exhausted,
+        "the immediate re-enforce evicted, so the verdict reset"
+    );
+}
+
+/// Limit 0 disables retention entirely — no eviction can happen, so the
+/// ruling must survive (the footer dim is the only guard the user has).
+#[test]
+fn retention_disabled_keeps_footer_exhausted_ruling() {
+    let mut t = BlockTracker::new();
+    t.set_retained_limit(0);
+    for i in 0..5 {
+        finish_cmd(&mut t, &format!("c{i}"));
+    }
+    t.footer_exhausted = true;
+    finish_cmd(&mut t, "more");
+    assert!(t.footer_exhausted, "no eviction → the verdict stands");
+}

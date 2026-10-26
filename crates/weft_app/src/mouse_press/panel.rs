@@ -130,6 +130,19 @@ impl App {
                 Some(crate::panel_component::PanelTarget::LoadOlder) => {
                     // v1.11.2 X4 (PLAN_v1112 §1.3): footer「加载更早」— page
                     // older history out of SQLite into the panel.
+                    // v1.15.0 (T3): an exhausted ruling early-exits as a
+                    // consumed no-op — the click must not re-query the store
+                    // the tracker already ruled empty. The flag resets on the
+                    // next retention eviction (new history → older becomes
+                    // reachable again).
+                    let exhausted = self
+                        .sessions
+                        .active()
+                        .and_then(|tab| tab.with_terminal(|t| t.block_tracker().footer_exhausted()))
+                        .unwrap_or(false);
+                    if exhausted {
+                        return PressOutcome::Consumed;
+                    }
                     self.drain_effects([Effect::LoadOlderBlocks]);
                     return PressOutcome::Consumed;
                 }

@@ -350,11 +350,40 @@ pub struct BlockTracker {
     /// owned (bumped under the tracker lock) so no cross-lock notification
     /// exists.
     title_generation: u64,
+    /// v1.15.0 (T3, PLAN_v1150): the panel footer's persistent exhausted
+    /// ruling — set by the app's "load older" effect when the store answers
+    /// empty, cleared by [`retention::BlockTracker::enforce_retention`] on
+    /// ANY eviction (an eviction moves the memory-front, so the old
+    /// "no older block in the store" verdict is stale and SQLite history
+    /// must become reachable from the footer again). Owned by the tracker
+    /// (same object as the blocks it rules about) so multi-pane tabs are
+    /// naturally per-pane. In-memory only; never persisted.
+    footer_exhausted: bool,
 }
 
 impl Default for BlockTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl BlockTracker {
+    /// v1.15.0 T3: the「加载更早」exhausted ruling (store has nothing older
+    /// than the memory front). Private field — accessor discipline like the
+    /// rest of this struct (rust-reviewer P3).
+    pub fn footer_exhausted(&self) -> bool {
+        self.footer_exhausted
+    }
+
+    /// Burn the ruling: the last load-older query answered empty.
+    pub fn burn_footer_exhausted(&mut self) {
+        self.footer_exhausted = true;
+    }
+
+    /// Retention eviction moved the memory front — the old ruling is stale
+    /// and the footer must become clickable again.
+    pub fn reset_footer_exhausted(&mut self) {
+        self.footer_exhausted = false;
     }
 }
 
@@ -392,6 +421,7 @@ impl BlockTracker {
             user_pinned_ids: HashSet::new(),
             settling: false,
             title_generation: 0,
+            footer_exhausted: false,
         }
     }
 

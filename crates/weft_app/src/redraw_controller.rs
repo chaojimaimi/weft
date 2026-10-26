@@ -171,6 +171,24 @@ impl App {
             .find(|(id, _)| *id == active_pane_id)
             .map(|(_, rect)| *rect)
             .unwrap_or(content_rect);
+        // v1.15.0 (T3): footer feedback snapshot BEFORE `active_pane_views()`
+        // takes the exclusive `&mut Tab` borrow for the rest of the draw
+        // scope (the :166-173 snapshot precedent). The message must be
+        // OWNED here — the &str projection downstream borrows this frame
+        // local (the feedback String lives inside `tab`, which is exclusively
+        // borrowed by the pane views). A tiny clone, only while a feedback
+        // is showing; the exhausted flag reads the ACTIVE pane's tracker
+        // through the `with_terminal` lock (the :128 read precedent).
+        let footer_feedback_snapshot: Option<(String, std::time::Instant)> = tab
+            .footer_feedback
+            .as_ref()
+            .map(|(text, at)| (text.clone(), *at));
+        let footer_exhausted_snapshot: bool = if self.panel.open {
+            tab.with_terminal(|t| t.block_tracker().footer_exhausted())
+                .unwrap_or(false)
+        } else {
+            false
+        };
         // T10 P1: the active pane's guard plus every background pane's guard
         // are scoped to this block — `clear_background_grid_dirty` below
         // re-locks the background panes, so the guards MUST drop first
@@ -391,6 +409,12 @@ impl App {
                             panel_expanded: self.panel.expanded,
                             panel_search_focused: self.panel.search_focused,
                             panel_scroll_offset: self.panel.scroll_offset,
+                            // v1.15.0 (T3): frame-local footer feedback
+                            // projection off the pre-borrow snapshot above.
+                            panel_footer_feedback: footer_feedback_snapshot
+                                .as_ref()
+                                .map(|(text, at)| (text.as_str(), *at)),
+                            panel_footer_exhausted: footer_exhausted_snapshot,
                         },
                         crate::overlay::ImeViewParams {
                             ime_preedit: &pane.ime_preedit,

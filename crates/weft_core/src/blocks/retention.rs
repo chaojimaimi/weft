@@ -94,6 +94,11 @@ impl BlockTracker {
             self.screen_owned_blocks.remove(&id);
             self.loaded_ids.remove(&id);
         }
+        // v1.15.0 (T3): an eviction moved the memory-front, so a previous
+        // "store has no older block" footer ruling is stale — without this
+        // reset the panel footer stays permanently dimmed even though the
+        // store regains reachable older history after new commands evict.
+        self.reset_footer_exhausted();
     }
 
     /// v1.7.6: IDs of blocks produced THIS session only (excludes blocks

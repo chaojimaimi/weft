@@ -392,6 +392,7 @@ fn settings_overlay_is_modal_and_highest_z() {
 #[test]
 fn build_overlay_stack_groups_carry_params_and_gate_settings() {
     let terminal = weft_core::vt::Terminal::new(24, 80);
+    let now = std::time::Instant::now();
 
     let panel = PanelViewParams {
         panel_width: 123.0,
@@ -403,6 +404,8 @@ fn build_overlay_stack_groups_carry_params_and_gate_settings() {
         panel_expanded: None,
         panel_search_focused: true,
         panel_scroll_offset: 7,
+        panel_footer_feedback: Some(("已加载 3 条", now)),
+        panel_footer_exhausted: true,
     };
     let ime = ImeViewParams {
         ime_preedit: "",

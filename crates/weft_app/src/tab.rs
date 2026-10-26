@@ -99,6 +99,13 @@ pub struct Tab {
     /// Stable tab-level identifier. Stays constant for the tab's lifetime
     /// regardless of how many panes are open or which is active.
     pub session_id: u64,
+    /// v1.15.0 (T3, PLAN_v1150): one-shot footer feedback for the「加载更早」
+    /// button — `Some((message, raised_at))` after a load-older action
+    /// ("已加载 N 条" / "没有更早的历史" / "读取历史失败"); the paint shows it
+    /// in place of the static label for 3s (expiry rides the 1 Hz tick,
+    /// `expire_paste_toast_tick`). Per-tab by construction; transient UI
+    /// state — deliberately NOT in the snapshot/restore path.
+    pub(crate) footer_feedback: Option<(String, std::time::Instant)>,
     /// Layout tree of pane splits. Owns the structure (direction + ratio at
     /// each internal node, `PaneId` at each leaf) but not the pane state —
     /// the state lives in `panes`.
@@ -346,6 +353,7 @@ impl Tab {
         panes.insert(pane_id, pane);
         Self {
             session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            footer_feedback: None,
             split_tree: SplitTree::new(pane_id),
             panes,
             active_pane: pane_id,

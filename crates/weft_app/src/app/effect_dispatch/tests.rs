@@ -4,8 +4,9 @@
 //! file enjoys the architecture-gate `*/tests.rs` exemption (plan P3).
 
 use super::{
-    paste_toast_eligible, paste_toast_expired, resolve_pending_paste,
-    take_pending_paste_if_seq_matches, PasteOutcome, PendingPaste, PASTE_TOAST_TTL,
+    footer_feedback_expired, paste_toast_eligible, paste_toast_expired, resolve_pending_paste,
+    take_pending_paste_if_seq_matches, PasteOutcome, PendingPaste, FOOTER_FEEDBACK_TTL,
+    PASTE_TOAST_TTL,
 };
 use crate::macos_alert::PastePromptResponse;
 
@@ -170,5 +171,27 @@ fn toast_expires_at_the_three_second_boundary() {
     assert!(paste_toast_expired(
         start,
         later(PASTE_TOAST_TTL.as_millis() as u64 + 999)
+    ));
+}
+
+// ── v1.15.0 (T3): footer feedback expiry (paste-toast precedent) ────
+
+#[test]
+fn footer_feedback_expires_at_the_three_second_boundary() {
+    let start = std::time::Instant::now();
+    let later = |millis: u64| start + std::time::Duration::from_millis(millis);
+    // Just before TTL: the feedback label still shows.
+    assert!(!footer_feedback_expired(
+        start,
+        later(FOOTER_FEEDBACK_TTL.as_millis() as u64 - 1)
+    ));
+    // At and past TTL: expired — the 1 Hz tick clears it (≤1s later).
+    assert!(footer_feedback_expired(
+        start,
+        later(FOOTER_FEEDBACK_TTL.as_millis() as u64)
+    ));
+    assert!(footer_feedback_expired(
+        start,
+        later(FOOTER_FEEDBACK_TTL.as_millis() as u64 + 999)
     ));
 }
