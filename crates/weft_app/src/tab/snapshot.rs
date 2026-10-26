@@ -23,9 +23,7 @@ impl Tab {
     /// pty-less/spawn-less, but its final snapshot must still land — only a
     /// diagnostic pane never went through `begin_close_teardown`.
     pub fn is_persist_excluded(&self) -> bool {
-        self.panes().all(|(_, pane)| {
-            pane.pty.is_none() && pane.pending_spawn.is_none() && pane.close_deadline.is_none()
-        })
+        self.panes().all(|(_, pane)| pane.is_spawn_dead())
     }
 
     /// v1.12.28 (P1-02 ②): serialize one leaf pane for the split-tree

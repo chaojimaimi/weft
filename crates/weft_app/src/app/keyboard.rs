@@ -250,6 +250,20 @@ impl crate::App {
             }
         }
 
+        // v1.15.1 (T3, PLAN_v1151): PTY 耗尽诊断页一键重试 —— spawn-dead 的
+        // 活动 pane 吃掉裸 r/R 原地重发 spawn（passthrough encode 之前：死
+        // pane 没有 PTY，编码字节只会无声丢失）。正常 pane / 修饰键组合 /
+        // 其他键不命中，r/R 照常编码。
+        let pane_spawn_dead = self
+            .sessions
+            .active()
+            .is_some_and(|tab| tab.active().is_spawn_dead());
+        let retry_is_repeat = kind == weft_core::input::KittyEventKind::Repeat;
+        if crate::app::retry_spawn::retry_key_hit(key, m, pane_spawn_dead, retry_is_repeat) {
+            self.retry_spawn_active_pane();
+            return;
+        }
+
         self.forward_key_to_pty(key, m, text, kind, kitty_flags, input_mode);
     }
 

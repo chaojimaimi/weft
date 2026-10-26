@@ -123,9 +123,9 @@ fn fork_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// v1.14.3 (T3, PLAN_v1143 §2): the grid text written into a
 /// resource-exhausted diagnostic pane (`Terminal::process`, \r\n line
 /// discipline — plain text, no OSC). The pane stays open; the user closes
-/// idle tabs or reboots, then Cmd+T retries.
+/// idle tabs or reboots, then Cmd+T retries — or presses R (v1.15.1, app/retry_spawn.rs).
 const RESOURCE_EXHAUSTED_DIAGNOSTIC: &str =
-    "系统终端资源(PTY)已耗尽，无法启动 shell。请关闭空闲的终端标签页或重启系统后，再用 Cmd+T 新建。";
+    "系统终端资源(PTY)已耗尽，无法启动 shell。请关闭空闲的终端标签页或重启系统后，再用 Cmd+T 新建。\r\n按 R 重试启动 shell。";
 
 /// The diagnostic bytes as fed to `Terminal::process` — a leading blank line
 /// plus a trailing newline so the message renders as its own paragraph on

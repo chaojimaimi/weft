@@ -244,3 +244,18 @@ fn begin_close_teardown_captures_child_pid_before_release() {
     bare.begin_close_teardown();
     assert!(bare.child_pid.is_none());
 }
+
+// ── v1.15.1 (T3, PLAN_v1151): 诊断 bytes 含 R 重试提示 ─────────────────
+
+#[test]
+fn diagnostic_bytes_include_retry_hint() {
+    // 纯函数级：诊断 bytes 必须带第二行「按 R 重试启动 shell」，且以 \r\n
+    // 独立成段（grid 渲染为单独一行）。
+    let text = String::from_utf8(resource_exhausted_diagnostic_bytes())
+        .expect("diagnostic bytes are UTF-8");
+    assert!(text.contains("按 R 重试启动 shell"), "text = {text:?}");
+    assert!(
+        text.contains("Cmd+T 新建。\r\n按 R 重试启动 shell。"),
+        "the hint must be its own paragraph; text = {text:?}"
+    );
+}

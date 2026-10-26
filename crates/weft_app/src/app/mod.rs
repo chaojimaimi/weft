@@ -43,6 +43,9 @@ pub(crate) mod pane_spawn;
 // v1.14.3 (T2, PLAN_v1143 §2): Pane 级对账判重 — the memoized
 // `reconciled_terminal_block_scroll` twin for the recompute-layout call site.
 pub(crate) mod reconcile_scroll;
+// v1.15.1 (T3, PLAN_v1151): PTY 耗尽诊断页一键重试 — spawn-dead 谓词 +
+// 裸 R 键判定 + 原地重发 spawn（terminal 原位重置见模块 doc）。
+pub(crate) mod retry_spawn;
 // v1.12.25 (3-B-2 P2-01): per-frame session I/O core (`spawn_pty` /
 // `pump_pty` / `process_messages` / `request_redraw`) moved verbatim out of
 // `main.rs`; bodies zero-rewritten, visibility `pub(crate)`.
