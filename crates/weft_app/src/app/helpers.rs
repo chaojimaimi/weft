@@ -589,10 +589,11 @@ mod tests {
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let cfg_path = cfg_dir.join("config.toml");
 
-        // Initial: theme = weft-warm.
-        std::fs::write(&cfg_path, "[theme]\nname = \"weft-warm\"\n").unwrap();
+        // Initial: theme = warp (the v1.15 default name; any explicit
+        // name round-trips the same way).
+        std::fs::write(&cfg_path, "[theme]\nname = \"warp\"\n").unwrap();
         let first = Config::load();
-        assert_eq!(first.theme.name, "weft-warm");
+        assert_eq!(first.theme.name, "warp");
 
         // External edit: theme → weft-light (simulating user editing the file).
         std::fs::write(&cfg_path, "[theme]\nname = \"weft-light\"\n").unwrap();

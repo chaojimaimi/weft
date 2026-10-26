@@ -63,7 +63,7 @@ pub struct ThemeConfig {
     /// Defaults to "weft-light" when None.
     pub light_name: Option<String>,
     /// v0.9 U-D1: theme name to use when system appearance is Dark.
-    /// Defaults to "weft-warm" when None.
+    /// Defaults to "warp" when None (v1.15; was "weft-warm").
     pub dark_name: Option<String>,
     /// v1.0 S5: per-syntax-token color overrides. Each field is an optional
     /// hex string (`"#rrggbb"`); when present it overrides the base theme's
@@ -161,7 +161,9 @@ pub struct UiConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            name: "weft-warm".into(),
+            // v1.15: default flipped to Warp's real default dark theme
+            // (`theme = "weft-warm"` restores the v0.8 warm-brown look).
+            name: "warp".into(),
             minimum_contrast: 7.0,
             foreground: None,
             background: None,

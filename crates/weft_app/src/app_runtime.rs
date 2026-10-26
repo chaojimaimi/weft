@@ -222,7 +222,7 @@ impl ApplicationHandler<AppEvent> for App {
                     .theme
                     .dark_name
                     .clone()
-                    .unwrap_or_else(|| "weft-warm".to_string())
+                    .unwrap_or_else(|| "warp".to_string())
             } else {
                 self.config_state
                     .config

@@ -521,9 +521,11 @@ impl App {
     /// useful themes at the top.
     pub(super) fn available_theme_names(&self) -> Vec<String> {
         let mut names: Vec<String> = [
+            // v1.15: "warp" is the default — it leads the curated order
+            // (defaults first), weft-warm demotes to a legacy choice.
+            "warp",
             "weft-warm",
             "weft-light",
-            "warp",
             "dracula",
             "solarized-dark",
             "gruvbox-dark",
@@ -644,7 +646,7 @@ impl App {
                     .theme
                     .dark_name
                     .clone()
-                    .unwrap_or_else(|| "weft-warm".to_string())
+                    .unwrap_or_else(|| "warp".to_string())
             } else {
                 self.config_state
                     .config

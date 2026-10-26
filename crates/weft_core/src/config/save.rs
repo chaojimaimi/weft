@@ -88,7 +88,7 @@ pub(super) fn set_string_if_diff(
     if new == default {
         // v1.0 fix: remove the key so the default takes effect on reload.
         // Previously this returned early without touching the table, leaving
-        // any old value in the file — so saving `name = "weft-warm"` (the
+        // any old value in the file — so saving `name = "warp"` (the v1.15
         // default) didn't clear a previously-saved `name = "solarized-dark"`.
         if table.contains_key(key) {
             table.remove(key);

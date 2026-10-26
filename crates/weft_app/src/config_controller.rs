@@ -319,7 +319,7 @@ impl App {
         //
         // v0.9 U-D1: when `[theme] follow_system = true`, the system
         // appearance picks the theme (via `light_name` / `dark_name`,
-        // defaulting to `weft-light` / `weft-warm`). The `name` field is
+        // defaulting to `weft-light` / `warp`). The `name` field is
         // ignored in this mode.
         let theme = if config.theme.follow_system {
             // SAFETY: `system_appearance_is_dark` reads NSUserDefaults
@@ -333,7 +333,7 @@ impl App {
                     .theme
                     .dark_name
                     .clone()
-                    .unwrap_or_else(|| "weft-warm".to_string())
+                    .unwrap_or_else(|| "warp".to_string())
             } else {
                 config
                     .theme

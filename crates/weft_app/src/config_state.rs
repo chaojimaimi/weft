@@ -60,7 +60,7 @@ impl ConfigState {
                     .theme
                     .dark_name
                     .clone()
-                    .unwrap_or_else(|| "weft-warm".into())
+                    .unwrap_or_else(|| "warp".into())
             };
         let keybindings = config.keybindings();
         Self {
@@ -88,7 +88,7 @@ impl ConfigState {
                     .theme
                     .dark_name
                     .clone()
-                    .unwrap_or_else(|| "weft-warm".into())
+                    .unwrap_or_else(|| "warp".into())
             };
         let keybindings = effective.keybindings();
         Self {

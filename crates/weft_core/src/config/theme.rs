@@ -286,63 +286,63 @@ impl Theme {
         }
     }
 
-    /// v0.9 W2+: Warp-style dark theme.
-    ///
-    /// Inspired by Warp's default "Warp Dark" palette: cool dark background,
-    /// coral-red accent (`#ff5d38`), and a saturated syntax palette tuned
-    /// for readability on a dark canvas. Sits alongside `weft_warm` as a
-    /// first-class built-in — set `name = "warp"` (or `"warp-dark"`) in
+    /// v1.15: Warp's real default "Dark" theme — verbatim source truth from
+    /// the local Warp checkout (`dark_theme()` + `dark_mode_colors()`,
+    /// app/src/themes/default_themes.rs:262-270 / :11-30), pinned value by
+    /// value by the config tests below. Upstream disclosure: cyan ≈ blue is
+    /// Warp's own design — copied faithfully, NOT tweaked (丙案 = closest to
+    /// Warp). v1.15 default; set `name = "warp"` (or `"warp-dark"`) in
     /// `[theme]` to use it.
     pub fn warp_dark() -> Self {
         let mut palette = Color::standard_palette();
-        // ANSI 0-15 — Warp-tuned cool palette with a coral accent bias.
+        // ANSI 0-15 — Warp source truth (default_themes.rs dark_mode_colors).
         let ansi = [
-            (0x1b, 0x1b, 0x28), // 0 black   (cool dark, == background)
-            (0xff, 0x5d, 0x38), // 1 red     (Warp coral — accent)
-            (0x3e, 0xd9, 0xa4), // 2 green   (mint)
-            (0xff, 0xc7, 0x4a), // 3 yellow  (warm yellow)
-            (0x5a, 0xb9, 0xf8), // 4 blue    (sky)
-            (0xb3, 0x87, 0xff), // 5 magenta (lavender)
-            (0x5a, 0xb9, 0xf8), // 6 cyan    (== blue for harmony)
-            (0xd9, 0xd9, 0xe3), // 7 white   (cool off-white, == foreground)
-            (0x3a, 0x3a, 0x52), // 8 bright black (muted purple-gray)
-            (0xff, 0x8a, 0x6a), // 9 bright red
-            (0x6a, 0xe8, 0xb8), // 10 bright green
-            (0xff, 0xe0, 0x8a), // 11 bright yellow
-            (0x8a, 0xc8, 0xff), // 12 bright blue
-            (0xc8, 0xa8, 0xff), // 13 bright magenta
-            (0x8a, 0xc8, 0xff), // 14 bright cyan
-            (0xf0, 0xf0, 0xf8), // 15 bright white
+            (0x61, 0x61, 0x61), // 0 black
+            (0xff, 0x82, 0x72), // 1 red
+            (0xb4, 0xfa, 0x72), // 2 green
+            (0xfe, 0xfd, 0xc2), // 3 yellow
+            (0xa5, 0xd5, 0xfe), // 4 blue
+            (0xff, 0x8f, 0xfd), // 5 magenta
+            (0xd0, 0xd1, 0xfe), // 6 cyan (upstream ≈ blue by design)
+            (0xf1, 0xf1, 0xf1), // 7 white
+            (0x8e, 0x8e, 0x8e), // 8 bright black
+            (0xff, 0xc4, 0xbd), // 9 bright red
+            (0xd6, 0xfc, 0xb9), // 10 bright green
+            (0xfe, 0xfd, 0xd5), // 11 bright yellow
+            (0xc1, 0xe3, 0xfe), // 12 bright blue
+            (0xff, 0xb1, 0xfe), // 13 bright magenta
+            (0xe5, 0xe6, 0xfe), // 14 bright cyan
+            (0xfe, 0xff, 0xff), // 15 bright white
         ];
         for (i, (r, g, b)) in ansi.iter().enumerate() {
             palette[i] = Color::rgb(*r, *g, *b);
         }
         Self {
-            foreground: Color::rgb(0xd9, 0xd9, 0xe3), // cool off-white
-            background: Color::rgb(0x1b, 0x1b, 0x28), // deep cool dark
-            cursor: Color::rgb(0xff, 0x5d, 0x38),     // coral (glow anchor)
-            selection: Color::rgb(0x3a, 0x3a, 0x5a),  // translucent purple
+            foreground: Color::rgb(0xff, 0xff, 0xff), // == upstream foreground
+            background: Color::rgb(0x05, 0x05, 0x05), // == upstream background
+            cursor: Color::rgb(0x19, 0xaa, 0xd8),     // Warp truth: cursor None → accent fallback
+            selection: Color::rgb(0x2a, 0x6d, 0x86),  // derived: accent lifted sat/dropped luma
             palette,
-            accent: Color::rgb(0xff, 0x5d, 0x38), // Warp coral — signature
-            accent_dim: Color::rgb(0x7a, 0x4a, 0x3a), // dim coral
-            separator: Color::rgb(0x2a, 0x2a, 0x40), // cool dark purple
+            accent: Color::rgb(0x19, 0xaa, 0xd8), // Warp source truth
+            accent_dim: Color::rgb(0x10, 0x70, 0x8f), // derived dim accent
+            separator: Color::rgb(0x2a, 0x2a, 0x2a), // derived barely-visible near-black
             syntax: SyntaxColors {
-                command: Color::rgb(0xe8, 0xe8, 0xf0), // bright off-white — distinct from default fg
-                flag: Color::rgb(0xff, 0x5d, 0x38),    // coral (== accent)
-                path: Color::rgb(0x5a, 0xb9, 0xf8),    // sky blue
-                string: Color::rgb(0xc7, 0xa5, 0x5c),  // warm yellow
-                number: Color::rgb(0xff, 0xc7, 0x4a),  // bright yellow
-                variable: Color::rgb(0xb3, 0x87, 0xff), // lavender
-                operator: Color::rgb(0x7a, 0x7a, 0x90), // cool gray
-                comment: Color::rgb(0x5a, 0x5a, 0x72), // muted purple-gray
-                argument: Color::rgb(0x7a, 0xc4, 0xc8), // soft teal — distinct from foreground command
-                default: Color::rgb(0xd9, 0xd9, 0xe3),  // == foreground
+                command: Color::rgb(0xb4, 0xfa, 0x72),  // == ANSI 2 green
+                flag: Color::rgb(0xa5, 0xd5, 0xfe),     // == ANSI 4 blue
+                path: Color::rgb(0x6f, 0xd3, 0xe8),     // derived cyan-blue between blue and cyan
+                string: Color::rgb(0xfe, 0xfd, 0xc2),   // == ANSI 3 yellow
+                number: Color::rgb(0xff, 0xb1, 0xfe),   // == ANSI 13 bright magenta
+                variable: Color::rgb(0xc1, 0xe3, 0xfe), // == ANSI 12 bright blue
+                operator: Color::rgb(0xff, 0x82, 0x72), // == ANSI 1 red
+                comment: Color::rgb(0x8e, 0x8e, 0x8e),  // == ANSI 8 bright black
+                argument: Color::rgb(0xa0, 0xb8, 0xd0), // derived mid-luma slate
+                default: Color::rgb(0xff, 0xff, 0xff),  // == foreground
             },
             output: OutputSemanticColors {
-                output_default: Color::rgb(0xd9, 0xd9, 0xe3), // == syntax.default
-                metadata: Color::rgb(0xa8, 0x6a, 0x5a),       // muted coral
-                success: Color::rgb(0x3e, 0xd9, 0xa4),        // ANSI 2 green (mint)
-                failure: Color::rgb(0xff, 0x5d, 0x38),        // ANSI 1 red (coral)
+                output_default: Color::rgb(0xff, 0xff, 0xff), // == syntax.default
+                metadata: Color::rgb(0x8e, 0x8e, 0x8e),       // == ANSI 8 (muted)
+                success: Color::rgb(0xb4, 0xfa, 0x72),        // ANSI 2 green
+                failure: Color::rgb(0xff, 0x82, 0x72),        // ANSI 1 red
             },
             link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
             ui: ThemeUi::default(),
@@ -836,7 +836,7 @@ impl Theme {
     ///
     /// Recognized names: `weft-warm` / `weft-dark` (alias) / `weft-light` /
     /// `warp` / `warp-dark` / `dracula` / `solarized-dark` / `gruvbox-dark`.
-    /// Unknown names fall back to `weft-warm`.
+    /// Unknown names fall back to `warp` (the v1.15 default).
     pub fn resolve(cfg: &ThemeConfig) -> Self {
         Self::resolve_named(&cfg.name, cfg)
     }
@@ -848,7 +848,7 @@ impl Theme {
     /// v0.9 W2+: when `name` doesn't match any built-in, attempts to load a
     /// theme file from `~/.config/weft/themes/<name>.{toml,yaml,yml}`. File
     /// schema mirrors the `[theme]` section of `config.toml`. If no file is
-    /// found, falls back to `weft_warm` (the v0.8 default).
+    /// found, falls back to `warp_dark` (the v1.15 default).
     pub fn resolve_named(name: &str, cfg: &ThemeConfig) -> Self {
         let base = match name {
             "weft-light" => Self::weft_light(),
@@ -871,14 +871,14 @@ impl Theme {
             other => match Self::load_from_file(other) {
                 Some(t) => t,
                 None => {
-                    // v1.12: 此前静默回落到 weft-warm，用户拼错主题名时毫无
-                    // 反馈（看起来像"换主题没生效"）。这里明确告警。
+                    // v1.12: 此前静默回落到默认主题，用户拼错主题名时毫无反馈
+                    //（看起来像"换主题没生效"）。这里明确告警。v1.15: 默认切 warp（丙案）。
                     tracing::warn!(
                         theme = other,
                         themes_dir = ?Self::themes_dir(),
-                        "unknown theme name — falling back to weft-warm",
+                        "unknown theme name — falling back to warp",
                     );
-                    Self::weft_warm()
+                    Self::warp_dark()
                 }
             },
         };

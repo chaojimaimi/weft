@@ -18,7 +18,7 @@
 //! emoji_family = "Apple Color Emoji"
 //!
 //! [theme]
-//! name = "weft-warm"            # weft-warm | weft-light (weft-dark = legacy alias for weft-warm)
+//! name = "warp"                 # warp | weft-warm | weft-light (weft-dark = legacy alias for weft-warm)
 //! minimum_contrast = 7.0         # 1.0 = exact RGB; higher = paint-only readability boost
 //! foreground = "#e0d4c4"        # optional inline overrides
 //! accent = "#d4a574"            # v0.8: signature accent (amber)

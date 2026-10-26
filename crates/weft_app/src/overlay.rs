@@ -162,7 +162,7 @@ impl SettingsTab {
 /// v1.0 S1 / v1.12: 主题条目。`name`/`label` 用 `String`（自定义主题名是运行时值）。
 #[derive(Debug, Clone)]
 pub struct SettingsThemeView {
-    /// Theme name as it appears in config (`weft-warm`, `warp`, etc.).
+    /// Theme name as it appears in config (`warp`, `weft-warm`, etc.).
     pub name: String,
     /// Human-readable display label.
     pub label: String,
@@ -242,7 +242,7 @@ pub struct SettingsDrawParams<'a> {
     /// v1.0 fix: vertical scroll offset for list-based categories (Keybindings).
     /// The renderer renders rows `[offset .. offset+max_rows]`.
     pub scroll_offset: usize,
-    /// Current theme name (config value, e.g. "weft-warm").
+    /// Current theme name (config value, e.g. "warp").
     pub theme_name: &'a str,
     /// All available built-in themes (name + display label).
     pub themes: &'a [SettingsThemeView],

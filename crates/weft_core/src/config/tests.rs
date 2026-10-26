@@ -90,7 +90,8 @@ fn with_weft_config<F: FnOnce()>(
 #[test]
 fn defaults_are_dark_menlo_10000() {
     let c = Config::default();
-    assert_eq!(c.theme.name, "weft-warm");
+    // v1.15: default theme name flipped to warp (was weft-warm).
+    assert_eq!(c.theme.name, "warp");
     assert_eq!(c.theme.minimum_contrast, 7.0);
     assert_eq!(c.font.family, "Menlo");
     assert_eq!(c.font.size, 14.0);
@@ -106,7 +107,7 @@ fn defaults_are_dark_menlo_10000() {
 fn empty_toml_uses_defaults() {
     let c: Config = toml::from_str("").unwrap();
     assert_eq!(c.font.family, "Menlo");
-    assert_eq!(c.theme.name, "weft-warm");
+    assert_eq!(c.theme.name, "warp");
 }
 
 #[test]
@@ -193,11 +194,12 @@ fn weft_warm_default_has_warm_palette() {
 
 #[test]
 fn theme_unknown_name_falls_back_to_dark() {
+    // v1.15: the unknown-name fallback follows the default flip — warp.
     let cfg = ThemeConfig {
         name: "nonsense".into(),
         ..Default::default()
     };
-    assert_eq!(Theme::resolve(&cfg), Theme::weft_dark());
+    assert_eq!(Theme::resolve(&cfg), Theme::warp_dark());
 }
 
 #[test]
@@ -218,13 +220,40 @@ fn warp_theme_resolves_by_name() {
 }
 
 #[test]
-fn warp_theme_has_coral_accent_and_distinct_syntax() {
-    // v0.9 W2+: Warp's signature coral accent + 9 distinct syntax colors.
+fn warp_theme_pins_warp_source_truth() {
+    // v1.15 真值回归锁：warp_dark 逐值钉死 Warp 默认 "Dark" 主题 —— 取自
+    // 本地 Warp 源码 app/src/themes/default_themes.rs（dark_theme()
+    // :262-270 + dark_mode_colors() :11-30）。改动任何一个值 = 偏离 Warp
+    // 上游，须在方案中重新备案（cyan≈blue 的接近为上游固有，照抄不微调）。
     let t = Theme::warp_dark();
-    // Coral accent (#ff5d38) is the Warp signature.
-    assert_eq!(t.accent, Color::rgb(0xff, 0x5d, 0x38));
-    // flag == accent (consistent with weft_warm's design intent).
-    assert_eq!(t.syntax.flag, t.accent);
+    // bg/fg/accent/cursor — Warp 真值（dark_theme() cursor 传 None，
+    // warp_core 回落 unwrap_or(accent)，故 cursor == accent）。
+    assert_eq!(t.background, Color::rgb(0x05, 0x05, 0x05));
+    assert_eq!(t.foreground, Color::rgb(0xff, 0xff, 0xff));
+    assert_eq!(t.accent, Color::rgb(0x19, 0xaa, 0xd8));
+    assert_eq!(t.cursor, t.accent);
+    // 16 个 ANSI 槽逐值（0-7 普通，8-15 bright）。
+    let expected: [(u8, u8, u8); 16] = [
+        (0x61, 0x61, 0x61),
+        (0xff, 0x82, 0x72),
+        (0xb4, 0xfa, 0x72),
+        (0xfe, 0xfd, 0xc2),
+        (0xa5, 0xd5, 0xfe),
+        (0xff, 0x8f, 0xfd),
+        (0xd0, 0xd1, 0xfe),
+        (0xf1, 0xf1, 0xf1),
+        (0x8e, 0x8e, 0x8e),
+        (0xff, 0xc4, 0xbd),
+        (0xd6, 0xfc, 0xb9),
+        (0xfe, 0xfd, 0xd5),
+        (0xc1, 0xe3, 0xfe),
+        (0xff, 0xb1, 0xfe),
+        (0xe5, 0xe6, 0xfe),
+        (0xfe, 0xff, 0xff),
+    ];
+    for (i, (r, g, b)) in expected.iter().enumerate() {
+        assert_eq!(t.palette[i], Color::rgb(*r, *g, *b), "ANSI slot {i}");
+    }
     // default == foreground.
     assert_eq!(t.syntax.default, t.foreground);
     // All 9 syntax colors distinct from background (must be visible).
@@ -256,7 +285,7 @@ fn warp_theme_supports_inline_overrides() {
     let theme = Theme::resolve(&cfg);
     assert_eq!(theme.accent, Color::rgb(0x00, 0xff, 0x00));
     // Background is still the warp default (override only touched accent).
-    assert_eq!(theme.background, Color::rgb(0x1b, 0x1b, 0x28));
+    assert_eq!(theme.background, Color::rgb(0x05, 0x05, 0x05));
 }
 
 #[test]
@@ -1390,7 +1419,7 @@ fn save_default_config_creates_empty_file() {
     // The file should be valid TOML (possibly empty).
     let reloaded: Config = toml::from_str(&text).unwrap();
     assert_eq!(reloaded.font.family, "Menlo");
-    assert_eq!(reloaded.theme.name, "weft-warm");
+    assert_eq!(reloaded.theme.name, "warp");
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
@@ -1815,7 +1844,7 @@ fn save_font_size_change() {
     assert_eq!(reloaded.font.size, 13.0);
     // Other fields retain defaults.
     assert_eq!(reloaded.font.family, "Menlo");
-    assert_eq!(reloaded.theme.name, "weft-warm");
+    assert_eq!(reloaded.theme.name, "warp");
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 

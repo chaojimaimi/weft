@@ -423,7 +423,7 @@ mod tests {
         assert!(super::theme_is_dark("weft-warm", &cfg));
         assert!(super::theme_is_dark("nord", &cfg));
         assert!(super::theme_is_dark("dracula", &cfg));
-        // 未知名主题回落到 weft-warm（暗），与 resolve_named 行为一致。
+        // 未知名主题回落到 warp（暗），与 resolve_named 行为一致。
         assert!(super::theme_is_dark("no-such-theme", &cfg));
     }
 

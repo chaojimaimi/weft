@@ -942,9 +942,10 @@ impl App {
     pub(super) fn settings_theme_views(&self) -> Vec<crate::overlay::SettingsThemeView> {
         use crate::overlay::SettingsThemeView;
         const BUILTINS: [(&str, &str); 11] = [
-            ("weft-warm", "Weft Warm (default)"),
+            ("weft-warm", "Weft Warm"),
             ("weft-light", "Weft Light"),
-            ("warp", "Warp Dark"),
+            // v1.15: the (default) marker moved with the default flip.
+            ("warp", "Warp (default)"),
             ("dracula", "Dracula"),
             ("solarized-dark", "Solarized Dark"),
             ("gruvbox-dark", "Gruvbox Dark"),

@@ -187,90 +187,90 @@
       "indicators": [
         {
           "pair": "find_match_composited",
-          "ratio": 3.591
+          "ratio": 3.663
         },
         {
           "pair": "increased_find_match_composited",
-          "ratio": 3.861
+          "ratio": 3.942
         },
         {
           "pair": "increased_border",
-          "ratio": 5.887
+          "ratio": 8.571
         },
         {
           "pair": "panel_selection",
-          "ratio": 3.053
+          "ratio": 3.006
         }
       ],
       "name": "warp-dark",
       "text": [
         {
           "pair": "primary_canvas",
-          "ratio": 12.143
+          "ratio": 20.381
         },
         {
           "pair": "primary_chrome",
-          "ratio": 12.676
+          "ratio": 20.502
         },
         {
           "pair": "primary_raised",
-          "ratio": 9.692
+          "ratio": 17.582
         },
         {
           "pair": "primary_panel",
-          "ratio": 13.62
+          "ratio": 20.624
         },
         {
           "pair": "secondary_canvas",
-          "ratio": 6.573
+          "ratio": 9.83
         },
         {
           "pair": "secondary_chrome",
-          "ratio": 6.862
+          "ratio": 9.888
         },
         {
           "pair": "secondary_raised",
-          "ratio": 5.246
+          "ratio": 8.48
         },
         {
           "pair": "secondary_panel",
-          "ratio": 7.372
+          "ratio": 9.947
         },
         {
           "pair": "focus",
-          "ratio": 5.571
+          "ratio": 7.554
         },
         {
           "pair": "focus_panel",
-          "ratio": 6.249
+          "ratio": 7.644
         },
         {
           "pair": "success",
-          "ratio": 8.77
+          "ratio": 10.503
         },
         {
           "pair": "success_panel",
-          "ratio": 9.836
+          "ratio": 10.628
         },
         {
           "pair": "warning",
-          "ratio": 7.786
+          "ratio": 9.325
         },
         {
           "pair": "warning_panel",
-          "ratio": 8.732
+          "ratio": 9.436
         },
         {
           "pair": "error",
-          "ratio": 4.567
+          "ratio": 5.47
         },
         {
           "pair": "error_panel",
-          "ratio": 5.122
+          "ratio": 5.535
         },
         {
           "pair": "panel_selection_text",
-          "ratio": 6.253
+          "ratio": 6.861
         }
       ]
     },
