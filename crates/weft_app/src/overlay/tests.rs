@@ -190,6 +190,49 @@ fn overlay_warmup_palette_collects_query_and_entries() {
     OverlayContent::CommandPalette(p).warm_chars(&mut missing);
     assert!(missing.contains(&'g'));
     assert!(missing.contains(&'i'));
+    // v1.15.1: entry chars are warmed too (label/description/kind_label) —
+    // before this the arm only guaranteed the query.
+    assert!(missing.contains(&'v'), "description char");
+    assert!(missing.contains(&'B'), "kind_label char");
+    assert!(missing.contains(&'t'), "label char");
+}
+
+#[test]
+fn overlay_warmup_palette_collects_form_workflow_and_field_chars() {
+    // v1.15.1: the form submode renders workflow_name + each field's name
+    // and value (paint/palette.rs) — CJK workflow names were the last char
+    // source missing from the CommandPalette warm arm.
+    let views: Vec<PaletteEntryView> = vec![];
+    let fields = vec![
+        ("环境".to_string(), "production".to_string(), true),
+        ("区域".to_string(), "us-east".to_string(), false),
+    ];
+    let form = PaletteFormView {
+        workflow_name: "部署",
+        fields: &fields,
+        current_field: 0,
+    };
+    let p = PaletteDrawParams {
+        query: "",
+        entries: &views,
+        selection: 0,
+        hovered_row: None,
+        form: Some(&form),
+        banner: "",
+        submode_input: "",
+        ime_preedit: "",
+        ime_preedit_cursor: None,
+        reveal: 1.0,
+    };
+    let mut missing = HashSet::new();
+    OverlayContent::CommandPalette(p).warm_chars(&mut missing);
+    // CJK workflow name + field names.
+    assert!(missing.contains(&'部'), "workflow name char");
+    assert!(missing.contains(&'环'), "field name char");
+    assert!(missing.contains(&'区'), "second field name char");
+    // Field values.
+    assert!(missing.contains(&'p'), "field value char");
+    assert!(missing.contains(&'-'), "field value dash char");
 }
 
 // ── v1.0 S1: Settings overlay tests ────────────────────────────────

@@ -285,6 +285,12 @@ impl MetalRenderer {
             missing.extend(crate::panel_component::FOOTER_FEEDBACK_DIGITS.chars());
             missing.extend(['▲', '▼']);
             missing.extend(p.query.chars());
+            // v1.15.1: warm the panel IME preedit — the paint path renders it
+            // inline after the query (panel.rs), and an unwarmed CJK
+            // composition's first frame would paint blank cells.
+            if !p.panel_ime_preedit.is_empty() {
+                missing.extend(p.panel_ime_preedit.chars());
+            }
             // v1.13.18 P4: the warm-up row estimate reads the shared budget
             // function. This associated fn has no renderer state, so
             // chrome_top reads 0.0 — the WIDEST (superset) window, exactly
@@ -369,6 +375,11 @@ impl MetalRenderer {
         if let Some(find) = find_state {
             missing.extend("Find: ".chars());
             missing.extend(find.query.chars());
+            // v1.15.1: warm the IME preedit (palette precedent) so the first
+            // frame of a CJK composition doesn't leave blank cells.
+            if !find.ime_preedit.is_empty() {
+                missing.extend(find.ime_preedit.chars());
+            }
             // Button labels + status fragments.
             missing.extend(['↑', '↓', 'A', 'a', '.', '*', '…']);
             if let Some(err) = &find.regex_error {
@@ -382,21 +393,18 @@ impl MetalRenderer {
             missing.extend(note.buffer.chars());
             missing.extend(['\u{23ce}', '\u{238b}']); // ⏎ ⎋
         }
-        // v0.9 fix: warm up the command palette (Cmd+P) query + banner
-        // + submode input so CJK / other non-ASCII chars typed via IME
-        // render instead of leaving blank cells (same rationale as the
-        // find bar above).
+        // v0.9 fix: warm up the command palette (Cmd+P) so CJK / other
+        // non-ASCII chars typed via IME render instead of leaving blank
+        // cells (same rationale as the find bar above).
+        // v1.15.1: single source — query/entries/form/banner/submode/preedit
+        // charsets now come from `OverlayContent::CommandPalette::warm_chars`
+        // (the Settings precedent), so warmup and paint can never drift.
+        // The "> " input prefix is rendered by the paint path
+        // (paint/palette.rs) but not covered by warm_chars, so it stays an
+        // explicit warm here.
         if let Some(p) = palette {
             missing.extend("> ".chars());
-            missing.extend(p.query.chars());
-            if !p.banner.is_empty() {
-                missing.extend(p.banner.chars());
-            }
-            missing.extend(p.submode_input.chars());
-            // v1.8.4: warm up IME preedit chars for the palette input.
-            if !p.ime_preedit.is_empty() {
-                missing.extend(p.ime_preedit.chars());
-            }
+            OverlayContent::CommandPalette(*p).warm_chars(&mut missing);
         }
         // v1.0 S1: warm up the Settings panel (Cmd+,) — tab labels,
         // status text, theme names, font family, keybinding strings.

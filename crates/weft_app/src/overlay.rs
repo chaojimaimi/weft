@@ -334,6 +334,10 @@ pub struct SettingsDrawParams<'a> {
 }
 
 /// Command Palette rendering parameters (v0.7).
+// v1.15.1: Copy lets the warmup pass `*p` into
+// `OverlayContent::CommandPalette::warm_chars` (single char source — all
+// fields are shared refs / plain ints).
+#[derive(Clone, Copy)]
 pub struct PaletteDrawParams<'a> {
     pub query: &'a str,
     pub entries: &'a [PaletteEntryView<'a>],
@@ -360,6 +364,7 @@ pub struct PaletteDrawParams<'a> {
 }
 
 /// A palette entry, rendered in the dropdown.
+#[derive(Clone, Copy)] // v1.15.1: required by PaletteDrawParams: Copy (warmup single-sourcing)
 pub struct PaletteEntryView<'a> {
     pub label: &'a str,
     pub description: &'a str,
@@ -481,6 +486,17 @@ impl OverlayWarmup for OverlayContent<'_> {
                     missing.extend(e.kind_label.chars());
                 }
                 missing.extend("Workflow Builtin — 填写参数 Enter 下一项 Esc".chars());
+                // v1.15.1: form submode — the workflow name and each field's
+                // name/value are rendered by the paint path (palette.rs), and
+                // CJK workflow names / field values were the last char source
+                // missing from this arm.
+                if let Some(f) = p.form {
+                    missing.extend(f.workflow_name.chars());
+                    for (name, value, _) in f.fields {
+                        missing.extend(name.chars());
+                        missing.extend(value.chars());
+                    }
+                }
                 // v1.8.4: warm up preedit + submode input chars.
                 if !p.banner.is_empty() {
                     missing.extend(p.banner.chars());
