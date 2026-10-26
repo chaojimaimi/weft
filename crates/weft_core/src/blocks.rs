@@ -368,26 +368,6 @@ impl Default for BlockTracker {
 }
 
 impl BlockTracker {
-    /// v1.15.0 T3: the「加载更早」exhausted ruling (store has nothing older
-    /// than the memory front). Private field — accessor discipline like the
-    /// rest of this struct (rust-reviewer P3).
-    pub fn footer_exhausted(&self) -> bool {
-        self.footer_exhausted
-    }
-
-    /// Burn the ruling: the last load-older query answered empty.
-    pub fn burn_footer_exhausted(&mut self) {
-        self.footer_exhausted = true;
-    }
-
-    /// Retention eviction moved the memory front — the old ruling is stale
-    /// and the footer must become clickable again.
-    pub fn reset_footer_exhausted(&mut self) {
-        self.footer_exhausted = false;
-    }
-}
-
-impl BlockTracker {
     pub fn new() -> Self {
         Self {
             phase: ShellPhase::NotIntegrated,

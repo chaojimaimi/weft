@@ -183,12 +183,11 @@ impl App {
             .footer_feedback
             .as_ref()
             .map(|(text, at)| (text.clone(), *at));
-        let footer_exhausted_snapshot: bool = if self.panel.open {
-            tab.with_terminal(|t| t.block_tracker().footer_exhausted())
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        // P3-3: skip the tracker lock entirely when the panel is closed.
+        let footer_exhausted_snapshot = self.panel.open
+            && tab
+                .with_terminal(|t| t.block_tracker().footer_exhausted())
+                .unwrap_or(false);
         // T10 P1: the active pane's guard plus every background pane's guard
         // are scoped to this block — `clear_background_grid_dirty` below
         // re-locks the background panes, so the guards MUST drop first

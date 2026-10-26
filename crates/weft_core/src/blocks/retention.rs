@@ -25,6 +25,24 @@ use std::collections::HashSet;
 pub const DEFAULT_BLOCKS_RETAINED_LIMIT: usize = 2000;
 
 impl BlockTracker {
+    /// v1.15.0 T3: the「加载更早」exhausted ruling (store has nothing older
+    /// than the memory front). Private field on the tracker — accessor
+    /// discipline (rust-reviewer P3); lives beside its retention reset.
+    pub fn footer_exhausted(&self) -> bool {
+        self.footer_exhausted
+    }
+
+    /// Burn the ruling: the last load-older query answered empty.
+    pub fn burn_footer_exhausted(&mut self) {
+        self.footer_exhausted = true;
+    }
+
+    /// Retention eviction moved the memory front — the old ruling is stale
+    /// and the footer must become clickable again.
+    pub fn reset_footer_exhausted(&mut self) {
+        self.footer_exhausted = false;
+    }
+
     /// v1.11.2 X4 (PLAN_v1112 §1.2): configure the in-memory retention cap.
     /// `0` disables retention (blocks accumulate unbounded — the pre-1.11.2
     /// behavior, kept as a test escape hatch).
