@@ -462,6 +462,21 @@ impl MetalRenderer {
             .map(crate::ui_tokens::clamp_sidebar_width);
     }
 
+    /// v1.14.4 (批A): best-effort glyph warm-up for dynamically set badge
+    /// text (paste toast / config status hint). Both badges draw through
+    /// paint/status_hint.rs's lookup-only `push_text`, which silently skips
+    /// glyphs missing from the atlas while still advancing the column —
+    /// the setter funnel is the one point shared by every sender, so it is
+    /// where the full string (plus the `…` truncation tail) gets rasterized.
+    /// Same best-effort semantics as warm_atlas: rasterize failures ignored.
+    fn warm_badge_text(&mut self, text: &str) {
+        for ch in text.chars().chain(std::iter::once('…')) {
+            let _ = self
+                .atlas
+                .get_or_rasterize(ch, crate::glyph::GlyphStyle::REGULAR);
+        }
+    }
+
     /// v1.5.3: Set the brief config error hint shown in the bottom-left
     /// status badge when Settings is closed. Pass `None` to clear (e.g.
     /// after a successful reload). The renderer truncates to fit the
@@ -471,6 +486,12 @@ impl MetalRenderer {
     /// hint — a stale/broken config is more important to surface than the
     /// "passthrough" badge.
     pub fn set_config_status_hint(&mut self, hint: Option<String>) {
+        // v1.14.4 (批A): symmetric warm-up with the paste toast — the config
+        // badge draws in status_hint.rs through the same pure-lookup path,
+        // and dynamic error details can contain CJK paths.
+        if let Some(message) = &hint {
+            self.warm_badge_text(message);
+        }
         self.config_status_hint = hint;
     }
 
@@ -479,7 +500,24 @@ impl MetalRenderer {
     /// after an approved large paste; the caller owns expiry via
     /// [`Self::clear_expired_paste_toast`] on the 1 Hz autosave tick.
     pub fn set_paste_toast(&mut self, toast: Option<(String, std::time::Instant)>) {
+        // v1.14.4 (批A): this setter is the single funnel for every toast
+        // sender — warm the toast glyphs here so the status_hint paint
+        // path (pure atlas lookup) finds every one of them.
+        if let Some((text, _)) = &toast {
+            self.warm_badge_text(text);
+        }
         self.paste_toast = toast;
+    }
+
+    /// v1.14.4 (批B): self-zoom 步进的原子提交括号。与
+    /// `set_live_resize`/config 门完全独立（后者有手势语义，且
+    /// window_event/resized.rs 每步 Resized 内的 `set_live_resize(false)`
+    /// 会无条件翻层——本括号必须开在 request_inner_size 之后，否则翻转
+    /// 会被覆盖）；self-zoom 是 ~8 帧的一次性动画，正确性优先。不做显式
+    /// CATransaction::flush（显式 flush 的 WindowServer 等待已被 B2 关停），
+    /// 帧与 bounds 同轮隐式事务提交。只允许 step_self_zoom 的步进括号调用。
+    pub(crate) fn set_zoom_atomic_present(&mut self, on: bool) {
+        self.layer.set_presents_with_transaction(on);
     }
 
     /// v1.11.1: drop the paste toast once its TTL elapsed. Returns `true`

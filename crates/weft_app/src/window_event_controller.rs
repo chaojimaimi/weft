@@ -612,6 +612,23 @@ impl App {
         window.set_outer_position(winit::dpi::LogicalPosition::new(x, y));
         crate::macos_zoom::zoom_anim_advance((x, y, w, h));
         crate::macos_zoom::zoom_anim_mark_stepped();
+        // v1.14.4 (批B/方案甲): 帧与 bounds 原子提交——本步 Resized 已在
+        // request_inner_size 内同步派发并完成 reflow（含 resized.rs:189 的
+        // set_live_resize(false)，故此刻翻转不会被覆盖），强制 draw 立即
+        // 绘制当前 viewport；presentsWithTransaction 使 present 并入本轮
+        // CA 事务，与 setFrameSize 的 bounds 提交原子。括号作用域成对，
+        // cancel/漂移分支在本括号之前 return，层状态恒为初始 false。
+        // 约束：本括号不得移到 request_inner_size 之前（见 setter doc）。
+        // 成本：强制 draw 约 +5-9ms/步——时间驱动插值折叠跳过的时长，
+        // 步距增大但动画总时长不变。
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_zoom_atomic_present(true);
+            tracing::debug!("zoom step atomic present on");
+        }
+        self.handle_redraw_requested_forced();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_zoom_atomic_present(false);
+        }
         if progress >= 1.0 {
             let steps = crate::macos_zoom::zoom_anim_finish().map_or(0, |finished| finished.steps);
             tracing::info!(steps, "self-zoom complete");

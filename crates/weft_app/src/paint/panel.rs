@@ -478,7 +478,10 @@ impl MetalRenderer {
                 [0.0; 4],
                 separator_color,
             );
-            let label = "加载更早";
+            // v1.14.4 (批A): the label literal moved to the shared constant —
+            // the atlas warm-up must rasterize exactly the glyphs painted here
+            // (unwarmed glyphs are silently skipped by push_text).
+            let label = crate::panel_component::FOOTER_LABEL;
             // Reviewer Minor-7: CJK glyphs render at double cell width —
             // count terminal columns, not chars, or the label centers
             // ~one CJK width off to the right.

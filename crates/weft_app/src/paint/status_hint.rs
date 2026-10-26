@@ -132,29 +132,52 @@ impl MetalRenderer {
         let content_cols = ((ctx.right() - ctx.left()) / cw).max(0.0) as usize;
         let max_cols = (content_cols / 2).clamp(8, 40);
         let display = truncate_with_ellipsis(toast, max_cols);
-        let text_cols = display.chars().count();
+        // v1.14.4 (批A): column width, not char count — a CJK toast must
+        // anchor its right edge exactly at ctx.right instead of overflowing
+        // by one CJK width (v1.12.27a panel_query_display precedent).
+        let text_cols = MetalRenderer::text_col_width(&display);
         let x = (ctx.right() - text_cols as f32 * cw).max(ctx.left());
         self.push_text(&mut verts, x, y, &display, fg, text_cols.max(1));
         verts
     }
 }
 
-/// Truncate `s` to at most `max_cols` visible columns (char count, since
-/// the atlas is monospace). If truncation occurs, the last char is replaced
-/// with `…` so the user knows there's more. Returns the original string if
-/// it already fits.
+/// Truncate `s` to at most `max_cols` visible columns (terminal column
+/// width — ASCII 1, CJK 2, matching what `push_text` actually renders). If
+/// truncation occurs, `…` is appended with its own width deducted from the
+/// budget FIRST so the result never exceeds `max_cols`. Returns the original
+/// string if it already fits.
+///
+/// v1.14.4 (批A): the budget switched from `chars().count()` to
+/// [`MetalRenderer::text_col_width`] — the char-count budget truncated a
+/// CJK string twice as early and let it overflow its right edge. For
+/// single-column ASCII sequences the result is identical to the old
+/// implementation. Shared by both badge callers (paste toast + config
+/// status hint), so the unit tests cover both paths.
 fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_cols {
+    use unicode_segmentation::UnicodeSegmentation;
+    if MetalRenderer::text_col_width(s) <= max_cols {
         return s.to_string();
     }
     if max_cols == 0 {
         return String::new();
     }
-    if max_cols == 1 {
+    let ellipsis_cols = MetalRenderer::text_col_width("…");
+    if max_cols <= ellipsis_cols {
         return "…".to_string();
     }
-    let mut truncated: String = chars[..max_cols - 1].iter().collect();
+    // '…' width already deducted; keep whole graphemes while they fit.
+    let budget = max_cols - ellipsis_cols;
+    let mut truncated = String::new();
+    let mut used_cols = 0usize;
+    for grapheme in s.graphemes(true) {
+        let width = MetalRenderer::text_col_width(grapheme);
+        if used_cols + width > budget {
+            break;
+        }
+        truncated.push_str(grapheme);
+        used_cols += width;
+    }
     truncated.push('…');
     truncated
 }
@@ -237,5 +260,103 @@ mod tests {
     #[test]
     fn truncate_zero_cols_returns_empty() {
         assert_eq!(truncate_with_ellipsis("abc", 0), "");
+    }
+
+    // ── v1.14.4 (批A) column-width truncation ────────────────────────
+
+    #[test]
+    fn truncate_cjk_respects_column_budget() {
+        // 5 CJK chars = 10 cols vs budget 6: '…'(1 col) is reserved first,
+        // leaving 5 → two CJK chars (4 cols); the third would need 6 > 5.
+        assert_eq!(truncate_with_ellipsis("你好世界吗", 6), "你好…");
+    }
+
+    #[test]
+    fn truncate_cjk_exact_fit_no_ellipsis() {
+        // Exactly 6 columns of CJK fits a 6-column budget untouched.
+        assert_eq!(truncate_with_ellipsis("你好世", 6), "你好世");
+    }
+
+    #[test]
+    fn truncate_cjk_one_column_over_truncates() {
+        // 3 CJK chars = 6 cols vs budget 5 → truncation fires and the
+        // result stays within the budget (2×2 + 1 = 5 cols).
+        assert_eq!(truncate_with_ellipsis("你好世", 5), "你好…");
+    }
+
+    #[test]
+    fn truncate_ellipsis_width_deducted_first() {
+        // Budget 2 with CJK input: '…' reserved first leaves 1 column —
+        // half a CJK char, which never fits, leaving the bare ellipsis.
+        assert_eq!(truncate_with_ellipsis("你好", 2), "…");
+        // Budget 3: after the reserve, 2 columns remain = one CJK char.
+        assert_eq!(truncate_with_ellipsis("你好", 3), "你…");
+    }
+
+    #[test]
+    fn truncate_ascii_identical_to_old_char_count_budget() {
+        // Single-column ASCII: the column-width budget must produce
+        // byte-identical output to the old chars().count() implementation
+        // (hardcoded expectations pinned against the old semantics).
+        assert_eq!(truncate_with_ellipsis("abc", 10), "abc");
+        assert_eq!(truncate_with_ellipsis("", 10), "");
+        assert_eq!(truncate_with_ellipsis("abcde", 5), "abcde");
+        assert_eq!(truncate_with_ellipsis("abcdefghij", 8), "abcdefg…");
+        assert_eq!(truncate_with_ellipsis("abc", 1), "…");
+        assert_eq!(truncate_with_ellipsis("abc", 0), "");
+    }
+
+    // ── v1.14.4 (批A) paste-toast right-edge anchoring ───────────────
+
+    fn headless() -> Option<MetalRenderer> {
+        if metal::Device::system_default().is_none() {
+            eprintln!("skipping: no Metal device");
+            return None;
+        }
+        Some(MetalRenderer::new_headless_paint(
+            weft_core::config::Theme::weft_dark(),
+        ))
+    }
+
+    /// The CJK toast's first quad must sit at exactly
+    /// `ctx.right() - text_col_width(display) × cw`, i.e. the rendered
+    /// right edge lands on the content-area right edge instead of
+    /// overflowing by one CJK width (the old chars().count() bug).
+    #[test]
+    fn paste_toast_cjk_right_edge_lands_on_content_right() {
+        let Some(mut renderer) = headless() else {
+            return;
+        };
+        let ctx = renderer
+            .layout_ctx
+            .expect("headless build fills layout_ctx");
+        let toast_text = "已粘贴 1000 行".to_string();
+        renderer.set_paste_toast(Some((toast_text.clone(), std::time::Instant::now())));
+        let verts = renderer.build_paste_toast_vertices();
+        assert!(
+            !verts.is_empty(),
+            "the setter funnel warms every glyph, so the whole toast must emit"
+        );
+        let cw = renderer.cell_width() as f32;
+        // Mirror the paint-side budget to pin that this fixture is NOT
+        // truncated (else the edge assertion below would be trivially true
+        // on a shortened display string).
+        let content_cols = ((ctx.right() - ctx.left()) / cw).max(0.0) as usize;
+        let max_cols = (content_cols / 2).clamp(8, 40);
+        let cols = MetalRenderer::text_col_width(&toast_text);
+        assert!(
+            cols <= max_cols,
+            "fixture must fit untruncated: {cols} cols vs budget {max_cols}"
+        );
+        // push_quad = 6 vertices × 12 floats; vertex 0 of quad 0 is x0, and
+        // the first grapheme is emitted at the run origin x.
+        assert!(
+            (verts[0] + cols as f32 * cw - ctx.right()).abs() < 0.5,
+            "toast right edge must land on ctx.right: {} + {}×{} vs {}",
+            verts[0],
+            cols,
+            cw,
+            ctx.right()
+        );
     }
 }

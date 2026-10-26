@@ -496,6 +496,36 @@ mod tests {
         assert!(!renderer.layer.presents_with_transaction());
     }
 
+    /// v1.14.4 (批B): the self-zoom atomic-present bracket flips ONLY the
+    /// layer's `presentsWithTransaction` property — no state, no config
+    /// gate, fully independent of `set_live_resize` (whose gesture semantics
+    /// and per-step unconditional un-flip in resized.rs are exactly why the
+    /// bracket must not ride it). Constructor initial false is pinned here.
+    #[test]
+    fn zoom_atomic_bracket_flips_layer() {
+        let Some(_device) = Device::system_default() else {
+            eprintln!("skipping zoom atomic bracket test: no Metal device available");
+            return;
+        };
+        let mut renderer = MetalRenderer::new_headless_paint(weft_core::config::Theme::weft_dark());
+        assert!(
+            !renderer.layer.presents_with_transaction(),
+            "layer starts in async-present mode"
+        );
+
+        renderer.set_zoom_atomic_present(true);
+        assert!(
+            renderer.layer.presents_with_transaction(),
+            "bracket open must flip the layer property"
+        );
+
+        renderer.set_zoom_atomic_present(false);
+        assert!(
+            !renderer.layer.presents_with_transaction(),
+            "bracket close must restore async present"
+        );
+    }
+
     // ── v1.12.2 B2 (PLAN_S2_render) + Phase E: the config gate now rolls
     // ── back ONLY the legacy CATransaction flush ──
     //

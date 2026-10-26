@@ -340,3 +340,127 @@ pub(crate) use note_layout::{
 
 #[path = "text_anchors.rs"]
 mod note_layout;
+
+#[cfg(test)]
+mod footer_glyph_probe {
+    use super::*;
+
+    // 取证探针 (2026-10-24)：Cmd+Shift+B 历史侧栏 footer 只显示孤字「更」。
+    // 待证机制：footer 标签「加载更早」不在任何 warm_atlas 名单里，而
+    // push_text 对图集缺失的字形静默跳过但保留步进 —— 于是可见字符集
+    // 取决于会话内容碰巧预热过哪些字。两个测试把该契约钉死在顶点层。
+
+    fn headless() -> Option<MetalRenderer> {
+        if metal::Device::system_default().is_none() {
+            eprintln!("skipping: no Metal device");
+            return None;
+        }
+        Some(MetalRenderer::new_headless_paint(
+            weft_core::config::Theme::weft_dark(),
+        ))
+    }
+
+    /// push_quad = 6 顶点 × 12 float；每 quad 取第 0 顶点的 x0。
+    fn quad_x0s(verts: &[f32]) -> Vec<f32> {
+        verts
+            .chunks(72)
+            .filter(|q| q.len() == 72)
+            .map(|q| q[0])
+            .collect()
+    }
+
+    #[test]
+    fn fresh_atlas_footer_label_emits_zero_quads() {
+        let Some(renderer) = headless() else {
+            return;
+        };
+        let label = crate::panel_component::FOOTER_LABEL;
+        for ch in label.chars() {
+            assert!(
+                renderer.atlas.get(ch).is_none(),
+                "{ch} unexpectedly present in a fresh atlas"
+            );
+        }
+        let mut verts = Vec::new();
+        renderer.push_text(&mut verts, 100.0, 50.0, label, [1.0; 4], 64);
+        assert!(
+            quad_x0s(&verts).is_empty(),
+            "paint path is lookup-only: an unwarmed label must emit nothing"
+        );
+    }
+
+    #[test]
+    fn only_geng_warmed_emits_single_quad_at_third_slot() {
+        let Some(mut renderer) = headless() else {
+            return;
+        };
+        renderer
+            .atlas
+            .get_or_rasterize('更', crate::glyph::GlyphStyle::REGULAR)
+            .expect("更 must rasterize via the CJK ladder");
+        for ch in "加载早".chars() {
+            assert!(
+                renderer.atlas.get(ch).is_none(),
+                "{ch} unexpectedly present; fixture requires only 更 warmed"
+            );
+        }
+        let x0 = 100.0;
+        let cw = renderer.cell_width() as f32;
+        let mut verts = Vec::new();
+        renderer.push_text(
+            &mut verts,
+            x0,
+            50.0,
+            crate::panel_component::FOOTER_LABEL,
+            [1.0; 4],
+            64,
+        );
+        let xs = quad_x0s(&verts);
+        assert_eq!(
+            xs.len(),
+            1,
+            "exactly the warmed glyph emits; got x0s={xs:?}"
+        );
+        let expected = x0 + 4.0 * cw; // 加(2列)+载(2列) 的步进保留在 更 之前
+        assert!(
+            (xs[0] - expected).abs() < 0.5,
+            "surviving glyph keeps its true slot: {} vs {}",
+            xs[0],
+            expected
+        );
+    }
+
+    /// v1.14.4 (批A A1)：四字全部预热 → 恰 4 个 quad，且各自落在真实
+    /// 列槽位（x = x0 + {0,2,4,6}×cw，CJK 每字 2 列）。与上面两个测试
+    /// 共同钉死预热契约：零预热零 quad / 部分预热部分 quad / 全预热全 quad。
+    /// A1 落地后 warm_atlas 的 panel 分支会预热 FOOTER_LABEL 全部四字，
+    /// 本测试即为该契约的顶点层等价物。
+    #[test]
+    fn fully_warmed_footer_label_emits_four_quads_at_true_slots() {
+        let Some(mut renderer) = headless() else {
+            return;
+        };
+        let label = crate::panel_component::FOOTER_LABEL;
+        for ch in label.chars() {
+            renderer
+                .atlas
+                .get_or_rasterize(ch, crate::glyph::GlyphStyle::REGULAR)
+                .expect("footer label glyph must rasterize via the CJK ladder");
+        }
+        let x0 = 100.0;
+        let cw = renderer.cell_width() as f32;
+        let mut verts = Vec::new();
+        renderer.push_text(&mut verts, x0, 50.0, label, [1.0; 4], 64);
+        let xs = quad_x0s(&verts);
+        assert_eq!(xs.len(), 4, "every warmed glyph emits; got x0s={xs:?}");
+        for (slot, &x) in xs.iter().enumerate() {
+            let expected = x0 + (2 * slot) as f32 * cw;
+            assert!(
+                (x - expected).abs() < 0.5,
+                "slot {slot}: {} vs expected {}",
+                x,
+                expected
+            );
+        }
+    }
+}

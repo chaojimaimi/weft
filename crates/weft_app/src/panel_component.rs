@@ -9,6 +9,14 @@
 use crate::layout::Rect;
 use crate::scene::{HitRegion, Scene, SemanticNode, SemanticRole};
 
+/// v1.14.4 (批A): single source for the history-footer "load older" label.
+/// `push_text` is lookup-only — glyphs missing from the atlas are silently
+/// skipped — so the paint site (paint/panel.rs), the AX label here, and the
+/// atlas warm-up (renderer/atlas_warmup.rs) must all render the SAME string.
+/// Three independent literals were the root cause of the lone-「更」footer
+/// artifact (footer-label-glyph-warmup-forensics).
+pub(crate) const FOOTER_LABEL: &str = "加载更早";
+
 /// A clickable region of the history panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PanelTarget {
@@ -73,7 +81,7 @@ pub(crate) fn build_panel_scene(
             .push(HitRegion::from_rect(footer, PanelTarget::LoadOlder));
         scene.semantics.push(SemanticNode {
             role: SemanticRole::Button,
-            label: "加载更早".into(),
+            label: FOOTER_LABEL.into(),
             bounds: footer,
             focus: None,
             state: String::new(),
