@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 mod freeze;
 mod ownership;
 mod tail;
+mod transform;
 
 mod capture;
 mod interrupt;
