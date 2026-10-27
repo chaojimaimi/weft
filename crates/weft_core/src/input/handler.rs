@@ -25,6 +25,12 @@ pub struct InputHandler {
     /// v1.11.4 (PLAN_v1114 §2.2): class of the current winit key event;
     /// drives the `:N` event sub-segment when 0b10 is negotiated.
     pub kitty_event_kind: super::kitty::KittyEventKind,
+    /// v1.16.0 (PLAN_v1160 §5): Flag 4 (ReportAlternateKeys) shifted
+    /// source — the layout text's first char while Shift is down, fed by
+    /// the app layer (`forward_key_to_pty`); `None` = no shifted knowledge
+    /// (synthetic/test paths), which simply omits the sub-segment (spec:
+    /// alternates are per-key optional). Precedent: `kitty_event_kind`.
+    pub kitty_shifted: Option<char>,
 }
 
 impl InputHandler {
@@ -36,6 +42,7 @@ impl InputHandler {
             mouse_coord_base: 1, // SGR uses 1-based
             kitty_flags: 0,
             kitty_event_kind: super::kitty::KittyEventKind::Press,
+            kitty_shifted: None,
         }
     }
 
@@ -53,12 +60,13 @@ impl InputHandler {
     /// pre-v1.11.4 stream (legacy-twin invariance, PLAN_v1114 §4.5).
     pub fn encode_key_text(&self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> Vec<u8> {
         if self.kitty_flags != 0 {
-            if let Some(bytes) = super::kitty::encode_kitty_key(
+            if let Some(bytes) = super::kitty::encode_kitty_key_shifted(
                 self.kitty_flags,
                 self.kitty_event_kind,
                 key,
                 mods,
                 text,
+                self.kitty_shifted,
             ) {
                 return bytes;
             }

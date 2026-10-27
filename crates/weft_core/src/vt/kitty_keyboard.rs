@@ -4,14 +4,35 @@
 //! for this module. Divergences from the kitty spec are deliberate and are
 //! pinned here so nobody "fixes" them back to spec:
 //!
-//! 1. **0b100 ReportAlternateKeys is NOT supported** — requested flags are
-//!    AND-ed with [`SUPPORTED_FLAG_MASK`] (foot's strategy) and the encoder
-//!    never emits a `:sk` shifted sub-segment (M5).
+//! 1. **Flag 4 emits the shifted sub-segment ONLY** (v1.16.0 T3) — the
+//!    base-layout slot (`key::base`) is not implemented: winit carries no
+//!    layout-group data and the Carbon TIS dependency outweighs the benefit
+//!    (PLAN_v1160 §5). Omission is spec-legal — alternates are per-key
+//!    optional; non-Latin-layout users get a strictly-better terminal, not
+//!    a regression. The v1.11.4-era M5 "never emits `:sk`" decision is
+//!    REVOKED.
 //! 2. **Ctrl+letter stays C0 at every level** (Weft explicit deviation) —
 //!    `Effect::InterruptPty`'s `[0x03]` atomic interrupt chain + shell
 //!    experience. kitty/foot/wezterm CSI-ify ctrl+keys at L1.
 //! 3. **L4 pure-modifier presses are still dropped** (explicit deviation) —
 //!    nvim/Helix don't consume them; actual impact is small.
+//! 4. **Enter/Tab/Backspace :2/:3 events require Flag 8** (v1.16.0 T2) —
+//!    the :3 release gate is the spec's own sentence ("do not have release
+//!    events unless ReportAllKeysAsEscapeCodes"); extending it to :2
+//!    repeats is a conservative Weft ruling (reviewer P3) pinned as an
+//!    explicit divergence. Without 0b1000 the press form stands in below
+//!    L4 and the app-side gate drops the release outright.
+//!
+//! ### v1.16.0 registry (PLAN_v1160 §6 — surface not implemented, by design)
+//!
+//! - Keypad KP operators (`+ - * /`), `,`/`.`/Enter, F13+, media and lock
+//!   keys have no `KeyCode` surface in Weft — unmapped, never emitted
+//!   (spec allows per-key omission). KP_0-9 = dedicated codes 57399-57408
+//!   from the Disambiguate flag.
+//! - Caps/Num-Lock modifier bits do not exist in Weft's `Modifiers` bit
+//!   set → the spec's lock-bit reporting rule is N/A.
+//! - The Flag 4 base-layout sub-segment is not done (§1).
+//! - The two v1.11.4 deviations (Ctrl+letter C0, pure-modifier drop) hold.
 //!
 //! Semantics (v2 table, M1-M8 folded in):
 //! - `CSI > flags u` push onto the CURRENT screen's stack (masked);
@@ -42,17 +63,20 @@ use super::Terminal;
 pub const STACK_CAP: usize = 10;
 
 /// Flags this terminal implements: 0b1 Disambiguate | 0b10 ReportEventTypes
-/// | 0b10000 ReportAssociatedText. 0b100 ReportAlternateKeys is deliberately
-/// absent (module doc, §1), and 0b1000 ReportAllKeysAsEscapeCodes is
-/// masked-out pending spec verification of the functional-key L4 forms
-/// (rust-reviewer v1.11.4 Blocker-2, downgrade clause — Home/End/F-key
-/// terminator shapes must be verified against `kitten show-key` before the
-/// bit is unmasked; the encoder's L4 rows are unreachable while masked).
-pub const SUPPORTED_FLAG_MASK: u8 = 0b1_0011;
+/// | 0b100 ReportAlternateKeys | 0b1000 ReportAllKeysAsEscapeCodes
+/// | 0b10000 ReportAssociatedText — the full kitty flag set, 0b1_1111
+/// (v1.16.0, PLAN_v1160). Flag 8 was unmasked in T2 (the v1.11.4 Blocker-2
+/// "verify L4 forms via kitten show-key" downgrade clause discharged by
+/// spec-table verification against the 2026-10-27 kitty spec pull, pinned
+/// row-by-row in `input/kitty_v1160_tests.rs`); Flag 4 followed in T3 with
+/// the shifted-only sub-segment (§1). Requested flags are AND-ed with this
+/// mask (foot's strategy).
+pub const SUPPORTED_FLAG_MASK: u8 = 0b1_1111;
 
 /// kitty keyboard-protocol flag bits (the LSB of each feature group).
 pub const FLAG_DISAMBIGUATE: u8 = 0b1;
 pub const FLAG_REPORT_EVENT_TYPES: u8 = 0b10;
+pub const FLAG_REPORT_ALTERNATE: u8 = 0b100;
 pub const FLAG_REPORT_ALL_KEYS: u8 = 0b1000;
 pub const FLAG_REPORT_ASSOCIATED_TEXT: u8 = 0b10000;
 
@@ -172,11 +196,13 @@ mod tests {
     #[test]
     fn push_masks_unsupported_flags() {
         let mut s = state();
+        // bits 5+ stay unimplemented — 0xff pushes back as the full mask
         s.push(false, 0b11111111);
         assert_eq!(s.flags(false), SUPPORTED_FLAG_MASK);
-        s.push(false, 0b100); // ReportAlternateKeys — cut
-                              // stack top is now 0b100 & mask = 0
-        assert_eq!(s.flags(false), 0);
+        // v1.16.0: 0b100 ReportAlternateKeys is SUPPORTED (shifted-only
+        // sub-segment, PLAN_v1160 §5) and survives the mask verbatim.
+        s.push(false, 0b100);
+        assert_eq!(s.flags(false), 0b100);
     }
 
     #[test]
@@ -248,17 +274,17 @@ mod tests {
         let mut s = state();
         s.push(false, 0b1);
         s.set(false, 0b1010, 2);
-        assert_eq!(s.flags(false), 0b11);
+        assert_eq!(s.flags(false), 0b1011);
     }
 
     #[test]
     fn set_mode_3_only_clears_bits() {
         let mut s = state();
         s.push(false, 0b11111);
-        assert_eq!(s.flags(false), 0b10011, "push masks to SUPPORTED");
+        assert_eq!(s.flags(false), 0b1_1111, "push masks to SUPPORTED");
         s.set(false, 0b1010, 3);
-        // 0b10011 & !0b1010 = 0b10001
-        assert_eq!(s.flags(false), 0b10001);
+        // 0b11111 & !0b1010 = 0b10101
+        assert_eq!(s.flags(false), 0b10101);
     }
 
     #[test]
@@ -298,7 +324,7 @@ mod tests {
         s.push(false, 0b1);
         s.push(true, 0b1011);
         assert_eq!(s.flags(false), 0b1);
-        assert_eq!(s.flags(true), 0b11);
+        assert_eq!(s.flags(true), 0b1011, "fully supported since v1.16.0");
         // Entering/leaving the alt screen never moves data (no swap hook).
         s.pop(true, 1);
         assert_eq!(s.flags(false), 0b1, "alt pops must not touch main");
@@ -314,7 +340,42 @@ mod tests {
         assert_eq!(s.flags(true), 0b1);
         s.pop(true, 1);
         assert_eq!(s.flags(true), 0);
-        assert_eq!(s.flags(false), 0b10011);
+        assert_eq!(s.flags(false), 0b1_1111);
+    }
+
+    // ── v1.16.0 (PLAN_v1160 §6): full-mask negotiation e2e ──────────
+
+    /// The complete flag set round-trips push/set/query/pop at terminal
+    /// level; the query answers `CSI ?31 u`.
+    #[test]
+    fn v1160_full_mask_push_set_query_pop_roundtrip() {
+        let mut t = Terminal::new(3, 10);
+        t.process(b"\x1b[>31u\x1b[?u");
+        assert_eq!(t.take_response(), b"\x1b[?31u", "push 0b1_1111 ⇒ ?31u");
+        t.process(b"\x1b[=8;3u\x1b[?u"); // clear the Flag 8 bit
+        assert_eq!(t.take_response(), b"\x1b[?23u");
+        t.process(b"\x1b[=8;2u\x1b[?u"); // set it back
+        assert_eq!(t.take_response(), b"\x1b[?31u");
+        t.process(b"\x1b[<u\x1b[?u"); // pop ⇒ empty stack
+        assert_eq!(t.take_response(), b"\x1b[?0u");
+    }
+
+    /// Disabled ([compat] kitty_keyboard = false) still swallows every op
+    /// with the full mask in play — the v1.11.3 silence is untouched.
+    #[test]
+    fn v1160_disabled_swallows_full_mask_ops() {
+        let mut t = Terminal::new(3, 10);
+        t.set_kitty_protocol_enabled(false);
+        t.process(b"\x1b[>31u");
+        t.process(b"\x1b[?u");
+        t.process(b"\x1b[=31;1u");
+        t.process(b"\x1b[<u");
+        assert_eq!(
+            t.take_response(),
+            b"",
+            "disabled: query and ops stay silent"
+        );
+        assert_eq!(t.keyboard_protocol_flags(), 0);
     }
 
     #[test]

@@ -105,10 +105,12 @@ fn l4_plain_printable_uses_key_code() {
         enc(0b1000, KeyCode::Char('A'), Modifiers::empty()),
         b"\x1b[65u"
     );
-    // kc comes from the BASE key, not layout text
+    // kc comes from the LAYOUT text (v1.16.0 PLAN §4 primary source — the
+    // unmodified L4 primary is the layout's unshifted code point; the
+    // pre-v1.16 physical-table answer 122 was the spec gap this fixes)
     assert_eq!(
         enc_text(0b1000, KeyCode::Char('z'), Modifiers::empty(), Some("y")),
-        b"\x1b[122u"
+        b"\x1b[121u"
     );
     // CJK base char → its code point
     assert_eq!(
@@ -340,6 +342,8 @@ fn ctrl_enter_tab_bs_rows() {
         enc(0b1000, KeyCode::Enter, Modifiers::CONTROL),
         b"\x1b[13;5u"
     );
+    // L2 repeat: the :2 sub-segment requires Flag 8 for the three keys
+    // (v1.16.0 conservative ruling, PLAN §4) — the press form stands in.
     assert_eq!(
         encode_kitty_key(
             0b11,
@@ -349,38 +353,24 @@ fn ctrl_enter_tab_bs_rows() {
             None
         )
         .unwrap(),
-        b"\x1b[13;5:2u"
+        b"\x1b[13;5u"
     );
-}
-
-// ── Alt rows ─────────────────────────────────────────────────────
-
-#[test]
-fn alt_printable_and_enter_rows() {
-    // Alt+a: CSI 97;3u — NO ESC prefix (deviation from legacy \x1ba)
-    assert_eq!(enc(0b1, KeyCode::Char('a'), Modifiers::ALT), b"\x1b[97;3u");
-    // Alt+Enter (new row): CSI 13;3u
-    assert_eq!(enc(0b1, KeyCode::Enter, Modifiers::ALT), b"\x1b[13;3u");
     assert_eq!(
         encode_kitty_key(
-            0b11,
+            0b1_1011,
             KittyEventKind::Repeat,
             KeyCode::Enter,
-            Modifiers::ALT,
+            Modifiers::CONTROL,
             None
         )
         .unwrap(),
-        b"\x1b[13;3:2u"
+        b"\x1b[13;5:2u",
+        "with Flag 8 the repeat materializes"
     );
-    // L5: Alt+Enter carries \r cps
-    assert_eq!(
-        enc(0b11011, KeyCode::Enter, Modifiers::ALT),
-        b"\x1b[13;3;13u"
-    );
-    // Alt+Backspace / Alt+Tab
-    assert_eq!(enc(0b1, KeyCode::Backspace, Modifiers::ALT), b"\x1b[127;3u");
-    assert_eq!(enc(0b1, KeyCode::Tab, Modifiers::ALT), b"\x1b[9;3u");
 }
+
+// The Alt rows test lives in kitty_golden_tests.rs (module-size gate —
+// this file stays under the 800-line budget; golden owns row coverage).
 
 // ── Enter/Tab/BS plain rows ──────────────────────────────────────
 
@@ -397,25 +387,17 @@ fn plain_enter_tab_bs_stay_legacy_through_l2_no_release() {
             enc_h(flags, KeyCode::Backspace, Modifiers::empty()),
             b"\x7f"
         );
-        // No release sub-segments WITHOUT 0b10 — the reset\n channel stays
-        // usable. With 0b10 the release IS escape-coded (reviewer
-        // Blocker-1 fix): raw text / legacy bytes may never ride release.
+        // No release sub-segments WITHOUT 0b10 — and since v1.16.0 (PLAN
+        // §4) NONE without 0b1000 either for the Enter/Tab/BS family (spec:
+        // no release events unless ReportAllKeysAsEscapeCodes): the app-side
+        // gate drops the event, the encoder's None guards the seam. Repeats
+        // of the plain keys stay legacy `\r` at every sub-L4 level.
         for kind in [KittyEventKind::Repeat, KittyEventKind::Release] {
             let bytes = encode_kitty_key(flags, kind, KeyCode::Enter, Modifiers::empty(), None);
-            let unreported = kind == KittyEventKind::Repeat
-                || flags & crate::input::kitty::FLAG_REPORT_EVENT_TYPES == 0;
-            if unreported {
-                assert_eq!(
-                    bytes, None,
-                    "no event-types ⇒ no release report; 0b{flags:b} {kind:?}"
-                );
-            } else {
-                assert_eq!(
-                    bytes,
-                    Some(b"\x1b[13;1:3u".to_vec()),
-                    "0b10 release is escape-coded; 0b{flags:b} {kind:?}"
-                );
-            }
+            assert_eq!(
+                bytes, None,
+                "no Flag 8 ⇒ the three keys report no :2/:3; 0b{flags:b} {kind:?}"
+            );
         }
     }
 }
@@ -612,8 +594,8 @@ fn home_end_pgup_pgdn_ins_del_plain() {
         );
     }
     // L4 forms keep the family terminators (spec): Home7~ End8~ PgUp5~
-    // PgDn6~ Ins2~ Del3~ — reviewer Blocker-2. Unreachable while 0b1000 is
-    // masked; pinned for future unmasking.
+    // PgDn6~ Ins2~ Del3~ — reviewer Blocker-2. Live since v1.16.0 (Flag 8
+    // unmasked, spec-table verified — PLAN_v1160 §4).
     assert_eq!(enc(0b1000, KeyCode::Home, Modifiers::empty()), b"\x1b[7~");
     assert_eq!(enc(0b1000, KeyCode::End, Modifiers::empty()), b"\x1b[8~");
     assert_eq!(enc(0b1000, KeyCode::PageUp, Modifiers::empty()), b"\x1b[5~");
@@ -697,11 +679,12 @@ fn modified_navigation_keys_l1_legacy_l4_kitty() {
 
 #[test]
 fn f_key_codes_l4() {
-    // Spec terminators: F1-F4 = 1P..1S, F5+ = 15~/17~/.../24~ (reviewer
-    // Blocker-2 — `u` is reserved for Esc/Enter/Tab/BS).
+    // Spec terminators: F1/F2/F4 = 1P/1Q/1S, F3 = 13~ (the spec DELETED the
+    // `CSI 1R` form — CPR conflict; PLAN_v1160 §4), F5+ = 15~/17~/.../24~
+    // (reviewer Blocker-2 — `u` is reserved for Esc/Enter/Tab/BS).
     assert_eq!(enc(0b1000, KeyCode::F(1), Modifiers::empty()), b"\x1b[1P");
     assert_eq!(enc(0b1000, KeyCode::F(2), Modifiers::empty()), b"\x1b[1Q");
-    assert_eq!(enc(0b1000, KeyCode::F(3), Modifiers::empty()), b"\x1b[1R");
+    assert_eq!(enc(0b1000, KeyCode::F(3), Modifiers::empty()), b"\x1b[13~");
     assert_eq!(enc(0b1000, KeyCode::F(4), Modifiers::empty()), b"\x1b[1S");
     assert_eq!(enc(0b1000, KeyCode::F(5), Modifiers::empty()), b"\x1b[15~");
     assert_eq!(enc(0b1000, KeyCode::F(6), Modifiers::empty()), b"\x1b[17~");
@@ -714,15 +697,30 @@ fn f_key_codes_l4() {
 }
 
 #[test]
-fn numpad_digit_goes_through_printable_rows() {
-    assert_eq!(enc_h(0b1, KeyCode::Numpad('5'), Modifiers::empty()), b"5");
+fn numpad_dedicated_codes_gated_on_disambiguate() {
+    // v1.16.0 (PLAN_v1160 §3, kitty spec §7): KP_0-9 = 57399-57408, gated
+    // on the DISAMBIGUATE FLAG BIT — not the level (0b10 / 0b10000 alone
+    // must not promote the keypad). Flag 8 ALSO claims the code (spec:
+    // "this enhancement implies all keys are automatically disambiguated
+    // as well" — rust-reviewer v1.16.0 P1). Without either bit the encoder
+    // does not claim the key ⇒ the handler's legacy plain digit byte.
     assert_eq!(
-        enc(0b1000, KeyCode::Numpad('5'), Modifiers::empty()),
-        b"\x1b[53u"
+        enc(0b1, KeyCode::Numpad('5'), Modifiers::empty()),
+        b"\x1b[57404u"
+    );
+    assert_eq!(enc_h(0b0, KeyCode::Numpad('5'), Modifiers::empty()), b"5");
+    assert_eq!(
+        enc_h(0b1000, KeyCode::Numpad('5'), Modifiers::empty()),
+        b"\x1b[57404u"
     );
     assert_eq!(
-        enc(0b1, KeyCode::Numpad('5'), Modifiers::CONTROL),
-        b"\x1b[53;5u"
+        enc_h(0b1_0000, KeyCode::Numpad('5'), Modifiers::empty()),
+        b"5"
+    );
+    // legacy twin: flags=0 (and every delegation) stays the plain byte
+    assert_eq!(
+        enc_h(0b1, KeyCode::Numpad('5'), Modifiers::empty()),
+        b"\x1b[57404u"
     );
 }
 
@@ -730,7 +728,9 @@ fn numpad_digit_goes_through_printable_rows() {
 
 #[test]
 fn unsupported_flag_combinations_delegate_legacy() {
-    // 0b100 (ReportAlternateKeys alone) is cut — no kitty behavior
+    // 0b100 (ReportAlternateKeys) has NO level of its own — alone it never
+    // claims a text key (v1.16.0: alternates only ride events already CSI
+    // via other flags, PLAN_v1160 §5)
     let bytes = encode_kitty_key(
         0b100,
         KittyEventKind::Press,
@@ -766,6 +766,10 @@ fn l5_implies_l4_forms_for_textless_keys() {
         b"a"
     );
 }
+
+#[cfg(test)]
+#[path = "kitty_v1160_tests.rs"]
+mod v1160;
 
 #[cfg(test)]
 #[path = "kitty_golden_tests.rs"]

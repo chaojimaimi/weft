@@ -4550,11 +4550,17 @@ fn csi_question_u_kitty_query_answers_current_flags() {
     let mut t = term();
     t.process(b"\x1b[?u");
     assert_eq!(t.take_response(), b"\x1b[?0u", "empty stack ⇒ ?0u");
-    t.process(b"\x1b[>27u\x1b[?u"); // 27 = 0b11011 → masked to 0b10011
-    assert_eq!(t.take_response(), b"\x1b[?19u", "masked push ⇒ ?19u");
+    // 63 = 0b111111 → masked to the full supported set 0b11111 (bits 5+
+    // stay unimplemented)
+    t.process(b"\x1b[>63u\x1b[?u");
+    assert_eq!(
+        t.take_response(),
+        b"\x1b[?31u",
+        "masked push ⇒ ?31u (full v1.16.0 flag set)"
+    );
     // a parameter on a query changes nothing (no conditional answers)
     t.process(b"\x1b[?2u");
-    assert_eq!(t.take_response(), b"\x1b[?19u", "query param ignored");
+    assert_eq!(t.take_response(), b"\x1b[?31u", "query param ignored");
 }
 
 /// v1.11.4 (PLAN_v1114 §4.1): `CSI > u` pushes 0 (`CSI >flags u` with an
@@ -4584,16 +4590,16 @@ fn kitty_push_omitted_flags_is_zero_and_pop_count_is_first_param() {
 #[test]
 fn kitty_set_modes_two_and_three_are_bitwise() {
     let mut t = term();
-    t.process(b"\x1b[>11u"); // 11 = 0b1011
+    t.process(b"\x1b[>11u"); // 11 = 0b1011 (fully supported since v1.16.0)
     t.process(b"\x1b[=16;2u"); // set mode 2: add the text-bit (16)
     t.process(b"\x1b[?u");
-    assert_eq!(t.take_response(), b"\x1b[?19u", "set-bits → masked 0b10011");
+    assert_eq!(t.take_response(), b"\x1b[?27u", "set-bits → 0b11011");
     t.process(b"\x1b[=18;3u"); // clear mode 3: drop bits 1 and 4 (18 = 0b10010)
     t.process(b"\x1b[?u");
     assert_eq!(
         t.take_response(),
-        b"\x1b[?1u",
-        "clear-bits → 0b10011 & !0b10010 = 0b1"
+        b"\x1b[?9u",
+        "clear-bits → 0b11011 & !0b10010 = 0b1001"
     );
     // M1 depth invariant survives mode flips
     t.process(b"\x1b[<u");
@@ -4635,12 +4641,12 @@ fn kitty_double_stack_is_isolated_across_alt_swap() {
     let mut t = term();
     t.process(b"\x1b[>1u"); // main: 1
     t.process(b"\x1b[?1049h"); // enter alt screen
-    t.process(b"\x1b[>11u"); // alt: 11 → masked to 0b11
+    t.process(b"\x1b[>11u"); // alt: 11 (fully supported since v1.16.0)
     t.process(b"\x1b[?u");
     assert_eq!(
         t.take_response(),
-        b"\x1b[?3u",
-        "alt screen sees its own push (masked)"
+        b"\x1b[?11u",
+        "alt screen sees its own push"
     );
     t.process(b"\x1b[?1049l"); // back to main
     t.process(b"\x1b[?u");
@@ -4675,8 +4681,8 @@ fn kitty_disabled_swallows_all_ops_and_zeroes_flags() {
 #[test]
 fn osc_133_d_command_end_resets_kitty_stacks() {
     let mut t = term();
-    t.process(b"\x1b[>1u\x1b[?1049h\x1b[>11u"); // main=1, alt=11→masked 3
-    assert_eq!(t.keyboard_protocol_flags(), 3);
+    t.process(b"\x1b[>1u\x1b[?1049h\x1b[>11u"); // main=1, alt=11
+    assert_eq!(t.keyboard_protocol_flags(), 11);
     t.process(b"\x1b]133;D;0\x07");
     assert_eq!(t.keyboard_protocol_flags(), 0, "main stack reset");
     t.process(b"\x1b[?1049l");
@@ -4692,8 +4698,8 @@ fn osc_133_d_command_end_resets_kitty_stacks() {
 #[test]
 fn ris_clears_kitty_stacks() {
     let mut t = term();
-    t.process(b"\x1b[>1u\x1b[>11u"); // 11 → masked to 0b11
-    assert_eq!(t.keyboard_protocol_flags(), 3);
+    t.process(b"\x1b[>1u\x1b[>11u"); // 11 (fully supported since v1.16.0)
+    assert_eq!(t.keyboard_protocol_flags(), 11);
     t.process(b"\x1bc");
     assert_eq!(t.keyboard_protocol_flags(), 0);
 }

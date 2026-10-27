@@ -227,8 +227,10 @@ fn handler_l2_event_kind_reaches_encoder() {
 }
 
 /// rust-reviewer v1.11.4 Blocker-1 end-to-end releases: a released Ctrl+C
-/// must be escape-CODED (never a second 0x03), a released Enter must not
-/// double-commit, and releases of C0-mappable letters follow the same rule.
+/// must be escape-CODED (never a second 0x03); a released Enter must never
+/// re-commit — since v1.16.0 (PLAN_v1160 §4) it is DROPPED outright below
+/// Flag 8 (spec: Enter/Tab/BS have no release events without it) and
+/// escape-coded with it.
 #[test]
 fn release_events_are_escape_coded_never_legacy() {
     assert_eq!(
@@ -250,22 +252,36 @@ fn release_events_are_escape_coded_never_legacy() {
             Modifiers::empty(),
             None
         ),
+        None,
+        "released Enter without Flag 8 is dropped — no double-commit, no legacy byte"
+    );
+    assert_eq!(
+        super::encode_kitty_key(
+            0b1_1010,
+            KittyEventKind::Release,
+            KeyCode::Enter,
+            Modifiers::empty(),
+            None
+        ),
         Some(b"\x1b[13;1:3u".to_vec()),
-        "released Enter must not double-commit"
+        "with Flag 8 the Enter release is escape-coded"
     );
 }
 
-/// AUDIT follow-up: SUPPORTED_FLAG_MASK cuts 0b1000 (Blocker-2 downgrade
-/// clause) — a negotiated 0b1000 can never come back in the ack.
+/// v1.16.0 (PLAN_v1160 §4/§5): the FULL flag set 0b1_1111 is now supported
+/// — Flag 8 unmasked after spec-table verification (Blocker-2 clause
+/// discharged), Flag 4 supported via the shifted-only sub-segment. A push
+/// of every possible bit comes back complete.
 #[test]
-fn mask_cuts_report_all_keys_bit() {
+fn v1160_full_flag_set_is_negotiable() {
     let mut s = crate::vt::kitty_keyboard::KittyKeyboardState::default();
-    s.push(false, 0b1_1011);
+    s.push(false, 0b1_1111);
     assert_eq!(
         s.flags(false),
-        0b1_0011,
-        "0b1000 must be masked out of the negotiated set"
+        crate::vt::kitty_keyboard::SUPPORTED_FLAG_MASK,
+        "every kitty flag bit is implementable and survives the mask"
     );
+    assert_eq!(s.flags(false), 0b1_1111);
 }
 
 // ── v1.11.13 (PLAN_v11113 §M3): Release-without-0b10 encoder defense ──
@@ -313,10 +329,11 @@ fn release_without_event_types_flag_returns_none() {
             "raw-text release must not be claimed without 0b10"
         );
     }
-    // Orthogonality: a legitimate 0b10 release still escape-codes.
+    // Orthogonality: a legitimate Flag-8 release still escape-codes (0b11
+    // alone is NOT enough for the three keys since v1.16.0 — PLAN §4).
     assert_eq!(
         encode_kitty_key(
-            0b11,
+            0b1_1010,
             KittyEventKind::Release,
             KeyCode::Enter,
             Modifiers::CONTROL,
@@ -324,4 +341,58 @@ fn release_without_event_types_flag_returns_none() {
         ),
         Some(b"\x1b[13;5:3u".to_vec())
     );
+}
+
+// ── Alt rows (moved from kitty_tests.rs — module-size gate) ──────
+
+#[test]
+fn alt_printable_and_enter_rows() {
+    // Alt+a: CSI 97;3u — NO ESC prefix (deviation from legacy \x1ba)
+    assert_eq!(enc(0b1, KeyCode::Char('a'), Modifiers::ALT), b"\x1b[97;3u");
+    // Alt+Enter (new row): CSI 13;3u
+    assert_eq!(enc(0b1, KeyCode::Enter, Modifiers::ALT), b"\x1b[13;3u");
+    // L2 repeat: no :2 for the three keys without Flag 8 (v1.16.0 PLAN §4)
+    assert_eq!(
+        encode_kitty_key(
+            0b11,
+            KittyEventKind::Repeat,
+            KeyCode::Enter,
+            Modifiers::ALT,
+            None
+        )
+        .unwrap(),
+        b"\x1b[13;3u"
+    );
+    assert_eq!(
+        encode_kitty_key(
+            0b1010,
+            KittyEventKind::Repeat,
+            KeyCode::Enter,
+            Modifiers::ALT,
+            None
+        )
+        .unwrap(),
+        b"\x1b[13;3:2u",
+        "with Flag 8 (pure L4, no text bit) the alt repeat materializes"
+    );
+    assert_eq!(
+        encode_kitty_key(
+            0b1_1011,
+            KittyEventKind::Repeat,
+            KeyCode::Enter,
+            Modifiers::ALT,
+            None
+        )
+        .unwrap(),
+        b"\x1b[13;3:2;13u",
+        "L5: the :2 event and the cps slot coexist"
+    );
+    // L5: Alt+Enter carries \r cps
+    assert_eq!(
+        enc(0b11011, KeyCode::Enter, Modifiers::ALT),
+        b"\x1b[13;3;13u"
+    );
+    // Alt+Backspace / Alt+Tab
+    assert_eq!(enc(0b1, KeyCode::Backspace, Modifiers::ALT), b"\x1b[127;3u");
+    assert_eq!(enc(0b1, KeyCode::Tab, Modifiers::ALT), b"\x1b[9;3u");
 }
