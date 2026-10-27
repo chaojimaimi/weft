@@ -224,6 +224,9 @@ impl EntryBuilder {
     }
 
     /// Appends the entry to `index` unless nothing was accumulated.
+    // `mut self` only mutates under `#[cfg(debug_assertions)]`; in release the
+    // mutation is compiled out and rustc would flag the `mut` as unused.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     pub(crate) fn append_to_index_if_nonempty(mut self, index: &mut Index) {
         #[cfg(debug_assertions)]
         {
