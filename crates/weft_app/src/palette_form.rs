@@ -1,43 +1,7 @@
 //! Palette form sub-mode handlers extracted from palette_controller.
 
+use self::support::{palette_form_field_direction, workflow_save_failure_message};
 use super::*;
-use weft_core::workflow::WorkflowStoreError;
-
-pub(crate) fn palette_form_field_direction(key: KeyCode, mods: Modifiers) -> Option<bool> {
-    use crate::paint::command_surface::CommandSurfaceKeyAction;
-    match crate::paint::command_surface::resolve_command_surface_key(key, mods) {
-        CommandSurfaceKeyAction::MoveUp | CommandSurfaceKeyAction::PageUp => Some(false),
-        CommandSurfaceKeyAction::MoveDown | CommandSurfaceKeyAction::PageDown => Some(true),
-        CommandSurfaceKeyAction::CycleFocus => Some(!mods.contains(Modifiers::SHIFT)),
-        _ => None,
-    }
-}
-
-/// v1.13.3: classify a workflow-store save failure for the toast copy.
-/// `name` is the table's only UNIQUE column (weft_core workflow.rs SCHEMA),
-/// so a constraint violation means "duplicate name" — the one deterministic
-/// failure an Enter-retry can never fix. Everything else is transient from
-/// the user's point of view and gets the generic retry copy.
-pub(crate) fn workflow_save_failure_message(err: &WorkflowStoreError) -> &'static str {
-    use rusqlite::ffi::ErrorCode;
-    // 判定精度论证（v1.13.3 r2）：workflows 表中 `name` 是唯一 UNIQUE 列；其余
-    // 约束仅 NOT NULL —— insert 恒供全列（Create 表单拒空名 + serde 恒非 NULL），
-    // NOT NULL 不可达；update SET name 在 Edit 不改名前提下不触发 UNIQUE。故
-    // 主码 ConstraintViolation 在实践上等价于"重名"。
-    // 耦合注明：若未来升级为 extended_code == SQLITE_CONSTRAINT_UNIQUE 精确判定，
-    // 下方单测的构造器须同步换结构体字面量 `Error { code, extended_code }`——
-    // libsqlite3-sys 0.28 只有 `new(c_int)` 一个构造器且它把 extended_code 设为
-    // result_code 本身（无 new_extended；字段 pub 可字面量构造）——见测试内钉死注释。
-    if matches!(
-        err,
-        WorkflowStoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
-            if e.code == ErrorCode::ConstraintViolation
-    ) {
-        "名称已存在，请换一个"
-    } else {
-        "保存失败，请重试"
-    }
-}
 
 impl App {
     // ── Settings panel (v1.0 S1, Cmd+,) ────────────────────────────────
@@ -701,74 +665,8 @@ impl App {
     }
 }
 
+mod support;
+
 #[cfg(test)]
-mod tests {
-    use super::palette_form_field_direction;
-    use super::workflow_save_failure_message;
-    use weft_core::input::{KeyCode, Modifiers};
-    use weft_core::workflow::WorkflowStoreError;
-
-    #[test]
-    fn palette_form_owns_tab_arrows_and_page_navigation() {
-        assert_eq!(
-            palette_form_field_direction(KeyCode::Tab, Modifiers::empty()),
-            Some(true)
-        );
-        assert_eq!(
-            palette_form_field_direction(KeyCode::Tab, Modifiers::SHIFT),
-            Some(false)
-        );
-        assert_eq!(
-            palette_form_field_direction(KeyCode::Up, Modifiers::empty()),
-            Some(false)
-        );
-        assert_eq!(
-            palette_form_field_direction(KeyCode::Down, Modifiers::empty()),
-            Some(true)
-        );
-        assert_eq!(
-            palette_form_field_direction(KeyCode::PageUp, Modifiers::empty()),
-            Some(false)
-        );
-        assert_eq!(
-            palette_form_field_direction(KeyCode::PageDown, Modifiers::empty()),
-            Some(true)
-        );
-        assert_eq!(
-            palette_form_field_direction(KeyCode::Char('x'), Modifiers::empty()),
-            None
-        );
-    }
-
-    #[test]
-    fn save_failure_message_maps_constraint_violation_to_duplicate_name() {
-        // 构造器耦合钉死（v1.13.3）：`ffi::Error::new(c_int)` 是 libsqlite3-sys 0.28
-        // 唯一构造器，它把 extended_code 设为 result_code 本身（无 new_extended；
-        // 字段 pub）。若 `workflow_save_failure_message` 升级为 extended_code ==
-        // SQLITE_CONSTRAINT_UNIQUE 精确判定，本测试必须同步换结构体字面量
-        // `Error { code, extended_code }` 构造——此处失败即提醒两处一起改。
-        let err = WorkflowStoreError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            None,
-        ));
-        assert_eq!(workflow_save_failure_message(&err), "名称已存在，请换一个");
-    }
-
-    #[test]
-    fn save_failure_message_maps_io_to_generic_copy() {
-        let err = WorkflowStoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "db not writable",
-        ));
-        assert_eq!(workflow_save_failure_message(&err), "保存失败，请重试");
-    }
-
-    #[test]
-    fn save_failure_message_maps_non_constraint_sqlite_to_generic_copy() {
-        let err = WorkflowStoreError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-            None,
-        ));
-        assert_eq!(workflow_save_failure_message(&err), "保存失败，请重试");
-    }
-}
+#[path = "palette_form/tests.rs"]
+mod tests;
