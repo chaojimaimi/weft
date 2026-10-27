@@ -60,12 +60,22 @@ impl Grid {
         self.sync_history_window();
     }
 
-    /// Pushes one row into flat history and invalidates the window (O(1)).
-    /// All in-grid history pushes funnel here so the invalidation cannot be
-    /// forgotten; the next sync point (process tail / scroll setter / resize
-    /// tail) materializes afresh.
-    pub(crate) fn push_history_row(&mut self, row: Row) {
-        self.scrollback.push(row);
+    /// Pushes the viewport row at `index` into flat history and invalidates
+    /// the window (O(1)).
+    ///
+    /// v1.15.3 P1b: the funnel takes the row by VIEWPORT INDEX — the
+    /// scroll-path callers (grid/scroll.rs) keep the row and blank it in
+    /// place instead of allocating a fresh row per scrolled line, and the
+    /// `self.scrollback.push(&self.viewport[index])` field-split borrow
+    /// (viewport ↔ scrollback are disjoint Grid fields) only checks on the
+    /// direct field form, not through a `&mut self` method call (E0502).
+    /// The window invalidation stays inside the funnel so it cannot be
+    /// forgotten. The resize protocol (grid/resize.rs:66) deliberately does
+    /// NOT funnel here: it calls `scrollback.push_without_truncation`
+    /// directly (the retention limit applies once at the end) and
+    /// invalidates the window itself.
+    pub(crate) fn push_history_row_at(&mut self, index: usize) {
+        self.scrollback.push(&self.viewport[index]);
         self.history_window_valid = false;
     }
 
@@ -121,7 +131,12 @@ mod tests {
         for c in b'a'..b'a' + count {
             let mut row = Row::new(cols);
             row.cells[0].character = c as char;
-            grid.push_history_row(row);
+            // v1.15.3 P1a: direct cell writes bypass the production funnels.
+            row.recompute_full();
+            // Funnel-equivalent (test helper pushes standalone rows, not
+            // viewport slots): push + invalidate, same as push_history_row_at.
+            grid.scrollback.push(&row);
+            grid.history_window_valid = false;
         }
         grid
     }
@@ -164,7 +179,11 @@ mod tests {
         // the next sync point materializes the fresh slice.
         let mut row = Row::new(4);
         row.cells[0].character = 'b';
-        grid.push_history_row(row);
+        // v1.15.3 P1a: direct cell writes bypass the production funnels.
+        row.recompute_full();
+        // Funnel-equivalent: push + invalidate (see grid_with_history).
+        grid.scrollback.push(&row);
+        grid.history_window_valid = false;
         assert!(!grid.history_window_valid);
 
         grid.sync_history_window();
@@ -185,7 +204,11 @@ mod tests {
 
         let mut row = Row::new(4);
         row.cells[0].character = 'x';
-        grid.push_history_row(row);
+        // v1.15.3 P1a: direct cell writes bypass the production funnels.
+        row.recompute_full();
+        // Funnel-equivalent: push + invalidate (see grid_with_history).
+        grid.scrollback.push(&row);
+        grid.history_window_valid = false;
         grid.set_scroll_offset(5);
         assert_eq!(grid.scroll_offset(), 5);
         assert_eq!(grid.history_window.len(), 1, "clamped to scrollback.len()");

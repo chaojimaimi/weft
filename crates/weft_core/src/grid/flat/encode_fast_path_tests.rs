@@ -177,7 +177,7 @@ fn assert_gate_equivalence(rows: &[Row], columns: usize, msg: &str) {
     let mut gated = FlatStorage::new(columns, usize::MAX);
     let mut ungated = FlatStorage::new(columns, usize::MAX);
     for row in rows {
-        gated.push(row.clone());
+        gated.push(&row.clone());
         ungated_encode_row(&mut ungated, row);
     }
 
@@ -232,6 +232,8 @@ fn grapheme_row() -> Row {
     row.cells[4].flags |= CellFlags::WIDE_SPACER;
     row.extras.set_grapheme(3, Arc::from("👩\u{200d}🔬"));
     row.cells[5].character = '!';
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row.recompute_full();
     row
 }
 
@@ -244,6 +246,8 @@ fn hyperlink_row() -> Row {
         row.cells[col].flags |= CellFlags::HYPERLINK;
         row.extras.set_hyperlink(col, Some(7));
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row.recompute_full();
     row
 }
 
@@ -261,6 +265,8 @@ fn mixed_row() -> Row {
     row.cells[5].character = '中';
     row.cells[5].width = CellWidth::Full;
     row.cells[6].flags |= CellFlags::WIDE_SPACER;
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row.recompute_full();
     row
 }
 
@@ -274,7 +280,7 @@ fn grapheme_row_encodes_identically_with_and_without_gate() {
     // Golden bytes: backfilled blanks at cols 0 and 2, whole-cluster bytes
     // for both clusters, '!' trailing, '\n' terminator.
     let mut gated = FlatStorage::new(6, usize::MAX);
-    gated.push(grapheme_row());
+    gated.push(&grapheme_row());
     assert_eq!(row_text(&gated, 0), " e\u{0301} 👩\u{200d}🔬!\n");
 }
 
@@ -287,7 +293,7 @@ fn hyperlink_row_encodes_identically_with_and_without_gate() {
     // blank on the first trailing default (bytes 0..1 unlinked, 1..3 id 7,
     // 3.. reset).
     let mut gated = FlatStorage::new(6, usize::MAX);
-    gated.push(hyperlink_row());
+    gated.push(&hyperlink_row());
     assert_eq!(row_text(&gated, 0), " ab \n");
     assert_eq!(
         link_values(&gated, 0, 5),
@@ -306,7 +312,7 @@ fn mixed_row_encodes_identically_with_and_without_gate() {
     // must NOT inherit the link, and the blank default at cell 4 resets the
     // span from byte 6.
     let mut gated = FlatStorage::new(8, usize::MAX);
-    gated.push(mixed_row());
+    gated.push(&mixed_row());
     assert_eq!(row_text(&gated, 0), "ae\u{0301} x 中\n");
     assert_eq!(
         link_values(&gated, 0, 10),
@@ -338,16 +344,20 @@ fn all_blank_rows_hit_the_gate_with_unchanged_encoding() {
     for cell in &mut written_blank.cells {
         cell.flags |= CellFlags::DIRTY;
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    written_blank.recompute_full();
     assert_gate_equivalence(&[written_blank], 4, "written blank row");
 
     let mut gated = FlatStorage::new(4, usize::MAX);
-    gated.push(Row::new(4));
+    gated.push(&Row::new(4));
     assert_eq!(row_text(&gated, 0), "\n");
     let mut written_blank = Row::new(4);
     for cell in &mut written_blank.cells {
         cell.flags |= CellFlags::DIRTY;
     }
-    gated.push(written_blank);
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    written_blank.recompute_full();
+    gated.push(&written_blank);
     assert_eq!(row_text(&gated, 1), "    \n");
 }
 
@@ -363,6 +373,8 @@ fn gate_is_per_row_while_attribute_state_still_crosses_rows() {
         linked.cells[col].flags |= CellFlags::HYPERLINK;
         linked.extras.set_hyperlink(col, Some(7));
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    linked.recompute_full();
     linked.wrapped = true;
 
     let rows = vec![linked, Row::new(cols)];

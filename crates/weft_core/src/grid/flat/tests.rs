@@ -24,6 +24,8 @@ fn collect_rows(storage: &FlatStorage) -> Vec<Row> {
 fn row_of(c: char, columns: usize) -> Row {
     let mut row = Row::new(columns);
     row.cells[0].character = c;
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row.recompute_full();
     row
 }
 
@@ -84,10 +86,12 @@ fn push_rows_with_color() {
             Cell::default(),
         ],
         dirty_occ: 0,
+        // v1.15.3 P1a: exact occupancy — last non-default cell is index 3.
+        occ: 4,
         wrapped: false,
         extras: Default::default(),
     };
-    storage.push(row.clone());
+    storage.push(&row.clone());
 
     let flat = storage.get(0).expect("row must exist");
     assert_rows_equal(&[flat], &[row], "colored row roundtrip");
@@ -117,10 +121,12 @@ fn push_rows_with_color_and_multibyte_chars() {
             multibyte_cell,
         ],
         dirty_occ: 0,
+        // v1.15.3 P1a: every cell is non-default content.
+        occ: 5,
         wrapped: false,
         extras: Default::default(),
     };
-    storage.push(row.clone());
+    storage.push(&row.clone());
 
     let flat = storage.get(0).expect("row must exist");
     assert_rows_equal(&[flat], &[row], "multibyte colored row roundtrip");
@@ -165,6 +171,8 @@ fn styling_change_within_trailing_empty_cells() {
     // to keep offsets column-aligned — and its style must not leak into the
     // next row.
     rows[0].cells[num_cols - 1].flags |= CellFlags::BOLD;
+    // v1.15.3 P1a: the styled blank becomes non-default content.
+    rows[0].cell_written(num_cols - 1);
 
     let mut storage = FlatStorage::new(num_cols, usize::MAX);
     storage.extend(rows.clone());
@@ -238,8 +246,10 @@ fn wide_char_hyperlink_spacer_survives_roundtrip() {
     wide_row.cells[1].flags |= CellFlags::WIDE_SPACER | CellFlags::HYPERLINK;
     wide_row.extras.set_hyperlink(0, Some(3));
     wide_row.extras.set_hyperlink(1, Some(3));
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    wide_row.recompute_full();
 
-    storage.push(wide_row);
+    storage.push(&wide_row);
 
     let flat = storage.get(0).expect("row must exist");
     assert_eq!(flat.cells[0].character, '😀');
@@ -260,10 +270,12 @@ fn blank_cells_before_hyperlink_are_not_clickable() {
     linked_row.cells[2].character = 'a';
     linked_row.cells[2].flags |= CellFlags::HYPERLINK;
     linked_row.extras.set_hyperlink(2, Some(5));
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    linked_row.recompute_full();
 
     // Two blank cells precede the linked cell. They are backfilled when the
     // row is flattened, and must not inherit the hyperlink id.
-    storage.push(linked_row);
+    storage.push(&linked_row);
 
     let flat = storage.get(0).expect("row must exist");
     assert_eq!(flat.extras.hyperlink_id_at(0), None);
@@ -323,8 +335,10 @@ fn row_extras_cluster_bytes_roundtrip() {
     row.cells[4].flags |= CellFlags::WIDE_SPACER;
     row.extras.set_grapheme(3, Arc::from("👩\u{200d}🔬"));
     row.cells[5].character = '!';
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row.recompute_full();
 
-    storage.push(row.clone());
+    storage.push(&row.clone());
 
     // Whole-cluster bytes must replace the base scalar's bytes on encode and
     // reconstruct the identical RowExtras on decode.
@@ -350,6 +364,9 @@ fn wavy_underline_and_sgr58_survive_push_evict_get() {
 
     let mut plain = Row::new(cols);
     plain.cells[1].character = 'p';
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    decorated.recompute_full();
+    plain.recompute_full();
 
     let rows = vec![decorated.clone(), plain.clone(), decorated, plain];
     let mut storage = FlatStorage::new(cols, 2);
@@ -418,6 +435,9 @@ fn hyperlink_survives_soft_wrap_split_and_rebuild() {
         cell.flags |= CellFlags::HYPERLINK;
         r1.extras.set_hyperlink(col, Some(7));
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    r0.recompute_full();
+    r1.recompute_full();
     r0.wrapped = true;
 
     let mut storage = FlatStorage::new(cols, usize::MAX);
@@ -457,7 +477,7 @@ fn position_clear_and_index_since_match_scrollback_semantics() {
     // Bit-for-bit transplant of scrollback.rs:96-108 behavior.
     let mut storage = FlatStorage::new(5, 3);
     for c in ['a', 'b', 'c', 'd', 'e'] {
-        storage.push(row_of(c, 5));
+        storage.push(&row_of(c, 5));
     }
     assert_eq!(storage.position(), 5);
     assert_eq!(storage.len(), 3);
@@ -475,7 +495,7 @@ fn position_clear_and_index_since_match_scrollback_semantics() {
     assert_eq!(storage.index_since(0), 0);
     assert_eq!(storage.index_since(5), 0);
 
-    storage.push(row_of('z', 5));
+    storage.push(&row_of('z', 5));
     assert_eq!(storage.position(), 6);
     assert_eq!(storage.index_since(5), 0);
     assert_eq!(storage.index_since(6), 1);

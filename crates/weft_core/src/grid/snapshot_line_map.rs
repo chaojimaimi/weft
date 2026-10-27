@@ -196,6 +196,9 @@ mod tests {
         for (index, ch) in text.chars().enumerate() {
             row.cells[index].character = ch;
         }
+        // v1.15.3 P1a: direct cell writes bypass the production funnels —
+        // normalize the occupancy tail.
+        row.recompute_full();
         row
     }
 
@@ -275,8 +278,8 @@ mod tests {
     #[test]
     fn ownership_filters_skip_unowned_rows_like_the_snapshot() {
         let mut grid = Grid::with_scrollback(3, 40, 3);
-        grid.scrollback.push(row("unowned old", 40));
-        grid.scrollback.push(row("owned page", 40));
+        grid.scrollback.push(&row("unowned old", 40));
+        grid.scrollback.push(&row("owned page", 40));
         grid.viewport[0] = row("owned tail", 40);
         grid.viewport[1] = row("stale shell", 40);
         grid.viewport[2] = row("owned prompt", 40);
@@ -324,8 +327,8 @@ mod tests {
     #[test]
     fn document_start_inside_scrollback_counts_prior_rows() {
         let mut grid = Grid::with_scrollback(3, 40, 3);
-        grid.scrollback.push(row("shell old", 40));
-        grid.scrollback.push(row("banner", 40));
+        grid.scrollback.push(&row("shell old", 40));
+        grid.scrollback.push(&row("banner", 40));
         grid.viewport[0] = row("header", 40);
         grid.viewport[1] = row("", 40);
         grid.viewport[2] = row("content", 40);
@@ -374,7 +377,7 @@ mod tests {
         let mut grid = Grid::with_scrollback(2, cols, 1_100);
         let full = "x".repeat(cols);
         for _ in 0..1_100 {
-            grid.scrollback.push(row(&full, cols));
+            grid.scrollback.push(&row(&full, cols));
         }
         grid.viewport[0] = row("tail", 1_100);
         grid.viewport[1] = row("more", 1_100);

@@ -4,7 +4,7 @@
 //! split; the flat/ submodule impl blocks are the precedent). Zero
 //! behavior or visibility changes.
 
-use super::{Grid, Row};
+use super::Grid;
 
 impl Grid {
     // ── Scrolling ────────────────────────────────────────────────
@@ -27,9 +27,11 @@ impl Grid {
         if n > bottom - top {
             // Push all rows in the scroll region into scrollback
             if top == 0 {
+                // v1.15.3 P1b: encode the row in place, then blank it —
+                // no fresh row allocation per scrolled line.
                 for i in top..=bottom {
-                    let old_row = std::mem::replace(&mut self.viewport[i], Row::new(self.num_cols));
-                    self.push_history_row(old_row);
+                    self.push_history_row_at(i);
+                    self.viewport[i].blank_in_place(self.num_cols);
                 }
             } else {
                 for i in top..=bottom {
@@ -50,14 +52,15 @@ impl Grid {
 
         if full_viewport {
             // v1.0 perf: Full-viewport scroll using rotate_left.
-            // For n=1 (the common streaming case): 1 Row alloc (was 2 with
+            // For n=1 (the common streaming case): zero Row allocs since
+            // v1.15.3 P1b (was 1 with the fresh-empty-Row rotate, was 2 with
             // drain+extend, was ~24 with the old shift loop).
             // rotate_left moves [0] to [n-1], shifts [1..] to [0..n-1].
-            // We take the old [0] into scrollback first, insert a fresh
-            // empty Row at [0], then rotate — the empty Row ends up at [n-1].
+            // We encode the old [0] into scrollback first, blank it in
+            // place, then rotate — the blanked Row ends up at [n-1].
             for _ in 0..n {
-                let old_top = std::mem::replace(&mut self.viewport[0], Row::new(self.num_cols));
-                self.push_history_row(old_top);
+                self.push_history_row_at(0);
+                self.viewport[0].blank_in_place(self.num_cols);
                 self.viewport.rotate_left(1);
             }
             self.pending_scroll
@@ -65,11 +68,12 @@ impl Grid {
         } else {
             // Scroll region (or partial viewport): rotate in place, then
             // clear the exposed bottom rows. For top==0, push the old top
-            // rows to scrollback before rotating.
+            // rows to scrollback before rotating (v1.15.3 P1b: blank in
+            // place — no allocation).
             if top == 0 {
                 for i in 0..n {
-                    let old_top = std::mem::replace(&mut self.viewport[i], Row::new(self.num_cols));
-                    self.push_history_row(old_top);
+                    self.push_history_row_at(i);
+                    self.viewport[i].blank_in_place(self.num_cols);
                 }
             }
             self.viewport[top..=bottom].rotate_left(n);

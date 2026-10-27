@@ -68,6 +68,7 @@ fn row_text_trims_trailing_and_keeps_internal_spaces() {
     // default cells.
     for ch in "ls  -la".chars() {
         grid.viewport[0].cells[grid.cursor.col].character = ch;
+        grid.viewport[0].cell_written(grid.cursor.col);
         grid.cursor.col += 1;
     }
     assert_eq!(grid.row_text(0), "ls  -la");
@@ -159,6 +160,7 @@ fn scroll_up_at_bottom() {
     let mut grid = Grid::new(5, 4);
     for i in 0..5 {
         grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
+        grid.viewport[i].cell_written(0);
     }
     grid.cursor.row = 4;
     grid.newline();
@@ -171,6 +173,7 @@ fn scroll_up_stores_in_scrollback() {
     let mut grid = Grid::with_scrollback(5, 4, 100);
     for i in 0..5 {
         grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
+        grid.viewport[i].cell_written(0);
     }
     grid.cursor.row = 4;
     grid.newline();
@@ -186,6 +189,7 @@ fn scrollback_navigation() {
     for i in 0..20 {
         grid.viewport[grid.cursor.row].cells[0].character =
             char::from_digit((i % 10) as u32, 10).unwrap_or('X');
+        grid.viewport[grid.cursor.row].cell_written(0);
         grid.cursor.row = 4;
         grid.newline();
     }
@@ -215,8 +219,11 @@ fn cell_shows_scrollback_content_when_scrolled() {
     let mut grid = Grid::with_scrollback(3, 4, 100);
     // Fill viewport with '1','2','3' then scroll so '1' enters scrollback.
     grid.viewport[0].cells[0].character = '1';
+    grid.viewport[0].cell_written(0);
     grid.viewport[1].cells[0].character = '2';
+    grid.viewport[1].cell_written(0);
     grid.viewport[2].cells[0].character = '3';
+    grid.viewport[2].cell_written(0);
     grid.cursor.row = 2;
     grid.newline(); // '1' -> scrollback, viewport = ['2','3',' ']
 
@@ -237,8 +244,8 @@ fn cell_shows_scrollback_content_when_scrolled() {
 fn scroll_up_history_never_exceeds_scrollback_len() {
     let mut grid = Grid::with_scrollback(5, 4, 100);
     // Two lines of scrollback.
-    grid.scrollback.push(Row::new(4));
-    grid.scrollback.push(Row::new(4));
+    grid.scrollback.push(&Row::new(4));
+    grid.scrollback.push(&Row::new(4));
     grid.set_scroll_offset(1);
     // Scrolling far past the top must clamp to scrollback length, not shrink.
     grid.scroll_up_history(5);
@@ -334,6 +341,7 @@ fn clear_screen_below_clears_from_cursor() {
     for r in 0..5 {
         for c in 0..5 {
             grid.viewport[r].cells[c].character = 'X';
+            grid.viewport[r].cell_written(c);
         }
     }
     grid.cursor.row = 2;
@@ -353,6 +361,7 @@ fn clear_screen_above_clears_to_cursor() {
     for r in 0..5 {
         for c in 0..5 {
             grid.viewport[r].cells[c].character = 'X';
+            grid.viewport[r].cell_written(c);
         }
     }
     grid.cursor.row = 2;
@@ -370,6 +379,7 @@ fn clear_line_right_clears_from_cursor() {
     let mut grid = Grid::new(5, 5);
     for c in 0..5 {
         grid.viewport[0].cells[c].character = char::from_digit(c as u32 + 1, 10).unwrap();
+        grid.viewport[0].cell_written(c);
     }
     grid.cursor.col = 2;
     grid.clear_line_right();
@@ -383,6 +393,7 @@ fn clear_line_left_clears_to_cursor() {
     let mut grid = Grid::new(5, 5);
     for c in 0..5 {
         grid.viewport[0].cells[c].character = char::from_digit(c as u32 + 1, 10).unwrap();
+        grid.viewport[0].cell_written(c);
     }
     grid.cursor.col = 2;
     grid.clear_line_left();
@@ -396,6 +407,7 @@ fn scroll_down_inserts_blank_at_top() {
     let mut grid = Grid::new(5, 4);
     for i in 0..5 {
         grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
+        grid.viewport[i].cell_written(0);
     }
     grid.scroll_down(1);
     assert_eq!(grid.cell(0, 0).character, ' ');
@@ -428,8 +440,11 @@ fn set_scroll_region_bounds() {
 fn insert_blank_shifts_right() {
     let mut grid = Grid::new(5, 5);
     grid.viewport[0].cells[0].character = 'A';
+    grid.viewport[0].cell_written(0);
     grid.viewport[0].cells[1].character = 'B';
+    grid.viewport[0].cell_written(1);
     grid.viewport[0].cells[2].character = 'C';
+    grid.viewport[0].cell_written(2);
     grid.cursor.col = 1;
     grid.insert_blank(1);
     assert_eq!(grid.cell(0, 0).character, 'A');
@@ -441,8 +456,11 @@ fn insert_blank_shifts_right() {
 fn delete_chars_shifts_left() {
     let mut grid = Grid::new(5, 5);
     grid.viewport[0].cells[0].character = 'A';
+    grid.viewport[0].cell_written(0);
     grid.viewport[0].cells[1].character = 'B';
+    grid.viewport[0].cell_written(1);
     grid.viewport[0].cells[2].character = 'C';
+    grid.viewport[0].cell_written(2);
     grid.cursor.col = 1;
     grid.delete_chars(1);
     assert_eq!(grid.cell(0, 0).character, 'A');
@@ -455,6 +473,7 @@ fn index_scrolls_at_bottom() {
     let mut grid = Grid::new(5, 4);
     for i in 0..5 {
         grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
+        grid.viewport[i].cell_written(0);
     }
     grid.cursor.row = 4;
     grid.index();
@@ -467,6 +486,7 @@ fn reverse_index_scrolls_at_top() {
     let mut grid = Grid::new(5, 4);
     for i in 0..5 {
         grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
+        grid.viewport[i].cell_written(0);
     }
     grid.cursor.row = 0;
     grid.reverse_index();
@@ -538,6 +558,7 @@ fn erase_chars_clears_count_cells() {
     let mut grid = Grid::new(5, 5);
     for c in 0..5 {
         grid.viewport[0].cells[c].character = char::from_digit(c as u32 + 1, 10).unwrap();
+        grid.viewport[0].cell_written(c);
     }
     grid.cursor.col = 1;
     grid.erase_chars(2);
@@ -660,6 +681,7 @@ fn resize_preserves_content() {
     let mut grid = Grid::with_scrollback(5, 5, 100);
     for c in 0..5 {
         grid.viewport[0].cells[c].character = char::from_digit(c as u32 + 1, 10).unwrap();
+        grid.viewport[0].cell_written(c);
     }
     grid.resize(5, 10);
     assert_eq!(grid.num_cols, 10);
@@ -676,8 +698,10 @@ fn resize_dims_does_not_reflow() {
     // Row 0: "ABCDEFGH" (8 chars, no wrap). Row 1: a second line.
     for c in 0..8 {
         grid.viewport[0].cells[c].character = char::from(b'A' + c as u8);
+        grid.viewport[0].cell_written(c);
     }
     grid.viewport[1].cells[0].character = 'X';
+    grid.viewport[1].cell_written(0);
 
     // Narrow to 4 cols. A REFLOW would merge/wrap "ABCD" / "EFGH"; a
     // dimension-only resize leaves each row in place. v1.10.26 B-2: narrowing
@@ -714,6 +738,7 @@ fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
     let mut grid = Grid::with_scrollback(2, 4, 10);
     for (col, ch) in "ABCD".chars().enumerate() {
         grid.viewport[0].cells[col].character = ch;
+        grid.viewport[0].cell_written(col);
     }
     grid.scroll_up(1);
 
@@ -768,6 +793,7 @@ fn narrowing_resize_keeps_scrollback_rows_at_original_width() {
     let mut grid = Grid::with_scrollback(2, 8, 16);
     for (col, ch) in "ABCDEFGH".chars().enumerate() {
         grid.viewport[0].cells[col].character = ch;
+        grid.viewport[0].cell_written(col);
     }
     grid.scroll_up(1);
     assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 8);
@@ -803,7 +829,9 @@ fn scrollback_row_cell_access_is_bounds_safe() {
     let mut grid = Grid::with_scrollback(2, 8, 8);
     let mut row = Row::new(5);
     row.cells[0].character = 'x';
-    grid.scrollback.push(row);
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row.recompute_full();
+    grid.scrollback.push(&row);
     grid.set_scroll_offset(1);
 
     assert_eq!(grid.cell(0, 0).character, 'x');
@@ -822,6 +850,9 @@ fn resize_dims_narrowing_keeps_wide_pair_intact() {
         row.cells[2].character = '中';
         row.cells[2].width = CellWidth::Full;
         row.cells[3].flags.insert(CellFlags::WIDE_SPACER);
+        // v1.15.3 P1a: direct cell writes bypass the production funnels.
+        row.cell_written(2);
+        row.cell_written(3);
     }
     grid.scroll_up(1);
 
@@ -854,6 +885,7 @@ fn resize_dims_narrowing_keeps_wide_pair_intact() {
 fn resize_dims_grows_and_shrinks_rows() {
     let mut grid = Grid::new(3, 4);
     grid.viewport[0].cells[0].character = 'A';
+    grid.viewport[0].cell_written(0);
     // Grow rows 3 → 5: new rows appended at the bottom.
     grid.resize_dims(5, 4);
     assert_eq!(grid.num_rows, 5);
@@ -877,6 +909,7 @@ fn resize_dims_narrowing_keeps_viewport_cells() {
     let mut grid = Grid::new(2, 8);
     for (col, ch) in "ABCDEFGH".chars().enumerate() {
         grid.viewport[0].cells[col].character = ch;
+        grid.viewport[0].cell_written(col);
     }
 
     grid.resize_dims(2, 4);
@@ -910,6 +943,7 @@ fn el_erase_then_rewrite_normalizes_row_width() {
     let mut grid = Grid::new(2, 8);
     for (col, ch) in "ABCDEFGH".chars().enumerate() {
         grid.viewport[0].cells[col].character = ch;
+        grid.viewport[0].cell_written(col);
     }
     grid.resize_dims(2, 4);
     assert_eq!(
@@ -935,6 +969,7 @@ fn scrollback_ring_buffer_overflow() {
     // Scroll more lines than scrollback can hold
     for i in 0..10 {
         grid.viewport[2].cells[0].character = char::from_digit(i as u32 % 10, 10).unwrap_or('X');
+        grid.viewport[2].cell_written(0);
         grid.cursor.row = 2;
         grid.newline();
     }
@@ -948,6 +983,7 @@ fn write_output_resets_scroll_offset() {
     // Scroll up into history
     for i in 0..10 {
         grid.viewport[4].cells[0].character = char::from_digit(i as u32 % 10, 10).unwrap_or('X');
+        grid.viewport[4].cell_written(0);
         grid.cursor.row = 4;
         grid.newline();
     }
@@ -979,6 +1015,7 @@ fn resize_shrink_keeps_cursor_content_visible() {
         for c in 0..20 {
             grid.viewport[r].cells[c].character =
                 char::from_digit((r * 20 + c) as u32 % 10, 10).unwrap_or('X');
+            grid.viewport[r].cell_written(c);
         }
     }
     grid.cursor.row = 5;
@@ -1013,10 +1050,15 @@ fn resize_grow_then_shrink_preserves_output() {
     // Simulate prompt + output in a 5×10 grid
     for c in 0..5 {
         grid.viewport[0].cells[c].character = if c == 0 { '>' } else { ' ' };
+        // Production print always tags written cells DIRTY (a written blank
+        // is content) — mirror that so `cell_written` below stays exact.
+        grid.viewport[0].cells[c].flags = CellFlags::DIRTY;
+        grid.viewport[0].cell_written(c);
     }
     for r in 1..4 {
         for c in 0..8 {
             grid.viewport[r].cells[c].character = char::from_digit(r as u32, 10).unwrap();
+            grid.viewport[r].cell_written(c);
         }
     }
     grid.cursor.row = 3;
@@ -1068,6 +1110,7 @@ fn resize_cursor_tracks_through_rewrap() {
     // Fill row 1 with content across all 10 cols
     for c in 0..10 {
         grid.viewport[1].cells[c].character = char::from_digit(c as u32, 10).unwrap();
+        grid.viewport[1].cell_written(c);
     }
     grid.cursor.row = 1;
     grid.cursor.col = 7; // col 7 should be in the first wrapped sub-row
@@ -1097,8 +1140,11 @@ fn resize_skips_empty_rows_between_content_and_cursor() {
     let mut grid = Grid::with_scrollback(5, 10, 200);
     for c in 0..8 {
         grid.viewport[0].cells[c].character = 'A';
+        grid.viewport[0].cell_written(c);
         grid.viewport[1].cells[c].character = 'B';
+        grid.viewport[1].cell_written(c);
         grid.viewport[2].cells[c].character = 'C';
+        grid.viewport[2].cell_written(c);
     }
     grid.cursor.row = 2;
     grid.cursor.col = 8;
@@ -1109,6 +1155,7 @@ fn resize_skips_empty_rows_between_content_and_cursor() {
     grid.cursor.col = 0;
     // Shell redraws prompt at row 19
     grid.viewport[19].cells[0].character = '$';
+    grid.viewport[19].cell_written(0);
 
     // Minimize back to 5×10
     grid.resize(5, 10);
@@ -1154,7 +1201,9 @@ fn resize_multiple_cycles_no_content_loss() {
     // Fill with content
     for c in 0..8 {
         grid.viewport[0].cells[c].character = 'X';
+        grid.viewport[0].cell_written(c);
         grid.viewport[1].cells[c].character = 'Y';
+        grid.viewport[1].cell_written(c);
     }
     grid.cursor.row = 1;
     grid.cursor.col = 8;
@@ -1163,6 +1212,7 @@ fn resize_multiple_cycles_no_content_loss() {
     grid.resize(15, 30);
     grid.cursor.row = 14;
     grid.viewport[14].cells[0].character = '$';
+    grid.viewport[14].cell_written(0);
     // Cycle 1: minimize
     grid.resize(5, 10);
 
@@ -1180,6 +1230,7 @@ fn resize_multiple_cycles_no_content_loss() {
     grid.resize(15, 30);
     grid.cursor.row = 14;
     grid.viewport[14].cells[0].character = '$';
+    grid.viewport[14].cell_written(0);
     // Cycle 2: minimize
     grid.resize(5, 10);
 
@@ -1221,10 +1272,12 @@ fn resize_reflow_merges_wrapped_rows_on_widen() {
     // Then "KLMNO" (5 chars) on row 1 — continuation
     for c in 0..10 {
         grid.viewport[0].cells[c].character = char::from_digit((c % 10) as u32, 10).unwrap();
+        grid.viewport[0].cell_written(c);
     }
     grid.viewport[0].wrapped = true;
     for c in 0..5 {
         grid.viewport[1].cells[c].character = char::from_digit((c % 10) as u32, 10).unwrap();
+        grid.viewport[1].cell_written(c);
     }
     grid.cursor.row = 1;
     grid.cursor.col = 5;
@@ -1265,10 +1318,12 @@ fn resize_reflow_does_not_merge_separate_lines() {
     // Row 0: "AAAA" (not wrapped)
     for c in 0..4 {
         grid.viewport[0].cells[c].character = 'A';
+        grid.viewport[0].cell_written(c);
     }
     // Row 1: "BBBB" (not wrapped)
     for c in 0..4 {
         grid.viewport[1].cells[c].character = 'B';
+        grid.viewport[1].cell_written(c);
     }
     grid.cursor.row = 1;
     grid.cursor.col = 4;
@@ -2134,6 +2189,7 @@ fn cursor_on_empty_row_survives_three_resizes_without_content_loss() {
         let label = format!("line-{i:02}");
         for (c, ch) in label.chars().enumerate() {
             grid.viewport[4].cells[c].character = ch;
+            grid.viewport[4].cell_written(c);
         }
         grid.cursor.row = 4;
         grid.newline();
@@ -2178,6 +2234,7 @@ fn resize_maps_cursor_to_its_character_in_the_new_wrap() {
     let line = "The quick";
     for (c, ch) in line.chars().enumerate() {
         grid.viewport[0].cells[c].character = ch;
+        grid.viewport[0].cell_written(c);
     }
     grid.cursor.row = 0;
     grid.cursor.col = 6;
@@ -2201,6 +2258,7 @@ fn resize_keeps_content_above_cursor_in_viewport() {
     for (r, label) in row_labels.iter().enumerate() {
         for c in 0..8 {
             grid.viewport[r].cells[c].character = (*label as u8 + c as u8) as char;
+            grid.viewport[r].cell_written(c);
         }
     }
     grid.cursor.row = 2;
@@ -2227,8 +2285,11 @@ fn resize_keeps_content_above_cursor_in_viewport() {
 fn resize_blank_above_cursor_anchors_at_mapped_line() {
     let mut grid = Grid::with_scrollback(3, 10, 50);
     grid.viewport[1].cells[0].character = 'a';
+    grid.viewport[1].cell_written(0);
     grid.viewport[1].cells[1].character = 'b';
+    grid.viewport[1].cell_written(1);
     grid.viewport[1].cells[2].character = 'c';
+    grid.viewport[1].cell_written(2);
     grid.cursor.row = 2; // parked on an empty row below "abc"
     grid.cursor.col = 0;
 
@@ -2272,9 +2333,11 @@ fn resize_blank_between_content_rows_anchors_at_mapped_line() {
     let mut grid = Grid::with_scrollback(4, 10, 50);
     for (c, ch) in "abcd".chars().enumerate() {
         grid.viewport[0].cells[c].character = ch;
+        grid.viewport[0].cell_written(c);
     }
     for (c, ch) in "wxyz".chars().enumerate() {
         grid.viewport[2].cells[c].character = ch;
+        grid.viewport[2].cell_written(c);
     }
     grid.cursor.row = 3; // parked on an empty row below "wxyz"
     grid.cursor.col = 0;
@@ -2480,8 +2543,10 @@ fn flat_row_snapshot_text_len_trims_per_cluster() {
     row.cells[2].flags = CellFlags::DIRTY | CellFlags::EXTRA;
     row.extras
         .set_grapheme(2, std::sync::Arc::from(" \u{0300}"));
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row.recompute_full();
     let mut grid = Grid::with_scrollback(2, 8, 16);
-    grid.scrollback.push(row);
+    grid.scrollback.push(&row);
     assert_eq!(
         grid.scrollback.row_snapshot_text_len(0),
         Some("ab \u{0300}".len()),
@@ -2493,8 +2558,10 @@ fn flat_row_snapshot_text_len_trims_per_cluster() {
     row2.cells[1].character = 'b';
     row2.cells[2].character = ' ';
     row2.cells[2].flags = CellFlags::DIRTY;
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    row2.recompute_full();
     let mut grid2 = Grid::with_scrollback(2, 8, 16);
-    grid2.scrollback.push(row2);
+    grid2.scrollback.push(&row2);
     assert_eq!(
         grid2.scrollback.row_snapshot_text_len(0),
         Some(2),
@@ -2509,8 +2576,11 @@ fn flat_row_snapshot_text_len_trims_per_cluster() {
 fn selection_keeps_nul_cells_verbatim_in_simple_and_block_modes() {
     let mut grid = Grid::new(1, 8);
     grid.viewport[0].cells[0].character = '\0';
+    grid.viewport[0].cell_written(0);
     grid.viewport[0].cells[0].flags = CellFlags::DIRTY;
+    grid.viewport[0].cell_written(0);
     grid.viewport[0].cells[1].character = 'b';
+    grid.viewport[0].cell_written(1);
 
     let simple = crate::selection::Selection::new(
         crate::selection::GridPos::new(0, 0),
@@ -2534,8 +2604,10 @@ fn selection_keeps_nul_cells_verbatim_in_simple_and_block_modes() {
 fn simple_selection_keeps_a_trailing_space_led_cluster() {
     let mut grid = Grid::new(1, 8);
     grid.viewport[0].cells[0].character = 'a';
+    grid.viewport[0].cell_written(0);
     grid.viewport[0].cells[1].character = ' '; // lead of " \u{0300}"
     grid.viewport[0].cells[1].flags = CellFlags::DIRTY | CellFlags::EXTRA;
+    grid.viewport[0].cell_written(1);
     grid.viewport[0]
         .extras
         .set_grapheme(1, std::sync::Arc::from(" \u{0300}"));

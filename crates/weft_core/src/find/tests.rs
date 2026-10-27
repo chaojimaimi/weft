@@ -327,6 +327,9 @@ fn make_row(num_cols: usize, text: &str) -> crate::grid::Row {
             crate::grid::CellWidth::Half
         };
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels —
+    // normalize the occupancy tail.
+    row.recompute_full();
     row
 }
 
@@ -337,8 +340,8 @@ fn find_in_grid_covers_scrollback_and_viewport() {
     // with row indices reflecting their unified position.
     let mut g = Grid::new(3, 25);
     // Push two rows into scrollback (the older region).
-    g.scrollback.push(make_row(25, "old foo here"));
-    g.scrollback.push(make_row(25, "second scrollback foo"));
+    g.scrollback.push(&make_row(25, "old foo here"));
+    g.scrollback.push(&make_row(25, "second scrollback foo"));
     // Viewport has a match too.
     write(&mut g, 0, 0, "viewport foo");
     write(&mut g, 1, 0, "no match here");
@@ -416,14 +419,18 @@ fn find_snapshot_flat_history_search_spec() {
     for (i, ch) in "see the ".chars().enumerate() {
         r0.cells[8 + i].character = ch;
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    r0.recompute_full();
     r0.wrapped = true;
     // Physical row 1: the wrap continuation (logically "…see the tail").
     let mut r1 = Row::new(80);
     for (i, ch) in "tail".chars().enumerate() {
         r1.cells[i].character = ch;
     }
-    grid.scrollback.push(r0);
-    grid.scrollback.push(r1);
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    r1.recompute_full();
+    grid.scrollback.push(&r0);
+    grid.scrollback.push(&r1);
     // A live viewport row for the unified-index check.
     write(&mut grid, 0, 0, "viewport needle");
 
@@ -522,6 +529,8 @@ fn find_in_grid_and_flat_snapshot_agree_on_scrollback() {
         cell.flags |= CellFlags::HYPERLINK;
         r0.extras.set_hyperlink(4 + i, Some(7));
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    r0.recompute_full();
     r0.wrapped = true;
     let mut r1 = Row::new(40);
     for (i, ch) in "tail 中".chars().enumerate() {
@@ -532,8 +541,10 @@ fn find_in_grid_and_flat_snapshot_agree_on_scrollback() {
             r1.cells[i * 2 + 1].flags |= CellFlags::WIDE_SPACER;
         }
     }
-    grid.scrollback.push(r0);
-    grid.scrollback.push(r1);
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    r1.recompute_full();
+    grid.scrollback.push(&r0);
+    grid.scrollback.push(&r1);
     // Uppercase row: tripwire for the folding path shared by substring AND
     // regex (the T3 rework skipped folding for regex mode; `HELLO`/`hello`
     // regressed and this fixture exists so that cannot come back).
@@ -541,7 +552,9 @@ fn find_in_grid_and_flat_snapshot_agree_on_scrollback() {
     for (i, ch) in "HELLO Doc".chars().enumerate() {
         r2.cells[i].character = ch;
     }
-    grid.scrollback.push(r2);
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    r2.recompute_full();
+    grid.scrollback.push(&r2);
     write(&mut grid, 0, 0, "viewport 中 needle");
 
     let snapshot = grid.find_snapshot();
@@ -592,13 +605,13 @@ fn find_snapshot_history_row_straddling_chunk_boundary() {
     // Prep short rows so the straddling row does not start at offset 0 —
     // the field shape was a row START landing mid-chunk. They own content
     // bytes 0..6.
-    grid.scrollback.push(make_row(2200, "aa"));
-    grid.scrollback.push(make_row(2200, "bb"));
+    grid.scrollback.push(&make_row(2200, "aa"));
+    grid.scrollback.push(&make_row(2200, "bb"));
     // The needle starts at row-relative byte 1017 → absolute 1023, so the
     // bytes of "needle" themselves straddle the chunk boundary at 1024;
     // the row (2100 bytes + terminator) crosses a second boundary at 2048.
     let long_text = format!("{}needle{}", "a".repeat(1017), "a".repeat(2100 - 1017 - 6));
-    grid.scrollback.push(make_row(2200, &long_text));
+    grid.scrollback.push(&make_row(2200, &long_text));
 
     // Must not panic.
     let snap = grid.find_snapshot();

@@ -7,15 +7,18 @@ fn row(text: &str, cols: usize) -> Row {
     for (index, ch) in text.chars().enumerate() {
         row.cells[index].character = ch;
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels —
+    // normalize the occupancy tail.
+    row.recompute_full();
     row
 }
 
 #[test]
 fn document_keeps_command_scrollback_and_final_viewport_only() {
     let mut grid = Grid::with_scrollback(4, 40, 20);
-    grid.scrollback.push(row("older shell history", 40));
+    grid.scrollback.push(&row("older shell history", 40));
     let command_start = grid.scrollback.position();
-    grid.scrollback.push(row("complete answer line 1", 40));
+    grid.scrollback.push(&row("complete answer line 1", 40));
     grid.viewport[0] = row("complete answer line 2", 40);
     grid.viewport[2] = row("Press Ctrl-C again to exit", 40);
     grid.viewport[3] = row("claude --resume session-id", 40);
@@ -38,9 +41,9 @@ fn cursor_snapshot_line_counts_viewport_rows_only() {
     // scrollback row right after the (excluded) shell prompt row, so
     // ONE scrollback row sits between document_start and the viewport.
     let mut grid = Grid::with_scrollback(4, 40, 2);
-    grid.scrollback.push(row("shell prompt row", 40));
+    grid.scrollback.push(&row("shell prompt row", 40));
     let document_start = grid.scrollback.position();
-    grid.scrollback.push(row("banner of the app", 40));
+    grid.scrollback.push(&row("banner of the app", 40));
     grid.viewport[0] = row("app header line", 40);
     grid.viewport[1] = row("app content line", 40);
     grid.viewport[2] = row("input prompt: ", 40);
@@ -100,11 +103,11 @@ fn document_clamps_a_cleared_scrollback_baseline() {
 #[test]
 fn document_uses_a_logical_baseline_after_ring_buffer_is_full() {
     let mut grid = Grid::with_scrollback(1, 24, 2);
-    grid.scrollback.push(row("old 1", 24));
-    grid.scrollback.push(row("old 2", 24));
+    grid.scrollback.push(&row("old 1", 24));
+    grid.scrollback.push(&row("old 2", 24));
     let command_start = grid.scrollback.position();
-    grid.scrollback.push(row("new answer 1", 24));
-    grid.scrollback.push(row("new answer 2", 24));
+    grid.scrollback.push(&row("new answer 1", 24));
+    grid.scrollback.push(&row("new answer 2", 24));
     grid.viewport[0] = row("resume tail", 24);
 
     assert_eq!(
@@ -117,12 +120,12 @@ fn document_uses_a_logical_baseline_after_ring_buffer_is_full() {
 fn document_baseline_survives_clear_and_more_than_baseline_pushes() {
     let mut grid = Grid::with_scrollback(1, 24, 20);
     for index in 0..5 {
-        grid.scrollback.push(row(&format!("old {index}"), 24));
+        grid.scrollback.push(&row(&format!("old {index}"), 24));
     }
     let command_start = grid.scrollback.position();
     grid.clear_scrollback();
     for index in 0..7 {
-        grid.scrollback.push(row(&format!("new {index}"), 24));
+        grid.scrollback.push(&row(&format!("new {index}"), 24));
     }
     grid.viewport[0] = row("resume", 24);
 
@@ -154,7 +157,7 @@ fn absolute_viewport_boundary_survives_scroll_ring_overflow_and_csi3j_clear() {
         "answer two"
     );
     for index in 0..4 {
-        grid.scrollback.push(row(&format!("new {index}"), 24));
+        grid.scrollback.push(&row(&format!("new {index}"), 24));
     }
     assert_eq!(
         grid.document_snapshot_from_position(document_start, DEFAULT_OUTPUT_CAP)
@@ -191,8 +194,8 @@ fn owned_viewport_snapshot_omits_stale_rows_without_mutating_grid() {
 #[test]
 fn owned_snapshot_filters_scrollback_and_viewport_with_aligned_masks() {
     let mut grid = Grid::with_scrollback(3, 24, 16);
-    grid.scrollback.push(row("old shell context", 24));
-    grid.scrollback.push(row("owned answer page", 24));
+    grid.scrollback.push(&row("old shell context", 24));
+    grid.scrollback.push(&row("owned answer page", 24));
     grid.viewport[0] = row("owned answer tail", 24);
     grid.viewport[1] = row("stale shell footer", 24);
     grid.viewport[2] = row("owned prompt", 24);
@@ -281,7 +284,7 @@ fn document_snapshot_streams_text_into_the_capture_limit() {
     let mut grid = Grid::with_scrollback(1, cols, 1_100);
     let full = "x".repeat(cols);
     for _ in 0..1_100 {
-        grid.scrollback.push(row(&full, cols));
+        grid.scrollback.push(&row(&full, cols));
     }
 
     let (text, styled) = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
@@ -301,7 +304,7 @@ fn snapshot_text_budget_follows_the_configured_cap() {
     let mut grid = Grid::with_scrollback(1, cols, 1_100);
     let full = "x".repeat(cols);
     for _ in 0..1_100 {
-        grid.scrollback.push(row(&full, cols));
+        grid.scrollback.push(&row(&full, cols));
     }
 
     // Raised cap: the >1MiB content is retained (budget 64 MiB + 4).
@@ -333,6 +336,8 @@ fn document_snapshot_discards_styles_after_the_rle_span_limit() {
         cell.character = 'x';
         cell.fg = crate::grid::CellColor::Palette((index % 2 + 1) as u8);
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    styled.recompute_full();
     grid.viewport[0] = styled;
 
     let (text, styled) = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
@@ -354,6 +359,8 @@ fn document_snapshot_overflow_row_degrades_but_keeps_other_rows_styles() {
         cell.character = 'a';
         cell.fg = crate::grid::CellColor::Palette((index % 2 + 1) as u8);
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    head.recompute_full();
     grid.viewport[0] = head;
 
     // Row 1: exceeds the whole 4096-span budget by itself.
@@ -362,6 +369,8 @@ fn document_snapshot_overflow_row_degrades_but_keeps_other_rows_styles() {
         cell.character = 'x';
         cell.fg = crate::grid::CellColor::Palette((index % 2 + 1) as u8);
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels.
+    styled.recompute_full();
     grid.viewport[1] = styled;
 
     let (text, out) = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
@@ -375,10 +384,10 @@ fn document_snapshot_overflow_row_degrades_but_keeps_other_rows_styles() {
 #[test]
 fn shrinking_scrollback_keeps_newest_command_rows() {
     let mut grid = Grid::with_scrollback(1, 24, 6);
-    grid.scrollback.push(row("old", 24));
+    grid.scrollback.push(&row("old", 24));
     let command_start = grid.scrollback.position();
     for index in 0..5 {
-        grid.scrollback.push(row(&format!("answer {index}"), 24));
+        grid.scrollback.push(&row(&format!("answer {index}"), 24));
     }
     grid.scrollback.set_max_lines(3, 24);
 

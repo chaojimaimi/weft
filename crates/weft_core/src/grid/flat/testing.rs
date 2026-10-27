@@ -148,5 +148,12 @@ pub(crate) fn to_rows(s: &str, columns: usize) -> Vec<Row> {
         rows.last_mut().expect("rows is never empty").wrapped = true;
     }
 
+    // v1.15.3 P1a: this builder writes cells directly (independent test
+    // reference — it deliberately bypasses the VT funnels); normalize the
+    // occupancy tail so pushed rows encode with the exact `occ`.
+    for row in &mut rows {
+        row.recompute_full();
+    }
+
     rows
 }

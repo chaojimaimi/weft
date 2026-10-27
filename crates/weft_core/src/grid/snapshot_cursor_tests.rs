@@ -6,6 +6,9 @@ fn row(text: &str, cols: usize) -> Row {
     for (index, ch) in text.chars().enumerate() {
         row.cells[index].character = ch;
     }
+    // v1.15.3 P1a: direct cell writes bypass the production funnels —
+    // normalize the occupancy tail.
+    row.recompute_full();
     row
 }
 

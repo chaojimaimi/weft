@@ -2,7 +2,9 @@
 //!
 //! Port of Warp `flat_storage/mod.rs`, adapted to weft per PLAN_S3 §二:
 //!
-//! - D2 (write path): `push` takes an owned weft [`Row`] and encodes it —
+//! - D2 (write path): `push` borrows a weft [`Row`] and encodes it —
+//!   (v1.15.3 P1b: borrowed, not owned — the storage never retains `Row`
+//!   objects, and the scroll path reuses the viewport row in place)
 //!   cell text as UTF-8 bytes, attribute change points into four logical
 //!   interval maps (fg / bg+flags+underline slots / hyperlink id; underline
 //!   slots live inside the widened bg+style value type per 评审 P1-3),
@@ -111,15 +113,20 @@ impl FlatStorage {
     /// Encodes one row into the flat structures (D2 write path) and then
     /// applies the retention limit.
     ///
+    /// v1.15.3 P1b (PLAN_v1153 §3): borrows the row — the storage never
+    /// keeps `Row` objects (encoding is the whole push), so ownership buys
+    /// nothing and forces the scroll path to allocate a fresh row per
+    /// scrolled line. Callers blank the row in place afterwards.
+    ///
     /// Mirrors `Scrollback::push` exactly: `max_lines == 0` makes this a
     /// complete no-op (position included), and `position` advances before
     /// any eviction so it counts rows *pushed*, not rows retained.
-    pub fn push(&mut self, row: Row) {
+    pub fn push(&mut self, row: &Row) {
         if self.max_lines == 0 {
             return;
         }
         self.position = self.position.saturating_add(1);
-        self.encode_row(&row);
+        self.encode_row(row);
         self.apply_max_rows();
     }
 
@@ -127,16 +134,16 @@ impl FlatStorage {
     /// `Scrollback::extend`).
     pub fn extend<I: IntoIterator<Item = Row>>(&mut self, iter: I) {
         for row in iter {
-            self.push(row);
+            self.push(&row);
         }
     }
 
     /// Encodes one row WITHOUT applying the retention limit (D4 step 2:
     /// the resize protocol pushes the whole viewport into storage before
     /// pulling rows back out; the limit applies once at the end).
-    pub(crate) fn push_without_truncation(&mut self, row: Row) {
+    pub(crate) fn push_without_truncation(&mut self, row: &Row) {
         self.position = self.position.saturating_add(1);
-        self.encode_row(&row);
+        self.encode_row(row);
     }
 
     /// Pops the last `count` rows off the tail of storage (D4 step 5: the
