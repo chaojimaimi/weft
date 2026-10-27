@@ -191,6 +191,12 @@ impl vte::Perform for Terminal {
             if new_col + 1 < num_cols {
                 self.grid.viewport[new_row].mark_dirty(new_col + 1);
             }
+            // v1.15.3 P1a: content write funnels — lead cell + spacer both
+            // hold non-default content (spacer carries WIDE_SPACER).
+            self.grid.viewport[new_row].cell_written(new_col);
+            if new_col + 1 < num_cols {
+                self.grid.viewport[new_row].cell_written(new_col + 1);
+            }
 
             self.grid.cursor.col = new_col + 2;
             if self.grid.cursor.col >= num_cols {
@@ -320,6 +326,12 @@ impl vte::Perform for Terminal {
             self.grid.viewport[row].mark_dirty(col);
             if width == CellWidth::Full && col + 1 < num_cols {
                 self.grid.viewport[row].mark_dirty(col + 1);
+            }
+            // v1.15.3 P1a: content write funnels — the printed cell (and the
+            // spacer half of a wide glyph) are non-default content.
+            self.grid.viewport[row].cell_written(col);
+            if width == CellWidth::Full && col + 1 < num_cols {
+                self.grid.viewport[row].cell_written(col + 1);
             }
         }
         self.grid.cursor.col += width as usize;

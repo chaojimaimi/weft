@@ -20,6 +20,8 @@ impl Grid {
             self.viewport[row].cells[c].reset();
             self.viewport[row].extras.clear_cell(c);
         }
+        // v1.15.3 P1a: EL/ED erase shrinks the occupancy tail.
+        self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(self.num_cols - 1);
         // Clear all subsequent rows
         for r in (row + 1)..self.num_rows {
@@ -27,6 +29,7 @@ impl Grid {
                 cell.reset();
             }
             self.viewport[r].extras.clear();
+            self.viewport[r].recompute_tail();
             self.viewport[r].mark_dirty(self.num_cols - 1);
         }
     }
@@ -41,6 +44,7 @@ impl Grid {
                 cell.reset();
             }
             self.viewport[r].extras.clear();
+            self.viewport[r].recompute_tail();
             self.viewport[r].mark_dirty(self.num_cols - 1);
         }
         // Clear from start of current line to cursor
@@ -49,6 +53,7 @@ impl Grid {
             self.viewport[row].cells[c].reset();
             self.viewport[row].extras.clear_cell(c);
         }
+        self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(col);
     }
 
@@ -59,6 +64,7 @@ impl Grid {
                 cell.reset();
             }
             row.extras.clear();
+            row.recompute_tail();
             row.mark_dirty(self.num_cols - 1);
         }
         // Note: does NOT reset cursor position (VT behavior)
@@ -79,6 +85,8 @@ impl Grid {
             self.viewport[row].cells[c].reset();
             self.viewport[row].extras.clear_cell(c);
         }
+        // v1.15.3 P1a: EL erase shrinks the occupancy tail.
+        self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
 
@@ -91,6 +99,7 @@ impl Grid {
             self.viewport[row].cells[c].reset();
             self.viewport[row].extras.clear_cell(c);
         }
+        self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(col);
     }
 
@@ -107,6 +116,9 @@ impl Grid {
         // clears and rewrites the line at the new width, the stale right half
         // is dropped — "normalizing back to num_cols" is the intended outcome.
         reflow::resize_row_cells(&mut self.viewport[row].cells, self.num_cols);
+        // v1.15.3 P1a: full-line erase (+ the B-2 width renormalization above
+        // may truncate) — shrink the occupancy tail.
+        self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(self.num_cols.saturating_sub(1));
     }
 
@@ -124,6 +136,8 @@ impl Grid {
             self.viewport[row].cells[c].reset();
             self.viewport[row].extras.clear_cell(c);
         }
+        // v1.15.3 P1a: ECH can erase the tail cell — shrink the occupancy.
+        self.viewport[row].recompute_tail();
         if end > 0 {
             self.viewport[row].mark_dirty(end - 1);
         }
@@ -147,6 +161,10 @@ impl Grid {
             .extras
             .shift_right(col, shift, self.num_cols);
         self.viewport[row].repair_wide_pairs();
+        // v1.15.3 P1a: ICH relocates cells without write funnels — `occ`
+        // can be stale in both directions; recompute from scratch (same
+        // O(cols) class as the shift loop itself).
+        self.viewport[row].recompute_full();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
 
@@ -166,6 +184,8 @@ impl Grid {
             .extras
             .shift_left(col, shift, self.num_cols);
         self.viewport[row].repair_wide_pairs();
+        // v1.15.3 P1a: DCH recomputes from scratch — same rationale as ICH.
+        self.viewport[row].recompute_full();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
 

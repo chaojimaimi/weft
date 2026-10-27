@@ -114,6 +114,9 @@ impl Terminal {
             spacer.flags = CellFlags::WIDE_SPACER;
             spacer.width = CellWidth::Half;
             self.grid.viewport[row].mark_dirty(col + 1);
+            // v1.15.3 P1a: the new spacer is non-default content (combining-
+            // mark promotion path).
+            self.grid.viewport[row].cell_written(col + 1);
             // Advance the cursor by 1 to account for the new spacer. The
             // cursor was at col+1 (after the base char); it should now be
             // at col+2 (after the spacer).
@@ -147,6 +150,9 @@ impl Terminal {
         self.grid.viewport[row].extras.clear_cell(col);
         self.hyperlinks.unlink_cell(row, col);
         self.grid.viewport[row].mark_dirty(col);
+        // v1.15.3 reviewer P3-1: a vacated tail slot would leave occ one
+        // high until the next tail event (safe direction, but keep exact).
+        self.grid.viewport[row].recompute_tail();
 
         self.deferred_wrap_newline();
         let new_row = self.grid.cursor.row;
@@ -228,6 +234,10 @@ impl Terminal {
         }
         self.grid.viewport[new_row].mark_dirty(new_col);
         self.grid.viewport[new_row].mark_dirty(new_col + 1);
+        // v1.15.3 P1a: the relocated pair is non-default content (lead carries
+        // the cluster, spacer the WIDE_SPACER flag).
+        self.grid.viewport[new_row].cell_written(new_col);
+        self.grid.viewport[new_row].cell_written(new_col + 1);
         // T3 review P1: the bisected far half's registry entry dies with
         // its pair (extras were handled by clear_wide_pair_at).
         if next_bisected {

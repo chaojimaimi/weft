@@ -494,8 +494,11 @@ fn subrow_extra_top_row_covers_the_viewport_top_band() {
     let mut grid = Grid::with_scrollback(2, 3, 100);
     let mut above = Row::new(3);
     above.cells[0] = Cell::with_char('X');
-    grid.scrollback.push(above);
-    grid.scrollback.push(Row::new(3));
+    // v1.15.3 P1a: direct cell writes bypass the in-crate funnels —
+    // notify the row so the flat encode keeps the exact tail.
+    above.cell_written(0);
+    grid.scrollback.push(&above);
+    grid.scrollback.push(&Row::new(3));
     grid.set_scroll_offset(1);
 
     let palette = Color::standard_palette();

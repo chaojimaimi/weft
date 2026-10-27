@@ -694,6 +694,7 @@ fn primary_screen_ownership_follows_rows_into_scrollback() {
     {
         for (col, character) in text.chars().enumerate() {
             terminal.grid_mut().viewport[row].cells[col].character = character;
+            terminal.grid_mut().viewport[row].cell_written(col);
         }
     }
     terminal.capabilities.primary_screen_ownership.viewport = Some(vec![false, true, true]);
@@ -754,6 +755,7 @@ fn ownership_mask_reads_stay_tail_aligned_under_trim_batch() {
         {
             for (col, character) in text.chars().enumerate() {
                 terminal.grid_mut().viewport[row].cells[col].character = character;
+                terminal.grid_mut().viewport[row].cell_written(col);
             }
         }
         terminal.capabilities.primary_screen_ownership.viewport = Some(vec![true, true, true]);
@@ -2665,6 +2667,7 @@ fn scroll_up_csi() {
     let mut t = Terminal::new(5, 4);
     for i in 0..5 {
         t.grid_mut().viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
+        t.grid_mut().viewport[i].cell_written(0);
     }
     t.process(b"\x1b[S");
     assert_eq!(t.grid().cell(0, 0).character, '2');

@@ -63,7 +63,7 @@ impl Grid {
                 old_wrapped.push(row.wrapped);
                 continue;
             }
-            self.scrollback.push_without_truncation(row);
+            self.scrollback.push_without_truncation(&row);
             self.history_window_valid = false;
             old_ends.push(
                 self.scrollback
@@ -151,10 +151,10 @@ impl Grid {
 
 /// The legacy reflow's blank-line predicate (`flush_line`): every cell
 /// is a never-written default. Written blanks (DIRTY) keep their row.
+/// v1.15.3 P1a: `occ == 0` is the same predicate by contract — read O(1)
+/// instead of scanning the row.
 fn row_is_all_blank(row: &Row) -> bool {
-    row.cells
-        .iter()
-        .all(|cell| cell.character == ' ' && cell.flags.is_empty())
+    row.occ == 0
 }
 
 /// Old row `i` (of `old_ends.len()`) maps to the post-rebuild rows

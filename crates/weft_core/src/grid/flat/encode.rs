@@ -70,10 +70,10 @@ impl FlatStorage {
             cell.fg = fg_color;
             cell.bg = bg_and_style.bg;
             // D2 drops DIRTY from the persisted style mask, but the flag is
-            // weft's write-marker: reflow (`row_content_end`) and the
-            // snapshot extents distinguish a written blank from a
-            // never-written one by it, and the VT print path sets it on
-            // every written cell. Re-add it on every cell a byte produced.
+            // weft's write-marker: `Row::occ` (v1.15.3 P1a) and the snapshot
+            // extents distinguish a written blank from a never-written one
+            // by it, and the VT print path sets it on every cell a byte
+            // produced. Re-add it on every cell a byte produced.
             cell.flags = bg_and_style.flags | CellFlags::DIRTY;
             cell.underline_style = bg_and_style.underline_style;
             cell.underline_color = bg_and_style.underline_color;
@@ -112,6 +112,10 @@ impl FlatStorage {
 
         // weft's `wrapped` flag is exactly "no trailing newline in content".
         row.wrapped = !entry.has_trailing_newline;
+        // v1.15.3 P1a: materialization writes cells contiguously from col 0,
+        // so the final `col` IS the exact occupied count (construction-time
+        // assignment; no reverse scan needed).
+        row.occ = col;
         // `ends_with_leading_wide_char_spacer` (rebuild-only) materializes as
         // the trailing blank default cell — weft has no separate flag, and a
         // blank cell is the visual result of that slot.
@@ -124,6 +128,39 @@ impl FlatStorage {
     /// loop with weft's specifics (extras clusters, `Row.wrapped`, ' '
     /// default cell).
     pub(super) fn encode_row(&mut self, row: &Row) {
+        // v1.15.3 P1a 防线4 (PLAN_v1153 §2.2): sampled occ audit. Failure
+        // mode asymmetry — occ too HIGH is only slow (dead tail walk), occ
+        // too LOW silently truncates bytes. The audit compares `occ` against
+        // the pre-occ reverse scan (the `#[cfg(test)]` oracle on `Row`,
+        // re-implemented inline so the production build can audit too).
+        // Coverage: the storage's FIRST encoded row always, then 1/1024 of
+        // subsequent rows. Deliberately sampled (not per-row) even under
+        // cfg(test): the perf-gate benchmarks themselves run via cargo test,
+        // and a per-row scan here would reintroduce the exact hotspot this
+        // car removes. The EXACT per-operation oracle lives in
+        // vt/occ_property_tests (every op of the mixed streams).
+        #[cfg(debug_assertions)]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static OCC_AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = OCC_AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let first_row_of_storage = self.index.len() == 0;
+            if first_row_of_storage || seq % 1024 == 0 {
+                let scanned = row
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, c)| c.character != ' ' || !c.flags.is_empty())
+                    .map_or(-1, |(i, _)| i as isize);
+                debug_assert_eq!(
+                    row.occ as isize,
+                    scanned + 1,
+                    "Row.occ drifted from the reverse-scan oracle (row tail truncation would diverge)"
+                );
+            }
+        }
+
         // Attribute state carries across rows: unchanged output across a row
         // boundary costs no new map entries.
         let mut fg_color = self.fg_color_map.tail();
@@ -161,7 +198,10 @@ impl FlatStorage {
             && hyperlink_id.is_none()
             && bg_and_style == default_style;
         let last_idx: isize = if carried_default {
-            row.last_written_cell()
+            // v1.15.3 P1a: O(1) exact occupancy (was a ~cols-cell reverse
+            // scan per row — 34% of the debug seq-stream profile). The
+            // invariant contract lives on `Row.occ`; oracle + audit above.
+            row.occ as isize - 1
         } else {
             row.cells.len() as isize - 1
         };

@@ -36,6 +36,13 @@ mod snapshot_cursor_tests;
 #[cfg(test)]
 mod tests;
 
+// v1.15.3 P1a (PLAN_v1153 §2.2 防线 1): source-scan tripwire pinning every
+// `Row.cells` mutation site to the occ classification inventory.
+#[cfg(test)]
+mod occ_mutation_sites_tests;
+#[cfg(test)]
+mod occ_sites_inventory;
+
 /// Terminal grid: visible viewport + scrollback buffer.
 pub struct Grid {
     pub viewport: Vec<Row>,
@@ -127,6 +134,11 @@ impl Grid {
     pub fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell {
         let r = &mut self.viewport[row];
         r.mark_dirty(col);
+        // v1.15.3 P1a: pub write funnel — extend `occ` here so a future
+        // production caller cannot silently under-count the tail (worst case
+        // of a no-op write is occ slightly high = encode walks dead tail
+        // cells, never truncation).
+        r.cell_written(col);
         &mut r.cells[col]
     }
 
@@ -323,6 +335,9 @@ impl Grid {
             cell.underline_color = None;
 
             self.viewport[row].mark_dirty(col);
+            // v1.15.3 P1a: content write funnel (test-only path, same contract
+            // as the VT print sites).
+            self.viewport[row].cell_written(col);
             self.cursor.col += width as usize;
 
             // Mark spacer cell for wide characters
@@ -332,6 +347,7 @@ impl Grid {
                 spacer.flags = CellFlags::WIDE_SPACER;
                 spacer.width = CellWidth::Half;
                 self.viewport[row].mark_dirty(col + 1);
+                self.viewport[row].cell_written(col + 1);
             }
         }
 
@@ -371,6 +387,7 @@ impl Grid {
             cell.width = width;
 
             self.viewport[row].mark_dirty(col);
+            self.viewport[row].cell_written(col);
 
             self.cursor.col += width as usize;
 
@@ -380,6 +397,7 @@ impl Grid {
                 spacer.flags = CellFlags::WIDE_SPACER;
                 spacer.width = CellWidth::Half;
                 self.viewport[row].mark_dirty(col + 1);
+                self.viewport[row].cell_written(col + 1);
             }
         }
 
@@ -595,6 +613,8 @@ impl Grid {
             for cell in &mut row.cells {
                 cell.reset();
             }
+            // v1.15.3 P1a: full-row erase — shrink the occupancy tail.
+            row.recompute_tail();
             row.mark_dirty(self.num_cols - 1);
         }
         self.cursor = Cursor::default();

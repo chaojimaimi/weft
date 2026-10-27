@@ -734,3 +734,9 @@ mod tests;
 
 #[cfg(test)]
 mod diagnostic_tests;
+
+// v1.15.3 P1a (PLAN_v1153 §2.2 防线 2): Row.occ property tests — randomized
+// mixed streams (print/SGR/ICH/DCH/IL/DL/ED/EL/ECH/DECSTBM/wide/combining)
+// asserting occ equals the reverse-scan oracle after every op.
+#[cfg(test)]
+mod occ_property_tests;

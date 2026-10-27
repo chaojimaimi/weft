@@ -208,6 +208,10 @@ impl Terminal {
 
             // Mark dirty once for the whole row segment — was per-cell.
             self.grid.viewport[row].mark_dirty(col + count - 1);
+            // v1.15.3 P1a: the whole segment [col, col + count) was written
+            // content — one O(1) occupancy extension per row segment.
+            debug_assert!(count >= 1);
+            self.grid.viewport[row].cell_written(col + count - 1);
 
             self.grid.cursor.col += count;
             offset += count;
