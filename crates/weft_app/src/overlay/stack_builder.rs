@@ -159,22 +159,18 @@ pub fn build_overlay_stack<'a>(
             })
             .collect();
 
-        // The PaletteDrawParams needs to borrow entry_views, but entry_views
-        // is a local. To avoid lifetime issues, we leak it into a Box that
-        // lives as long as 'a — but that's wrong. Instead, we store the
-        // entry_views inline. The OverlayStack owns the data.
-        // Actually, the entries are borrowed from palette_entries which has
-        // lifetime 'a, so we can build PaletteEntryView directly from it
-        // without an intermediate Vec. But PaletteDrawParams takes a slice.
-        // The simplest approach: store entry_views in a Box pinned to the
-        // stack. Since OverlayStack is stack-local and consumed within the
-        // same function, this is safe via a temporary.
+        // PaletteDrawParams needs `&'a [PaletteEntryView<'a>]`, but
+        // `entry_views` is a function-local Vec, so it is moved into a Box
+        // and leaked (`Box::leak`) to obtain the `'a` slice.
         //
-        // In practice we build the entry views into a leaked Box. This is
-        // acceptable because the OverlayStack is consumed and dropped within
-        // the same RedrawRequested handler — the leak is per-frame and freed
-        // when the frame ends. This is a known Rust pattern for self-referential
-        // temporaries in render loops.
+        // REAL lifetime: `Box::leak` memory is NEVER freed — both the 24-byte
+        // Box (holding the Vec header) and the Vec's element buffer
+        // (~48 B × entry count) live for the rest of the process. Every
+        // palette render pass leaks one such pair, i.e. an open palette leaks
+        // on every redraw frame; the growth stops when the palette closes and
+        // no palette layer is built. Accepted as the price of handing a local
+        // behind the stack's `'a` without restructuring `OverlayStack` to own
+        // the entries.
         let entry_views_box: &'a [PaletteEntryView<'a>] = {
             let boxed: Box<Vec<PaletteEntryView<'a>>> = Box::new(entry_views);
             Box::leak(boxed).as_slice()
