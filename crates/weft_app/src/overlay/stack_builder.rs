@@ -57,6 +57,7 @@ pub fn build_overlay_stack<'a>(
                 // exhausted dim decided by the shared pure fn at paint time).
                 footer_feedback: panel.panel_footer_feedback,
                 footer_exhausted: panel.panel_footer_exhausted,
+                filtered_cache: panel.panel_filtered_cache,
             }),
         });
     }

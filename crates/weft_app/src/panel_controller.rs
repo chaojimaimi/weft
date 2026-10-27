@@ -46,17 +46,22 @@ impl App {
 
     /// F3-4: Total count of blocks matching the panel query (no truncation).
     /// Used to clamp `scroll_offset` so the list can't scroll past the end.
+    /// v1.15.3 P2: reads the PanelState filtered-index cache (rebuilt only
+    /// when (blocks.len(), last_block_id, query) changes) — the same cache
+    /// `build_panel_vertices` fills, so the per-frame and clamp paths share
+    /// one O(n) scan instead of running one each.
     pub(super) fn panel_total_filtered(&self) -> usize {
-        let total = self
-            .sessions
+        self.sessions
             .active()
             .and_then(|tab| {
                 tab.with_terminal(|t| {
-                    panel_filtered_count(t.block_tracker().blocks(), &self.panel.query)
+                    let mut cache = self.panel.filtered_cache.borrow_mut();
+                    cache
+                        .get_or_rebuild(t.block_tracker().blocks(), &self.panel.query)
+                        .len()
                 })
             })
-            .unwrap_or(0);
-        total
+            .unwrap_or(0)
     }
 
     /// F3-4: Clamp `panel.scroll_offset` to `[0, max(0, total - visible)]`.

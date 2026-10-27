@@ -4,6 +4,7 @@
 //! command-name matching, path abbreviation, duration formatting, and string
 //! truncation. None depend on `MetalRenderer` state.
 
+use std::cell::Cell;
 use std::time::SystemTime;
 
 use weft_core::blocks::Block;
@@ -47,11 +48,18 @@ pub fn block_matches_query(block: &Block, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    let q = query.to_lowercase();
+    block_matches_query_lowered(block, &query.to_lowercase())
+}
+
+/// v1.15.3 P2 (PLAN_v1153 §4): single-block core of
+/// [`block_matches_query`] with the query already lowercased — the list
+/// scan paths hoist the `to_lowercase` allocation out of the per-block
+/// loop (n allocations → 1). Signature-identical semantics.
+fn block_matches_query_lowered(block: &Block, lowered_query: &str) -> bool {
     let cleaned = strip_prompt_prefix(&block.command);
     // Only the command name (first token) participates in matching.
     match cleaned.split_whitespace().next() {
-        Some(cmd_name) => cmd_name.to_lowercase().contains(&q),
+        Some(cmd_name) => cmd_name.to_lowercase().contains(lowered_query),
         None => false,
     }
 }
@@ -59,6 +67,12 @@ pub fn block_matches_query(block: &Block, query: &str) -> bool {
 /// F3-4: Total count of blocks matching the panel query (newest-first, no
 /// truncation). Used to clamp `scroll_offset` so the list can't scroll past
 /// the last filtered block.
+///
+/// v1.15.3 P2: production reads go through [`PanelFilteredCache`] (which
+/// rebuilds via [`panel_filtered_indices`]); this pure form stays as the
+/// unit-test + perf-gate oracle (`perf_panel_10k_history_filter_and_
+/// virtualize` measures it directly).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn panel_filtered_count(blocks: &[Block], query: &str) -> usize {
     blocks
         .iter()
@@ -119,6 +133,94 @@ pub(crate) fn panel_display<'a>(
         .skip(scroll_offset)
         .take(max)
         .collect()
+}
+
+/// v1.15.3 P2: newest-first indices of the blocks matching `query` — the
+/// one-scan rebuild behind [`PanelFilteredCache`].
+pub(crate) fn panel_filtered_indices(blocks: &[Block], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..blocks.len()).rev().collect();
+    }
+    let lowered = query.to_lowercase();
+    blocks
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, b)| block_matches_query_lowered(b, &lowered))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Virtualized window over precomputed filtered indices — the cached twin
+/// of [`panel_display`] (identical output when fed
+/// [`panel_filtered_indices`] output for the same query).
+pub(crate) fn panel_display_from_indices<'a>(
+    blocks: &'a [Block],
+    indices: &[usize],
+    scroll_offset: usize,
+    max: usize,
+) -> Vec<&'a Block> {
+    indices
+        .iter()
+        .skip(scroll_offset)
+        .take(max)
+        .map(|&i| &blocks[i])
+        .collect()
+}
+
+/// Cache key for [`PanelFilteredCache`]: block count + newest block id +
+/// raw query. Finalized blocks are immutable (the tracker's `command` never
+/// changes after `133;C`), and retention eviction changes `len`, so any of
+/// the three changing means the index list is stale.
+type PanelCacheKey = (usize, Option<u64>, String);
+
+/// v1.15.3 P2 (PLAN_v1153 §4): newest-first filtered-index cache for the
+/// history panel. `build_panel_vertices` runs the O(n) query filter twice
+/// per frame (count + display) — with hundreds of blocks that is dead work
+/// on every frame the panel stays open. The cache rebuilds only when
+/// `(blocks.len(), last_block_id, query)` changes; `PanelState::close()`
+/// clears it so the index vector never outlives the panel surface.
+///
+/// Not `Copy`/`Clone` on purpose — mutation goes through
+/// [`get_or_rebuild`](Self::get_or_rebuild) so the rebuild counter stays
+/// truthful for the invalidation tests.
+#[derive(Debug, Default)]
+pub(crate) struct PanelFilteredCache {
+    key: Option<PanelCacheKey>,
+    indices: Vec<usize>,
+    /// Test observability: number of full O(n) rebuilds performed.
+    rebuilds: Cell<u64>,
+}
+
+impl PanelFilteredCache {
+    /// Cached newest-first filtered indices; rebuilds on key mismatch.
+    /// The caller wraps this in a `RefCell` borrow (frame-cache precedent:
+    /// `cached_panel_scroll_metrics`).
+    pub(crate) fn get_or_rebuild(&mut self, blocks: &[Block], query: &str) -> &[usize] {
+        let key: PanelCacheKey = (
+            blocks.len(),
+            blocks.last().map(|b| b.id.0),
+            query.to_string(),
+        );
+        if self.key.as_ref() != Some(&key) {
+            self.indices = panel_filtered_indices(blocks, query);
+            self.key = Some(key);
+            self.rebuilds.set(self.rebuilds.get() + 1);
+        }
+        &self.indices
+    }
+
+    /// Drops the cached indices (panel closed — memory must not linger).
+    pub(crate) fn clear(&mut self) {
+        self.key = None;
+        self.indices = Vec::new();
+    }
+
+    /// Rebuild count so far (invalidation-test oracle).
+    #[cfg(test)]
+    pub(crate) fn rebuild_count(&self) -> u64 {
+        self.rebuilds.get()
+    }
 }
 
 // v1.13.18 P4: `visible_panel_rows`（`(vp_h/ch) − 2` 近似）已删除——面板

@@ -414,6 +414,7 @@ impl App {
                                 .as_ref()
                                 .map(|(text, at)| (text.as_str(), *at)),
                             panel_footer_exhausted: footer_exhausted_snapshot,
+                            panel_filtered_cache: &self.panel.filtered_cache,
                         },
                         crate::overlay::ImeViewParams {
                             ime_preedit: &pane.ime_preedit,

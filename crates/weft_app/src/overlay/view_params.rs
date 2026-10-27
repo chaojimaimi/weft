@@ -44,6 +44,9 @@ pub struct PanelViewParams<'a> {
     /// v1.15.0 (T3): the active pane's tracker ruled "no older history" —
     /// the footer label paints dimmed (still visible, still hit-testable).
     pub panel_footer_exhausted: bool,
+    /// v1.15.3 P2 (PLAN_v1153 §4): the panel's filtered-index cache, lent
+    /// to the paint path (`&RefCell` keeps this struct `Copy`).
+    pub panel_filtered_cache: &'a std::cell::RefCell<crate::paint::ui_helpers::PanelFilteredCache>,
 }
 
 /// IME preedit overlay inputs (TUI passthrough preedit + ownership gate).

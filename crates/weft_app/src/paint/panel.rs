@@ -2,7 +2,7 @@
 
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::ui_helpers::{
-    block_duration_str, panel_display, panel_filtered_count, strip_prompt_prefix, truncate_str,
+    block_duration_str, panel_display_from_indices, strip_prompt_prefix, truncate_str,
 };
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::continuation::{classify_exit, ExitClass};
@@ -13,6 +13,10 @@ use weft_core::blocks::{Block, BlockId};
 pub struct PanelDrawParams<'a> {
     /// Finished blocks (oldest-first; the renderer shows newest first).
     pub blocks: &'a [Block],
+    /// v1.15.3 P2 (PLAN_v1153 §4): the panel's filtered-index cache — the
+    /// per-frame double O(n) query scan (count + display) collapses to one
+    /// scan per (blocks.len(), last_block_id, query) change.
+    pub filtered_cache: &'a std::cell::RefCell<crate::paint::ui_helpers::PanelFilteredCache>,
     /// Panel width in physical pixels.
     pub width_px: f32,
     /// Live search filter (matches command or output, case-insensitive).
@@ -306,15 +310,30 @@ impl MetalRenderer {
             ch,
             rows_bottom,
         );
-        let total_filtered = panel_filtered_count(p.blocks, p.query);
-        let max_scroll = total_filtered.saturating_sub(max_rows);
-        // Batch 5 Step 2: cache metrics for active_panel_scrollbar_layout
-        // (mouse handlers). Written here once per frame; read on every mouse
-        // move to avoid re-running panel_filtered_count (O(n) over all blocks).
-        self.cached_panel_scroll_metrics
-            .set(Some((total_filtered, max_rows, max_scroll)));
-        let scroll_offset = p.scroll_offset.min(max_scroll);
-        let display = panel_display(p.blocks, p.query, scroll_offset, max_rows);
+        // v1.15.3 P2 (PLAN_v1153 §4): one cached O(n) filter scan serves both
+        // the count (scrollbar math) and the display window below; the scan
+        // re-runs only when (blocks.len(), last_block_id, query) changes.
+        // The cache lives on PanelState (lent in via PanelDrawParams) so
+        // `PanelState::close()` empties it — memory does not linger.
+        let (display, total_filtered, max_scroll, scroll_offset) = {
+            let mut cache = p.filtered_cache.borrow_mut();
+            let indices = cache.get_or_rebuild(p.blocks, p.query);
+            let total_filtered = indices.len();
+            let max_scroll = total_filtered.saturating_sub(max_rows);
+            // Batch 5 Step 2: cache metrics for active_panel_scrollbar_layout
+            // (mouse handlers). Written here once per frame; read on every
+            // mouse move to avoid re-running the filter (O(n) over all
+            // blocks).
+            self.cached_panel_scroll_metrics
+                .set(Some((total_filtered, max_rows, max_scroll)));
+            let scroll_offset = p.scroll_offset.min(max_scroll);
+            (
+                panel_display_from_indices(p.blocks, indices, scroll_offset, max_rows),
+                total_filtered,
+                max_scroll,
+                scroll_offset,
+            )
+        };
         let row_h = panel_layout.row_height;
         let mut y = panel_layout.list_top;
         let mut drawn = 0usize;

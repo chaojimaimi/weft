@@ -3,6 +3,9 @@
 //! so every existing `app_state::X` path keeps compiling unchanged.
 
 use super::*;
+use std::cell::RefCell;
+
+use crate::paint::ui_helpers::PanelFilteredCache;
 
 #[derive(Debug, Default)]
 pub struct PanelState {
@@ -53,8 +56,14 @@ pub struct PanelState {
     pub sidebar_drag_last_apply: Option<Instant>,
     /// v1.14.2 (A2): pointer width seen inside the 8ms throttle window —
     /// parked here instead of applied, then written by the next due frame
-    /// or by the release (终值必写).
+    /// or at the release (终值必写).
     pub pending_drag_width: Option<f32>,
+    /// v1.15.3 P2 (PLAN_v1153 §4): cached newest-first filtered indices for
+    /// the panel list — one O(n) query scan per (blocks, query) change
+    /// instead of two per frame. `RefCell` because the paint path fills it
+    /// through a shared `&PanelDrawParams` borrow (frame-cache precedent:
+    /// `cached_panel_scroll_metrics`). Cleared in [`PanelState::close`].
+    pub filtered_cache: RefCell<PanelFilteredCache>,
 }
 
 impl PanelState {
@@ -70,6 +79,9 @@ impl PanelState {
         self.highlight_until = None;
         self.last_click = None;
         self.scroll_offset = 0;
+        // v1.15.3 P2: the filtered-index cache must not outlive the panel
+        // surface (memory does not linger; next open rebuilds from scratch).
+        self.filtered_cache.get_mut().clear();
     }
 
     /// v1.14.0 (T2): toggle-side predicate — true when the sidebar is

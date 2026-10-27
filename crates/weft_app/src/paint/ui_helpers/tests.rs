@@ -500,3 +500,89 @@ fn perf_panel_v110_scale_visible_window() {
         );
     }
 }
+
+// ── v1.15.3 P2 (PLAN_v1153 §4): PanelFilteredCache invalidation ─────────
+
+fn fixture_block(id: u64, command: &str) -> Block {
+    Block {
+        id: BlockId(id),
+        command: command.to_string(),
+        cwd: None,
+        output: String::new().into(),
+        styled_output: None,
+        exit_code: Some(0),
+        started_at: std::time::SystemTime::UNIX_EPOCH,
+        finished_at: None,
+        collapsed: false,
+        screen_origin: false,
+    }
+}
+
+/// The three invalidation axes each force exactly one rebuild; an unchanged
+/// key reuses the cached indices (call-count oracle: `rebuild_count`).
+#[test]
+fn panel_filtered_cache_invalidates_on_len_last_id_and_query() {
+    let mut blocks = vec![
+        fixture_block(1, "git status"),
+        fixture_block(2, "cargo test"),
+        fixture_block(3, "git pull"),
+    ];
+    let mut cache = PanelFilteredCache::default();
+    assert_eq!(cache.rebuild_count(), 0);
+
+    // First read: one rebuild. Indices are newest-first and filtered.
+    assert_eq!(cache.get_or_rebuild(&blocks, "git"), &[2, 0]);
+    assert_eq!(cache.rebuild_count(), 1);
+    // Same key again: reused, no rebuild.
+    assert_eq!(cache.get_or_rebuild(&blocks, "git"), &[2, 0]);
+    assert_eq!(cache.rebuild_count(), 1);
+
+    // Axis 1 — blocks.len() changes (new block appended).
+    blocks.push(fixture_block(4, "git log"));
+    assert_eq!(cache.get_or_rebuild(&blocks, "git"), &[3, 2, 0]);
+    assert_eq!(cache.rebuild_count(), 2);
+
+    // Axis 2 — last block id changes at constant len (retention eviction
+    // replaces the tail; len alone would not catch it).
+    let len = blocks.len();
+    blocks[len - 1] = fixture_block(99, "cargo build");
+    assert_eq!(cache.get_or_rebuild(&blocks, "git"), &[2, 0]);
+    assert_eq!(cache.rebuild_count(), 3);
+
+    // Axis 3 — query changes.
+    assert_eq!(cache.get_or_rebuild(&blocks, "cargo"), &[3, 1]);
+    assert_eq!(cache.rebuild_count(), 4);
+
+    // Nothing changed: still 4 rebuilds.
+    assert_eq!(cache.get_or_rebuild(&blocks, "cargo"), &[3, 1]);
+    assert_eq!(cache.rebuild_count(), 4);
+
+    // close() clears: the next read rebuilds from scratch (memory does not
+    // linger past the panel surface).
+    cache.clear();
+    assert_eq!(cache.get_or_rebuild(&blocks, "cargo"), &[3, 1]);
+    assert_eq!(cache.rebuild_count(), 5);
+}
+
+/// The cached display window is identical to the pure-scan
+/// [`panel_display`] for the same (blocks, query, offset, max).
+#[test]
+fn panel_display_from_indices_matches_pure_scan() {
+    let blocks: Vec<Block> = (0..50)
+        .map(|i| fixture_block(i, if i % 3 == 0 { "git status" } else { "echo hi" }))
+        .collect();
+    let indices = panel_filtered_indices(&blocks, "git");
+    for offset in [0usize, 1, 4, 16] {
+        assert_eq!(
+            panel_display_from_indices(&blocks, &indices, offset, 5),
+            panel_display(&blocks, "git", offset, 5),
+            "cached window diverges at offset {offset}"
+        );
+    }
+    // Empty query: every block matches, newest-first.
+    assert_eq!(panel_filtered_indices(&blocks, "").len(), 50);
+    assert_eq!(
+        panel_filtered_indices(&blocks, ""),
+        (0..50).rev().collect::<Vec<_>>()
+    );
+}
