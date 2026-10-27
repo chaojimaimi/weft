@@ -522,11 +522,11 @@ async fn editor_kitty_keyboard_protocol_negotiates_without_corruption() {
 
     // Drain any startup negotiation answers (XTVERSION etc.) so the reply
     // assertion below is exact, then run the push — masked to supported
-    // bits (0b100 ReportAlternateKeys is cut).
+    // bits (v1.16.0: the full kitty set 0b1_1111 is supported).
     let _ = session.terminal.take_response();
     session.terminal.process(b"\x1b[>31u");
     let flags = session.terminal.keyboard_protocol_flags();
-    assert_eq!(flags, 31 & 0b1_0011, "push must register masked");
+    assert_eq!(flags, 31, "push must register the full supported set");
     session.terminal.process(b"\x1b[?u");
     let reply = session.terminal.take_response();
     assert_eq!(

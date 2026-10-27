@@ -394,6 +394,29 @@ fn native_key_mapping_replays_function_and_search_keys_without_text_guessing() {
     assert_eq!(map_winit_key(WinitKeyCode::AudioVolumeUp), None);
 }
 
+/// v1.16.0 (PLAN_v1160 §3): the keypad digits were DEAD keys (whole event
+/// dropped); the ten Numpad arms revive them onto `KeyCode::Numpad`, from
+/// which the legacy path emits the plain digit and the kitty path the
+/// 57399+ dedicated code.
+#[test]
+fn numpad_digits_map_to_numpad_key_codes() {
+    let cases = [
+        (WinitKeyCode::Numpad0, '0'),
+        (WinitKeyCode::Numpad1, '1'),
+        (WinitKeyCode::Numpad2, '2'),
+        (WinitKeyCode::Numpad3, '3'),
+        (WinitKeyCode::Numpad4, '4'),
+        (WinitKeyCode::Numpad5, '5'),
+        (WinitKeyCode::Numpad6, '6'),
+        (WinitKeyCode::Numpad7, '7'),
+        (WinitKeyCode::Numpad8, '8'),
+        (WinitKeyCode::Numpad9, '9'),
+    ];
+    for (native, digit) in cases {
+        assert_eq!(map_winit_key(native), Some(KeyCode::Numpad(digit)));
+    }
+}
+
 // ── Batch 6 Step 2 (R5-3): keyboard replay harness ─────────────────────
 //
 // These tests exercise the `dispatch_keyboard` path: a physical key +

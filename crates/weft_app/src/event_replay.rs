@@ -207,6 +207,25 @@ pub(crate) fn map_winit_key(key: WinitKeyCode) -> Option<KeyCode> {
         WinitKeyCode::Digit7 => KeyCode::Char('7'),
         WinitKeyCode::Digit8 => KeyCode::Char('8'),
         WinitKeyCode::Digit9 => KeyCode::Char('9'),
+        // v1.16.0 (PLAN_v1160 §3): keypad digits were DEAD keys — no arm
+        // matched, so app/keyboard.rs dropped the whole event (text and all).
+        // They now map like the Digit row: the legacy path emits the plain
+        // digit byte (handler.rs `KeyCode::Numpad` arm) and the kitty path
+        // the 57399+ dedicated code (kitty spec §7). Single-channel (§3
+        // step 3): winit delivers physical_key and text on the SAME
+        // KeyEvent, consumed by ONE handle_key_event call — no separate
+        // char-received path exists, so Numpad inherits the Digit row's
+        // single-emission semantics.
+        WinitKeyCode::Numpad0 => KeyCode::Numpad('0'),
+        WinitKeyCode::Numpad1 => KeyCode::Numpad('1'),
+        WinitKeyCode::Numpad2 => KeyCode::Numpad('2'),
+        WinitKeyCode::Numpad3 => KeyCode::Numpad('3'),
+        WinitKeyCode::Numpad4 => KeyCode::Numpad('4'),
+        WinitKeyCode::Numpad5 => KeyCode::Numpad('5'),
+        WinitKeyCode::Numpad6 => KeyCode::Numpad('6'),
+        WinitKeyCode::Numpad7 => KeyCode::Numpad('7'),
+        WinitKeyCode::Numpad8 => KeyCode::Numpad('8'),
+        WinitKeyCode::Numpad9 => KeyCode::Numpad('9'),
         WinitKeyCode::Minus => KeyCode::Char('-'),
         WinitKeyCode::Equal => KeyCode::Char('='),
         WinitKeyCode::BracketLeft => KeyCode::Char('['),

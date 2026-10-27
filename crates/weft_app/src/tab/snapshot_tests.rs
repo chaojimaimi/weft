@@ -489,8 +489,8 @@ fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
 fn pty_exit_resets_kitty_keyboard_flags() {
     let mut tab = tab_with_terminal();
     let mut terminal = tab.lock_terminal().unwrap();
-    terminal.process(b"\x1b[>1u\x1b[?1049h\x1b[>11u"); // main=1, alt=11→masked 3
-    assert_eq!(terminal.keyboard_protocol_flags(), 3);
+    terminal.process(b"\x1b[>1u\x1b[?1049h\x1b[>11u"); // main=1, alt=11
+    assert_eq!(terminal.keyboard_protocol_flags(), 11);
     // T10 P1 (D9 rule 2): release the guard before process_messages re-locks.
     drop(terminal);
 
@@ -523,7 +523,7 @@ fn close_tail_pty_exit_resets_kitty_keyboard_flags() {
         "close-tail precondition"
     );
     terminal.process(b"\x1b[>27u");
-    assert_eq!(terminal.keyboard_protocol_flags(), 27 & 0b1_0011);
+    assert_eq!(terminal.keyboard_protocol_flags(), 27);
     // T10 P1 (D9 rule 2): release the guard before finish_pending_blocks.
     drop(terminal);
 

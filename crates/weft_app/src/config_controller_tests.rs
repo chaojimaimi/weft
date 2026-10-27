@@ -35,8 +35,9 @@ fn kitty_protocol_walk_touches_every_pane() {
     t.process(b"\x1b[?u");
     assert_eq!(
         t.take_response(),
-        b"\x1b[?19u",
-        "re-enabled ⇒ previous negotiation is still live"
+        b"\x1b[?27u",
+        "re-enabled ⇒ previous negotiation is still live (27 = 0b11011, \
+         fully supported since v1.16.0)"
     );
 }
 

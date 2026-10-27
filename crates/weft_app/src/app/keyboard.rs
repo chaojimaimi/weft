@@ -75,6 +75,16 @@ impl crate::App {
             if (kitty_flags & weft_core::input::kitty::FLAG_REPORT_EVENT_TYPES) == 0 {
                 return;
             }
+            // v1.16.0 (PLAN_v1160 §4): Enter/Tab/Backspace have NO release
+            // events unless Flag 8 (ReportAllKeysAsEscapeCodes) — drop the
+            // event here so the legacy fallback can never emit a second
+            // `\r`/`\t`/`\x7f` (the encoder-side None is the seam guard;
+            // this is the actual drop).
+            if matches!(key, KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace)
+                && (kitty_flags & weft_core::input::kitty::FLAG_REPORT_ALL_KEYS) == 0
+            {
+                return;
+            }
             // Defense in depth: with flags 0 above, a Release already returned
             // at the gate — this only matters if that invariant ever changes.
             // Empty tabs (`None`) read as "not passthrough" and return here.
@@ -299,6 +309,15 @@ impl crate::App {
                 0
             };
             ih.kitty_event_kind = kind;
+            // v1.16.0 (PLAN_v1160 §5): Flag 4 shifted source — the layout's
+            // Shift character (winit text first char) while Shift is down;
+            // the encoder's condition chain decides whether the `:sk`
+            // sub-segment may ride the event. Synthetic paths keep None.
+            ih.kitty_shifted = if m.contains(Modifiers::SHIFT) {
+                text.and_then(|t| t.chars().next())
+            } else {
+                None
+            };
         }
 
         let bytes = crate::ime::encode_passthrough_key(&tab.input_handler, key, m, text);
