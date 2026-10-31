@@ -156,6 +156,24 @@ pub fn terminal_char_width(ch: char) -> usize {
     if matches!(ch, '\u{1f1e6}'..='\u{1f1ff}') {
         return 2;
     }
+    // WP1 D4: CJK common blocks range-checked before the unicode_width table
+    // walk. ASCII never reaches this fn (short-circuited at the print sites),
+    // so the real cost is these CJK lookups on the wide-char print path and
+    // the fast-lane scan. Ranges are narrow where unicode_width is uniformly
+    // 2 — deliberate splits: U+302A-302F (combining tone marks → 0),
+    // U+3097-309A (unassigned → 1, combining voiced marks → 0), U+303F/U+3040
+    // (1 / 0). Value equivalence over the whole scalar domain is pinned by
+    // `wide_fastpath_tests::terminal_char_width_matches_unicode_width_everywhere`.
+    if matches!(
+        ch,
+        '\u{3400}'..='\u{4dbf}' // CJK Ext A
+            | '\u{4e00}'..='\u{9fff}' // CJK Unified Ideographs
+            | '\u{3000}'..='\u{3029}' | '\u{3030}'..='\u{303e}' // CJK Symbols & Punctuation
+            | '\u{3041}'..='\u{3096}' | '\u{309b}'..='\u{30ff}' // Hiragana + Katakana
+            | '\u{ff01}'..='\u{ff60}' // Fullwidth Forms
+    ) {
+        return 2;
+    }
     unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 

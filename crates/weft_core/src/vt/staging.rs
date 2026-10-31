@@ -91,6 +91,21 @@ impl Terminal {
         }
     }
 
+    /// Sink for the UTF-8 wide-char fast path in `Terminal::process` (WP1
+    /// D1). Same phase-only predicate as `capture_print_ascii_run`; the
+    /// char-aware `OutputCapture::print_str` keeps `char_cursor`, cap
+    /// truncation and the T16a ledger correct for multi-byte runs.
+    pub(super) fn capture_print_wide_run(&mut self, s: &str, style: CapturedStyle) {
+        let capturing = !self.capabilities.alt_active
+            && self.block_tracker.phase() == ShellPhase::CommandExecuting;
+        if capturing {
+            self.block_tracker.on_print_wide_run(s, style);
+        } else if self.staging_active() {
+            self.preexec_staging
+                .print_str(s, style, self.block_tracker.output_cap());
+        }
+    }
+
     /// Sink for LF/VT/FF (`execute`).
     pub(super) fn capture_newline(&mut self) {
         if !self.capabilities.alt_active && self.block_tracker.is_capturing() {

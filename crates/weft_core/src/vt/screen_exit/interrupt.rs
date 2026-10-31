@@ -89,6 +89,22 @@ impl Terminal {
         }
     }
 
+    /// WP1 D1: char-aware twin of `capture_primary_screen_interrupt_ascii`
+    /// for the UTF-8 wide-char fast lane. The tail is retained text, so the
+    /// cap reads the tracker field (same as the per-char twin above);
+    /// `OutputCapture::print_str` keeps char-space cursor/truncation correct.
+    pub(in crate::vt) fn capture_primary_screen_interrupt_str(
+        &mut self,
+        s: &str,
+        style: CapturedStyle,
+    ) {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
+            capture
+                .tail
+                .print_str(s, style, self.block_tracker.output_cap());
+        }
+    }
+
     pub(in crate::vt) fn capture_primary_screen_interrupt_newline(&mut self) {
         if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             capture.tail.newline(self.block_tracker.output_cap());

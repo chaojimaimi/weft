@@ -1,7 +1,7 @@
 use super::replies;
 use super::Terminal;
 use crate::blocks::ShellPhase;
-use crate::grid::{terminal_char_width, CellFlags, CellWidth};
+use crate::grid::terminal_char_width;
 
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
@@ -28,12 +28,11 @@ impl vte::Perform for Terminal {
         // `133;B` (FIX_ORPHAN_PARSE_ERROR_OUTPUT), nothing otherwise.
         // v1.7.0-A: capture the current VT SGR attrs so the block preserves
         // program-emitted colors after the live grid scrolls away.
+        // WP1 D2: one capture_style() feeds both sinks — neither mutates
+        // `self.attrs`, so the second snapshot was byte-identical.
         {
             let style = self.capture_style();
             self.capture_print(c, style);
-        }
-        {
-            let style = self.capture_style();
             self.capture_primary_screen_interrupt_print(c, style);
         }
 
@@ -86,260 +85,13 @@ impl vte::Perform for Terminal {
             return;
         }
 
-        // Handle deferred wrap
-        if self.grid.cursor.wrap_pending {
-            self.deferred_wrap_newline();
-        }
-
-        // v1.0 perf: ASCII fast path — all ASCII chars are width 1.
-        // This skips the unicode_width lookup for the common case (terminal
-        // output is predominantly ASCII: digits, letters, punctuation).
-        // For 58KB of `seq` output, this saves ~58000 lookup calls.
-        let width = if scalar_width > 1 {
-            CellWidth::Full
-        } else {
-            CellWidth::Half
-        };
-
-        let num_cols = self.grid.num_cols;
-        let row = self.grid.cursor.row;
-        let col = self.grid.cursor.col;
-
-        // Wide char straddling line boundary → wrap first
-        if width == CellWidth::Full && col + 1 >= num_cols {
-            self.deferred_wrap_newline();
-            let new_row = self.grid.cursor.row;
-            let new_col = self.grid.cursor.col;
-            self.prepare_primary_screen_exit_row_overwrite();
-            self.include_primary_screen_viewport_row(new_row);
-            // T3 review P1: bisected far-half registry accounting (see the
-            // standard site) — the fresh pair below re-tags new_col and
-            // new_col+1; only a slot beyond them can keep a stale entry.
-            let next_bisected = new_col + 2 < num_cols
-                && self.grid.viewport[new_row].cells[new_col + 1].width == CellWidth::Full
-                && self.grid.viewport[new_row].cells[new_col + 2]
-                    .flags
-                    .contains(CellFlags::WIDE_SPACER);
-            self.grid.viewport[new_row].clear_wide_pair_at(new_col);
-            self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
-            // v1.6.0 review C1: clear orphaned grapheme extras for wide-char overwrite.
-            self.grid.viewport[new_row].extras.clear_grapheme(new_col);
-            if new_col + 1 < num_cols {
-                self.grid.viewport[new_row]
-                    .extras
-                    .clear_grapheme(new_col + 1);
-            }
-            {
-                let cells = &mut self.grid.viewport[new_row].cells;
-                let cell = &mut cells[new_col];
-                cell.character = c;
-                cell.fg = self.attrs.fg;
-                cell.bg = self.attrs.bg;
-                cell.flags = self.attrs.flags | CellFlags::DIRTY;
-                cell.width = CellWidth::Full;
-                // v1.11.3 (§1.1): carry underline fields (field-assigned).
-                cell.underline_style = self.attrs.underline_style;
-                cell.underline_color = self.attrs.underline_color;
-                // OSC 8: tag the wrapped wide-char cell with the active hyperlink.
-                if self.active_hyperlink_id.is_some() {
-                    cell.flags |= CellFlags::HYPERLINK;
-                }
-
-                if new_col + 1 < num_cols {
-                    let spacer = &mut cells[new_col + 1];
-                    spacer.character = ' ';
-                    spacer.flags = CellFlags::WIDE_SPACER;
-                    spacer.width = CellWidth::Half;
-                }
-            }
-            // v1.6.1: update hyperlink registry + RowExtras after releasing the
-            // `cells` borrow (same pattern as the standard print path above).
-            if let Some(id) = self.active_hyperlink_id {
-                self.hyperlinks.link_cell(new_row, new_col, id);
-                self.grid.viewport[new_row]
-                    .extras
-                    .set_hyperlink(new_col, Some(id));
-            } else {
-                self.hyperlinks.unlink_cell(new_row, new_col);
-                self.grid.viewport[new_row]
-                    .extras
-                    .set_hyperlink(new_col, None);
-            }
-            // T3 (P3-2 ruling): the spacer half carries the lead's hyperlink
-            // so viewport rows hover like materialized history rows (both
-            // halves of the glyph are clickable). Plain assignment above
-            // already dropped any stale HYPERLINK flag; registry/extras are
-            // cleaned symmetrically with the lead.
-            if new_col + 1 < num_cols {
-                if let Some(id) = self.active_hyperlink_id {
-                    self.hyperlinks.link_cell(new_row, new_col + 1, id);
-                    self.grid.viewport[new_row]
-                        .extras
-                        .set_hyperlink(new_col + 1, Some(id));
-                    self.grid.viewport[new_row].cells[new_col + 1].flags |= CellFlags::HYPERLINK;
-                } else {
-                    self.hyperlinks.unlink_cell(new_row, new_col + 1);
-                    self.grid.viewport[new_row]
-                        .extras
-                        .set_hyperlink(new_col + 1, None);
-                }
-            }
-            if next_bisected {
-                self.hyperlinks.unlink_cell(new_row, new_col + 2);
-            }
-            self.grid.viewport[new_row].mark_dirty(new_col);
-            if new_col + 1 < num_cols {
-                self.grid.viewport[new_row].mark_dirty(new_col + 1);
-            }
-            // v1.15.3 P1a: content write funnels — lead cell + spacer both
-            // hold non-default content (spacer carries WIDE_SPACER).
-            self.grid.viewport[new_row].cell_written(new_col);
-            if new_col + 1 < num_cols {
-                self.grid.viewport[new_row].cell_written(new_col + 1);
-            }
-
-            self.grid.cursor.col = new_col + 2;
-            if self.grid.cursor.col >= num_cols {
-                self.grid.cursor.wrap_pending = true;
-                self.grid.cursor.col = num_cols - 1;
-            }
-            return;
-        }
-
-        // Write the character. Normally `col < num_cols` because the deferred-
-        // wrap / wide-char logic above keeps the cursor in bounds, but during a
-        // resize the grid narrows immediately while the PTY SIGWINCH is still
-        // in flight — the shell keeps emitting at the old width and the cursor
-        // can momentarily point past the last column. Instead of silently
-        // dropping those characters, wrap to the next line so nothing is lost.
-        // The shell will repaint correctly once it learns the new width.
-        let mut row = row;
-        let mut col = col;
-        if col >= num_cols {
-            self.deferred_wrap_newline();
-            row = self.grid.cursor.row;
-            col = 0;
-        }
-        self.prepare_primary_screen_exit_row_overwrite();
-        self.include_primary_screen_viewport_row(row);
-
-        // T3 review P1: a narrow write that bisects a wide pair clears the
-        // far half's cell + extras (inside clear_wide_pair_at) — its
-        // registry entry must follow. Detected before the clears mutate the
-        // row.
-        let lead_bisected = col > 0
-            && self.grid.viewport[row].cells[col]
-                .flags
-                .contains(CellFlags::WIDE_SPACER)
-            && self.grid.viewport[row].cells[col - 1].width == CellWidth::Full;
-        let spacer_bisected = width == CellWidth::Half
-            && col + 1 < num_cols
-            && self.grid.viewport[row].cells[col].width == CellWidth::Full
-            && self.grid.viewport[row].cells[col + 1]
-                .flags
-                .contains(CellFlags::WIDE_SPACER);
-
-        {
-            self.grid.viewport[row].clear_wide_pair_at(col);
-            if width == CellWidth::Full {
-                self.grid.viewport[row].clear_wide_pair_at(col + 1);
-            }
-            // v1.6.0 review C1: clear orphaned grapheme extras before overwriting.
-            // A non-combining scalar replaces the cell's content; any multi-scalar
-            // grapheme cluster stored in extras becomes stale and must be removed
-            // (preserving hyperlink_id, which is handled below).
-            self.grid.viewport[row].extras.clear_grapheme(col);
-            if width == CellWidth::Full {
-                self.grid.viewport[row].extras.clear_grapheme(col + 1);
-            }
-            // v1.0 fix (CJK splat): before writing a new char, clear any
-            // existing wide-char pair that this write would bisect. Without
-            // this, overwriting part of a double-width CJK char (or its
-            // WIDE_SPACER second cell) leaves an orphaned half that manifests
-            // as merged fragments and phantom spaces after a TUI app (vim)
-            // scrolls via IL/DL and reprints shorter/different content. This
-            // is the standard "wide splat" handling xterm/Alacritty perform.
-            {
-                let cells = &mut self.grid.viewport[row].cells;
-                let cell = &mut cells[col];
-                cell.character = c;
-                cell.fg = self.attrs.fg;
-                cell.bg = self.attrs.bg;
-                cell.flags = self.attrs.flags | CellFlags::DIRTY;
-                cell.width = width;
-                // v1.11.3 (§1.1): carry underline style/color (see wrap site).
-                cell.underline_style = self.attrs.underline_style;
-                cell.underline_color = self.attrs.underline_color;
-
-                // OSC 8: tag the cell with HYPERLINK and record its (row,col)→id
-                // in the registry side-map. When the active hyperlink is None
-                // (overwriting a previously tagged cell), drop the side-map entry
-                // and clear the flag so the underline disappears.
-                if self.active_hyperlink_id.is_some() {
-                    cell.flags |= CellFlags::HYPERLINK;
-                } else if cell.flags.contains(CellFlags::HYPERLINK) {
-                    cell.flags.remove(CellFlags::HYPERLINK);
-                }
-
-                if width == CellWidth::Full && col + 1 < num_cols {
-                    let spacer = &mut cells[col + 1];
-                    spacer.character = ' ';
-                    spacer.flags = CellFlags::WIDE_SPACER;
-                    spacer.width = CellWidth::Half;
-                }
-            }
-            // v1.6.1: update hyperlink registry + RowExtras after releasing the
-            // `cells` borrow so we don't violate the borrow checker (cells and
-            // extras are different fields of the same Row, but the borrow
-            // checker can't prove non-aliasing through `&mut self.grid.viewport[row]`).
-            if let Some(id) = self.active_hyperlink_id {
-                self.hyperlinks.link_cell(row, col, id);
-                self.grid.viewport[row].extras.set_hyperlink(col, Some(id));
-            } else {
-                self.hyperlinks.unlink_cell(row, col);
-                self.grid.viewport[row].extras.set_hyperlink(col, None);
-            }
-            // T3 (P3-2 ruling): spacer carries the lead's hyperlink — see the
-            // wrap-first site above. `spacer.flags = WIDE_SPACER` in the write
-            // above already cleared a stale HYPERLINK flag; the id/registry
-            // follow the lead symmetrically.
-            if width == CellWidth::Full && col + 1 < num_cols {
-                if let Some(id) = self.active_hyperlink_id {
-                    self.hyperlinks.link_cell(row, col + 1, id);
-                    self.grid.viewport[row]
-                        .extras
-                        .set_hyperlink(col + 1, Some(id));
-                    self.grid.viewport[row].cells[col + 1].flags |= CellFlags::HYPERLINK;
-                } else {
-                    self.hyperlinks.unlink_cell(row, col + 1);
-                    self.grid.viewport[row].extras.set_hyperlink(col + 1, None);
-                }
-            }
-            // T3 review P1: registry entries of bisected wide-pair halves die
-            // with the pair (extras already handled by clear_wide_pair_at).
-            if lead_bisected {
-                self.hyperlinks.unlink_cell(row, col - 1);
-            }
-            if spacer_bisected {
-                self.hyperlinks.unlink_cell(row, col + 1);
-            }
-            self.grid.viewport[row].mark_dirty(col);
-            if width == CellWidth::Full && col + 1 < num_cols {
-                self.grid.viewport[row].mark_dirty(col + 1);
-            }
-            // v1.15.3 P1a: content write funnels — the printed cell (and the
-            // spacer half of a wide glyph) are non-default content.
-            self.grid.viewport[row].cell_written(col);
-            if width == CellWidth::Full && col + 1 < num_cols {
-                self.grid.viewport[row].cell_written(col + 1);
-            }
-        }
-        self.grid.cursor.col += width as usize;
-
-        if self.grid.cursor.col >= num_cols {
-            self.grid.cursor.wrap_pending = true;
-            self.grid.cursor.col = num_cols - 1;
-        }
+        // WP1 D1: everything from the deferred-wrap handling on is the shared
+        // write body — moved verbatim to actions_print.rs (`print_char_write`)
+        // so the UTF-8 wide-char fast lane runs the identical code. The
+        // preamble above (snap / capture / suppress / RI / width-0) stays
+        // slow-path only; the lane re-asserts it at entry (D3 admission makes
+        // those branches unreachable there).
+        self.print_char_write(c, scalar_width);
     }
 
     fn execute(&mut self, byte: u8) {

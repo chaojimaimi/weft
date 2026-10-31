@@ -350,6 +350,70 @@ impl OutputCapture {
         }
     }
 
+    /// WP1 D1: char-aware batch twin of [`Self::print_ascii`] for the UTF-8
+    /// wide-char fast lane. Deliberately NOT routing through `print_ascii`:
+    /// that path conflates bytes with chars (byte-indexed `char_cursor`
+    /// splice, byte-level cap truncation that can split a multi-byte char,
+    /// Latin-1 fallback on the mid-document rewrite path) — all three are
+    /// wrong for a `&str` run (plan P0 revision).
+    ///
+    /// - `char_cursor` advances by `chars().count()`, matching the per-char
+    ///   `print` accounting so style RLE splices stay aligned either way;
+    /// - cap truncation backs up to a char boundary (a char the remaining
+    ///   budget cannot hold whole is truncated, never split) and sets
+    ///   `truncated`;
+    /// - mid-document (cursor not at end) falls back to per-char `print`;
+    /// - T16a ledger: `text_char_count += chars().count()`, `text_line_count`
+    ///   += '\n' count (same discipline as print_ascii's continuation-byte
+    ///   arithmetic, without the byte/char conflation).
+    pub(crate) fn print_str(&mut self, s: &str, style: CapturedStyle, max_bytes: usize) {
+        if s.is_empty() || self.truncated {
+            return;
+        }
+        if self.cursor == self.text.len() {
+            // Append path — cursor sits at the document end. NOT watermark-
+            // recorded, same rationale as print_ascii's append path (only
+            // bytes at the tail are pushed).
+            let remaining = max_bytes.saturating_sub(self.text.len());
+            let mut accepted = remaining.min(s.len());
+            if accepted < s.len() {
+                // Cap: back up to a char boundary of `s` so no multi-byte
+                // char is split at the truncation point.
+                while accepted > 0 && !s.is_char_boundary(accepted) {
+                    accepted -= 1;
+                }
+            }
+            if accepted > 0 {
+                let pushed = &s[..accepted];
+                self.text.push_str(pushed);
+                self.cursor = self.text.len();
+                // One RLE splice covering the whole run, in char space.
+                let mut char_count = 0u32;
+                let mut newlines = 0usize;
+                for ch in pushed.chars() {
+                    char_count += 1;
+                    if ch == '\n' {
+                        newlines += 1;
+                    }
+                }
+                self.splice_style(self.char_cursor, self.char_cursor + char_count, style);
+                self.char_cursor += char_count;
+                self.text_line_count += newlines;
+                self.text_char_count += char_count as usize;
+            }
+            if accepted < s.len() {
+                self.truncated = true;
+            }
+            return;
+        }
+        for c in s.chars() {
+            self.print(c, style, max_bytes);
+            if self.truncated {
+                break;
+            }
+        }
+    }
+
     pub(crate) fn newline(&mut self, max_bytes: usize) {
         if self.truncated {
             return;

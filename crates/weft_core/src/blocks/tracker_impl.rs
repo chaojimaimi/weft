@@ -375,6 +375,20 @@ impl BlockTracker {
         self.maybe_publish_live_styled(self.batch_clock);
     }
 
+    /// WP1 D1: batch-append a run of width-2 chars (UTF-8 wide-char fast
+    /// lane) to the in-flight block's output. One `print_str` call instead
+    /// of N `on_print`s — the run shares a single style (no SGR change is
+    /// possible mid-run) and one live-publish throttle tick, mirroring
+    /// `on_print_ascii_run`. No-op unless a command is executing.
+    pub fn on_print_wide_run(&mut self, s: &str, style: CapturedStyle) {
+        if !self.is_capturing() || s.is_empty() {
+            return;
+        }
+        self.output.print_str(s, style, self.output_cap);
+        self.live_output_version = self.live_output_version.wrapping_add(1);
+        self.maybe_publish_live_styled(self.batch_clock);
+    }
+
     /// Append a newline to the in-flight block's output. No-op unless a command
     /// is executing.
     pub fn on_newline(&mut self) {

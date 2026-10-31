@@ -101,7 +101,15 @@ impl HyperlinkRegistry {
 
     /// Remove the hyperlink tag from cell `(row, col)` — called when a
     /// non-hyperlink character overwrites a previously tagged cell.
+    ///
+    /// WP1 D1 profiling: the no-active-link print path calls this per char,
+    /// and with an empty registry the `remove` is a provable no-op that
+    /// still pays the SipHash of the (row, col) key (~22% of headless
+    /// cjk_50k). The emptiness guard makes that case free.
     pub fn unlink_cell(&mut self, row: usize, col: usize) {
+        if self.cell_map.is_empty() {
+            return;
+        }
         self.cell_map.remove(&(row, col));
     }
 

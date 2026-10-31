@@ -565,49 +565,54 @@ pub(crate) const CLASSIFIED: &[(&str, &str, &str)] = &[
         "self.grid.viewport[row].mark_dirty(col);",
         dirty_no_extend,
     ),
-    ("vt/perform.rs", "let cell = &mut cells[col];", cell_written),
+    // WP1 D1: the print() write body (deferred wrap / straddle / standard
+    // write) moved verbatim from vt/perform.rs to vt/actions_print.rs as
+    // `print_char_write` (shared with the UTF-8 wide-char fast lane); the
+    // entries below follow the code. `let cells = &mut …viewport[row].cells`
+    // is shared verbatim with print_ascii_run, so its single existing entry
+    // covers both sites.
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
+        "let cell = &mut cells[col];",
+        cell_written,
+    ),
+    (
+        "vt/actions_print.rs",
         "let cell = &mut cells[new_col];",
         cell_written,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "let cells = &mut self.grid.viewport[new_row].cells;",
         cell_written,
     ),
     (
-        "vt/perform.rs",
-        "let cells = &mut self.grid.viewport[row].cells;",
-        cell_written,
-    ),
-    (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "let spacer = &mut cells[col + 1];",
         cell_written,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "let spacer = &mut cells[new_col + 1];",
         cell_written,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "self.grid.viewport[new_row].mark_dirty(new_col + 1);",
         dirty_no_extend,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "self.grid.viewport[new_row].mark_dirty(new_col);",
         dirty_no_extend,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "self.grid.viewport[row].mark_dirty(col + 1);",
         dirty_no_extend,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "self.grid.viewport[row].mark_dirty(col);",
         dirty_no_extend,
     ),
@@ -647,12 +652,12 @@ pub(crate) const CLASSIFIED: &[(&str, &str, &str)] = &[
         cell_written,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "self.grid.viewport[new_row].cells[new_col + 1].flags |= CellFlags::HYPERLINK;",
         cell_written,
     ),
     (
-        "vt/perform.rs",
+        "vt/actions_print.rs",
         "self.grid.viewport[row].cells[col + 1].flags |= CellFlags::HYPERLINK;",
         cell_written,
     ),

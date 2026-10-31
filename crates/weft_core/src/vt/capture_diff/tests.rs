@@ -96,7 +96,12 @@ fn interrupt_tail_matches_the_plain_print_stream() {
     assert!(terminal.primary_screen_interrupt_capture_active());
 
     // Double-fed window: every byte below reaches the Grid AND the tail sink.
-    terminal.process(b"\ntail A\ntail B");
+    // The CJK line rides the WP1 UTF-8 wide-char fast lane, so the window
+    // exercises BOTH tail sinks — `capture_primary_screen_interrupt_ascii`
+    // for the ASCII lines and `capture_primary_screen_interrupt_str`
+    // (OutputCapture::print_str, char-aware) for the CJK run
+    // (rust-review WP1 P3-2).
+    terminal.process("\ntail A\ntail B\n尾部输出".as_bytes());
 
     let capture = terminal
         .capabilities
@@ -117,15 +122,19 @@ fn interrupt_tail_matches_the_plain_print_stream() {
     );
     // Truth 2 — the tail is the post-freeze print stream, equal to the grid
     // rows written after the freeze. The frame CUP put the cursor on row 1,
-    // so the frame occupies rows 1-2 and the tail lands on rows 3-4.
+    // so the frame occupies rows 1-2 and the tail lands on rows 3-5.
     assert_eq!(
         text_lines(capture.tail.as_str()),
-        vec!["tail A".to_string(), "tail B".to_string()],
+        vec![
+            "tail A".to_string(),
+            "tail B".to_string(),
+            "尾部输出".to_string()
+        ],
         "tail must mirror the post-freeze print stream"
     );
     let grid = terminal.grid();
     let post_freeze = normalize(
-        (3..5)
+        (3..6)
             .map(|row| grid.displayed_row_text(row))
             .collect::<Vec<_>>(),
     );
@@ -142,7 +151,9 @@ fn interrupt_tail_matches_the_plain_print_stream() {
         .in_flight()
         .expect("screen-owned command stays in flight");
     assert!(
-        live.output.contains("frame one") && live.output.contains("tail B"),
+        live.output.contains("frame one")
+            && live.output.contains("tail B")
+            && live.output.contains("尾部输出"),
         "merged transcript must carry frozen frame AND tail: {:?}",
         live.output
     );

@@ -51,7 +51,7 @@ pub use osc::osc52_read_reply;
 #[cfg(test)]
 pub(crate) use screen_exit::{sustained_alt_cols_kind, SUSTAINED_ALT_COLS_MS};
 
-use crate::blocks::{BlockTracker, CapturedStyle, OutputCapture};
+use crate::blocks::{BlockTracker, OutputCapture};
 use crate::editor::Editor;
 use crate::grid::{Color, Cursor, CursorStyle, Grid};
 use crate::hyperlink::HyperlinkRegistry;
@@ -160,6 +160,20 @@ pub struct Terminal {
     /// THIS parser is the authoritative undo (h and l alike). `None` until
     /// the app injects it — clears are then no-ops.
     mouse_suppress: Option<MouseSuppressFlag>,
+    /// WP1 D1: test-only fast-lane kill switch (plan §3 — no production
+    /// flag; prod builds fold `print_fast_lanes_enabled()` to `true`).
+    #[cfg(test)]
+    print_fast_lanes_for_test: bool,
+    /// WP1 D1: shadow of vte's out-of-band UTF-8 collector (utf8parse
+    /// 0.2.2), `(remaining, next_min, next_max)`. While collecting, vte
+    /// SWALLOWS every aborting byte (one U+FFFD, never reprocessed) — both
+    /// print lanes must disengage or an ASCII byte after a truncated
+    /// sequence would print instead (a live v1.0 ASCII-lane divergence the
+    /// WP1 harness caught). See `note_slow_path_utf8_byte` in
+    /// actions_print.rs; `remaining == 0` = idle, lanes may engage.
+    utf8_collect_rem: u8,
+    utf8_collect_min: u8,
+    utf8_collect_max: u8,
 }
 
 impl Terminal {
@@ -209,6 +223,11 @@ impl Terminal {
             kitty_protocol_enabled: true,
             tui_render_mode: TuiRenderMode::Classic,
             mouse_suppress: None,
+            #[cfg(test)]
+            print_fast_lanes_for_test: true,
+            utf8_collect_rem: 0,
+            utf8_collect_min: 0x80,
+            utf8_collect_max: 0xBF,
         }
     }
 
@@ -478,6 +497,10 @@ impl Terminal {
     /// and writes them directly via `print_ascii_run`, bypassing vte's
     /// per-byte state machine. Only ESC (0x1B) and C0 controls go through
     /// `parser.advance()`. See `parser_in_ground_state` and inline notes.
+    /// WP1 D1: a second lane does the same for consecutive D3-admitted
+    /// width-2 UTF-8 chars via `print_wide_run` — same-source guards,
+    /// conservative scan that never consumes malformed or cross-batch
+    /// partial sequences (see `scan_wide_run`).
     pub fn process(&mut self, bytes: &[u8]) {
         self.block_tracker.begin_batch(std::time::Instant::now());
         let mut parser = std::mem::take(&mut self.parser);
@@ -489,9 +512,11 @@ impl Terminal {
             // count it). Scan a run of printable ASCII (0x20..=0x7E) that
             // doesn't start with an escape/C0 control. These bytes map 1:1 to
             // chars and are all width-1, so they bypass vte entirely.
-            if self.osc_guard_fast_path_allowed()
+            if self.print_fast_lanes_enabled()
+                && self.osc_guard_fast_path_allowed()
                 && self.parser_in_ground_state
                 && !self.suppress_joined_scalar
+                && self.utf8_collect_rem == 0
             {
                 let run_start = i;
                 while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] <= 0x7E {
@@ -499,6 +524,16 @@ impl Terminal {
                 }
                 if i > run_start {
                     self.print_ascii_run(&bytes[run_start..i]);
+                    continue;
+                }
+                // WP1 D1: UTF-8 wide-char lane — D3 conservative admission;
+                // the scan never consumes malformed / batch-truncated bytes
+                // (left verbatim for the slow path below). The scanner lends
+                // its validated &str straight to the writer (single
+                // validation point, rust-review P2-1).
+                if let Some(s) = Terminal::scan_wide_run(&bytes[i..]) {
+                    self.print_wide_run(s);
+                    i += s.len();
                     continue;
                 }
             }
@@ -529,6 +564,9 @@ impl Terminal {
                     self.parser_in_ground_state = false;
                 }
                 parser.advance(self, b);
+                // WP1 D1: mirror the out-of-band UTF-8 collector so the fast
+                // lanes know when vte is mid-sequence (see field docs).
+                self.note_slow_path_utf8_byte(b);
                 i += 1;
             }
         }
@@ -698,20 +736,6 @@ impl Terminal {
         self.editor.buffer.set_text(command);
         self.submit_command()
     }
-
-    // ── SGR helpers ──────────────────────────────────────────────
-
-    /// Current capture style — the batch-sink twin of the per-char sites
-    /// in perform.rs (v1.11.3: includes underline style/color carriers).
-    pub(crate) fn capture_style(&self) -> CapturedStyle {
-        CapturedStyle::from_attrs(
-            self.attrs.fg,
-            self.attrs.bg,
-            self.attrs.flags,
-            self.attrs.underline_style,
-            self.attrs.underline_color,
-        )
-    }
 }
 
 /// Helper: extract a single parameter with a default value.
@@ -746,3 +770,10 @@ mod diagnostic_caret_tests;
 // asserting occ equals the reverse-scan oracle after every op.
 #[cfg(test)]
 mod occ_property_tests;
+
+// WP1 (v1.17.0): UTF-8 wide-char fast lane — differential fuzz vs the
+// forced-slow-path baseline (cfg(test) kill switch), capture equivalence,
+// cap-boundary truncation, malformed UTF-8, resize race, D3 admission set,
+// and the D4 full-domain width sweep.
+#[cfg(test)]
+mod wide_fastpath_tests;
