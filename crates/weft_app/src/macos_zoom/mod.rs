@@ -618,6 +618,12 @@ unsafe fn display_layer_pull(layer: *mut objc2::runtime::AnyObject) {
 }
 
 mod anim;
+// WP2 Phase A (PLAN_v1181_WP2 §4-A2): the giant rig variants' in-app
+// precharge state machine — one cached-env atomic read per pass when
+// unarmed (inert), a full injection sequence only under the gate's giant
+// envs. Kept out of anim.rs (module-size budget).
+mod rig_precharge;
+pub(crate) use rig_precharge::{precharge_done, pump, rig_anchor};
 #[cfg(test)]
 mod tests;
 

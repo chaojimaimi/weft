@@ -15,6 +15,9 @@ use weft_core::blocks::Block;
 
 /// M6-b: freshness verdict for one cached entry, shared by `ensure_cached`
 /// and the band classification ([`classify`]) so the two can't disagree.
+/// Debug (WP2 A1 P1): the `block rebuild slow` warn prints the kind so the
+/// T1 (Both) and T2 (WidthOnly) families stay distinguishable in the log.
+#[derive(Debug)]
 pub(super) enum RebuildKind {
     None,
     WidthOnly,
@@ -243,6 +246,11 @@ impl BlockLayoutCache {
         if self.deferred_ids.is_empty() || max_n == 0 || !self.last_sync_stable {
             return;
         }
+        // WP2 A1 P2 (`pump drain slow`): time the whole drain round — the
+        // settle-phase T2c observation point (PLAN_v1181_WP2 §4-A1). The
+        // early return above keeps steady state at zero cost; a real drain
+        // pays one Instant read + one compare (RECONCILE_PROBE shape).
+        let drain_started = std::time::Instant::now();
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for_each_stale_interval(self, blocks, |index, bottom, _top| {
             if self.deferred_ids.contains(&blocks[index].id.0) {
@@ -258,6 +266,9 @@ impl BlockLayoutCache {
             self.remove_pending(blocks[index].id.0);
         }
         self.build_prefix_sum(blocks);
+        if drain_started.elapsed() >= super::SLOW_REBUILD_WARN {
+            tracing::warn!(drained = candidates.len().min(max_n), "pump drain slow");
+        }
     }
 
     /// M6-b: entries currently deferred above the sync band (bench/tests).

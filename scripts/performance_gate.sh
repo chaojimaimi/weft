@@ -369,6 +369,159 @@ if [ "${WEFT_PERF_SLACK:-1.0}" = "1.0" ]; then
         fi
     fi
     printf 'PERF_GATE PASS: zoom rig criteria met\n' | tee -a "$PERF_LOG"
+
+    # ── WP2 Phase A giant rig sub-variants (PLAN_v1181_WP2 §4-A2/A3) ──────
+    # local-only, opt-in: WEFT_ZOOM_RIG_GIANT=1 (shaped — the 32MB giant
+    # block plus 5 seq shaping rounds) or WEFT_ZOOM_RIG_GIANT_INBAND=1
+    # (giant only). Neither env set → this block is inert and everything
+    # above stays byte-identical to v1.18.0.
+    if [ "${WEFT_ZOOM_RIG_GIANT:-0}" = "1" ] || [ "${WEFT_ZOOM_RIG_GIANT_INBAND:-0}" = "1" ]; then
+        if [ "${WEFT_ZOOM_RIG_GIANT:-0}" = "1" ] && [ "${WEFT_ZOOM_RIG_GIANT_INBAND:-0}" = "1" ]; then
+            echo "zoom giant rig: set only ONE of WEFT_ZOOM_RIG_GIANT / WEFT_ZOOM_RIG_GIANT_INBAND" >&2
+            exit 1
+        fi
+        if [ "${WEFT_ZOOM_RIG_GIANT:-0}" = "1" ]; then
+            GIANT_VARIANT=shaped
+        else
+            GIANT_VARIANT=inband
+        fi
+
+        giant_rig_round() {
+            # One giant rig session. The fresh temp config is raised to the
+            # legal capture cap (plan §4-A2 ①: the default output_cap_mib=1
+            # would truncate the 32MB precharge block at 1MiB; 64 is
+            # blocks.rs OUTPUT_CAP_MAX_MIB), the in-app precharge state
+            # machine is armed (WEFT_ZOOM_RIG_PRECHARGE=1), and the window
+            # is 90s = the precharge total budget (60s) + both rig fires
+            # (2s/6s from the shaping anchor) + animation + convergence
+            # margin (plan R2 P2 closure). WEFT_ZOOM_RIG_GIANT_INBAND is
+            # inherited by the app process (it selects the inband sequence).
+            local offset size zoom_tmp
+            if [ -f "${HOME}/Library/Logs/Weft/weft.log" ]; then
+                offset="$(wc -c < "${HOME}/Library/Logs/Weft/weft.log" | tr -d ' ')"
+            else
+                offset=0
+            fi
+            zoom_tmp="$(mktemp -d "${TMPDIR:-/tmp}/weft-zoom-rig.XXXXXX")"
+            mkdir -p "$zoom_tmp/cache" "$zoom_tmp/config/weft"
+            printf '[blocks]\noutput_cap_mib = 64\n' > "$zoom_tmp/config/weft/config.toml"
+            XDG_CACHE_HOME="$zoom_tmp/cache" \
+                XDG_CONFIG_HOME="$zoom_tmp/config" \
+                WEFT_ALLOW_SECOND_INSTANCE=1 \
+                WEFT_SELF_ZOOM_TEST=1 \
+                WEFT_ZOOM_RIG_PRECHARGE=1 \
+                RUST_LOG=info \
+                target/release/weft &
+            local rig_pid=$!
+            sleep 90
+            kill "$rig_pid" 2>/dev/null || true
+            wait "$rig_pid" 2>/dev/null || true
+            rm -rf "$zoom_tmp"
+            if [ -f "${HOME}/Library/Logs/Weft/weft.log" ]; then
+                size="$(wc -c < "${HOME}/Library/Logs/Weft/weft.log" | tr -d ' ')"
+                if [ "$size" -ge "$offset" ]; then
+                    tail -c "+$((offset + 1))" "${HOME}/Library/Logs/Weft/weft.log"
+                else
+                    cat "${HOME}/Library/Logs/Weft/weft.log"
+                fi
+            fi
+        }
+
+        giant_rig_verdict() {
+            # Criteria (plan §7-2): both rig directions complete
+            # (completes >= 2); a precharge error line (timeout / shell not
+            # integrated / PTY write failure) is an immediate FAIL — the
+            # giant signature is missing and the red would be
+            # unattributable to the mechanism. The animation-feel budgets
+            # apply to the SHAPED variant only: every steps >= 3 (inband's
+            # steps ~1-2 IS the T2a signature and must not red) and zero
+            # >= 1s steps. The fresh variant's [10,15] band and 33ms draw
+            # budget are deliberately NOT applied — giant rebuilds pause
+            # zoom steps by design; their counts are the A3 attribution
+            # evidence. Probe counters on the summary line: rebuild_slow
+            # (P1) / pump_slow (P2) / degrades (P3) / exempt (P5).
+            awk -v variant="$1" '
+                /block rebuild slow/ { rebuild_slow++ }
+                /pump drain slow/ { pump_slow++ }
+                /budget degrade/ { degrades++ }
+                /exempt tables/ { exempt++ }
+                /zoom rig precharge timeout/ { precharge_errors++ }
+                /zoom rig precharge: shell not integrated/ { precharge_errors++ }
+                /zoom rig precharge: PTY write failed/ { precharge_errors++ }
+                /self-zoom complete steps=/ {
+                    n = $0
+                    sub(/.*steps=/, "", n)
+                    sub(/[^0-9].*$/, "", n)
+                    completes++
+                    if (!steps_seen || n + 0 < min_steps) {
+                        min_steps = n + 0
+                        steps_seen = 1
+                    }
+                    printf("zoom-giant-rig(%s): self-zoom complete steps=%s\n", variant, n)
+                }
+                /zoom frame draw draw_ms=/ {
+                    ms = $0
+                    sub(/.*draw_ms=/, "", ms)
+                    sub(/[^0-9].*$/, "", ms)
+                    draws++
+                    if (ms + 0 > max_draw) max_draw = ms + 0
+                    if (ms + 0 >= 1000) second_steps++
+                }
+                END {
+                    printf("zoom-giant-rig(%s): completes=%d min_steps=%d max_draw_ms=%d second_steps=%d rebuild_slow=%d pump_slow=%d degrades=%d exempt=%d precharge_errors=%d\n", variant, completes + 0, min_steps + 0, max_draw + 0, second_steps + 0, rebuild_slow + 0, pump_slow + 0, degrades + 0, exempt + 0, precharge_errors + 0)
+                    if (precharge_errors + 0 > 0) {
+                        print "zoom-giant-rig(" variant "): FAIL precharge error present"
+                        exit 1
+                    }
+                    if (completes + 0 < 2) {
+                        print "zoom-giant-rig(" variant "): FAIL fewer than 2 self-zoom complete lines"
+                        exit 1
+                    }
+                    if (variant == "shaped") {
+                        if (min_steps + 0 < 3) {
+                            print "zoom-giant-rig(" variant "): FAIL steps < 3 (animation feel)"
+                            exit 1
+                        }
+                        if (second_steps + 0 > 0) {
+                            print "zoom-giant-rig(" variant "): FAIL >= 1s step present"
+                            exit 1
+                        }
+                    }
+                    print "zoom-giant-rig(" variant "): PASS"
+                }
+            ' "$2"
+        }
+
+        giant_rig_attempt() {
+            # One round: run the giant rig, slice the log, verify. The
+            # verdict and the raw slice land in PERF_LOG either way
+            # (A3 evidence); the exit code carries the verdict.
+            local slice rc
+            slice="$(mktemp "${TMPDIR:-/tmp}/weft-zoom-slice.XXXXXX")"
+            giant_rig_round > "$slice"
+            if giant_rig_verdict "$GIANT_VARIANT" "$slice" | tee -a "$PERF_LOG"; then
+                rc=0
+            else
+                rc=1
+            fi
+            cat "$slice" >> "$PERF_LOG"
+            rm -f "$slice"
+            return "$rc"
+        }
+
+        echo "==> Performance gate: zoom giant rig ($GIANT_VARIANT variant, WP2 Phase A)"
+        if ! giant_rig_attempt; then
+            # No auto-retry: the pre-F1 baseline red IS the expected evidence
+            # (docs/perf/v1181-wp2-phase-a-baseline.md); triage order is
+            # precharge error lines first, then the probe counters.
+            {
+                printf 'PERF_GATE FAIL: zoom giant rig (%s) criteria not met\n' "$GIANT_VARIANT"
+                printf 'context: %s\n' "$(uptime)"
+            } | tee -a "$PERF_LOG"
+            exit 1
+        fi
+        printf 'PERF_GATE PASS: zoom giant rig (%s) criteria met\n' "$GIANT_VARIANT" | tee -a "$PERF_LOG"
+    fi
 fi
 
 python3 - "$PERF_LOG" "$REPORT_DIR/baseline.json" <<'PY'

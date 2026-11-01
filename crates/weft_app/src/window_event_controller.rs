@@ -621,6 +621,9 @@ impl App {
     /// tracks live instead of freezing like the system zoom does (I-1:
     /// AppKit's own animation suspends winit dispatch entirely).
     pub(crate) fn step_self_zoom(&mut self) {
+        // WP2 A2: pump the giant precharge state machine ahead of the rig
+        // tick (inert one-atomic-read per pass unless WEFT_ZOOM_RIG_PRECHARGE=1).
+        crate::macos_zoom::pump(self);
         // Appendix I acceptance rig: fires one `zoom:` ~2s after startup
         // when WEFT_SELF_ZOOM_TEST=1 (inert otherwise).
         if let Some(window) = self.window.as_ref() {

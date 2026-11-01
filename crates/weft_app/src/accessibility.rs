@@ -38,6 +38,12 @@ fn push_semantic(
     ));
 }
 
+/// WP2 A1 P4 threshold (PLAN_v1181_WP2 §4-A1): a snapshot+update segment at
+/// or above this is logged. The 50ms AX rebuild throttle already caps
+/// rebuilds at ≤20Hz, so the warn marks segments that saturate that cap —
+/// the T4 evidence F2 (zoom-window AX defer) is judged on.
+const AX_REBUILD_WARN: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl App {
     pub(super) fn update_accessibility_tree(&mut self) {
         // v1.14.2 (A4/PLAN §2): gate before the expensive snapshot + ObjC
@@ -59,6 +65,14 @@ impl App {
         if key::should_skip(last_built, &key, now) {
             return;
         }
+        // WP2 A1 P4 (`ax rebuild slow`): time the snapshot + bridge-update
+        // segment (PLAN_v1181_WP2 §4-A1, T4 evidence for F2). The
+        // early-return branches below (invalid tree / missing renderer or
+        // window) leave the probe silent by construction — the timer only
+        // covers a path that actually executed snapshot AND update.
+        // Steady-state cost: one Instant read + one compare (RECONCILE_PROBE
+        // shape, block_component.rs).
+        let ax_started = std::time::Instant::now();
         let nodes = self.accessibility_snapshot();
         if !tree_is_valid(&nodes) {
             tracing::error!(node_count = nodes.len(), "invalid accessibility tree");
@@ -70,8 +84,16 @@ impl App {
         let Some(window) = self.window.as_ref() else {
             return;
         };
+        let node_count = nodes.len();
         self.accessibility
             .update(window, nodes, renderer.scale(), renderer.viewport().1);
+        if ax_started.elapsed() >= AX_REBUILD_WARN {
+            tracing::warn!(
+                elapsed_ms = ax_started.elapsed().as_millis() as u64,
+                nodes = node_count,
+                "ax rebuild slow"
+            );
+        }
         self.accessibility.ax_key = Some(key);
         self.accessibility.ax_built_at = Some(now);
     }

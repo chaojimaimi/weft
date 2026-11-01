@@ -683,9 +683,17 @@ pub(crate) fn self_zoom_test_tick(window: &winit::window::Window) {
         .and_then(|v| v.into_string().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2);
+    // WP2 A2 (PLAN_v1181_WP2 §4-A2 item 1): with the giant precharge rig
+    // armed, the timing anchor moves from startup to precharge completion
+    // (整形完成) — the 2s/6s fire SPACING is unchanged, and a long precharge
+    // no longer collapses the gap between the two rig fires. Unarmed
+    // sessions keep the startup anchor: byte-identical legacy semantics
+    // (precharge_done is unconditionally true and the anchor is `started`).
+    let anchor = super::rig_anchor(started);
+    let elapsed = anchor.elapsed();
     let due = match n {
-        0 => started.elapsed() >= std::time::Duration::from_secs(base),
-        1 => started.elapsed() >= std::time::Duration::from_secs(base + 4),
+        0 => super::precharge_done() && elapsed >= std::time::Duration::from_secs(base),
+        1 => elapsed >= std::time::Duration::from_secs(base + 4),
         _ => false,
     };
     if !due {

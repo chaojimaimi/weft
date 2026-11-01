@@ -37,6 +37,32 @@ const LAYOUT_TABLE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// and re-degrading it would thrash against the band check every frame.
 const BUDGET_EXEMPT_NEWEST_BLOCKS: usize = 4;
 
+/// WP2 A1 (PLAN_v1181_WP2 §4-A1): the P1/P2 probe threshold — a rebuild or
+/// pump drain at/above this is logged so the giant-block cost families (T1
+/// degrade→Both loop, T2 WidthOnly rebuilds) are observable in production
+/// logs without a bench harness.
+const SLOW_REBUILD_WARN: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// WP2: the giant-block table threshold, defined WITH the P5 probe so the
+/// probe's giant-share arithmetic and the coming degradation exemption
+/// (F1, commit 2 — PLAN_v1181_WP2 §5-F1 reuses this constant) share one
+/// number. 32MiB of tables ≈ 4M graphemes ≈ multi-MB of output — a Both
+/// rebuild there is 50-150ms+, so a degrade-rebuild round trip is never
+/// worth it. F1's exempt population: high-cap configs plus legacy restored
+/// blocks (the default `output_cap_mib = 1` caps new blocks at ~8MiB of
+/// tables, below this threshold).
+pub(crate) const GIANT_TABLE_EXEMPT_BYTES: usize = 32 * 1024 * 1024;
+
+/// WP2 A1 P5 (`exempt tables`) throttle: the cache-bytes overview logs at
+/// most once per 10s (it sits on the over-budget frame path).
+const EXEMPT_TABLES_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// WP2 A1 P5: last `exempt tables` emission. The cache lives on the render
+/// thread, so the mutex is uncontended in steady state (one lock + compare
+/// per over-budget frame).
+static EXEMPT_TABLES_LAST_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
 /// Cached layout for a single finished block.
 #[derive(Clone)]
 pub(crate) struct CachedBlockLayout {
@@ -324,9 +350,23 @@ impl BlockLayoutCache {
                 // the band check and Both rebuilds retire pending ids.
                 let mut prev = self.entries.remove(&id).expect("checked above");
                 self.table_bytes_total -= prev.estimated_table_bytes();
+                // WP2 A1 P1 (`block rebuild slow`): same probe as the Both
+                // arm below — this arm is the T2a/T2b/T2c evidence (plan
+                // §4-A1). Steady-state cost: one Instant read + one compare.
+                let rebuild_started = std::time::Instant::now();
                 prev = compute_block_layout_with_content(block, cols, prev.content);
-                self.table_bytes_total += prev.estimated_table_bytes();
+                let table_bytes = prev.estimated_table_bytes();
+                self.table_bytes_total += table_bytes;
                 self.entries.insert(id, prev);
+                if rebuild_started.elapsed() >= SLOW_REBUILD_WARN {
+                    tracing::warn!(
+                        id,
+                        kind = ?RebuildKind::WidthOnly,
+                        table_bytes,
+                        cols,
+                        "block rebuild slow"
+                    );
+                }
             }
             RebuildKind::Both => {
                 self.misses += 1;
@@ -337,11 +377,29 @@ impl BlockLayoutCache {
                     .get(&id)
                     .map(|c| c.estimated_table_bytes())
                     .unwrap_or(0);
+                // WP2 A1 P1 (`block rebuild slow`): time the O(content)
+                // rebuild segment. All three sync paths converge on this one
+                // site (band.rs sync_classified / rebuild_pending_in_band /
+                // pump_deferred), so a single probe covers the T1
+                // (degrade→Both) and T2 families of PLAN_v1181_WP2 §2.
+                // Steady-state cost: one Instant read + one compare
+                // (RECONCILE_PROBE shape, block_component.rs).
+                let rebuild_started = std::time::Instant::now();
                 let next = compute_block_layout(block, cols);
+                let table_bytes = next.estimated_table_bytes();
                 self.table_bytes_total -= prev_bytes;
-                self.table_bytes_total += next.estimated_table_bytes();
+                self.table_bytes_total += table_bytes;
                 self.entries.insert(id, next);
                 self.remove_pending(id);
+                if rebuild_started.elapsed() >= SLOW_REBUILD_WARN {
+                    tracing::warn!(
+                        id,
+                        kind = ?RebuildKind::Both,
+                        table_bytes,
+                        cols,
+                        "block rebuild slow"
+                    );
+                }
             }
         }
     }
@@ -530,8 +588,59 @@ impl BlockLayoutCache {
             if index >= first_exempt_index || band_exempt.contains(&block.id.0) {
                 continue;
             }
-            self.degrade_entry(block.id.0);
+            // WP2 A1 P3 (`budget degrade`): one warn per ACTUAL degradation,
+            // carrying the dropped table size — the T1 loop observation
+            // point and F1's before/after counter (post-F1 giants must never
+            // appear here; PLAN_v1181_WP2 §4-A1). The size is read before
+            // the call because degradation empties the tables.
+            let dropped_bytes = self
+                .entries
+                .get(&block.id.0)
+                .map(|c| c.estimated_table_bytes())
+                .unwrap_or(0);
+            if self.degrade_entry(block.id.0) {
+                tracing::warn!(
+                    id = block.id.0,
+                    table_bytes = dropped_bytes,
+                    "budget degrade"
+                );
+            }
         }
+        // WP2 A1 P5 (`exempt tables`): the cache table-byte overview — F1's
+        // memory data plane. Pre-F1 the exempt SET doesn't exist yet, so the
+        // equivalent face (main-agent ruling, plan §4-A1) is the total plus
+        // the >GIANT_TABLE_EXEMPT_BYTES giant share. Fires only on
+        // over-budget frames (the early return above keeps steady state at
+        // zero cost), throttled to one line per 10s.
+        self.log_exempt_tables_overview();
+    }
+
+    /// WP2 A1 P5: the throttled `exempt tables` info line (see the
+    /// `enforce_table_budget` tail).
+    fn log_exempt_tables_overview(&self) {
+        let mut last = EXEMPT_TABLES_LAST_LOG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|at| at.elapsed() < EXEMPT_TABLES_LOG_INTERVAL) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        drop(last);
+        let mut giant_blocks = 0usize;
+        let mut giant_table_bytes = 0usize;
+        for entry in self.entries.values() {
+            let bytes = entry.estimated_table_bytes();
+            if bytes > GIANT_TABLE_EXEMPT_BYTES {
+                giant_blocks += 1;
+                giant_table_bytes += bytes;
+            }
+        }
+        tracing::info!(
+            total_table_bytes = self.table_bytes_total,
+            giant_blocks,
+            giant_table_bytes,
+            "exempt tables"
+        );
     }
 
     /// M6-c: full recompute of the byte total — the test-only oracle for the
