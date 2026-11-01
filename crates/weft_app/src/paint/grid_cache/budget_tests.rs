@@ -467,3 +467,224 @@ fn revived_entry_matches_one_shot_build() {
         assert_eq!(cache.get(blk.id.0).width.rows.len(), reference[&blk.id.0]);
     }
 }
+
+// ── WP2 F1 (PLAN_v1181_WP2 §5-F1): the giant-block degradation exemption ─
+
+/// The number of grapheme entries whose L1 estimate alone crosses the giant
+/// threshold (8B per GEntry — pinned by the formula test above).
+fn giant_grapheme_count() -> usize {
+    super::GIANT_TABLE_EXEMPT_BYTES / std::mem::size_of::<visual_rows::GEntry>() + 1
+}
+
+/// A CachedBlockLayout whose tables exceed `GIANT_TABLE_EXEMPT_BYTES` built
+/// from zeroed grapheme entries — no captured content needed (the estimate
+/// reads `.len()` fields only; the rig's real 32MB output stays a rig
+/// concern). Scalars are inert: `base_row_count = 0` gives the entry an
+/// empty stale interval, so the budget's band walk never band-exempts it.
+fn giant_layout(cols: usize) -> CachedBlockLayout {
+    CachedBlockLayout {
+        output_len: 0,
+        output_identity: 0,
+        command_len: 0,
+        collapsed: false,
+        cols,
+        foldable: false,
+        base_row_count: 0,
+        is_clear: false,
+        command_wrap_rows: 0,
+        content: visual_rows::ContentTable {
+            graphemes: vec![
+                visual_rows::GEntry {
+                    byte_offset: 0,
+                    width: 1,
+                    flags: 0,
+                };
+                giant_grapheme_count()
+            ],
+            line_meta: Vec::new(),
+            screen_origin: false,
+            trailing_trim_lines: 0,
+        },
+        stale_output_rows: 0,
+        width: visual_rows::WidthTable {
+            rows: Vec::new(),
+            line_row_base: vec![0],
+            hint_rows: 0,
+        },
+        degraded: false,
+    }
+}
+
+/// Overwrite `id`'s synced entry with the giant layout and keep the
+/// incremental byte total exact (the child-module escape hatch for the
+/// private entries map; the production path can never build this entry
+/// from a sub-threshold output).
+fn install_giant(cache: &mut BlockLayoutCache, id: u64, cols: usize) {
+    let layout = giant_layout(cols);
+    let dropped = cache
+        .entries
+        .insert(id, layout)
+        .map(|old| old.estimated_table_bytes())
+        .unwrap_or(0);
+    let added = cache.get(id).estimated_table_bytes();
+    cache.table_bytes_total = cache.table_bytes_total - dropped + added;
+    assert!(cache.get(id).estimated_table_bytes() > super::GIANT_TABLE_EXEMPT_BYTES);
+}
+
+/// F1 ①: a giant block is never degraded, even when it is the OLDEST
+/// candidate a pre-F1 budget walk would have dropped first.
+#[test]
+fn giant_block_is_never_degraded_even_oldest() {
+    let blocks: Vec<Block> = (1..=6).map(|i| block(i, 4 + i as usize)).collect();
+    let mut cache = fresh_synced(&blocks, 80);
+    install_giant(&mut cache, 1, 80); // id 1 = oldest, outside newest-4
+    let giant_bytes = cache.get(1).estimated_table_bytes();
+
+    // Budget below the giant alone: pre-F1 this degrades id 1 first.
+    let budget = cache.table_bytes_total() - giant_bytes - 1;
+    cache.enforce_table_budget(&blocks, no_band(), budget);
+
+    assert!(!cache.get(1).degraded, "the giant survives");
+    assert_eq!(
+        cache.get(1).estimated_table_bytes(),
+        giant_bytes,
+        "the giant's tables are intact"
+    );
+    // The over-budget state persists (documented-legal: the giant alone
+    // exceeds what degradation could reclaim here — no candidate was left).
+    assert!(cache.table_bytes_total() > budget);
+    assert!(
+        cache.no_degradable_candidates,
+        "memo arms for the steady state"
+    );
+}
+
+/// F1 ②: over budget with ONLY giants among the candidates — the walk runs
+/// to the end, degrades nothing, and the session stays legally over budget.
+#[test]
+fn all_giant_session_walks_to_exhaustion_without_degradation() {
+    let blocks: Vec<Block> = (1..=6).map(|i| block(i, 4 + i as usize)).collect();
+    let mut cache = fresh_synced(&blocks, 80);
+    for blk in &blocks {
+        install_giant(&mut cache, blk.id.0, 80);
+    }
+    let total = cache.table_bytes_total();
+    let budget = total - 1; // permanently over
+    cache.enforce_table_budget(&blocks, no_band(), budget);
+
+    assert_eq!(cache.degraded_count(), 0, "nothing degraded");
+    assert_eq!(cache.table_bytes_total(), total, "legal over-budget state");
+    assert!(cache.no_degradable_candidates);
+    // Idempotent: the memo'd next frame changes nothing.
+    cache.enforce_table_budget(&blocks, no_band(), budget);
+    assert_eq!(cache.degraded_count(), 0);
+    assert!(cache.no_degradable_candidates);
+}
+
+/// F1 ③: the exemption is per-entry — resident giants do not shield the
+/// ordinary blocks, which still degrade oldest-first with scalars intact.
+#[test]
+fn mixed_session_degrades_non_giants_around_the_giant() {
+    // 7 blocks: first_exempt_index = 3, so blocks 1-3 are candidates and
+    // 4-7 hold the newest-4 exemption. Giants at 1 and 3 sit INSIDE the
+    // candidate range — pre-F1 both would degrade.
+    let blocks: Vec<Block> = (1..=7).map(|i| block(i, 4 + i as usize)).collect();
+    let reference = fresh_synced(&blocks, 80);
+    let mut cache = fresh_synced(&blocks, 80);
+    install_giant(&mut cache, 1, 80);
+    install_giant(&mut cache, 3, 80);
+
+    // Budget pinched to fit exactly ONE degradation (block 2, the oldest
+    // non-giant candidate — the same pinch formula degrade_oldest uses).
+    let budget = cache.table_bytes_total() - cache.get(2).estimated_table_bytes()
+        + std::mem::size_of::<u32>();
+    cache.enforce_table_budget(&blocks, no_band(), budget);
+
+    assert!(
+        !cache.get(1).degraded && !cache.get(3).degraded,
+        "giants exempt"
+    );
+    assert!(cache.get(2).degraded, "the non-giant candidate degrades");
+    for id in 4..=7 {
+        assert!(!cache.get(id).degraded, "newest-4 exemption still holds");
+    }
+    // Scalars survive on the degraded non-giant (zero-drift contract).
+    assert_eq!(
+        cache.get(2).stale_output_rows,
+        reference.get(2).stale_output_rows
+    );
+    assert_eq!(cache.table_bytes_total(), cache.recomputed_table_bytes());
+}
+
+/// F1 ④: the thrash regression — band sweeps must never re-degrade the
+/// giant (pre-F1 each degrade→in-band→Both round trip cost a 300ms+ rebuild
+/// on the Phase A numbers; the loop is now structurally impossible).
+#[test]
+fn band_sweeps_never_re_degrade_the_giant() {
+    let blocks: Vec<Block> = (1..=6).map(|i| block(i, 4 + i as usize)).collect();
+    let mut cache = fresh_synced(&blocks, 80);
+    install_giant(&mut cache, 1, 80);
+    let giant_bytes = cache.get(1).estimated_table_bytes();
+    let budget = cache.table_bytes_total() - giant_bytes - 1;
+
+    // Sweep the band from the bottom to far above the giant's (empty)
+    // interval and back: every sync re-runs the budget walk, and the small
+    // blocks thrash through degrade→in-band→Both exactly as before — the
+    // giant must never join that loop.
+    for high in [0usize, 40, 400, 4_000, 400, 0] {
+        cache.sync_blocks(
+            &blocks,
+            80,
+            BandSync {
+                low_rows: 0,
+                high_rows: high,
+            },
+        );
+        cache.enforce_table_budget(&blocks, no_band(), budget);
+        assert!(
+            !cache.get(1).degraded,
+            "band high={high} degraded the giant"
+        );
+        assert_eq!(
+            cache.get(1).estimated_table_bytes(),
+            giant_bytes,
+            "giant tables intact"
+        );
+    }
+}
+
+/// F1 memo truth table: once the walk exhausts (flag armed), a newly
+/// eligible candidate must still be degraded — the rebuild arm's flag clear
+/// is load-bearing, not a formality.
+#[test]
+fn memo_arms_but_new_candidate_still_degrades() {
+    let blocks: Vec<Block> = (1..=6).map(|i| block(i, 4 + i as usize)).collect();
+    let mut cache = fresh_synced(&blocks, 80);
+    install_giant(&mut cache, 1, 80);
+    // Block 2 degrades (oldest non-giant candidate), the rest sit in the
+    // newest-4 → the walk exhausts → the memo arms.
+    let giant_bytes = cache.get(1).estimated_table_bytes();
+    let budget = cache.table_bytes_total() - giant_bytes - 1;
+    cache.enforce_table_budget(&blocks, no_band(), budget);
+    assert!(cache.get(2).degraded);
+    assert!(
+        cache.no_degradable_candidates,
+        "id 1 giant + newest-4 + degraded rest = exhausted"
+    );
+
+    // Append block 7: its ensure_cached Both rebuild clears the memo, AND
+    // the append shifts the newest-4 window so block 3 becomes a candidate.
+    let mut grown = blocks.clone();
+    grown.push(block(7, 4));
+    cache.sync_blocks(&grown, 80, no_band());
+    assert!(
+        !cache.no_degradable_candidates,
+        "the new block's rebuild clears the memo"
+    );
+    cache.enforce_table_budget(&grown, no_band(), budget);
+    assert!(
+        cache.get(3).degraded,
+        "the newly eligible candidate degrades despite the armed memo"
+    );
+    assert!(!cache.get(1).degraded, "the giant is still exempt");
+}

@@ -46,6 +46,24 @@ const AX_REBUILD_WARN: std::time::Duration = std::time::Duration::from_millis(50
 
 impl App {
     pub(super) fn update_accessibility_tree(&mut self) {
+        // WP2 F2 (PLAN_v1181_WP2 §5-F2): defer the whole rebuild while the
+        // self-zoom window is open and younger than ZOOM_AX_DEFER_MAX — the
+        // animation changes cols every step and each AX rebuild pays a full
+        // layout pass (T4 evidence: a 690ms segment when a giant block
+        // materializes). The guard sits BEFORE the key collect: nothing is
+        // read, nothing is recorded. Skipped changes ride the existing
+        // "throttled change stays pending" semantics (the AccessibilityKey
+        // is recorded only on actual builds), so the window closing on any
+        // later frame rebuilds the tree automatically. The 2s cap is the
+        // lifecycle guard for an anomalously long-open window (appendix
+        // C.4's restored-session suspicion): past it the rebuild force-
+        // releases so the AX tree can never freeze.
+        if crate::paint::zoom_render::ax_rebuild_deferred(
+            crate::paint::zoom_render::self_zoom_window(),
+            crate::paint::zoom_render::self_zoom_window_open_for(),
+        ) {
+            return;
+        }
         // v1.14.2 (A4/PLAN §2): gate before the expensive snapshot + ObjC
         // bridge sync — the 50ms rebuild throttle caps drag/output-storm
         // rebuilds at ≤20Hz (the cap also bounds anything the fingerprint

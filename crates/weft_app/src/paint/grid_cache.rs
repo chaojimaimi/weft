@@ -43,23 +43,21 @@ const BUDGET_EXEMPT_NEWEST_BLOCKS: usize = 4;
 /// logs without a bench harness.
 const SLOW_REBUILD_WARN: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// WP2: the giant-block table threshold, defined WITH the P5 probe so the
-/// probe's giant-share arithmetic and the coming degradation exemption
-/// (F1, commit 2 — PLAN_v1181_WP2 §5-F1 reuses this constant) share one
-/// number. 32MiB of tables ≈ 4M graphemes ≈ multi-MB of output — a Both
-/// rebuild there is 50-150ms+, so a degrade-rebuild round trip is never
-/// worth it. F1's exempt population: high-cap configs plus legacy restored
-/// blocks (the default `output_cap_mib = 1` caps new blocks at ~8MiB of
-/// tables, below this threshold).
+/// WP2 F1 (PLAN_v1181_WP2 §5-F1): the giant-block table threshold, defined
+/// WITH the P5 probe (commit 1) so its giant-share arithmetic and this
+/// exemption share one number. 32MiB of tables ≈ 4M graphemes ≈ multi-MB of
+/// output — a Both rebuild there is 50-150ms+, so a degrade-rebuild round
+/// trip is never worth it. Exempt population: high-cap configs + legacy
+/// restored blocks (default `output_cap_mib = 1` caps new blocks at ~8MiB
+/// of tables, below this threshold).
 pub(crate) const GIANT_TABLE_EXEMPT_BYTES: usize = 32 * 1024 * 1024;
 
-/// WP2 A1 P5 (`exempt tables`) throttle: the cache-bytes overview logs at
-/// most once per 10s (it sits on the over-budget frame path).
+/// WP2 A1 P5 (`exempt tables`) throttle: the overview logs at most once per
+/// 10s (it sits on the over-budget frame path).
 const EXEMPT_TABLES_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// WP2 A1 P5: last `exempt tables` emission. The cache lives on the render
-/// thread, so the mutex is uncontended in steady state (one lock + compare
-/// per over-budget frame).
+/// thread, so the mutex is uncontended in steady state.
 static EXEMPT_TABLES_LAST_LOG: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
@@ -218,6 +216,12 @@ pub(crate) struct BlockLayoutCache {
     /// membership in the pending set, a cols-fresh degraded entry would
     /// report a Hit forever and the render would read empty tables.
     degraded_ids: Vec<u64>,
+    /// WP2 F1 steady-state memo (see `enforce_table_budget`): true when the
+    /// last over-budget walk found nothing degradable under ANY band — every
+    /// entry degraded, giant, or newest-4. Cleared by `ensure_cached`'s
+    /// rebuild arms (the only ways the candidate pool can change) — not by
+    /// the band, which the verdict accounts for via latent candidates.
+    no_degradable_candidates: bool,
 }
 
 impl BlockLayoutCache {
@@ -341,6 +345,9 @@ impl BlockLayoutCache {
                 self.misses += 1;
                 self.misses_total = self.misses_total.wrapping_add(1);
                 self.prefix_sum_dirty = true;
+                // F1 memo: a rebuild can shift the candidate pool (table
+                // resize may cross the giant threshold) — clear, always safe.
+                self.no_degradable_candidates = false;
                 // Take the old entry out so the L1 table MOVES into the new
                 // entry (no clone of the per-cluster tables). Pending-set
                 // membership is NOT touched here — M6-b semantics: the
@@ -372,6 +379,9 @@ impl BlockLayoutCache {
                 self.misses += 1;
                 self.misses_total = self.misses_total.wrapping_add(1);
                 self.prefix_sum_dirty = true;
+                // F1 memo: a Both rebuild inserts a fresh entry (new block)
+                // or un-degrades a degraded one — the pool changed, re-walk.
+                self.no_degradable_candidates = false;
                 let prev_bytes = self
                     .entries
                     .get(&id)
@@ -559,16 +569,45 @@ impl BlockLayoutCache {
     /// OLDEST eligible blocks first (single oldest-first walk — each round
     /// continues from the oldest not-yet-degraded block) to metrics-only
     /// entries. Exempt: blocks intersecting `band` (they are rendered this
-    /// frame) and the newest [`BUDGET_EXEMPT_NEWEST_BLOCKS`] blocks (live
-    /// neighborhood). When every remaining block is exempt the total may
-    /// legitimately stay over budget (e.g. one giant block larger than the
-    /// budget itself) — the walk simply runs out of candidates and the next
-    /// frame's early return is skipped until something degradable appears.
+    /// frame), the newest [`BUDGET_EXEMPT_NEWEST_BLOCKS`] blocks (live
+    /// neighborhood), and — WP2 F1 (PLAN_v1181_WP2 §5-F1) — GIANT blocks
+    /// (tables > [`GIANT_TABLE_EXEMPT_BYTES`]).
+    ///
+    /// F1 WHY: one degrade→rebuild round trip on a giant stalls the main
+    /// thread 100ms-to-seconds (Phase A baseline: a 301MB-table giant paid a
+    /// 300ms+ Both rebuild per round, looping) — far beyond the memory the
+    /// degradation reclaims, and permanent over-budget is already documented
+    /// legal here ("one giant block larger than the budget itself"). The
+    /// budget keeps governing the NON-giant population; the exempt population
+    /// is high-cap configs + legacy restored blocks (default `output_cap_mib
+    /// = 1` caps new blocks at ~8MiB of tables, below the threshold). WP1.5
+    /// (read-only): giants no longer enter `degraded_ids`, so
+    /// `pending_ids_empty()` is reached EARLIER and then every entry is
+    /// cols-fresh — the re-clamp consumers only get more precise.
+    ///
+    /// Steady-state memo (review P3): with a giant resident the cache stays
+    /// permanently over budget, so every sync would pay the O(n) interval
+    /// walk + band_exempt alloc. Once a walk ends with NOTHING degradable
+    /// under ANY band (all entries degraded/giant/newest-4), the
+    /// `no_degradable_candidates` memo short-circuits later frames;
+    /// `ensure_cached`'s rebuild arms clear it when the candidate population
+    /// can change. Band changes cannot invalidate it: band-exempt entries
+    /// still eligible elsewhere count as latent candidates (memo stays off).
     /// `budget` is a parameter so tests can pin the behavior with tiny
     /// values; production passes [`LAYOUT_TABLE_BUDGET_BYTES`].
     fn enforce_table_budget(&mut self, blocks: &[Block], band: BandSync, budget: usize) {
         // Per-frame budget check: zero cost while under budget.
         if self.table_bytes_total <= budget {
+            return;
+        }
+        // WP2 A1 P5 (`exempt tables`): the cache table-byte overview — F1's
+        // memory data plane (total + >GIANT_TABLE_EXEMPT_BYTES giant share;
+        // post-F1 the permanent-over-budget regime is what it reports). MUST
+        // precede the memo short-circuit — otherwise the memo silences the
+        // overview in exactly the regime it exists to report. 10s throttle.
+        self.log_exempt_tables_overview();
+        // F1 steady-state memo: nothing degradable remains under any band.
+        if self.no_degradable_candidates {
             return;
         }
         // Band-intersection exemptions, from the same interval walk the band
@@ -581,42 +620,52 @@ impl BlockLayoutCache {
             }
         });
         let first_exempt_index = blocks.len().saturating_sub(BUDGET_EXEMPT_NEWEST_BLOCKS);
+        // Band-exempt entries that are neither degraded nor giant: not
+        // degradable THIS frame, but candidates under a different band —
+        // their presence keeps the memo off. `exhausted` goes false when
+        // the budget was met mid-walk (candidates may remain).
+        let mut latent_candidates = 0usize;
+        let mut exhausted = true;
         for (index, block) in blocks.iter().enumerate() {
             if self.table_bytes_total <= budget {
+                exhausted = false;
                 break;
             }
-            if index >= first_exempt_index || band_exempt.contains(&block.id.0) {
+            // Newest-4 exemption first: it holds under every band, so those
+            // entries never enter the candidate pool (no lookup needed).
+            if index >= first_exempt_index {
                 continue;
             }
-            // WP2 A1 P3 (`budget degrade`): one warn per ACTUAL degradation,
-            // carrying the dropped table size — the T1 loop observation
-            // point and F1's before/after counter (post-F1 giants must never
-            // appear here; PLAN_v1181_WP2 §4-A1). The size is read before
-            // the call because degradation empties the tables.
-            let dropped_bytes = self
-                .entries
-                .get(&block.id.0)
-                .map(|c| c.estimated_table_bytes())
-                .unwrap_or(0);
-            if self.degrade_entry(block.id.0) {
-                tracing::warn!(
-                    id = block.id.0,
-                    table_bytes = dropped_bytes,
-                    "budget degrade"
-                );
+            let id = block.id.0;
+            let (is_giant, is_degraded, table_bytes) = match self.entries.get(&id) {
+                Some(entry) => {
+                    let bytes = entry.estimated_table_bytes();
+                    (bytes > GIANT_TABLE_EXEMPT_BYTES, entry.degraded, bytes)
+                }
+                None => (false, false, 0),
+            };
+            if band_exempt.contains(&id) {
+                if !is_giant && !is_degraded {
+                    latent_candidates += 1;
+                }
+                continue;
+            }
+            // F1: giants are never degraded (see the fn doc for WHY).
+            if is_giant {
+                continue;
+            }
+            // WP2 A1 P3 (`budget degrade`): one warn per ACTUAL degradation
+            // carrying the dropped table size — the T1 observation point and
+            // F1's before/after counter (post-F1 giants must never appear
+            // here; PLAN_v1181_WP2 §4-A1).
+            if self.degrade_entry(id) {
+                tracing::warn!(id, table_bytes, "budget degrade");
             }
         }
-        // WP2 A1 P5 (`exempt tables`): the cache table-byte overview — F1's
-        // memory data plane. Pre-F1 the exempt SET doesn't exist yet, so the
-        // equivalent face (main-agent ruling, plan §4-A1) is the total plus
-        // the >GIANT_TABLE_EXEMPT_BYTES giant share. Fires only on
-        // over-budget frames (the early return above keeps steady state at
-        // zero cost), throttled to one line per 10s.
-        self.log_exempt_tables_overview();
+        self.no_degradable_candidates = exhausted && latent_candidates == 0;
     }
 
-    /// WP2 A1 P5: the throttled `exempt tables` info line (see the
-    /// `enforce_table_budget` tail).
+    /// WP2 A1 P5: the throttled `exempt tables` line (before the F1 memo skip).
     fn log_exempt_tables_overview(&self) {
         let mut last = EXEMPT_TABLES_LAST_LOG
             .lock()

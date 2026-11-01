@@ -472,3 +472,114 @@ fn zoom_step_wait_global_round_trip() {
     set_zoom_step_wait(None);
     assert_eq!(zoom_step_wait(), None, "the reset must stick");
 }
+
+// ── WP2 F2 (PLAN_v1181_WP2 §5-F2): the AX rebuild defer ─────────────────
+
+/// Pure kernel truth table: the defer fires only for an OPEN window younger
+/// than ZOOM_AX_DEFER_MAX. `None` open-for with the flag up is a
+/// construction-impossible state; the kernel's false there is documented
+/// (the accessor returns Some whenever the flag is up — see the fn doc).
+#[test]
+fn ax_rebuild_deferred_truth_table() {
+    let under = Some(Duration::from_millis(
+        ZOOM_AX_DEFER_MAX.as_millis() as u64 - 1,
+    ));
+    let at = Some(ZOOM_AX_DEFER_MAX);
+    let over = Some(ZOOM_AX_DEFER_MAX + Duration::from_secs(5));
+    // Window closed: never defer (the whole point of the cap's release side).
+    assert!(!ax_rebuild_deferred(false, None));
+    assert!(!ax_rebuild_deferred(false, under));
+    assert!(!ax_rebuild_deferred(false, over));
+    // Window open, young: defer. At the cap: release. Past it: release.
+    assert!(ax_rebuild_deferred(true, Some(Duration::ZERO)));
+    assert!(ax_rebuild_deferred(true, under));
+    assert!(!ax_rebuild_deferred(true, at), "the cap is exclusive (<)");
+    assert!(!ax_rebuild_deferred(true, over));
+    // Defensive shape: open flag without a stamp (impossible by
+    // construction) must NOT defer — the release side wins.
+    assert!(!ax_rebuild_deferred(true, None));
+}
+
+/// The open-timestamp lifecycle (F2 ④): written on the false→true
+/// transition only (a re-arm while open must NOT refresh it — both the anim
+/// arm and the resize arm can fire while the window is already open), and
+/// cleared on close. GLOBAL_ZOOM_STATE_LOCK is MANDATORY (process-global
+/// flag shared with the macos_zoom anim tests).
+#[test]
+fn self_zoom_window_open_timestamp_lifecycle() {
+    let _guard = super::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Clean slate.
+    set_self_zoom_window(false);
+    assert_eq!(self_zoom_window_open_for(), None, "closed = None");
+    assert_eq!(super::SELF_ZOOM_WINDOW_OPENED_AT.load(Ordering::Acquire), 0);
+
+    set_self_zoom_window(true);
+    let stamp = super::SELF_ZOOM_WINDOW_OPENED_AT.load(Ordering::Acquire);
+    assert_ne!(stamp, 0, "the transition writes the stamp");
+    let open_for = self_zoom_window_open_for().expect("open = Some");
+    assert!(open_for < ZOOM_AX_DEFER_MAX, "a fresh window is young");
+
+    // Re-arm while open: the stamp must NOT move (no wall-clock reading
+    // needed — an unwritten static returns the identical value).
+    set_self_zoom_window(true);
+    assert_eq!(
+        super::SELF_ZOOM_WINDOW_OPENED_AT.load(Ordering::Acquire),
+        stamp,
+        "re-arm must not refresh the open timestamp"
+    );
+
+    set_self_zoom_window(false);
+    assert_eq!(self_zoom_window_open_for(), None);
+    assert_eq!(super::SELF_ZOOM_WINDOW_OPENED_AT.load(Ordering::Acquire), 0);
+}
+
+/// F2 ②③ via the live accessor: an open window defers while young and
+/// force-releases once its age passes the cap — the appendix C.4 guard
+/// against an anomalously long-open window freezing the AX tree. The stamp
+/// is backdated directly (no wall-clock precision dependency; the margins
+/// are seconds against a 2s cap).
+#[test]
+fn window_age_crossing_the_cap_releases_the_ax_guard() {
+    let _guard = super::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    set_self_zoom_window(false);
+    set_self_zoom_window(true);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("unix clock")
+        .as_millis() as u64;
+
+    // Freshly opened (stamp just written): defer.
+    assert!(ax_rebuild_deferred(
+        self_zoom_window(),
+        self_zoom_window_open_for()
+    ));
+
+    // Backdate past the cap: release.
+    super::SELF_ZOOM_WINDOW_OPENED_AT.store(
+        now.saturating_sub(ZOOM_AX_DEFER_MAX.as_millis() as u64 + 1_000),
+        Ordering::Release,
+    );
+    assert!(!ax_rebuild_deferred(
+        self_zoom_window(),
+        self_zoom_window_open_for()
+    ));
+
+    // Backdate inside the cap: defer again.
+    super::SELF_ZOOM_WINDOW_OPENED_AT.store(now.saturating_sub(100), Ordering::Release);
+    assert!(ax_rebuild_deferred(
+        self_zoom_window(),
+        self_zoom_window_open_for()
+    ));
+
+    set_self_zoom_window(false);
+    assert!(!ax_rebuild_deferred(
+        self_zoom_window(),
+        self_zoom_window_open_for()
+    ));
+}

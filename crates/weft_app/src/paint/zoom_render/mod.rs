@@ -30,12 +30,12 @@
 //! *usage* stays main-thread-exclusive by construction (same discipline as
 //! the rest of the renderer).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // (cache.rs owns the FRAME_CACHE Mutex now; this module's only Mutex use is
 // the test-only global-state lock below.)
 #[cfg(test)]
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use metal::{
     MTLClearColor, MTLLoadAction, MTLPrimitiveType, MTLResourceOptions, MTLScissorRect,
@@ -88,6 +88,13 @@ static PULL_LIVE_RESIZE_STAND_DOWN: AtomicBool = AtomicBool::new(false);
 /// ≤300 ms hot tail. Gates the C1 suppression and the C2 pull stand-down;
 /// `zoom_anim_active()` alone drops one step early (the F.0 defect).
 static SELF_ZOOM_WINDOW: AtomicBool = AtomicBool::new(false);
+/// WP2 F2 (PLAN_v1181_WP2 §5-F2): the instant the self-zoom window OPENED,
+/// as unix millis (0 = closed). The AX rebuild defer reads the window AGE
+/// off this stamp — its lifecycle guard needs the OPENED moment, not just
+/// the open flag, so an anomalously long-open window (appendix C.4's
+/// restored-session suspicion) force-releases the AX tree instead of
+/// freezing it.
+static SELF_ZOOM_WINDOW_OPENED_AT: AtomicU64 = AtomicU64::new(0);
 /// Registration is once-per-session; flipping this back on is `teardown`.
 static HANDLES_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Serializes process-global zoom-state tests across MODULE boundaries
@@ -114,12 +121,66 @@ fn pull_live_resize_stand_down() -> bool {
 /// Phase F window writers/readers (same shape as the PULL_ENABLED pair):
 /// opened by `start_zoom_anim` (macos_zoom), closed by `zoom_anim_cancel`
 /// and by the flush verdict (`zoom_window_finished`).
+///
+/// F2: the open timestamp is written ONLY on the false→true transition.
+/// `set_self_zoom_window(true)` has two call sites (the anim arm,
+/// macos_zoom/anim.rs start_zoom_anim, and the resize arm,
+/// window_event/resized.rs) and either may fire while the window is ALREADY
+/// open (re-arm / trailing resize dispatch) — a naive overwrite would push
+/// the stamp forward and stretch the AX defer window on every re-arm.
 pub(crate) fn set_self_zoom_window(active: bool) {
-    SELF_ZOOM_WINDOW.store(active, Ordering::Release);
+    if active {
+        if !SELF_ZOOM_WINDOW.swap(true, Ordering::AcqRel) {
+            SELF_ZOOM_WINDOW_OPENED_AT.store(now_unix_millis(), Ordering::Release);
+        }
+    } else {
+        SELF_ZOOM_WINDOW.store(false, Ordering::Release);
+        SELF_ZOOM_WINDOW_OPENED_AT.store(0, Ordering::Release);
+    }
 }
 
 pub(crate) fn self_zoom_window() -> bool {
     SELF_ZOOM_WINDOW.load(Ordering::Acquire)
+}
+
+/// WP2 F2: how long the self-zoom window has been open (`None` = closed).
+/// The flag/stamp pair is written together on the main thread, so a reader
+/// can only observe the stamp lagging the flag mid-update; an open flag
+/// with a zero stamp is defensively reported as just-opened (defer — the
+/// conservative side of the AX guard).
+pub(crate) fn self_zoom_window_open_for() -> Option<Duration> {
+    if !SELF_ZOOM_WINDOW.load(Ordering::Acquire) {
+        return None;
+    }
+    let opened_ms = SELF_ZOOM_WINDOW_OPENED_AT.load(Ordering::Acquire);
+    if opened_ms == 0 {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_millis(
+        now_unix_millis().saturating_sub(opened_ms),
+    ))
+}
+
+/// WP2 F2: the AX rebuild defer cap (plan §5-F2) — a zoom window younger
+/// than this defers accessibility rebuilds; an older one force-releases
+/// (appendix C.4: a window stuck open must not freeze the AX tree).
+pub(crate) const ZOOM_AX_DEFER_MAX: Duration = Duration::from_secs(2);
+
+/// WP2 F2 guard kernel (pure; truth-tabled): defer the accessibility
+/// rebuild while the self-zoom window is open AND younger than
+/// [`ZOOM_AX_DEFER_MAX`]. The caller feeds both globals so the decision
+/// table stays injectable. Skipped rebuilds are carried by the existing
+/// "throttled change stays pending" semantics of the 50ms AX throttle
+/// (accessibility.rs records the AccessibilityKey only on actual builds) —
+/// when the window closes, the next build picks the change up.
+pub(crate) fn ax_rebuild_deferred(window_open: bool, open_for: Option<Duration>) -> bool {
+    window_open && open_for.is_some_and(|open| open < ZOOM_AX_DEFER_MAX)
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// RAII re-entry guard (truth-table tested): the second `try_enter` while
