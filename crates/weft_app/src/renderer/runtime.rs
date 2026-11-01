@@ -84,6 +84,11 @@ impl MetalRenderer {
     /// while a `drawable` borrow is alive.
     pub fn force_full_grid_redraw(&self) {
         self.force_full_grid.set(true);
+        // v1.18.2 WP3 (PLAN_v1182 §4-A2): arm the frame-trace attribution
+        // latch — the first draw after this call reports
+        // `grid_force_full=true` in its frame line (G5 calibration:
+        // force-full vs incremental frame cost).
+        self.grid_force_full_pending.set(true);
         // v1.0 P1.5-B2: a forced redraw means instances WILL change — clear
         // the unchanged flag so draw() doesn't skip the instance draw call.
         self.instances_unchanged.set(false);

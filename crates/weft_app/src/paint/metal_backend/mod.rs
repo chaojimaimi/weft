@@ -87,6 +87,17 @@ fn offscreen_blit_size(viewport: (f32, f32), drawable: (f32, f32)) -> (u64, u64)
     )
 }
 
+/// v1.18.2 WP4 (PLAN_v1182 §4-A3): warn threshold for the serialized gesture
+/// present's `wait_until_completed` block. 8ms = half the 16.7ms frame
+/// budget — PLAN_v1182 §3's G2 judgment row (wait p95 < 8ms → keep the
+/// Phase E serial present; ≥ 8ms → escalate with a gpu_us upper-bound
+/// argument). Pure predicate so the threshold has a truth-table regression
+/// surface in `tests.rs` (the gate's `*/tests.rs` exemption) — a real
+/// drag gesture cannot be synthesized headless.
+pub(crate) fn present_wait_should_warn(wait_ms: u128) -> bool {
+    wait_ms >= 8
+}
+
 impl MetalRenderer {
     /// v1.0 P0-c: Ensure the offscreen texture exists and can hold the
     /// current viewport. Returns true if the texture is usable (false on the
@@ -281,8 +292,21 @@ impl MetalRenderer {
             if self.live_resize_active {
                 // Phase E (Warp parity): serialize the gesture present — the
                 // pool drains so next_drawable always vends the NEW size.
+                // v1.18.2 WP4 (PLAN_v1182 §4-A3): the wait is the gesture
+                // frame's real blocking cost — time it and warn past half a
+                // frame budget (RECONCILE_PROBE shape: Instant read +
+                // compare; runs only inside this gesture branch, zero
+                // steady-state cost). The clock starts AFTER commit() so the
+                // probe measures the pure wait_until_completed block — the
+                // §3 G2 criterion's input (rust-reviewer P2-1: commit's
+                // enqueue cost stays out of the wait figure).
                 command_buffer.commit();
+                let wait_started = std::time::Instant::now();
                 command_buffer.wait_until_completed();
+                let wait_ms = wait_started.elapsed().as_millis();
+                if present_wait_should_warn(wait_ms) {
+                    tracing::warn!(ms = wait_ms, "drag present wait");
+                }
                 drawable.present();
             } else {
                 command_buffer.present_drawable(drawable);
@@ -587,8 +611,17 @@ impl MetalRenderer {
         if self.live_resize_active {
             // Phase E (Warp parity): serialize the gesture present — the pool
             // drains so next_drawable always vends the NEW size.
+            // v1.18.2 WP4 (PLAN_v1182 §4-A3): gesture-frame wait probe —
+            // same RECONCILE_PROBE shape as the idle path branch above;
+            // clock starts AFTER commit() (pure wait口径, rust-reviewer
+            // P2-1, matching the idle path branch).
             command_buffer.commit();
+            let wait_started = std::time::Instant::now();
             command_buffer.wait_until_completed();
+            let wait_ms = wait_started.elapsed().as_millis();
+            if present_wait_should_warn(wait_ms) {
+                tracing::warn!(ms = wait_ms, "drag present wait");
+            }
             drawable.present();
         } else {
             command_buffer.present_drawable(drawable);

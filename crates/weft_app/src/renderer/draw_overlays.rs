@@ -250,6 +250,14 @@ impl crate::renderer::MetalRenderer {
         let grid_glyph_instances = glyph_stream.len() / 16;
         let grid_upload_bytes = (vertices.len() + bg_stream.len() + glyph_stream.len()) as u64 * 4;
         let grid_build_us = self.grid_build_us_counter.get();
+        // v1.18.2 WP3 (PLAN_v1182 §4-A2): one-shot read-and-clear — the
+        // FIRST draw after a force_full_grid_redraw() request carries
+        // `grid_force_full=true`; further draws read false until a new
+        // request arms the latch again (idempotent arming collapses
+        // several requests before one draw into a single `true` frame).
+        // If no draw happened since the last request, the bit survives to
+        // THIS draw — correct semantics: that draw is the rebuild frame.
+        let grid_force_full = self.grid_force_full_pending.replace(false);
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
@@ -275,6 +283,7 @@ impl crate::renderer::MetalRenderer {
                 grid_build_us,
                 layout_table_bytes,
                 deferred_blocks,
+                grid_force_full,
             });
         self.frame_trace.borrow_mut().encode_start();
 

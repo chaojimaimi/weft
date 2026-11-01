@@ -204,6 +204,15 @@ pub struct MetalRenderer {
     /// v1.4.2 Phase A: per-frame wall-clock μs for `build_grid_instances`,
     /// read at `build_end` for `FrameCounters.grid_build_us`.
     pub(crate) grid_build_us_counter: Cell<u64>,
+    /// v1.18.2 WP3 (PLAN_v1182 §4-A2): one-shot attribution latch for the
+    /// frame line's `grid_force_full` bit. Armed by EVERY
+    /// `force_full_grid_redraw()` call (the latch point is the fn body, so
+    /// all call sites are covered); read-and-cleared at the frame counters
+    /// assembly (draw_overlays.rs) so exactly the FIRST draw after a
+    /// request carries `grid_force_full=true`. Re-arming between draws is
+    /// idempotent (one `true` frame, not N); a request with no following
+    /// draw keeps the latch armed — the next draw IS the rebuild frame.
+    pub(crate) grid_force_full_pending: Cell<bool>,
     /// v1.4.1: bounded FIFO cache for completed-block styled-line vertices.
     pub(crate) styled_line_cache: RefCell<crate::paint::styled_line_cache::StyledLineCache>,
     /// Batch 6 Step 1: per-frame expanded block count from last layout pass.

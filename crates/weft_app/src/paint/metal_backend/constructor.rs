@@ -351,6 +351,11 @@ impl MetalRenderer {
             styled_lookup_counter: Cell::new(0),
             styled_paint_us_counter: Cell::new(0),
             grid_build_us_counter: Cell::new(0),
+            // v1.18.2 WP3 (PLAN_v1182 §4-A2): attribution latch starts
+            // unarmed — only force_full_grid_redraw() calls arm it, so the
+            // constructor's own initial force_full_grid=true (first-frame
+            // rebuild) stays attributed by the dims fingerprint instead.
+            grid_force_full_pending: Cell::new(false),
             styled_line_cache: RefCell::new(crate::paint::styled_line_cache::StyledLineCache::new()),
             last_expanded_block_count: Cell::new(0),
             block_view_tui_caret_area: Cell::new(None),

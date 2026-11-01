@@ -151,6 +151,16 @@ pub(crate) struct FrameCounters {
     /// M6-c: blocks currently deferred above the sync band (B-2). Grows with
     /// history size during a drag; the idle pump drains it after cols settle.
     pub(crate) deferred_blocks: usize,
+    /// v1.18.2 WP3 (PLAN_v1182 §4-A2): one-shot force-full attribution bit —
+    /// `true` when THIS draw is the first draw after a
+    /// `force_full_grid_redraw()` request. Lets the G5 calibration separate
+    /// force-full frames (TUI dirty-all at draw_phases.rs / per-Resized at
+    /// runtime.rs) from incremental frames in the `frame` line without
+    /// changing any existing field. Arming is idempotent: several requests
+    /// between two draws collapse to one `true` frame; a request followed by
+    /// no draw keeps the latch armed so the NEXT draw — the actual rebuild
+    /// frame — is the one attributed.
+    pub(crate) grid_force_full: bool,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -406,6 +416,7 @@ impl FrameTraceRecorder {
             grid_build_us = counters.grid_build_us,
             layout_table_bytes = counters.layout_table_bytes,
             deferred_blocks = counters.deferred_blocks,
+            grid_force_full = counters.grid_force_full,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
@@ -567,6 +578,8 @@ mod tests {
             // layout-table budget observability.
             layout_table_bytes: 983_041,
             deferred_blocks: 3,
+            // v1.18.2 WP3: attribution bit rides the same build_end path.
+            grid_force_full: true,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));
@@ -595,6 +608,9 @@ mod tests {
         // they feed the frame trace's `layout_table_bytes` / `deferred_blocks`.
         assert_eq!(r.counters.layout_table_bytes, 983_041);
         assert_eq!(r.counters.deferred_blocks, 3);
+        // v1.18.2 WP3: the attribution bit must survive build_end too — it
+        // feeds the frame line's `grid_force_full` field.
+        assert!(r.counters.grid_force_full);
         assert_eq!(r.frame_id, 42);
         let (_, rx) = mpsc::channel();
         r.finish(&rx);
@@ -702,5 +718,23 @@ mod tests {
         ] {
             assert!(!env_flag_enabled(value));
         }
+    }
+
+    // ── v1.18.2 WP3 (PLAN_v1182 §4-A2): grid_force_full attribution bit ──
+    // The latch itself lives on the renderer (Cell<bool>, armed by
+    // force_full_grid_redraw, read-and-cleared at the draw_overlays
+    // counters assembly); the renderer-side truth table runs in
+    // paint/metal_backend/tests.rs (headless renderer). Here: the
+    // recorder-level default — a default-constructed FrameCounters (the
+    // value a build_end caller passes when no force-full request was
+    // armed) must read false so unattributed frames never emit
+    // grid_force_full=true.
+
+    #[test]
+    fn default_counters_report_grid_force_full_false() {
+        // 未置位帧恒 false: every counter construction path that does not
+        // arm the latch (FrameCounters::default — bench.rs / disabled
+        // recorder) produces the false bit.
+        assert!(!FrameCounters::default().grid_force_full);
     }
 }
