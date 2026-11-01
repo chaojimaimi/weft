@@ -220,6 +220,155 @@ if [ "${WEFT_PERF_SLACK:-1.0}" = "1.0" ]; then
     fi
     printf 'PERF_GATE PASS: cjk_50k median=%sms <= budget %sms\n' \
         "$CJK_MEDIAN_MS" "$CJK_50K_BUDGET_MS" | tee -a "$PERF_LOG"
+
+    # ── WP1 D6 zoom rig segment (PLAN_v1180_WP1_ZOOM_ROOT §2-D6 + WP1.5 §7-5) ──
+    # MUST be run from Terminal.app, never inside Weft (nested-instance
+    # discipline). Scope limitation (WP1.5 R1 review P3, explicit): the
+    # criteria below run on a FRESH config (no session restore), where
+    # documents are tiny and the G4 block reconcile is structurally cheap —
+    # this segment pins the WP1 frame-supply mechanics (steps band +
+    # per-frame draw_ms + drawable waits) but is BLIND to a G4 reconcile
+    # regression; the restored-session protection is the manual rig
+    # (acceptance 1/3) plus the F4 sequence tests.
+    echo "==> Performance gate: zoom self-zoom rig (WP1 D6, steps in [10,15], draw_ms < 33)"
+
+    if [ ! -x target/release/weft ]; then
+        echo "zoom rig: target/release/weft missing (build release first)" >&2
+        exit 1
+    fi
+
+    zoom_rig_round() {
+        # Run one rig session and emit the log slice to stdout. The offset
+        # is taken BEFORE the launch (a concurrently running dev instance
+        # may append to the same log); if the log rotated mid-run (file
+        # smaller than the offset), fall back to parsing the whole current
+        # file instead of reporting a false red.
+        local offset size zoom_tmp
+        if [ -f "${HOME}/Library/Logs/Weft/weft.log" ]; then
+            offset="$(wc -c < "${HOME}/Library/Logs/Weft/weft.log" | tr -d ' ')"
+        else
+            offset=0
+        fi
+        zoom_tmp="$(mktemp -d "${TMPDIR:-/tmp}/weft-zoom-rig.XXXXXX")"
+        # WEFT_ALLOW_SECOND_INSTANCE=1: the user's production Weft holds the
+        # single-instance flock (ds-worker finding, WP1.5); the documented
+        # dev/nested-test escape hatch lets the rig session start beside it.
+        XDG_CACHE_HOME="$zoom_tmp/cache" \
+            XDG_CONFIG_HOME="$zoom_tmp/config" \
+            WEFT_ALLOW_SECOND_INSTANCE=1 \
+            WEFT_SELF_ZOOM_TEST=1 \
+            RUST_LOG=info \
+            target/release/weft &
+        local rig_pid=$!
+        # 11s covers both rig fires (2s zoom-in + 6s zoom-out) plus the
+        # animation and convergence margins.
+        sleep 11
+        kill "$rig_pid" 2>/dev/null || true
+        wait "$rig_pid" 2>/dev/null || true
+        rm -rf "$zoom_tmp"
+        if [ -f "${HOME}/Library/Logs/Weft/weft.log" ]; then
+            size="$(wc -c < "${HOME}/Library/Logs/Weft/weft.log" | tr -d ' ')"
+            if [ "$size" -ge "$offset" ]; then
+                tail -c "+$((offset + 1))" "${HOME}/Library/Logs/Weft/weft.log"
+            else
+                cat "${HOME}/Library/Logs/Weft/weft.log"
+            fi
+        fi
+    }
+
+    zoom_rig_verdict() {
+        # Criteria (WP1 §2-D6): >= 2 `self-zoom complete steps=N` lines
+        # (both rig directions) with every N in [10,15] (upper bound 14 is
+        # structurally capped by the pacing floor; the tripwire is the lower
+        # bound 10 = late wakes merging steps); every `zoom frame draw`
+        # draw_ms < 33; zero `zoom frame draw slow`; zero `next drawable
+        # wait`. Emits a PASS/FAIL verdict line; exits nonzero on FAIL.
+        awk '
+            /self-zoom complete steps=/ {
+                n = $0
+                sub(/.*steps=/, "", n)
+                sub(/[^0-9].*$/, "", n)
+                completes++
+                if (n + 0 < 10 || n + 0 > 15) {
+                    bad_steps++
+                    printf("zoom-rig: out-of-band steps=%s\n", n)
+                } else {
+                    printf("zoom-rig: self-zoom complete steps=%s\n", n)
+                }
+            }
+            /zoom frame draw draw_ms=/ {
+                ms = $0
+                sub(/.*draw_ms=/, "", ms)
+                sub(/[^0-9].*$/, "", ms)
+                draws++
+                if (ms + 0 >= 33) slow_draw++
+                if (ms + 0 > max_draw) max_draw = ms + 0
+            }
+            /zoom frame draw slow/ { slow_warn++ }
+            /next drawable wait/ { wait_warn++ }
+            END {
+                summary = sprintf("zoom-rig: completes=%d draws=%d max_draw_ms=%d slow_draws=%d slow_warn=%d wait_warn=%d", completes + 0, draws + 0, max_draw + 0, slow_draw + 0, slow_warn + 0, wait_warn + 0)
+                print summary
+                if (completes < 2) {
+                    print "zoom-rig: FAIL fewer than 2 self-zoom complete lines"
+                    exit 1
+                }
+                if (bad_steps > 0) {
+                    print "zoom-rig: FAIL steps outside [10,15]"
+                    exit 1
+                }
+                if (slow_draw > 0) {
+                    print "zoom-rig: FAIL draw_ms >= 33 present"
+                    exit 1
+                }
+                if (slow_warn > 0) {
+                    print "zoom-rig: FAIL zoom frame draw slow present"
+                    exit 1
+                }
+                if (wait_warn > 0) {
+                    print "zoom-rig: FAIL next drawable wait present"
+                    exit 1
+                }
+                print "zoom-rig: PASS"
+            }
+        ' "$1"
+    }
+
+    zoom_rig_attempt() {
+        # One round: run the rig, slice the log, verify. The verdict and the
+        # raw slice land in PERF_LOG either way (evidence for triage); the
+        # function's exit code carries the verdict (pipefail propagates the
+        # awk exit).
+        local slice rc
+        slice="$(mktemp "${TMPDIR:-/tmp}/weft-zoom-slice.XXXXXX")"
+        zoom_rig_round > "$slice"
+        if zoom_rig_verdict "$slice" | tee -a "$PERF_LOG"; then
+            rc=0
+        else
+            rc=1
+        fi
+        cat "$slice" >> "$PERF_LOG"
+        rm -f "$slice"
+        return "$rc"
+    }
+
+    if ! zoom_rig_attempt; then
+        # First red: exactly one noisy-neighbour retry (load perturbs the
+        # rig — the historical low-load samples reach 5 steps), with the
+        # load averages recorded for triage either way.
+        {
+            printf 'PERF_GATE RETRY: zoom rig red, retrying once\n'
+            printf 'context: %s\n' "$(uptime)"
+        } | tee -a "$PERF_LOG"
+        if ! zoom_rig_attempt; then
+            {
+                printf 'PERF_GATE FAIL: zoom rig criteria not met after retry\n'
+                printf 'context: %s\n' "$(uptime)"
+            } | tee -a "$PERF_LOG"
+            exit 1
+        fi
+    fi
+    printf 'PERF_GATE PASS: zoom rig criteria met\n' | tee -a "$PERF_LOG"
 fi
 
 python3 - "$PERF_LOG" "$REPORT_DIR/baseline.json" <<'PY'
