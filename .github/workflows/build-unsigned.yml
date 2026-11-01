@@ -36,7 +36,7 @@ permissions:
 jobs:
   build-macos-unsigned:
     name: Build macOS .app + .dmg (unsigned)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
