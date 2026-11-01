@@ -94,7 +94,7 @@ jobs:
       - name: Run release quality gates
         run: |
           cargo fmt --all -- --check
-          cargo test --workspace
+          cargo test --workspace -- --show-output
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           ./scripts/architecture_gate.sh
 

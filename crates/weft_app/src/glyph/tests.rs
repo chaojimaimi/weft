@@ -1180,11 +1180,24 @@ fn fact_pin_pingfang_lacks_hangul_sdgothic_covers_hangul_and_kana() {
     // cjk-first serves them without ever loading SDG. A regression here
     // means the kana range gate would start loading SDG for characters
     // PingFang already carries.
-    for ch in ['あ', 'ア', '・', '中'] {
-        assert!(
-            pingfang.glyph_for_char(ch).is_some(),
-            "fact pin: PingFang SC must have U+{:04X} on this system (kana territory served cjk-first, zero SDG cost)",
-            ch as u32
+    // v1.18.2 (2026-11-01): presence of kana in PingFang is NOT
+    // version-stable across macOS builds — the GitHub macos-15 runner
+    // (CI migration, brownout-forced after macos-14 retirement notice)
+    // loads PingFang SC yet answers None for U+3042, failing this pin
+    // while the hangul gap and SDG coverage pins above stay green. Kana
+    // falling through to the SDG rung keeps rendering correct (SDG kana
+    // coverage is pinned hard above), so this is an optimization
+    // observation, not a correctness fact — same soft treatment as the
+    // ExtB block below. The eprintln reports the exact coverage shape so
+    // runner/OS deltas stay visible instead of silently shifting fonts.
+    let missing_kana: Vec<char> = ['あ', 'ア', '・', '中']
+        .into_iter()
+        .filter(|ch| pingfang.glyph_for_char(*ch).is_none())
+        .collect();
+    if !missing_kana.is_empty() {
+        eprintln!(
+            "note: PingFang SC lacks {:?} on this macOS build — kana coverage is version-dependent; cjk-first falls through to the SDG rung (still pinned hard above)",
+            missing_kana
         );
     }
     // ExtB 覆盖版本相关(本机 AssetsV2 PingFang 有 𠮷;CI macos-14/Sonoma 的
