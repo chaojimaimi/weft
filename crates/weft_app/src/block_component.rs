@@ -270,6 +270,11 @@ pub(crate) fn block_match_visual_ranges(
     ranges
 }
 
+/// WP1.5 F1: the production callers (reconciled_terminal_block_scroll /
+/// reconciled_with_memo) now go through the cache-backed variant; this
+/// None-wrapper remains as the tests' uncached baseline (same shape as the
+/// `block_view_line_end_col` precedent below).
+#[cfg(test)]
 pub(crate) fn block_content_metrics(
     terminal: &Terminal,
     cols: usize,
@@ -290,6 +295,12 @@ pub(crate) fn block_content_metrics_with_cache(
 ) -> (usize, usize) {
     use weft_core::blocks::ShellPhase;
 
+    // WP1.5 acceptance-2 probe (PLAN_v1180_WP15_G4_RECONCILE_CACHE §3-2):
+    // the O(document) fallback is the regression this whole plan removes —
+    // a >10 ms scan here means the cache supply broke (uncached caller,
+    // try_borrow degradation). Grep tag RECONCILE_PROBE; steady-state cost
+    // is two Instant reads + one compare per call.
+    let metrics_started = std::time::Instant::now();
     let mut total = 0;
     let viewport_rows = terminal.grid().num_rows.max(1);
     for block in terminal.block_tracker().session_blocks() {
@@ -336,6 +347,14 @@ pub(crate) fn block_content_metrics_with_cache(
             total += 2; // command + separator
             total += usize::from(live.cwd.or(terminal.cwd()).is_some());
         }
+    }
+    let metrics_ms = metrics_started.elapsed().as_millis();
+    if metrics_ms > 10 {
+        tracing::warn!(
+            ms = metrics_ms,
+            fallbacks = cache.map_or(0, |c| c.metrics_fallback_rebuilds()),
+            "RECONCILE_PROBE block metrics slow"
+        );
     }
     (total, terminal.grid().num_rows.max(1))
 }
@@ -389,16 +408,28 @@ pub(crate) fn reconciled_block_scroll(
 }
 
 /// 几何变化(窗口/面板/字体/恢复窗口)后统一重算单 tab 的 detached transcript 滚动,防止各路径漂移。
+/// WP1.5 F1 (PLAN_v1180_WP15_G4_RECONCILE_CACHE): 对账接 `BlockLayoutCache` ——
+/// PRESENT 条目读 stale 标量(M6-b B-3 语义,cols-stale 容忍),zoom 步进/拖拽每 tick
+/// 的对账从 O(文档) 直算降为 O(块数) 标量读(sample 实证 45% 主线程卡在本站点)。
+/// `live_cache` 维持 None:对账读 session_blocks + in_flight,in_flight 有 live.version
+/// 键控的独立语义,不引入。`None` 回退旧直算(无缓存访问权的调用方/测试)。
 pub(crate) fn reconciled_terminal_block_scroll(
     terminal: &Terminal,
     layout_ctx: &crate::layout::LayoutCtx,
     header_rows: usize,
     current: usize,
+    cache: Option<&crate::paint::grid_cache::BlockLayoutCache>,
 ) -> Option<(usize, usize, usize)> {
     if !terminal.show_block_view() {
         return None;
     }
-    let (total, _) = block_content_metrics(terminal, terminal.grid().num_cols, header_rows);
+    let (total, _) = block_content_metrics_with_cache(
+        terminal,
+        terminal.grid().num_cols,
+        header_rows,
+        cache,
+        None,
+    );
     let cwd_header = crate::layout::block_cwd_header_active(
         terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
         terminal.cwd().is_some(),

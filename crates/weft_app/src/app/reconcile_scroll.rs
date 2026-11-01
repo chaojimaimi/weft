@@ -2,16 +2,21 @@
 //! `reconciled_terminal_block_scroll` for the recompute-layout call site.
 //!
 //! `geometry_controller::recompute_layout` reconciles every tab's detached
-//! block-scroll on EVERY recompute, and the reconcile pays a full UNCACHED
-//! `block_content_metrics` O(blocks) scan (`block_component.rs:401 → :273`)
-//! each time. The memo makes a same-key repeat O(1). The key MIRRORS the
-//! renderer-side `BlockScrollMetricsKey` (`paint/live_cache.rs`) field for
-//! field, minus exactly two documented exclusions (plan §T2-2 — 禁止子集):
+//! block-scroll on EVERY recompute. The memo makes a same-key repeat O(1).
+//! The key MIRRORS the renderer-side `BlockScrollMetricsKey`
+//! (`paint/live_cache.rs`) field for field, with one structural exclusion
+//! and one substitution:
 //!
 //! - `pane_session_id` — the memo lives ON the Pane, structurally per-pane;
-//! - `cache_rebuilds` — the memo's value comes from the UNCACHED direct
-//!   computation (`block_content_metrics`), so the layout-cache miss count
-//!   cannot change it.
+//! - `cache_rebuilds` → **`cache_epoch`** — v1.18.0 WP1.5 F2 unfroze plan
+//!   §T2-2 (see geometry_controller.rs): the compute closure now reads the
+//!   layout cache through `block_content_metrics_with_cache` (stale
+//!   scalars), so the layout-cache rebuild count CAN change the value. The
+//!   key carries it as `cache_epoch` = `BlockLayoutCache::total_misses()`:
+//!   entries rebuilding after the final cols bump the fingerprint, so a
+//!   memoized stale total cannot survive past the rebuild (the
+//!   `cache_rebuilds` exclusion's original rationale — "the UNCACHED
+//!   computation cannot see it" — no longer holds).
 //!
 //! Dropping any REMAINING field reintroduces two real stale bugs (the R1
 //! review's findings): a pure height resize (`num_rows`) would keep a stale
@@ -38,6 +43,12 @@ pub(crate) struct ReconcileMemoKey {
     /// Whether the live block shows a cwd line — the
     /// `+usize::from(live.cwd.or(terminal.cwd()).is_some())` total term.
     pub(crate) cwd_present: bool,
+    /// WP1.5 F2: the `BlockLayoutCache` fingerprint the metrics were
+    /// computed against (= `total_misses()`, 0 when no cache was available).
+    /// An entry rebuild (WidthOnly or Both) bumps the count, so a same-geometry
+    /// key computed from pre-rebuild stale scalars can never hit again —
+    /// the memo cannot fixate a stale total past the final-cols rebuild.
+    pub(crate) cache_epoch: u64,
 }
 
 /// Pane-held memo state: the last key + the metrics it produced. A matching
@@ -47,11 +58,13 @@ pub(crate) type ReconcileMemo = Option<(ReconcileMemoKey, (usize, usize))>;
 
 /// Build the key from exactly the inputs the reconcile metrics read —
 /// mirrors `renderer/runtime.rs block_scroll_metrics` key assembly line for
-/// line (minus the two excluded fields).
+/// line (minus the excluded fields, plus the WP1.5 `cache_epoch`
+/// fingerprint the caller reads off its borrowed cache).
 pub(crate) fn reconcile_key(
     terminal: &Terminal,
     layout_ctx: &LayoutCtx,
     header_rows: usize,
+    cache_epoch: u64,
 ) -> ReconcileMemoKey {
     let cols = terminal.grid().num_cols;
     let prompt_lines = crate::block_component::block_prompt_lines(terminal);
@@ -76,12 +89,14 @@ pub(crate) fn reconcile_key(
         header_rows: header_rows as u32,
         visible: visible as u32,
         cwd_present,
+        cache_epoch,
     }
 }
 
 /// Same-key hit reuses the stored `(total, visible)`; a miss runs `compute`
-/// (the UNCACHED total — the expensive part) once and stores. Split key from
-/// compute so tests can count invocations (成本计数器断言).
+/// (the metrics total — the expensive part; cache-backed since WP1.5 F2)
+/// once and stores. Split key from compute so tests can count invocations
+/// (成本计数器断言).
 pub(crate) fn memoized_metrics(
     memo: &mut ReconcileMemo,
     key: ReconcileMemoKey,
@@ -115,16 +130,23 @@ pub(crate) fn reconciled_with_memo(
     layout_ctx: &LayoutCtx,
     header_rows: usize,
     current: usize,
+    cache: Option<&crate::paint::grid_cache::BlockLayoutCache>,
 ) -> Option<(usize, usize, usize)> {
     if !terminal.show_block_view() {
         return None;
     }
-    let key = reconcile_key(terminal, layout_ctx, header_rows);
+    // WP1.5 F2: the cache fingerprint rides the key — a rebuild between two
+    // same-geometry calls forces a recompute instead of returning the
+    // pre-rebuild stale total forever.
+    let cache_epoch = cache.map_or(0, |c| c.total_misses());
+    let key = reconcile_key(terminal, layout_ctx, header_rows, cache_epoch);
     let (total, visible) = memoized_metrics(memo, key, || {
-        crate::block_component::block_content_metrics(
+        crate::block_component::block_content_metrics_with_cache(
             terminal,
             terminal.grid().num_cols,
             header_rows,
+            cache,
+            None,
         )
         .0
     });
@@ -135,193 +157,76 @@ pub(crate) fn reconciled_with_memo(
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{memoized_metrics, reconcile_key, reconciled_with_memo, ReconcileMemo};
-    use crate::layout::LayoutCtx;
+/// WP1.5 F3: what the epoch-driven re-clamp consumer does this pass (pure
+/// decision, truth-table tested). Inputs: the pending flag armed by the two
+/// reconcile sites, whether the cache epoch advanced past the last re-clamp
+/// (an entry rebuild can shift the stale scalars the clamps read), whether
+/// the cache is quiescent (`deferred_ids ∪ degraded_ids` empty — every
+/// entry cols-fresh, so stale scalar reads ARE the exact values), and —
+/// P1-1 (rust-reviewer) — whether at least one re-clamp has completed since
+/// the arm (`reclamped_since_arm`). The no-Resized families (font/settings/
+/// scale changes) arm during the event, BEFORE any draw has rebuilt the
+/// cache, so the very next `about_to_wait` pass can see epoch-stable AND
+/// (spuriously) quiescent; a Clear arm there killed the flag before the
+/// first re-clamp ever ran and left the terminal state at the stale clamp.
+///
+/// - !pending → Skip.
+/// - pending && !reclamped → Reclamp: the FIRST pass after an arm
+///   unconditionally re-clamps once (idempotent min-clamp) and stays
+///   armed — this is the P1-1 window's fix.
+/// - pending && reclamped && epoch_advanced → Reclamp (stay armed; the
+///   convergence pump may still rebuild and bump the epoch again).
+/// - pending && reclamped && !epoch_advanced && quiescent → ReclampAndClear:
+///   the clamps ran at the current epoch and nothing is pending → final.
+/// - pending && reclamped && !epoch_advanced && !quiescent → Skip: wait for
+///   the pump's next rebuild (re-clamping would repeat the last pass).
+///
+/// Self-clear stays gated on quiescence because pure epoch stability can be
+/// punctured by the pump's frame gating (1-2 frames of fake stability), and
+/// clearing early would leave the terminal state with unreconverged offsets
+/// once the pump resumed (R3 review P2). Degraded-session shape (known,
+/// accepted): a resident degraded entry keeps quiescent false forever, so
+/// the flag never self-clears and the streaming Both rebuilds keep driving
+/// re-clamps — cost bounded (O(blocks) stale scalar reads per pass), the
+/// min-clamp idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockReclampAction {
+    /// Nothing owed (flag clear or nothing changed): do nothing.
+    Skip,
+    /// Re-clamp all tabs and keep the flag armed.
+    Reclamp,
+    /// Re-clamp all tabs at the verified-stable epoch, then clear the flag.
+    ReclampAndClear,
+}
 
-    fn ctx(height: f32) -> LayoutCtx {
-        LayoutCtx::new((800.0, height), 10.0, 20.0, 0.0, 0.0)
+#[must_use]
+pub(crate) fn block_reclamp_action(
+    pending: bool,
+    epoch_advanced: bool,
+    quiescent: bool,
+    reclamped_since_arm: bool,
+) -> BlockReclampAction {
+    if !pending {
+        return BlockReclampAction::Skip;
     }
-
-    /// A Terminal carrying one finished shell-integration block (the
-    /// grid_cache/tests.rs FTCS convention) — block view content for the
-    /// key/equivalence tests.
-    fn terminal_with_block() -> weft_core::vt::Terminal {
-        let mut terminal = weft_core::vt::Terminal::new(24, 80);
-        terminal.process(
-            b"\x1b]133;A\x07cargo test\x1b]133;B\x07\x1b]133;C\x07one\r\ntwo\r\nthree\r\n\x1b]133;D;0\x07",
-        );
-        terminal
+    if !reclamped_since_arm {
+        // P1-1: the first pass after an arm re-clamps regardless of how
+        // settled the cache looks — the settlement may be spurious (the
+        // rebuild has not happened yet).
+        return BlockReclampAction::Reclamp;
     }
-
-    fn key_of(
-        t: &weft_core::vt::Terminal,
-        layout: &LayoutCtx,
-        header_rows: usize,
-    ) -> super::ReconcileMemoKey {
-        reconcile_key(t, layout, header_rows)
-    }
-
-    /// 同键命中复用 (成本计数器断言): a second lookup with the same key must
-    /// NOT re-run the compute closure.
-    #[test]
-    fn same_key_hit_reuses_without_recompute() {
-        let key = key_of(&terminal_with_block(), &ctx(600.0), 2);
-        let mut calls = 0;
-        let mut memo: ReconcileMemo = None;
-        let first = memoized_metrics(&mut memo, key, || {
-            calls += 1;
-            42
-        });
-        let second = memoized_metrics(&mut memo, key, || {
-            calls += 1;
-            999
-        });
-        assert_eq!(calls, 1, "the second same-key lookup must reuse the memo");
-        assert_eq!(first, (42, key.visible as usize));
-        assert_eq!(second, first, "the reused value must equal the stored one");
-    }
-
-    /// 键矩阵 (R2 P2 指定七变体): every key field participates — mutating
-    /// each one must MISS (compute re-runs). Covers the four R1-漏 fields
-    /// (num_rows/visible/cwd_present/header_rows) plus blocks_len/
-    /// live_version/first/last/cols.
-    #[test]
-    fn key_matrix_every_field_participates() {
-        let terminal = terminal_with_block();
-        let layout = ctx(600.0);
-        let base = key_of(&terminal, &layout, 2);
-
-        let mut other_layout = ctx(600.0);
-        other_layout.viewport = (800.0, 900.0); // changes `visible`
-        let variants: Vec<(&str, super::ReconcileMemoKey)> = vec![
-            (
-                "cols",
-                super::ReconcileMemoKey {
-                    cols: base.cols + 1,
-                    ..base
-                },
-            ),
-            (
-                "num_rows",
-                super::ReconcileMemoKey {
-                    num_rows: base.num_rows + 1,
-                    ..base
-                },
-            ),
-            (
-                "live_version",
-                super::ReconcileMemoKey {
-                    live_version: Some(7),
-                    ..base
-                },
-            ),
-            (
-                "blocks_len",
-                super::ReconcileMemoKey {
-                    blocks_len: base.blocks_len + 1,
-                    ..base
-                },
-            ),
-            (
-                "first_block_id",
-                super::ReconcileMemoKey {
-                    first_block_id: Some(999),
-                    ..base
-                },
-            ),
-            (
-                "last_block_id",
-                super::ReconcileMemoKey {
-                    last_block_id: Some(999),
-                    ..base
-                },
-            ),
-            (
-                "header_rows",
-                super::ReconcileMemoKey {
-                    header_rows: base.header_rows + 1,
-                    ..base
-                },
-            ),
-            (
-                "visible",
-                super::ReconcileMemoKey {
-                    visible: base.visible + 1,
-                    ..base
-                },
-            ),
-            (
-                "cwd_present",
-                super::ReconcileMemoKey {
-                    cwd_present: !base.cwd_present,
-                    ..base
-                },
-            ),
-            // The derived-key cross-check: a taller layout really does move
-            // `visible` (the stale-钳制 scenario the R1 key missed).
-            (
-                "derived visible via layout height",
-                key_of(&terminal, &other_layout, 2),
-            ),
-        ];
-        for (name, key) in variants {
-            assert_ne!(key, base, "variant `{name}` must differ from the base key");
-            let mut memo: ReconcileMemo = Some((base, (10, 5)));
-            let mut calls = 0;
-            let (total, _) = memoized_metrics(&mut memo, key, || {
-                calls += 1;
-                77
-            });
-            assert_eq!(calls, 1, "variant `{name}` must invalidate the memo");
-            assert_eq!(total, 77);
-        }
-    }
-
-    /// 返回值与 UNCACHED 直算等价 (同输入双跑断言): the memoized twin returns
-    /// exactly what the direct `reconciled_terminal_block_scroll` returns —
-    /// on the first (compute) call AND on the second (memo-hit) call.
-    #[test]
-    fn memoized_result_equals_uncached_direct_run() {
-        let terminal = terminal_with_block();
-        let layout = ctx(600.0);
-        let direct =
-            crate::block_component::reconciled_terminal_block_scroll(&terminal, &layout, 2, 3);
-        assert!(
-            direct.is_some(),
-            "FTCS block terminal must show the block view"
-        );
-        let mut memo: ReconcileMemo = None;
-        let first = reconciled_with_memo(&mut memo, &terminal, &layout, 2, 3);
-        assert_eq!(
-            first, direct,
-            "compute call must equal the UNCACHED direct run"
-        );
-        let second = reconciled_with_memo(&mut memo, &terminal, &layout, 2, 3);
-        assert_eq!(
-            second, direct,
-            "memo-hit call must equal the UNCACHED direct run"
-        );
-        // A different scroll offset reconciles fresh (the clamp is not memoized):
-        let clamped = reconciled_with_memo(&mut memo, &terminal, &layout, 2, 1_000);
-        assert_eq!(
-            clamped.map(|(scroll, _, _)| scroll),
-            Some(0),
-            "an oversized offset clamps to the document top-minus-viewport"
-        );
-    }
-
-    /// 非块视图 (fresh terminal, no shell integration) → None, 同直算。
-    #[test]
-    fn non_block_view_returns_none_like_direct() {
-        let terminal = weft_core::vt::Terminal::new(24, 80);
-        let layout = ctx(600.0);
-        let mut memo: ReconcileMemo = None;
-        assert_eq!(
-            reconciled_with_memo(&mut memo, &terminal, &layout, 2, 0),
-            crate::block_component::reconciled_terminal_block_scroll(&terminal, &layout, 2, 0),
-        );
-        assert!(memo.is_none(), "a None result must not populate the memo");
+    match (epoch_advanced, quiescent) {
+        (true, _) => BlockReclampAction::Reclamp,
+        (false, true) => BlockReclampAction::ReclampAndClear,
+        (false, false) => BlockReclampAction::Skip,
     }
 }
+
+// WP1.5 review follow-up: the WP1.5 test family (F4-1..6 + the harness)
+// pushed this file past the 800-line hard ceiling, so the tests moved to
+// the exempted sibling module (block_component/tests.rs convention,
+// pty/tests.rs precedent) so inline test lines stay out of the
+// production-file budget.
+#[cfg(test)]
+#[path = "reconcile_scroll/tests.rs"]
+mod tests;

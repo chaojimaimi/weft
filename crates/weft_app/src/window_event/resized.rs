@@ -65,6 +65,26 @@ impl crate::App {
                 ];
                 let cell_w = base_layout.cell_width as f32;
                 let cell_h = base_layout.cell_height as f32;
+                // WP1.5 F1 (PLAN_v1180_WP15_G4_RECONCILE_CACHE): feed the
+                // block-layout cache to the per-tab reconcile below — a
+                // PRESENT entry reads stale scalars (M6-b B-3), so the
+                // per-step/tick cost drops from O(document) to O(blocks)
+                // (sample: 45% of the main thread sat in this site).
+                // Borrow shape (review P1-1): `renderer` above is a
+                // `&mut` binding held across this loop, so the RefCell
+                // borrow MUST come from that binding — `self.renderer
+                // .as_ref()` here would be E0502. WP1.5 R2: try_borrow,
+                // never panic — a live draw-side borrow degrades to the
+                // uncached direct path (correctness first), but the
+                // degradation MUST be audible: a silent fallback would
+                // resurrect the O(document) stall with no signal.
+                let block_cache = match renderer.block_layout_cache.try_borrow() {
+                    Ok(cache) => Some(cache),
+                    Err(_) => {
+                        tracing::warn!("block reconcile cache unavailable");
+                        None
+                    }
+                };
                 for (tab_index, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
                     if tab.has_terminal() {
                         tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
@@ -86,10 +106,26 @@ impl crate::App {
                                     &layout_ctx,
                                     header_rows,
                                     previous,
+                                    block_cache.as_deref(),
                                 )
                             })
                             .flatten();
                         if let Some((reconciled, total, visible)) = reconciliation {
+                            // WP1.5 F3: this site just clamped from
+                            // (possibly cols-stale) cache scalars — arm
+                            // the epoch-driven re-clamp consumer so the
+                            // scroll offset converges once the layout
+                            // cache finishes rebuilding at the final
+                            // cols. Drag ticks arm here too (there is no
+                            // zoom flush on the drag path — the arming is
+                            // what keeps the post-gesture terminal state
+                            // exact, the pre-WP1.5 uncached behavior).
+                            // P1-1: every arm resets the "re-clamped since
+                            // arm" dimension so the consumer's FIRST pass
+                            // re-clamps unconditionally (see
+                            // block_reclamp_action).
+                            self.window_runtime.block_reconcile_pending = true;
+                            self.window_runtime.block_reclamp_reclamped = false;
                             if previous != reconciled {
                                 info!(
                                     tab = tab_index,
@@ -104,6 +140,11 @@ impl crate::App {
                         }
                     }
                 }
+                // WP1.5 F1 (review P1-1 borrow delimitation): the cache Ref
+                // must die before the `&mut self` calls below
+                // (`clamp_tab_scroll` :129 and the second
+                // `(&mut self.renderer, …)` if-let :145).
+                drop(block_cache);
                 info!(
                     rows = base_layout.rows,
                     cols = base_layout.cols,

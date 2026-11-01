@@ -203,6 +203,47 @@ fn block_scroll_is_reconciled_when_a_larger_viewport_shrinks_the_range() {
     assert_eq!(reconciled_block_scroll(12, 20, 30), 0);
 }
 
+/// WP1.5 F4-1b (PLAN_v1180_WP15_G4_RECONCILE_CACHE review P2-1): the
+/// re-clamp and the scrollbar read ONE total source — the total the clamp
+/// returns equals `block_content_metrics_with_cache` for the same
+/// (terminal, cols, header, cache) inputs, fresh and stale-deferred alike.
+#[test]
+fn reconcile_clamp_total_matches_the_scrollbar_metrics_source() {
+    let mut terminal = Terminal::new(24, 80);
+    terminal.process(
+        b"\x1b]133;A\x07echo one with a long command line that wraps somewhere\x1b]133;B\x07\x1b]133;C\x07alpha beta gamma delta epsilon zeta eta theta iota kappa\r\nsecond line\r\n\x1b]133;D;0\x07",
+    );
+    let layout = crate::layout::LayoutCtx::new((1200.0, 900.0), 10.0, 20.0, 10.0, 10.0);
+    let cols = terminal.grid().num_cols;
+
+    // Fresh cache.
+    let mut cache = crate::paint::grid_cache::BlockLayoutCache::default();
+    for blk in terminal.block_tracker().session_blocks() {
+        cache.ensure_cached(blk, cols);
+    }
+    let (_, clamp_total, _) =
+        reconciled_terminal_block_scroll(&terminal, &layout, 1, 0, Some(&cache)).unwrap();
+    let (metrics_total, _) =
+        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(clamp_total, metrics_total);
+
+    // Stale-deferred variant: narrow the cache entries (deferral shape), the
+    // two sources must still agree on the (stale) scalars.
+    let blocks: Vec<Block> = terminal.block_tracker().session_blocks().to_vec();
+    for blk in &blocks {
+        cache.ensure_cached(blk, 30);
+    }
+    let (_, stale_clamp_total, _) =
+        reconciled_terminal_block_scroll(&terminal, &layout, 1, 0, Some(&cache)).unwrap();
+    let (stale_metrics_total, _) =
+        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(stale_clamp_total, stale_metrics_total);
+    assert_ne!(
+        stale_clamp_total, clamp_total,
+        "the stale entries must actually shift the shared total"
+    );
+}
+
 #[test]
 fn terminal_scroll_reconciliation_uses_shared_layout_geometry() {
     let mut terminal = Terminal::new(8, 32);
@@ -213,7 +254,7 @@ fn terminal_scroll_reconciliation_uses_shared_layout_geometry() {
     let layout = crate::layout::LayoutCtx::new((1200.0, 900.0), 10.0, 20.0, 10.0, 10.0);
 
     let (scroll, total, visible) =
-        reconciled_terminal_block_scroll(&terminal, &layout, 2, usize::MAX).unwrap();
+        reconciled_terminal_block_scroll(&terminal, &layout, 2, usize::MAX, None).unwrap();
     assert_eq!(scroll, total.saturating_sub(visible));
 }
 

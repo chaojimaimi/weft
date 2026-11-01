@@ -275,7 +275,9 @@ impl BlockLayoutCache {
 
     /// M6-b B-3: how often the metrics path had no entry and computed output
     /// rows from scratch. Deferred/degraded scenarios must keep this at 0.
-    #[cfg(test)]
+    /// WP1.5: un-gated from cfg(test) — the acceptance-2 RECONCILE_PROBE
+    /// warn (block_component) reports the fallback count alongside the
+    /// duration; a pure read accessor, zero cost.
     pub(crate) fn metrics_fallback_rebuilds(&self) -> usize {
         self.metrics_fallback_rebuilds.get()
     }

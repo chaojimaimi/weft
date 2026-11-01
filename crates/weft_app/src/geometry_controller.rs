@@ -166,6 +166,24 @@ impl App {
         ];
         let cell_w = base_layout.cell_width as f32;
         let cell_h = base_layout.cell_height as f32;
+        // WP1.5 F2 (PLAN_v1180_WP15_G4_RECONCILE_CACHE): feed the block
+        // layout cache to the per-tab reconcile memo below — a cache-backed
+        // compute is O(blocks) stale scalar reads instead of the O(document)
+        // uncached scan, and the memo key carries `total_misses()` so a
+        // rebuild after the final cols invalidates stale memos. Borrow shape
+        // (WP1.5 review P1-1, same as window_event/resized.rs): `renderer`
+        // above is a `&mut` binding held across this loop, so the RefCell
+        // borrow MUST come from that binding. R2: try_borrow, never panic —
+        // a live draw-side borrow degrades to the uncached direct path
+        // (correctness first), but the degradation MUST be audible: a silent
+        // fallback would resurrect the O(document) stall with no signal.
+        let block_cache = match renderer.block_layout_cache.try_borrow() {
+            Ok(cache) => Some(cache),
+            Err(_) => {
+                tracing::warn!("block reconcile cache unavailable");
+                None
+            }
+        };
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
             if tab.has_terminal() {
                 let resized = tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
@@ -217,13 +235,19 @@ impl App {
                 // v1.14.3 (T2): the reconcile goes through the pane-level
                 // memo (`app::reconcile_scroll`) — a same-key repeat (the
                 // per-8ms drag recomputes with unchanged content/geometry)
-                // reuses the previous UNCACHED metrics instead of re-scanning
-                // O(blocks) per event. The owned `lock_terminal` guard is the
+                // reuses the previous metrics instead of re-scanning O(blocks)
+                // per event. The owned `lock_terminal` guard is the
                 // D9-blessed shape that lets `tab.reconcile_memo` be mutated
                 // beside the guard (the guard carries no borrow of the pane).
-                // The `Resized` call site (window_event/resized.rs) keeps the
-                // direct UNCACHED path by design — its key would mismatch
-                // anyway (fresh geometry), and plan §T2-2 freezes it.
+                // v1.18.0 WP1.5 F2: plan §T2-2 ("the Resized/recompute path
+                // stays UNCACHED — its key would mismatch anyway on fresh
+                // geometry") is UNFROZEN: the freeze premise ("a fresh
+                // geometry key always misses") does not hold for
+                // `get_if_cached`, which is id-keyed and stale-tolerant. The
+                // compute closure now reads the layout cache (stale scalars,
+                // O(blocks)) and the memo key carries the `total_misses()`
+                // fingerprint, so a rebuild after the final cols invalidates
+                // the memo instead of fixating a stale total.
                 let reconciliation = tab.lock_terminal().and_then(|terminal| {
                     crate::app::reconcile_scroll::reconciled_with_memo(
                         &mut tab.reconcile_memo,
@@ -231,9 +255,22 @@ impl App {
                         &pane_layout_ctx,
                         header_rows,
                         previous,
+                        block_cache.as_deref(),
                     )
                 });
                 if let Some((reconciled, total, visible)) = reconciliation {
+                    // WP1.5 F3: this site just clamped from (possibly
+                    // cols-stale) cache scalars — arm the epoch-driven
+                    // re-clamp consumer. This covers the no-Resized families
+                    // (divider drag / font change / sidebar toggles) whose
+                    // cols change without any window Resized event.
+                    // P1-1: every arm resets the "re-clamped since arm"
+                    // dimension so the consumer's FIRST pass re-clamps
+                    // unconditionally (see block_reclamp_action) — this
+                    // family arms before any draw has rebuilt the cache,
+                    // so the next pass can look spuriously settled.
+                    self.window_runtime.block_reconcile_pending = true;
+                    self.window_runtime.block_reclamp_reclamped = false;
                     if previous != reconciled {
                         info!(
                             tab = i,
@@ -248,8 +285,131 @@ impl App {
                 }
             }
         }
+        // WP1.5 F2 (review P1-1 borrow delimitation): the cache Ref must die
+        // before the `&mut self` calls below — including
+        // `scroll_active_tab_into_view()`.
+        drop(block_cache);
         self.window_runtime.last_resize_instant = std::time::Instant::now();
         self.scroll_active_tab_into_view();
+    }
+
+    /// WP1.5 F3 (PLAN_v1180_WP15_G4_RECONCILE_CACHE): the epoch-driven
+    /// re-clamp consumer — the persistent invariant behind the two armed
+    /// reconcile sites. Runs at the TOP of `about_to_wait` every pass
+    /// (落点定案: about_to_wait 开头,见交付报告): the draw has finished (the
+    /// convergence pump bumps `total_misses()` inside draw, so this pass
+    /// already sees the fresh epoch), the renderer borrow here is SHARED
+    /// (no conflict with anything), `tabs_mut` has no cross-borrow, and
+    /// winit guarantees the pass runs. The final pump rebuild's pass
+    /// therefore completes the terminal re-clamp in the same pass.
+    ///
+    /// Semantics (plan F3): re-clamps ONLY the scroll offset
+    /// (`reconciled_block_scroll` pure fn) — no layout recompute, no
+    /// SIGWINCH; iterates ALL tabs (the Resized reconcile's G2 semantics —
+    /// the draw paints only the active tab, so a background tab's terminal
+    /// re-clamp cannot ride an active-tab consumer). Self-clear = at least
+    /// one re-clamp since the arm (P1-1) + epoch stable + quiescent — the
+    /// first pass after an arm re-clamps unconditionally and a SECOND pass
+    /// verifies and clears (`block_reclamp_action` truth table).
+    pub(super) fn reclamp_block_scroll_pending(&mut self) {
+        if !self.window_runtime.block_reconcile_pending {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        // Same R2 contract as the two sites: try_borrow, never panic, and
+        // a conflict is AUDIBLE. On conflict the flag stays armed — the
+        // next pass retries.
+        let cache = match renderer.block_layout_cache.try_borrow() {
+            Ok(cache) => cache,
+            Err(_) => {
+                tracing::warn!("block reconcile cache unavailable");
+                return;
+            }
+        };
+        let epoch = cache.total_misses();
+        let quiescent = cache.pending_ids_empty();
+        let epoch_advanced = epoch != self.window_runtime.block_reconcile_epoch;
+        let arm = crate::app::reconcile_scroll::block_reclamp_action(
+            self.window_runtime.block_reconcile_pending,
+            epoch_advanced,
+            quiescent,
+            self.window_runtime.block_reclamp_reclamped,
+        );
+        match arm {
+            crate::app::reconcile_scroll::BlockReclampAction::Skip => return,
+            crate::app::reconcile_scroll::BlockReclampAction::Reclamp
+            | crate::app::reconcile_scroll::BlockReclampAction::ReclampAndClear => {}
+        }
+        // Re-clamp every tab against the CURRENT layout, cache-backed
+        // (O(blocks) stale scalar reads — the same predicate the F1 site
+        // runs, minus the resize/SIGWINCH side effects).
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let chrome_left = if self.panel.open {
+            renderer.sidebar_push_width() as f64
+        } else {
+            0.0
+        };
+        let base_layout = terminal_layout_for_renderer(renderer, size, chrome_left);
+        if base_layout.rows == 0 || base_layout.cols == 0 {
+            return;
+        }
+        let header_rows = renderer.block_header_rows();
+        let layout_ctx = base_layout.layout_ctx();
+        let content_rect: weft_core::pane_layout::Rect = [
+            base_layout.content.left as f32,
+            base_layout.content.top as f32,
+            base_layout.content.right as f32,
+            base_layout.content.bottom as f32,
+        ];
+        // No `resize_all_panes_for_rect` here (F3 re-clamps the scroll
+        // offset only — no pane resize, no SIGWINCH).
+        for tab in self.sessions.tabs_mut().iter_mut() {
+            if !tab.has_terminal() {
+                continue;
+            }
+            let pane_layout_ctx = tab
+                .split_tree()
+                .layout(content_rect)
+                .into_iter()
+                .find_map(|(id, rect)| {
+                    (id == tab.active_pane_id()).then_some(layout_ctx.for_pane(rect))
+                })
+                .unwrap_or(layout_ctx);
+            let previous = tab.block_scroll();
+            let reconciliation = tab.lock_terminal().and_then(|terminal| {
+                crate::block_component::reconciled_terminal_block_scroll(
+                    &terminal,
+                    &pane_layout_ctx,
+                    header_rows,
+                    previous,
+                    Some(&cache),
+                )
+            });
+            if let Some((reconciled, _total, _visible)) = reconciliation {
+                if previous != reconciled {
+                    tab.set_block_scroll(reconciled);
+                }
+            }
+        }
+        self.window_runtime.block_reconcile_epoch = epoch;
+        // P1-1: the arm's re-clamp obligation is now discharged — the NEXT
+        // pass (epoch stable) may verify-and-clear. The clear itself is
+        // gated on the verdict arm (ReclampAndClear), NOT on quiescence:
+        // the truth table keeps an epoch-advanced pass armed even when the
+        // cache looks quiescent, so the fresh-epoch clamp gets one verified
+        // pass before the flag dies.
+        self.window_runtime.block_reclamp_reclamped = true;
+        if matches!(
+            arm,
+            crate::app::reconcile_scroll::BlockReclampAction::ReclampAndClear
+        ) {
+            self.window_runtime.block_reconcile_pending = false;
+        }
     }
 
     /// Convert pixel coordinates to grid (row, col).

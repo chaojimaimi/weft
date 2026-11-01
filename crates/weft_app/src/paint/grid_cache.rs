@@ -549,6 +549,15 @@ impl BlockLayoutCache {
     pub(crate) fn degraded_count(&self) -> usize {
         self.degraded_ids.len()
     }
+
+    /// WP1.5 F3: whether the `deferred ∪ degraded` pending union is empty —
+    /// the re-clamp consumer's quiescence test. Empty means every entry is
+    /// cols-fresh, so the consumer's stale scalar reads ARE the exact
+    /// values and its clamps are final. Production twin of the test-only
+    /// counters above (deferred_blocks/degraded_count).
+    pub(crate) fn pending_ids_empty(&self) -> bool {
+        self.deferred_ids.is_empty() && self.degraded_ids.is_empty()
+    }
 }
 
 /// Compute the layout for a single block (expensive — call once, then cache).

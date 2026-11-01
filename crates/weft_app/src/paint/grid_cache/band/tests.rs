@@ -622,3 +622,64 @@ fn in_band_giant_shrink_corrects_below_band_deferral_same_frame() {
     let (_, misses) = cache.take_hit_miss_counts();
     assert_eq!(misses, 2, "giant + corrected neighbor both rebuild");
 }
+
+/// WP1.5 F4-1 (PLAN_v1180_WP15_G4_RECONCILE_CACHE): the F1 reconcile's
+/// cache-backed total with band-deferred (cols-stale) entries equals the
+/// manual stale-scalar composition side-by-side — collapsed → 0, header
+/// rows, command wrap and the clear spacer each read the SAME entry the
+/// prefix sum composed from — and after a full fresh sync it equals the
+/// uncached direct computation exactly.
+#[test]
+fn reconcile_metrics_equal_stale_scalar_composition_then_the_uncached_total() {
+    let mut terminal = Terminal::new(24, 80);
+    terminal.process(
+        b"\x1b]133;A\x07echo one with a long command line that wraps somewhere\x1b]133;B\x07\x1b]133;C\x07alpha beta gamma delta epsilon zeta eta theta iota kappa\r\nsecond line\r\n\x1b]133;D;0\x07",
+    );
+    terminal.process(
+        b"\x1b]133;A\x07echo two\x1b]133;B\x07\x1b]133;C\x07epsilon zeta\r\n\x1b]133;D;0\x07",
+    );
+    let blocks: Vec<Block> = terminal.block_tracker().session_blocks().to_vec();
+
+    let mut cache = BlockLayoutCache::default();
+    for blk in &blocks {
+        cache.ensure_cached(blk, 80);
+    }
+    // Defer the OLDEST block above the band at the new cols: cols-stale
+    // entry kept, newest rebuilt in band (the B-6 deferral semantics).
+    let high = cache.get(blocks[1].id.0).base_row_count;
+    cache.sync_blocks(
+        &blocks,
+        60,
+        BandSync {
+            low_rows: 0,
+            high_rows: high,
+        },
+    );
+    assert_eq!(cache.deferred_count(), 1, "oldest block defers");
+
+    // Side-by-side: the metrics total composes from the entry scalars only.
+    let viewport_rows = terminal.grid().num_rows.max(1);
+    let mut composed = 0usize;
+    for blk in &blocks {
+        let entry = cache.get(blk.id.0);
+        let output_rows = if blk.collapsed {
+            0
+        } else {
+            entry.stale_output_rows
+        };
+        composed += completed_block_row_count(output_rows, 1, entry.command_wrap_rows)
+            + clear_block_spacer_rows(&blk.command, viewport_rows);
+    }
+    let (total, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None);
+    assert_eq!(cache.metrics_fallback_rebuilds(), 0, "scalar reads only");
+    assert_eq!(
+        total, composed,
+        "cached total = the stale-scalar composition"
+    );
+
+    // Full fresh sync at the new cols → equals the uncached direct total.
+    cache.sync_blocks(&blocks, 60, full_band());
+    let (fresh, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None);
+    let (direct, _) = crate::block_component::block_content_metrics(&terminal, 60, 1);
+    assert_eq!(fresh, direct, "fresh entries must equal the direct scan");
+}

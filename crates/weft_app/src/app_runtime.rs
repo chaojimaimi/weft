@@ -648,6 +648,12 @@ impl ApplicationHandler<AppEvent> for App {
     /// F-3B: hot zoom windows skip the pump (it would only hit the
     /// suppression gate and self-wake); zoom_wait_policy owns all wakes.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // WP1.5 F3: the epoch-driven block-scroll re-clamp consumer runs
+        // FIRST — the draw has ended (the convergence pump's rebuilds from
+        // last pass are visible in the cache epoch), the renderer borrow is
+        // shared, and every pass passes through here. See
+        // `geometry_controller::reclamp_block_scroll_pending`.
+        self.reclamp_block_scroll_pending();
         self.step_self_zoom();
         self.zoom_wait_policy(event_loop);
         let rt = &self.window_runtime;

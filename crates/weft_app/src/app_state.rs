@@ -188,6 +188,26 @@ pub struct WindowRuntimeState {
     pub last_resized_physical: Option<(u32, u32)>,
     /// Appendix F-3B: post-expiry flush flag pairing `zoom_jump_until`.
     pub zoom_flush_pending: bool,
+    /// WP1.5 F3 (PLAN_v1180_WP15_G4_RECONCILE_CACHE): "a stale-scalar clamp
+    /// happened, the convergence re-clamp is still owed". Armed by the two
+    /// reconcile sites (Resized F1 + recompute-layout F2) after every
+    /// cache-backed reconciliation; consumed by the epoch-driven re-clamp
+    /// in `about_to_wait` (all tabs). NOT "total changed" — new-output Both
+    /// rebuilds are the live follow/snap paths' domain.
+    pub block_reconcile_pending: bool,
+    /// WP1.5 F3 (rust-reviewer P1-1): "at least one re-clamp completed since
+    /// the arm". The no-Resized families (font/settings/scale changes) arm
+    /// during the event, BEFORE any draw has rebuilt the cache — the very
+    /// next `about_to_wait` pass can see epoch-stable AND (spuriously)
+    /// quiescent, and a Clear arm there would kill the flag before the
+    /// first re-clamp ever ran. The sites reset this on every arm; the
+    /// consumer sets it after its first (unconditional) re-clamp.
+    pub block_reclamp_reclamped: bool,
+    /// WP1.5 F3: the `BlockLayoutCache::total_misses()` epoch the last
+    /// re-clamp ran at; the consumer re-clamps whenever the live epoch
+    /// advances past it (each cache entry rebuild can shift the stale
+    /// scalars the clamps read).
+    pub block_reconcile_epoch: u64,
     pub last_system_appearance_dark: Option<bool>,
     pub last_appearance_check: Instant,
     pub current_logo_variant: weft_core::config::LogoVariant,
@@ -229,6 +249,9 @@ impl WindowRuntimeState {
             zoom_jump_until: None,
             last_resized_physical: None,
             zoom_flush_pending: false,
+            block_reconcile_pending: false,
+            block_reclamp_reclamped: false,
+            block_reconcile_epoch: 0,
             last_system_appearance_dark: None,
             last_appearance_check: Instant::now(),
             current_logo_variant: weft_core::config::LogoVariant::Cool,
