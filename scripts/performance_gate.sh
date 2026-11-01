@@ -16,6 +16,14 @@ run_logged() {
     "$@" 2>&1 | tee -a "$PERF_LOG"
 }
 
+# WP3 anchor budgets (PLAN_v1.17.0_WP3_PERF_GATE §2), enforced by the
+# local-only tripwire block below (skipped when WEFT_PERF_SLACK != 1.0).
+#   B: seq_2m production pipeline, min-of-3 (WP2-F2 measured 2.80s, +6%
+#      headroom for the min-of-3 estimator).
+#   A: cjk_50k headless probe, median-of-3 (WP1 measured 117.2ms).
+SEQ2M_PROBE_BUDGET_MS=3000
+CJK_50K_BUDGET_MS=130
+
 echo "==> Performance gate: VT parsing and 10k-scrollback resize"
 run_logged cargo test -p weft_core --lib perf_ -- \
     --ignored --nocapture --test-threads=1
@@ -39,6 +47,9 @@ run_logged cargo test -p weft_app perf_offscreen_metal_frame_budget -- \
     --ignored --nocapture --test-threads=1
 
 echo "==> Performance gate: cold start to first frame (20 fresh-config samples)"
+# WW_BENCH 2026-10 external cross-check: cold start to first frame 0.43s
+# (manual measurement on the reference machine — local-only metric, not
+# wired into CI; the automated budget below stays the 485ms p95).
 COLD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/weft-cold-start.XXXXXX")"
 PROBE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/weft-gui-perf.XXXXXX")"
 trap 'rm -rf "$COLD_TMP" "$PROBE_TMP"' EXIT
@@ -72,6 +83,143 @@ printf '%s\n' "$GUI_OUTPUT" >> "$PERF_LOG"
 if ! grep -q "WEFT_GUI_PERF status=PASS" <<<"$GUI_OUTPUT"; then
     echo "GUI performance probe did not report PASS" >&2
     exit 1
+fi
+
+# ── WP3 anchor tripwires (PLAN_v1.17.0_WP3_PERF_GATE §3-2) ──────────
+# local-only: both anchors are single-threaded probes calibrated on the
+# dev reference machine, so CI (WEFT_PERF_SLACK=3) skips this block and
+# keeps only the scaled legacy budgets above.
+if [ "${WEFT_PERF_SLACK:-1.0}" = "1.0" ]; then
+    # B anchor: seq_2m production pipeline, min-of-3 (WP2-F2 estimator).
+    # The probe prints one
+    #   V110_METRIC name=probe_seq2m_pipeline_ms value=<ms>
+    # line per run (parse_worker_probes.rs); run_logged lands it in
+    # PERF_LOG and the python report below carries it into baseline.json.
+    # Multi-threaded pipeline, but 2026-11-01 load testing still saw
+    # min-of-3 at 3650-3696ms under ~64% background CPU (+21% vs the
+    # clean-window 2786ms) — so a first red triggers exactly one
+    # noisy-neighbour retry (same shape as the A anchor); a red that
+    # survives the retry logs the load averages for triage.
+    echo "==> Performance gate: seq2m production pipeline probe (WP3 B anchor, min-of-3 <= ${SEQ2M_PROBE_BUDGET_MS}ms)"
+
+    seq2m_probe_round() {
+        # 3 probe runs; output tees to PERF_LOG and the gate log verbatim.
+        # MUST run outside command substitution — run_logged's tee writes
+        # the cargo output to stdout, which a $( ) would swallow into the
+        # captured value (2026-11-01: that exact bug put a cargo warning
+        # into the PASS line's min=).
+        for _seq2m_run in 1 2 3; do
+            run_logged cargo test --release -p weft_app probe_real_pty_seq2m_single_pane -- \
+                --ignored --nocapture --test-threads=1
+        done
+    }
+
+    seq2m_round_min() {
+        # Min over the V110_METRIC lines appended to PERF_LOG after line
+        # $1 (the total log line count taken BEFORE the round). Pure
+        # reader — safe under command substitution. Scoping to the round's
+        # appended lines keeps a retry round from being masked by a faster
+        # first round.
+        tail -n +"$(( $1 + 1 ))" "$PERF_LOG" | awk '
+            BEGIN { min = -1 }
+            /V110_METRIC name=probe_seq2m_pipeline_ms/ {
+                if (match($0, /value=[0-9]+/)) {
+                    v = substr($0, RSTART + 6, RLENGTH - 6) + 0
+                    if (min < 0 || v < min) { min = v }
+                }
+            }
+            END { if (min >= 0) { print min } }
+        '
+    }
+
+    SEQ2M_BEFORE="$(wc -l < "$PERF_LOG" | tr -d ' ')"
+    seq2m_probe_round
+    SEQ2M_MIN_MS="$(seq2m_round_min "$SEQ2M_BEFORE")"
+    if [ -z "$SEQ2M_MIN_MS" ]; then
+        echo "seq2m pipeline probe emitted no V110_METRIC line" >&2
+        exit 1
+    fi
+    if [ "$SEQ2M_MIN_MS" -gt "$SEQ2M_PROBE_BUDGET_MS" ]; then
+        printf 'PERF_GATE RETRY: probe_seq2m_pipeline_ms min=%sms > budget %sms (background-load suspect)\n' \
+            "$SEQ2M_MIN_MS" "$SEQ2M_PROBE_BUDGET_MS" | tee -a "$PERF_LOG"
+        SEQ2M_BEFORE="$(wc -l < "$PERF_LOG" | tr -d ' ')"
+        seq2m_probe_round
+        SEQ2M_MIN_MS="$(seq2m_round_min "$SEQ2M_BEFORE")"
+        if [ -z "$SEQ2M_MIN_MS" ]; then
+            echo "seq2m pipeline probe emitted no V110_METRIC line on retry" >&2
+            exit 1
+        fi
+    fi
+    if [ "$SEQ2M_MIN_MS" -gt "$SEQ2M_PROBE_BUDGET_MS" ]; then
+        {
+            printf 'PERF_GATE FAIL: probe_seq2m_pipeline_ms min=%sms > budget %sms\n' \
+                "$SEQ2M_MIN_MS" "$SEQ2M_PROBE_BUDGET_MS"
+            printf 'context: %s\n' "$(uptime)"
+        } | tee -a "$PERF_LOG"
+        exit 1
+    fi
+    printf 'PERF_GATE PASS: probe_seq2m_pipeline_ms min=%sms <= budget %sms\n' \
+        "$SEQ2M_MIN_MS" "$SEQ2M_PROBE_BUDGET_MS" | tee -a "$PERF_LOG"
+
+    # A anchor: cjk_50k headless (WP1 fast lane), median-of-3 gate-side.
+    # Each probe_cjk invocation already reports the in-binary median of 3
+    # runs on its "cjk_50k (44 fullwide/line)" line. Single-threaded, so a
+    # first red triggers exactly one noisy-neighbour retry; a red that
+    # survives the retry logs the load averages for triage (background
+    # load degraded this probe +63% on 2026-11-01 while the multi-
+    # threaded seq2m probe moved only +3.5%).
+    echo "==> Performance gate: cjk_50k headless probe (WP3 A anchor, median-of-3 <= ${CJK_50K_BUDGET_MS}ms)"
+    mkdir -p /tmp/ww_bench/data
+    cp docs/perf/ww-bench-2026-10/data/cjk_50k_pty.bin /tmp/ww_bench/data/cjk_50k_pty.bin
+
+    cjk_probe_once() {
+        # One probe_cjk invocation; echoes the parsed ms value.
+        local out ms
+        if ! out="$(cargo run --release --bin probe_cjk --manifest-path \
+            docs/perf/ww-bench-2026-10/probe_cjk/Cargo.toml 2>&1)"; then
+            echo "probe_cjk invocation failed" >&2
+            return 1
+        fi
+        printf '%s\n' "$out" >> "$PERF_LOG"
+        ms="$(printf '%s\n' "$out" | grep 'cjk_50k (44 fullwide/line)' \
+            | sed -E 's/.*[[:space:]]([0-9]+(\.[0-9]+)?) ms.*/\1/' || true)"
+        [ -n "$ms" ] || { echo "probe_cjk emitted no cjk_50k timing line" >&2; return 1; }
+        printf '%s\n' "$ms"
+    }
+
+    cjk_attempt_median() {
+        # Median of 3 probe_cjk invocations.
+        local samples="" ms
+        for _cjk_run in 1 2 3; do
+            ms="$(cjk_probe_once)" || return 1
+            samples="$samples $ms"
+        done
+        # shellcheck disable=SC2086  # word splitting is the point
+        printf '%s\n' $samples | sort -n | sed -n 2p
+    }
+
+    CJK_MEDIAN_MS="$(cjk_attempt_median)" || {
+        echo "cjk_50k probe failed to report a timing" >&2
+        exit 1
+    }
+    if awk -v v="$CJK_MEDIAN_MS" -v b="$CJK_50K_BUDGET_MS" 'BEGIN { exit !(v > b) }'; then
+        printf 'PERF_GATE RETRY: cjk_50k median=%sms > budget %sms (background-load suspect)\n' \
+            "$CJK_MEDIAN_MS" "$CJK_50K_BUDGET_MS" | tee -a "$PERF_LOG"
+        CJK_MEDIAN_MS="$(cjk_attempt_median)" || {
+            echo "cjk_50k probe failed to report a timing on retry" >&2
+            exit 1
+        }
+    fi
+    if awk -v v="$CJK_MEDIAN_MS" -v b="$CJK_50K_BUDGET_MS" 'BEGIN { exit !(v > b) }'; then
+        {
+            printf 'PERF_GATE FAIL: cjk_50k median=%sms > budget %sms\n' \
+                "$CJK_MEDIAN_MS" "$CJK_50K_BUDGET_MS"
+            printf 'context: %s\n' "$(uptime)"
+        } | tee -a "$PERF_LOG"
+        exit 1
+    fi
+    printf 'PERF_GATE PASS: cjk_50k median=%sms <= budget %sms\n' \
+        "$CJK_MEDIAN_MS" "$CJK_50K_BUDGET_MS" | tee -a "$PERF_LOG"
 fi
 
 python3 - "$PERF_LOG" "$REPORT_DIR/baseline.json" <<'PY'

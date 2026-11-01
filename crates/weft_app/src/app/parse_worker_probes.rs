@@ -222,6 +222,16 @@ fn probe_real_pty_seq2m_big_window() {
 fn probe_real_pty_seq2m_single_pane() {
     let wall = probe_pipeline("/bin/sh", &["-c", "seq 2000000"], 1_990_000, 0, 0);
     println!("[probe] seq2m single-pane wall = {wall:?} (headless: no render/present)");
+    // WP3 B anchor (PLAN_v1.17.0_WP3_PERF_GATE §3-1): structured metric the
+    // gate's existing V110_METRIC parser ingests into baseline.json with zero
+    // parser changes. `as_millis()` truncation matches the gate's int()
+    // parsing; budget lives in performance_gate.sh (SEQ2M_PROBE_BUDGET_MS,
+    // min-of-3). The [probe] line above is kept for backward compatibility
+    // with existing grep consumers.
+    println!(
+        "V110_METRIC name=probe_seq2m_pipeline_ms value={}",
+        wall.as_millis()
+    );
 }
 
 #[test]
