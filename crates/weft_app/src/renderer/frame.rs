@@ -54,10 +54,25 @@ impl crate::renderer::MetalRenderer {
         active_pane_session_id: u64,
     ) {
         self.block_view_tui_caret_area.set(None);
+        // v1.18.0 WP1 D5.2: nextDrawable wait probe — the missing link of
+        // the v1.14.5 R4 observability chain. `next_drawable` blocks up to
+        // its <=1 s cap when the 3-drawable pool runs dry (the v1.17.0
+        // reload-session stall class); normal service is sub-frame, so a
+        // wait >= 16 ms (one 60 Hz refresh) means the pool is starving.
+        // Warn with the wait and do NOT touch control flow (two Instant
+        // reads + one compare per frame is the steady-state cost).
+        // Main path only by design: the zoom pull path stands down inside
+        // SELF_ZOOM_WINDOW (zoom_render/mod.rs), so the cap's main
+        // battlefield is this call site.
+        let drawable_wait_started = std::time::Instant::now();
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
             None => return,
         };
+        let drawable_wait_ms = drawable_wait_started.elapsed().as_millis();
+        if drawable_wait_ms >= 16 {
+            tracing::warn!(wait_ms = drawable_wait_ms, "next drawable wait");
+        }
 
         // v1.3 Batch 5: reset per-pane scissor ranges for this frame. Each
         // grid-instance segment (one per pane) is recorded here as

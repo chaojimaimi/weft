@@ -509,17 +509,6 @@ impl MetalRenderer {
         self.paste_toast = toast;
     }
 
-    /// v1.14.4 (批B): self-zoom 步进的原子提交括号。与
-    /// `set_live_resize`/config 门完全独立（后者有手势语义，且
-    /// window_event/resized.rs 每步 Resized 内的 `set_live_resize(false)`
-    /// 会无条件翻层——本括号必须开在 request_inner_size 之后，否则翻转
-    /// 会被覆盖）；self-zoom 是 ~8 帧的一次性动画，正确性优先。不做显式
-    /// CATransaction::flush（显式 flush 的 WindowServer 等待已被 B2 关停），
-    /// 帧与 bounds 同轮隐式事务提交。只允许 step_self_zoom 的步进括号调用。
-    pub(crate) fn set_zoom_atomic_present(&mut self, on: bool) {
-        self.layer.set_presents_with_transaction(on);
-    }
-
     /// v1.11.1: drop the paste toast once its TTL elapsed. Returns `true`
     /// when a toast was removed so the caller requests a redraw. The
     /// boundary judgment delegates to

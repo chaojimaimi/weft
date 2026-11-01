@@ -246,6 +246,64 @@ fn gate_wiring_truth_tables() {
     assert!(!cascade_force_commit(false));
 }
 
+/// WP1 D4 (PLAN_v1180_WP1_ZOOM_ROOT): the zoom-window frames bypass both
+/// non-forced suppression gates (DEC 2026 synchronized-output +
+/// route-consume); frames outside the window keep the plain path.
+#[test]
+fn zoom_frame_bypasses_gates_truth_table() {
+    assert!(
+        zoom_frame_bypasses_gates(true),
+        "inside SELF_ZOOM_WINDOW the draw must run forced (the bracket's old semantics)"
+    );
+    assert!(
+        !zoom_frame_bypasses_gates(false),
+        "outside the window the draw keeps the suppression gates"
+    );
+}
+
+/// WP1 §3: the step_self_zoom pass routing as a truth table — idle clears
+/// the wake, a pacing refusal arms it, a due step below the target steps,
+/// progress >= 1.0 finishes and clears. Boundary: exactly 1.0 finishes.
+#[test]
+fn zoom_step_outcome_truth_table() {
+    // No anim: Idle regardless of the other inputs.
+    assert!(matches!(
+        zoom_step_outcome(false, false, 0.0),
+        ZoomStepOutcome::Idle
+    ));
+    assert!(matches!(
+        zoom_step_outcome(false, true, 0.5),
+        ZoomStepOutcome::Idle
+    ));
+    // Present + pacing refusal: Defer (arm the WaitUntil deadline).
+    assert!(matches!(
+        zoom_step_outcome(true, false, 0.0),
+        ZoomStepOutcome::Defer
+    ));
+    assert!(matches!(
+        zoom_step_outcome(true, false, 0.99),
+        ZoomStepOutcome::Defer
+    ));
+    // Present + due, short of the target: Stepped (advance + request_redraw).
+    assert!(matches!(
+        zoom_step_outcome(true, true, 0.0),
+        ZoomStepOutcome::Stepped
+    ));
+    assert!(matches!(
+        zoom_step_outcome(true, true, 0.999),
+        ZoomStepOutcome::Stepped
+    ));
+    // Boundary: progress >= 1.0 finishes (clear the step wake).
+    assert!(matches!(
+        zoom_step_outcome(true, true, 1.0),
+        ZoomStepOutcome::Finished
+    ));
+    assert!(matches!(
+        zoom_step_outcome(true, true, 2.0),
+        ZoomStepOutcome::Finished
+    ));
+}
+
 /// Pull present-rate limiter truth table (PLAN_zoom_drawable_stall A, E): no
 /// previous present is allowed, anything strictly inside the window is
 /// throttled, exactly at (or past) the boundary is allowed. Live-resize and

@@ -113,10 +113,18 @@ fn zoom_step_due_truth_table() {
     ));
     // Boundary: >= — exactly the floor is due.
     assert!(zoom_step_due(STEP_MIN_INTERVAL));
-    assert!(zoom_step_due(std::time::Duration::from_millis(16)));
+    // v1.18.0 WP1 D3: the floor moved to 16.667 ms (the 60 Hz drawable
+    // return period), so 16 ms — previously past the 12 ms floor — is now
+    // BELOW it; 17 ms is the first whole millisecond at/above the floor.
+    assert!(!zoom_step_due(std::time::Duration::from_millis(16)));
+    assert!(zoom_step_due(std::time::Duration::from_millis(17)));
     assert!(zoom_step_due(std::time::Duration::from_secs(1)));
-    // Pin the pacing claim: floor 12 ms bounds a 220 ms animation at 19 steps.
-    assert_eq!(STEP_MIN_INTERVAL, std::time::Duration::from_millis(12));
+    // Pin the pacing claim: floor 16_666_667 ns (1e9/60) bounds a 220 ms
+    // animation at ceil(220/16.667) = 14 steps — full refresh-rate motion.
+    assert_eq!(
+        STEP_MIN_INTERVAL,
+        std::time::Duration::from_nanos(16_666_667)
+    );
 }
 
 #[test]

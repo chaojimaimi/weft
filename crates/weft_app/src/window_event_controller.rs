@@ -185,7 +185,33 @@ impl App {
             });
         if !pull_supplies_frame {
             let started = std::time::Instant::now();
-            self.handle_redraw_requested();
+            // v1.18.0 WP1 D4 (PLAN_v1180_WP1_ZOOM_ROOT): the retired
+            // in-step bracket draw's `forced` semantics live here. Both
+            // suppression gates on the non-forced path (DEC 2026
+            // synchronized-output + route-consume, redraw/pump_process.rs
+            // :59-90) abort a non-forced frame — during a self-zoom that
+            // would stretch the previous drawable across the whole
+            // animation, worse than the bracket it replaces. The bypass is
+            // the WINDOW flag (arm→flush, ≤300 ms bounded) — the closest
+            // match to the bracket's old scope without new App state.
+            let zoom_frame = crate::paint::zoom_render::zoom_frame_bypasses_gates(self_zoom_window);
+            if zoom_frame {
+                self.handle_redraw_requested_forced();
+            } else {
+                self.handle_redraw_requested();
+            }
+            // v1.18.0 WP1 D5.1: the v1.14.5 R4 in-step draw probe follows
+            // the chain here — per-frame draw duration plus the >50 ms
+            // slow warning (the old "zoom step draw slow — stretch window
+            // = draw duration" text retired with the bracket). The clock
+            // read sits inside the zoom arm: non-zoom frames save it.
+            if zoom_frame {
+                let draw_ms = started.elapsed().as_millis();
+                tracing::info!(draw_ms, "zoom frame draw");
+                if draw_ms > 50 {
+                    tracing::warn!(draw_ms, "zoom frame draw slow");
+                }
+            }
             self.performance_probe.record_redraw(started.elapsed());
         }
     }
@@ -587,10 +613,13 @@ impl App {
     /// Each step applies the eased intermediate frame through the SAME
     /// winit setters a user drag exercises, so the whole pipeline runs live:
     /// `request_inner_size` -> injected `setFrameSize:` IMP (drawable sync +
-    /// inline pull) -> Resized dispatched same-pass -> tab/PTY reflow -> full
-    /// draw. That is the drag semantics, which is why the animation tracks
-    /// live instead of freezing like the system zoom does (I-1: AppKit's own
-    /// animation suspends winit dispatch entirely).
+    /// inline pull) -> Resized dispatched same-pass -> tab/PTY reflow ->
+    /// request_redraw, and the frame itself draws on the NEXT loop pass
+    /// (RedrawRequested; v1.18.0 WP1 D1 — the v1.14.4 in-step bracket draw
+    /// is withdrawn, one request_redraw per step is the step's only frame
+    /// supply). That is the drag semantics, which is why the animation
+    /// tracks live instead of freezing like the system zoom does (I-1:
+    /// AppKit's own animation suspends winit dispatch entirely).
     pub(crate) fn step_self_zoom(&mut self) {
         // Appendix I acceptance rig: fires one `zoom:` ~2s after startup
         // when WEFT_SELF_ZOOM_TEST=1 (inert otherwise).
@@ -624,16 +653,44 @@ impl App {
         // (same geometry, same content) per refusal, 1-2 wasted 5-9 ms
         // frames per step. It now arms a WaitUntil deadline at the next
         // step boundary: the loop sleeps and the deadline wakes it for
-        // exactly one bracket draw per step. Each refused pass costs one
+        // exactly one request_redraw per step — the frame lands on the
+        // next loop pass (F5: request_redraw wakes the loop immediately,
+        // no WaitUntil round-trip), so the drawable pool stays at <=1
+        // frame in flight in steady state. Each refused pass costs one
         // anim peek + one flag check; the due pass then folds the skipped
         // interval in (time-driven interpolation).
-        if !crate::macos_zoom::zoom_step_due(anim.last_step.elapsed()) {
-            crate::paint::zoom_render::set_zoom_step_wait(Some(
-                anim.last_step + crate::macos_zoom::STEP_MIN_INTERVAL,
-            ));
-            return;
-        }
+        // v1.18.0 WP1 (§3): the pass routing — Idle (no anim, consumed at
+        // the peek above) / Defer (pacing refusal) / Stepped / Finished —
+        // is the pure `zoom_step_outcome` verdict, truth-table tested in
+        // zoom_render/tests.rs; this site only executes it.
         let progress = (anim.start.elapsed().as_secs_f64() / anim.duration.as_secs_f64()).min(1.0);
+        let outcome = crate::paint::zoom_render::zoom_step_outcome(
+            true,
+            crate::macos_zoom::zoom_step_due(anim.last_step.elapsed()),
+            progress,
+        );
+        // Rust-reviewer P2-2: consume the verdict through an EXHAUSTIVE
+        // match — every arm named, none swallowed by an `else`.
+        match outcome {
+            crate::paint::zoom_render::ZoomStepOutcome::Idle => {
+                // Unreachable: the peek above guarantees an anim (WP1 §3 —
+                // the truth table keeps every arm named here). Release
+                // falls to the safe reset below.
+                debug_assert!(false, "anim peek early-exit already covers this arm");
+                crate::paint::zoom_render::set_zoom_step_wait(None);
+                return;
+            }
+            crate::paint::zoom_render::ZoomStepOutcome::Defer => {
+                crate::paint::zoom_render::set_zoom_step_wait(Some(
+                    anim.last_step + crate::macos_zoom::STEP_MIN_INTERVAL,
+                ));
+                return;
+            }
+            // Fall through: the step applies below (drift check first); the
+            // tail consults the SAME verdict for the wake bookkeeping.
+            crate::paint::zoom_render::ZoomStepOutcome::Stepped
+            | crate::paint::zoom_render::ZoomStepOutcome::Finished => {}
+        }
         let eased = crate::macos_zoom::ease_in_out_quad(progress);
         let x = crate::macos_zoom::lerp(anim.origin_start.0, anim.origin_target.0, eased);
         let y = crate::macos_zoom::lerp(anim.origin_start.1, anim.origin_target.1, eased);
@@ -670,67 +727,71 @@ impl App {
         window.set_outer_position(winit::dpi::LogicalPosition::new(x, y));
         crate::macos_zoom::zoom_anim_advance((x, y, w, h));
         crate::macos_zoom::zoom_anim_mark_stepped();
-        // v1.14.4 (批B/方案甲): 帧与 bounds 原子提交——本步 Resized 已在
-        // request_inner_size 内同步派发并完成 reflow（含 resized.rs:189 的
-        // set_live_resize(false)，故此刻翻转不会被覆盖），强制 draw 立即
-        // 绘制当前 viewport；presentsWithTransaction 使 present 并入本轮
-        // CA 事务，与 setFrameSize 的 bounds 提交原子。括号作用域成对，
-        // cancel/漂移分支在本括号之前 return，层状态恒为初始 false。
-        // 约束：本括号不得移到 request_inner_size 之前（见 setter doc）。
-        // 成本：强制 draw 约 +5-9ms/步——时间驱动插值折叠跳过的时长，
-        // 步距增大但动画总时长不变。
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_zoom_atomic_present(true);
-            tracing::debug!("zoom step atomic present on");
-        }
-        // v1.14.5 R4: bracket-timing observability — the step's stretch
-        // window IS this draw's duration (the wake below is
-        // last_step + 12ms, already past when the draw ran longer), so a
-        // slow draw both holds the main thread and stretches the step
-        // interval. >50 ms = the reload-session stall class (v1.14.4
-        // post-audit residual); the warn supplies forensics data without a
-        // debug reproduction run.
-        let draw_started = std::time::Instant::now();
-        self.handle_redraw_requested_forced();
-        let draw_ms = draw_started.elapsed().as_millis();
-        if draw_ms > 50 {
-            tracing::warn!(
-                draw_ms,
-                "zoom step draw slow — stretch window = draw duration"
-            );
-        }
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_zoom_atomic_present(false);
-        }
-        if progress >= 1.0 {
-            let steps = crate::macos_zoom::zoom_anim_finish().map_or(0, |finished| finished.steps);
-            tracing::info!(steps, "self-zoom complete");
-            // Phase F (PLAN_zoom_drawable_stall): the final frame must draw
-            // NOW. The final synth Resized lands only after `about_to_wait`
-            // returns — i.e. after the anim was cleared here — so without
-            // this request the final-geometry frame waits for the ≤300 ms
-            // flush (the F.0 final-adjustment defect).
-            self.request_redraw();
-            // v1.14.5 R1: the animation is over — clear the step wake (the
-            // terminal redraw above stays the Phase F final-content safety
-            // net, untouched).
-            crate::paint::zoom_render::set_zoom_step_wait(None);
-        } else {
-            // v1.14.5 R1: timer wake replaces the old request_redraw spin —
-            // that spin drew a SECOND full frame per step (double supply
-            // beside the bracket draw). Re-peek for the wake basis so it
-            // shares ONE reference with the not-due path and zoom_step_due
-            // (zoom_anim_mark_stepped above advanced last_step): step
-            // distance = max(12 ms floor, this draw's duration) — a draw
-            // slower than the floor leaves the deadline already past, so
-            // the next pass falls straight through: denser AND more even
-            // than a now+12 ms guess. Exactly one bracket draw per step.
-            // The anim vanishing between here and the peek naturally maps
-            // to None (no wake).
-            crate::paint::zoom_render::set_zoom_step_wait(
-                crate::macos_zoom::zoom_anim_peek()
-                    .map(|a| a.last_step + crate::macos_zoom::STEP_MIN_INTERVAL),
-            );
+        // v1.18.0 WP1 D1 — frame supply timing (the v1.14.4 atomic bracket
+        // draw is withdrawn; a slow bracket draw held the main thread AND
+        // stretched the step interval, and the 12 ms step floor against the
+        // ~16.7 ms drawable return period drained the 3-drawable pool into
+        // nextDrawable's <=1 s blocking cap — the v1.17.0 reload-session
+        // stall, draw_ms 1004-1689 ms, steps truncated to 2):
+        //   pass k   step: setFrame (bounds enter this pass's CA
+        //            transaction, committed at vsync k) + the
+        //            request_redraw below;
+        //   pass k+1 wakes immediately (F5: request_redraw wakes the loop,
+        //            no WaitUntil round-trip) and RedrawRequested draws the
+        //            frame — the SELF_ZOOM_WINDOW gate keeps the main path
+        //            drawing (F1) and D4 routes it through the forced
+        //            handler — present commits asynchronously (<=1 frame
+        //            in flight);
+        //   then the not-due check arms WaitUntil(last_step +
+        //            STEP_MIN_INTERVAL) and the loop sleeps to the next
+        //            step.
+        // Exactly ONE frame per step, no double supply: the v1.14.5 R1
+        // "second full frame per step" defect (bracket draw + spin redraw)
+        // cannot recur — the bracket is gone and this request_redraw is
+        // the step's only supply point.
+        self.request_redraw();
+        // Finished arm (WP1 D1/§3): the animation is over — clear the step
+        // wake. Phase F (PLAN_zoom_drawable_stall): the final frame must
+        // draw NOW; its supply point is the unified request_redraw above
+        // (the old duplicate call here supplied the terminal frame through
+        // the non-forced path, where an active sync-output TUI could abort
+        // it — D4's window-level forced scope closes that hole). The final
+        // synth Resized lands only after `about_to_wait` returns — i.e.
+        // after the anim was cleared here — so without the unified request
+        // the final-geometry frame would wait for the ≤300 ms flush (the
+        // F.0 final-adjustment defect).
+        match outcome {
+            crate::paint::zoom_render::ZoomStepOutcome::Finished => {
+                let steps =
+                    crate::macos_zoom::zoom_anim_finish().map_or(0, |finished| finished.steps);
+                tracing::info!(steps, "self-zoom complete");
+                crate::paint::zoom_render::set_zoom_step_wait(None);
+            }
+            crate::paint::zoom_render::ZoomStepOutcome::Stepped => {
+                // Stepped arm (v1.14.5 R1): timer wake replaces the old
+                // request_redraw spin — that spin drew a SECOND full frame per
+                // step (double supply beside the bracket draw). Re-peek for the
+                // wake basis so it shares ONE reference with the Defer path and
+                // zoom_step_due (zoom_anim_mark_stepped above advanced
+                // last_step): step distance = max(STEP_MIN_INTERVAL floor, this
+                // pass's duration) — a pass slower than the floor leaves the
+                // deadline already past, so the next pass falls straight
+                // through: denser AND more even than a now+floor guess.
+                // Exactly one request_redraw per step; the frame lands on the
+                // next loop pass. The anim vanishing between here and the peek
+                // naturally maps to None (no wake).
+                crate::paint::zoom_render::set_zoom_step_wait(
+                    crate::macos_zoom::zoom_anim_peek()
+                        .map(|a| a.last_step + crate::macos_zoom::STEP_MIN_INTERVAL),
+                );
+            }
+            // Returned above (Defer) or impossible (Idle): P2-2 keeps the
+            // arms named; release takes the safe reset.
+            crate::paint::zoom_render::ZoomStepOutcome::Idle
+            | crate::paint::zoom_render::ZoomStepOutcome::Defer => {
+                debug_assert!(false, "routing returned above");
+                crate::paint::zoom_render::set_zoom_step_wait(None);
+            }
         }
     }
 }

@@ -147,6 +147,62 @@ pub(crate) fn cascade_force_commit(anim_active: bool) -> bool {
     anim_active
 }
 
+/// WP1 D4 (PLAN_v1180_WP1_ZOOM_ROOT): the retired in-step bracket draw's
+/// `forced` semantics need a home now that zoom step frames arrive through
+/// `on_redraw_requested` instead of a synchronous `handle_redraw_requested_
+/// forced` inside `step_self_zoom`. WHY: both suppression gates on the
+/// non-forced path (DEC 2026 synchronized-output and route-consume,
+/// redraw/pump_process.rs:59-90) abort a non-forced frame — a zoom step
+/// frame must bypass them, or an active sync-output TUI stretches the
+/// previous drawable across the whole animation (worse than the bracket it
+/// replaces). Placement = the WINDOW flag (SELF_ZOOM_WINDOW, arm→flush,
+/// each window bounded ≤300 ms): zero new App state and the closest match
+/// to the bracket's old scope. Pure predicate so the wiring has a truth
+/// table.
+#[must_use]
+pub(crate) fn zoom_frame_bypasses_gates(self_zoom_window: bool) -> bool {
+    self_zoom_window
+}
+
+/// The `step_self_zoom` pass-routing verdict (WP1 §3): the controller's
+/// branch decision (not-due → arm the WaitUntil / due → advance the step
+/// and request the frame / finish → clear the wake) as a pure predicate so
+/// the routing has a truth table and never rests on on-device verification
+/// alone. `anim_present` comes from `zoom_anim_peek`, `due` from
+/// `zoom_step_due`, `progress` from the animation clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZoomStepOutcome {
+    /// No animation: clear any stale step wake (the H1 busy-loop guard)
+    /// and do nothing.
+    Idle,
+    /// Pacing refusal: (re)arm the WaitUntil deadline at the next step
+    /// boundary.
+    Defer,
+    /// Step applied short of the target: arm the next wake (timer semantics,
+    /// v1.14.5 R1 — no redraw spin).
+    Stepped,
+    /// Final step applied (progress ≥ 1.0): log + clear the step wake; the
+    /// final frame's supply point is the step's unified `request_redraw`.
+    Finished,
+}
+
+/// Truth table for [`ZoomStepOutcome`]: Idle dominates, then the pacing
+/// refusal, then progress ≥ 1.0 splits Stepped from Finished.
+#[must_use]
+pub(crate) fn zoom_step_outcome(anim_present: bool, due: bool, progress: f64) -> ZoomStepOutcome {
+    if !anim_present {
+        return ZoomStepOutcome::Idle;
+    }
+    if !due {
+        return ZoomStepOutcome::Defer;
+    }
+    if progress >= 1.0 {
+        ZoomStepOutcome::Finished
+    } else {
+        ZoomStepOutcome::Stepped
+    }
+}
+
 /// Pull present-rate limiter (PLAN_zoom_drawable_stall A): the inline
 /// pull must acquire drawables at most once per PULL_MIN_INTERVAL — the
 /// 60 Hz period, the lowest common refresh. The 3-drawable pool is

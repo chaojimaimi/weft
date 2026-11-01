@@ -162,13 +162,17 @@ pub(crate) fn zoom_anim_mark_stepped() {
 
 /// Pacing floor (appendix I measurement; NOW wired by
 /// PLAN_zoom_drawable_stall — 95799d2 stamped `last_step` but no check
-/// ever read it). The display refreshes every ~16.7 ms (60 Hz) or ~8.3 ms
-/// (120 Hz); steps applied faster than ~12 ms never reach the screen, so
-/// the floor halves the per-step pipeline + present work. Interpolation
-/// is elapsed-based, so a refused step's interval folds into the next
-/// applied one — the trajectory stays position-exact. Also halves the
-/// pull acquisition rate that Fix A throttles (belt and braces).
-pub(crate) const STEP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
+/// ever read it). v1.18.0 WP1 D3 (PLAN_v1180_WP1_ZOOM_ROOT): 12 ms →
+/// 16_666_667 ns = 1e9/60, the 60 Hz drawable RETURN period — with the
+/// 3-drawable pool (Apple hard top; v1.14.5 R2 proved
+/// maximumDrawableCount=5 raises NSException) returned at display cadence,
+/// any step floor below it lets frames-in-flight exceed one and drains the
+/// pool into nextDrawable's ≤1 s blocking cap. Interpolation is
+/// elapsed-based, so a refused step's interval folds into the next applied
+/// one — the trajectory stays position-exact; ceil(220 ms / 16.667 ms) =
+/// 14 steps = full refresh-rate motion, ZOOM_ANIM_DURATION stays 220 ms.
+pub(crate) const STEP_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_nanos(16_666_667);
 
 /// Pure pacing predicate (truth-table tested): a step is due when at
 /// least STEP_MIN_INTERVAL has passed since the previous applied step.
