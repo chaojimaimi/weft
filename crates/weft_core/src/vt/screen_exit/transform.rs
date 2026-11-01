@@ -73,6 +73,7 @@ impl Terminal {
     }
 }
 
+#[inline]
 pub(super) fn transform_viewport_ownership(
     owned: &mut [bool],
     top: usize,
@@ -97,6 +98,7 @@ pub(super) fn transform_viewport_ownership(
     }
 }
 
+#[inline]
 pub(super) fn transform_document_start(
     start: u64,
     origin_before: u64,
