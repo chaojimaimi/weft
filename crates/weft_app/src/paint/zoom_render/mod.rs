@@ -52,9 +52,9 @@ use crate::renderer::MetalRenderer;
 // control plumbing.
 mod policy;
 pub(crate) use policy::{
-    cascade_force_commit, pull_can_freshen, pull_present_allowed, set_zoom_step_wait,
-    zoom_control_flow, zoom_flush_action, zoom_frame_bypasses_gates, zoom_step_outcome,
-    zoom_step_wait, ZoomControlFlow, ZoomFlushAction, ZoomStepOutcome,
+    pull_can_freshen, pull_present_allowed, set_zoom_step_wait, zoom_control_flow,
+    zoom_flush_action, zoom_frame_bypasses_gates, zoom_step_outcome, zoom_step_wait,
+    ZoomControlFlow, ZoomFlushAction, ZoomStepOutcome,
 };
 mod verdict;
 pub(crate) use verdict::{note_zoom_step, zoom_window_finished};

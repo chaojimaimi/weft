@@ -166,23 +166,27 @@ impl crate::App {
         // The active pane commits every redraw: delaying until a resize
         // cascade pauses leaves its PTY at the old width while the Grid is
         // already narrow, so long synchronized progress lines auto-wrap and
-        // later `CSI A` repaints cannot erase the extra rows. Background tabs
-        // remain settle-debounced; both their PTY and Grid retain the old
-        // geometry together until the transaction commits.
-        // PLAN_zoom_drawable_stall Phase C (revises Appendix I-6): commit
-        // background panes per step in BOTH animation directions. The
-        // zoom-in arm predates it (a live background TUI stayed at its old
-        // width, field: split + top); zoom-out joins it because C3's
-        // main-path un-suppression feeds it per step -- otherwise the right
-        // pane would stay at the old width (the same field symptom).
-        // Review MEDIUM-2 wiring anchor: the force bit is the pure truth
-        // table (zoom_render::cascade_force_commit); the elapsed-debounce
-        // leg stays here at the call site.
+        // later `CSI A` repaints cannot erase the extra rows.
+        //
+        // PLAN_zoom_drawable_stall Phase C (revises Appendix I-6) used to
+        // commit background panes per step in BOTH animation directions via
+        // a zoom-force bit (zoom_render::cascade_force_commit, retired
+        // here). F6 (v1.18.3, PLAN_v1183_F6_CASCADE_TAB_SCOPE §2-F6-1)
+        // narrows that wiring: the force bit passed every non-active TAB's
+        // session through the ready gate too, so a large background document
+        // paid O(document) re-layout plus a SIGWINCH prompt repaint per
+        // step — all billed to the active tab's zoom frame (the field root
+        // cause of v1.18.3's cross-tab stutter). Cross-tab sessions now
+        // follow the settle-once path only: `elapsed_debounce` commits
+        // their coalesced FINAL size once, via the 100ms debounce that
+        // starts at animation end (last_resize_instant refreshes on the
+        // final Resized — drag-period semantics, dimension-only and
+        // invisible until the next tab switch). Split panes keep the Phase
+        // C per-step commit: they share the active tab's session_id, so the
+        // same-session ready branch inside pending_resize_effects carries
+        // the original split+top motive.
         let elapsed_debounce = self.window_runtime.last_resize_instant.elapsed()
             > std::time::Duration::from_millis(100);
-        let force =
-            crate::paint::zoom_render::cascade_force_commit(crate::macos_zoom::zoom_anim_active());
-        let cascade_settled = elapsed_debounce || force;
         let pending: Vec<_> = self
             .sessions
             .tabs()
@@ -199,7 +203,7 @@ impl crate::App {
                 effect::pending_resize_effects(
                     &pending,
                     tab.session_id,
-                    cascade_settled,
+                    elapsed_debounce,
                     std::time::Instant::now(),
                 )
             })

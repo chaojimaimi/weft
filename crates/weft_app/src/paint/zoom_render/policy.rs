@@ -137,16 +137,6 @@ pub(crate) fn zoom_control_flow(
     }
 }
 
-/// Resize-cascade force-commit bit (Appendix I-6, revised by
-/// PLAN_zoom_drawable_stall Phase C): during a self-managed zoom animation
-/// in EITHER direction background panes commit per step, or a live
-/// background TUI stays at its old width for the whole animation (field:
-/// split + top intermediate state). The elapsed-debounce leg is composed
-/// by the caller; this is only the force bit.
-pub(crate) fn cascade_force_commit(anim_active: bool) -> bool {
-    anim_active
-}
-
 /// WP1 D4 (PLAN_v1180_WP1_ZOOM_ROOT): the retired in-step bracket draw's
 /// `forced` semantics need a home now that zoom step frames arrive through
 /// `on_redraw_requested` instead of a synchronous `handle_redraw_requested_

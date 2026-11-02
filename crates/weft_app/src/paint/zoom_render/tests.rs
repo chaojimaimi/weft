@@ -231,21 +231,6 @@ fn zoom_flush_action_truth_table() {
     ));
 }
 
-/// Review MEDIUM-2: the controller gate wiring is a pure function, so the
-/// wiring gets a truth-table anchor here. PLAN_zoom_drawable_stall Phase C:
-/// the force bit mirrors the animation ACTIVE state in BOTH directions; the
-/// retired direction-aware RedrawRequested deferral gate has no rows here
-/// (the I-6 rationale it pinned no longer exists).
-#[test]
-fn gate_wiring_truth_tables() {
-    // cascade_force_commit(anim_active) = anim_active: the force-commit bit
-    // mirrors the animation ACTIVE state (both directions; the
-    // elapsed-debounce leg is composed at the call site, so the pure
-    // function pins the force bit only).
-    assert!(cascade_force_commit(true));
-    assert!(!cascade_force_commit(false));
-}
-
 /// WP1 D4 (PLAN_v1180_WP1_ZOOM_ROOT): the zoom-window frames bypass both
 /// non-forced suppression gates (DEC 2026 synchronized-output +
 /// route-consume); frames outside the window keep the plain path.
