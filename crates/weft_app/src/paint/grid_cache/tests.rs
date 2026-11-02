@@ -382,3 +382,106 @@ fn build_prefix_sum_handles_collapsed_blocks() {
     // rev() → b2 (base=4) then b1 (base=2). prefix_sum = [0, 4, 6]
     assert_eq!(cache.prefix_sum(), &[0, 4, 6]);
 }
+
+// ── F7-2 (PLAN_v1184 §2-F7-2): the defer-all freeze band ────────────────
+// The freeze wraps the sync CALL SITE (block_view.rs / rows.rs construct
+// this band literal — grid_cache.rs itself is untouched). Truth table:
+// ② armed → every cols-stale entry defers (stale tables keep serving);
+// ④ armed → no entry eviction for a stable block set; ⑤ unfreeze → the
+// next real-band sync restores normal band semantics same-frame.
+
+/// The freeze band the two sync call sites construct while armed:
+/// `high_rows = 0` makes `fully_above` true for every block.
+fn defer_all_band() -> BandSync {
+    BandSync {
+        low_rows: 0,
+        high_rows: 0,
+    }
+}
+
+#[test]
+fn defer_all_band_defers_every_cols_rebuild_and_keeps_entries() {
+    let blocks: Vec<_> = (1..=3)
+        .map(|id| mk_block_with_output(id, "echo", "0123456789abcdefghij"))
+        .collect();
+    let mut cache = BlockLayoutCache::default();
+    cache.sync_blocks(&blocks, 80, full_band());
+    assert!(cache.pending_ids_empty(), "cold sync rebuilds everything");
+    cache.take_hit_miss_counts();
+
+    // Armed freeze + a cols change (the zoom/drag case): every entry defers.
+    cache.sync_blocks(&blocks, 40, defer_all_band());
+    let (hits, misses) = cache.take_hit_miss_counts();
+    assert_eq!((hits, misses), (0, 0), "defer-all must rebuild NOTHING");
+    for id in 1..=3 {
+        let entry = cache.get_if_cached(id).expect("entry must survive");
+        assert_eq!(
+            entry.cols, 80,
+            "stale cols entry keeps serving (no rebuild)"
+        );
+    }
+    assert_eq!(cache.deferred_count(), 3, "all cols-stale ids defer");
+}
+
+#[test]
+fn defer_all_band_still_caches_uncached_blocks_for_the_layout_pass() {
+    // The layout pass calls `cache.get()` (panics on a missing entry), so
+    // the freeze band must NOT defer an UNCACHED block — classify's
+    // Immediate arm covers it.
+    let block = mk_block_with_output(1, "echo", "0123456789abcdefghij");
+    let mut cache = BlockLayoutCache::default();
+    cache.sync_blocks(std::slice::from_ref(&block), 40, defer_all_band());
+    let entry = cache
+        .get_if_cached(1)
+        .expect("uncached block must Both-build");
+    assert_eq!(entry.cols, 40, "the new entry is cols-fresh");
+    assert_eq!(cache.deferred_count(), 0);
+}
+
+#[test]
+fn unfreeze_first_real_band_sync_restores_normal_band_semantics() {
+    // Truth table ⑤: settle converges through the EXISTING machinery —
+    // the first unfrozen sync's B-1 pending band check rebuilds every
+    // deferred in-band block the same frame (no new convergence channel).
+    let blocks: Vec<_> = (1..=3)
+        .map(|id| mk_block_with_output(id, "echo", "0123456789abcdefghij"))
+        .collect();
+    let mut cache = BlockLayoutCache::default();
+    cache.sync_blocks(&blocks, 80, full_band());
+    cache.sync_blocks(&blocks, 40, defer_all_band());
+    assert_eq!(cache.deferred_count(), 3);
+
+    cache.sync_blocks(&blocks, 40, full_band());
+    assert!(cache.pending_ids_empty(), "in-band pending must rebuild");
+    for id in 1..=3 {
+        assert_eq!(
+            cache.get_if_cached(id).expect("entry survives").cols,
+            40,
+            "first unfrozen sync rebuilds at the settled cols"
+        );
+    }
+}
+
+#[test]
+fn defer_all_band_cannot_prevent_set_rotation_eviction_hence_bg_skip() {
+    // Truth table ④'s mechanism note: the band only gates REBUILDS — the
+    // non-append sync's retain evicts a rotated set's absent ids REGARDLESS
+    // of band. This is exactly why the F7-2 bg-pane freeze SKIPS the rebuild
+    // wholesale (panes.rs early return) instead of only band-deferring it:
+    // a bg rebuild's sync_blocks would evict the active pane's entries even
+    // under the defer-all band.
+    let pane_a: Vec<_> = (1..=2)
+        .map(|id| mk_block_with_output(id, "echo", "a\n"))
+        .collect();
+    let pane_b: Vec<_> = (3..=4)
+        .map(|id| mk_block_with_output(id, "echo", "b\n"))
+        .collect();
+    let mut cache = BlockLayoutCache::default();
+    cache.sync_blocks(&pane_a, 80, full_band());
+    cache.sync_blocks(&pane_b, 80, defer_all_band());
+    assert!(
+        cache.get_if_cached(1).is_none() && cache.get_if_cached(2).is_none(),
+        "a different pane's sync evicts the other pane's entries even defer-all"
+    );
+    assert!(cache.get_if_cached(3).is_some() && cache.get_if_cached(4).is_some());
+}

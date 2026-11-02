@@ -175,9 +175,40 @@ impl MetalRenderer {
         {
             let mut cache = self.block_layout_cache.borrow_mut();
             // M6-b B-1: same band as rows.rs; B-5 pump gate also in rows.rs.
-            let band = BandSync::for_viewport(block_scroll as usize, viewport_rows);
+            // F7-2 (PLAN_v1184 §2-F7-2): during the rewrap freeze (self-zoom
+            // window / live-resize drag) the band is DEFER-ALL — `high_rows=0`
+            // makes `fully_above` true for every block, so every cols-stale
+            // entry defers and keeps serving its stale (self-consistent)
+            // tables; uncached blocks still Both-build (the layout pass's
+            // `get()` precondition). Settling reuses the existing machinery:
+            // the freeze lifts → the next sync passes the real band →
+            // in-band blocks rebuild immediately, the rest defer to the idle
+            // pump. No new convergence channel.
+            //
+            // Budget interaction (rust-reviewer P1-1): a defer-all band
+            // makes `enforce_table_budget`'s band-exempt set EMPTY (its
+            // `bottom < 0` guard never holds), so a session above the
+            // 256MiB table budget can degrade VISIBLE blocks during the
+            // freeze window — and the degraded rebuild is itself suppressed
+            // while `fully_above` holds, so the metrics shell persists for
+            // the whole animation. Bounded by the freeze window (the flush
+            // verdict); ~86MiB sessions never cross the budget. Revisit if
+            // either the freeze semantics or the budget threshold change.
+            let freeze = crate::paint::zoom_render::rewrap_freeze_active();
+            let band = if freeze {
+                BandSync {
+                    low_rows: 0,
+                    high_rows: 0,
+                }
+            } else {
+                BandSync::for_viewport(block_scroll as usize, viewport_rows)
+            };
             cache.sync_blocks(blocks, cols, band);
-            if self.block_view_pump_idle(live.as_ref()) {
+            // F7-2: the idle pump is ALSO frozen — pump_deferred rebuilds
+            // regardless of band (the band only orders candidates), so a
+            // drain here would rebuild deferred blocks at the in-flight cols
+            // and defeat the freeze. One boolean read per frame.
+            if !freeze && self.block_view_pump_idle(live.as_ref()) {
                 cache.pump_deferred(blocks, cols, band, 1);
             }
         }

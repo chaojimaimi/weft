@@ -177,6 +177,11 @@ impl MetalRenderer {
         // Phase E: the pull STANDS DOWN during the gesture (Warp presents
         // once per tick) instead of bypassing the present-rate limiter.
         crate::paint::zoom_render::set_pull_live_resize_stand_down(active);
+        // F7-2 (PLAN_v1184 §2-F7-2): the live-resize leg of the block-rewrap
+        // freeze rides the same unconditional gesture poll — the bit pairs
+        // because the false reset does not depend on a later
+        // RedrawRequested (the last drag event can be a Resized).
+        crate::paint::zoom_render::set_rewrap_freeze_live_resize(active);
         self.layer.set_presents_with_transaction(active); // metal-rs typed API
         if self.live_resize_flip_enabled {
             // Legacy flip+flush observability only; the flush itself is

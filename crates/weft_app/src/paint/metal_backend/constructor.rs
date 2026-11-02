@@ -345,6 +345,9 @@ impl MetalRenderer {
             // MetalRenderer).
             bg_visible_blocks: RefCell::new(HashMap::new()),
             bg_visible_blocks_sink: RefCell::new(None),
+            // F7-3: the split-zoom forensic probe starts with "last frame
+            // saw no zoom window" — the first armed frame emits the arm line.
+            zoom_split_probe_window_open: false,
             scroll_metrics_memo: Cell::new(None),
             cached_scroll_metrics: Cell::new(None),
             cached_panel_scroll_metrics: Cell::new(None),

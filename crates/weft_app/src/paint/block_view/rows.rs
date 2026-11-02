@@ -142,10 +142,22 @@ impl MetalRenderer {
             let mut cache = self.block_layout_cache.borrow_mut();
             // M6-b B-1: same band derivation as the paint path (block_view.rs)
             // so hit-testing geometry matches what sync classified.
-            let band = crate::paint::grid_cache::BandSync::for_viewport(
-                block_scroll as usize,
-                viewport_rows,
-            );
+            // F7-2 (PLAN_v1184 §2-F7-2): the freeze band twin of the paint
+            // site — a mouse hit-test during the animation must not rebuild
+            // in-band blocks at the in-flight cols either (same defer-all
+            // shape; uncached blocks still Both-build for the `get()`
+            // precondition).
+            let band = if crate::paint::zoom_render::rewrap_freeze_active() {
+                crate::paint::grid_cache::BandSync {
+                    low_rows: 0,
+                    high_rows: 0,
+                }
+            } else {
+                crate::paint::grid_cache::BandSync::for_viewport(
+                    block_scroll as usize,
+                    viewport_rows,
+                )
+            };
             cache.sync_blocks(blocks, cols, band);
         }
         let cache = self.block_layout_cache.borrow();

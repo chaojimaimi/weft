@@ -568,3 +568,66 @@ fn window_age_crossing_the_cap_releases_the_ax_guard() {
         self_zoom_window_open_for()
     ));
 }
+
+// ── F7-2 (PLAN_v1184 §2-F7-2): block-rewrap freeze predicate ────────────
+// Truth table ①: the two arming sites pair their bits; a cancellation path
+// (zoom_anim_cancel / flush verdict both funnel set_self_zoom_window(false))
+// cannot leak `true` — a leaked freeze means permanent stale-cols rendering.
+
+#[test]
+fn rewrap_freeze_rides_the_zoom_window_funnel() {
+    let _guard = GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Clean slate (both bits — the tests under the shared lock rely on it).
+    set_rewrap_freeze_live_resize(false);
+    set_self_zoom_window(false);
+    assert!(!rewrap_freeze_active(), "no window, no gesture → unfrozen");
+
+    // The zoom arm (start_zoom_anim / resized.rs re-arm → set_self_zoom_window).
+    set_self_zoom_window(true);
+    assert!(rewrap_freeze_active(), "armed zoom window freezes rewrap");
+
+    // The zoom CANCELLATION path (zoom_anim_cancel) and the flush verdict
+    // both close via the same funnel — one assert covers both no-leak arms.
+    set_self_zoom_window(false);
+    assert!(
+        !rewrap_freeze_active(),
+        "cancel/flush must reset the zoom freeze bit (no leak)"
+    );
+}
+
+#[test]
+fn rewrap_freeze_live_resize_bit_pairs_and_overlaps_independently() {
+    let _guard = GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Clean slate.
+    set_self_zoom_window(false);
+    set_rewrap_freeze_live_resize(false);
+    assert!(!rewrap_freeze_active());
+
+    // The live-resize leg arms via set_live_resize's unconditional gesture
+    // poll (the writer is tested directly — set_live_resize itself needs a
+    // renderer).
+    set_rewrap_freeze_live_resize(true);
+    assert!(rewrap_freeze_active(), "gesture alone freezes rewrap");
+    set_rewrap_freeze_live_resize(false);
+    assert!(!rewrap_freeze_active(), "gesture end must reset (no leak)");
+
+    // Overlap: a drag starting while the zoom flush tail is still open.
+    // TWO bits — the shared-bit design would let the zoom reset below clear
+    // the still-active drag and leak stale-cols rendering mid-gesture.
+    set_self_zoom_window(true);
+    set_rewrap_freeze_live_resize(true);
+    assert!(rewrap_freeze_active());
+    set_self_zoom_window(false); // zoom cancel mid-gesture
+    assert!(
+        rewrap_freeze_active(),
+        "the zoom reset must NOT clear the live-resize bit"
+    );
+    set_rewrap_freeze_live_resize(false); // gesture ends
+    assert!(!rewrap_freeze_active(), "both bits clear → unfrozen");
+}

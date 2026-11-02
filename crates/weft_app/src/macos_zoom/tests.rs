@@ -324,3 +324,35 @@ fn zoom_anim_arm_and_cancel_drive_self_zoom_window() {
         "cancelling the animation must close the self-zoom window"
     );
 }
+
+/// F7-2 negative path (PLAN_v1184 §2-F7-2): a cancelled animation (live
+/// resize interrupting a zoom, `zoom_anim_cancel`) must reset the rewrap
+/// FREEZE too — a leaked `true` means permanent stale-cols rendering. This
+/// drives the REAL cancel fn, not just the funnel.
+#[test]
+fn zoom_anim_cancel_resets_the_rewrap_freeze() {
+    let _guard = ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _shared_guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Clean slate.
+    zoom_anim_cancel();
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
+    assert!(!crate::paint::zoom_render::rewrap_freeze_active());
+
+    let frame: ZoomFrame = (0.0, 0.0, 800.0, 600.0);
+    start_zoom_anim(frame, frame, 900.0);
+    assert!(
+        crate::paint::zoom_render::rewrap_freeze_active(),
+        "the anim arm freezes the block rewrap"
+    );
+
+    zoom_anim_cancel();
+    assert!(
+        !crate::paint::zoom_render::rewrap_freeze_active(),
+        "cancelling the animation must unfreeze (no leak)"
+    );
+}

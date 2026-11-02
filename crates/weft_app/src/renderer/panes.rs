@@ -181,6 +181,36 @@ impl MetalRenderer {
                 false
             }
             PaneBaseView::Block => {
+                // F7-2 (PLAN_v1184 §2-F7-2): the background pane's BLOCK
+                // rebuild is skipped WHOLESALE while the rewrap freeze is
+                // armed — not merely fingerprint-gated. The rebuild runs
+                // `build_block_view_vertices`, whose internal `sync_blocks`
+                // pushes THIS pane's block set into the SHARED
+                // `block_layout_cache`; the non-append sync's retain evicts
+                // the active pane's entries (and the active sync evicts this
+                // pane's back) — the ≤15fps cross-eviction the freeze exists
+                // to stop. A band-defer alone would still pay the eviction,
+                // hence the early return. Trade (plan §2-F7-2): the previous
+                // build keeps serving (old rect/cols vertices, absolutely
+                // baked) for the whole freeze window (≤ the animation + flush
+                // tail) — the same stale-render the 60ms throttle already
+                // shows, widened; a cold pane (no cached entry) renders
+                // nothing until the freeze lifts.
+                if crate::paint::zoom_render::rewrap_freeze_active() {
+                    if let Some(entry) = self
+                        .background_block_caches
+                        .borrow()
+                        .get(&pane.pane_session_id)
+                    {
+                        background_vertices.extend_from_slice(&entry.vertices);
+                    }
+                    tracing::debug!(
+                        bg_rect = ?pane.rect,
+                        pane_session_id = pane.pane_session_id,
+                        "background block pane rebuild frozen (rewrap freeze armed)"
+                    );
+                    return false;
+                }
                 let editor_mode = pane.terminal.effective_input_mode() == InputMode::Editor;
                 let prompt = background_prompt(pane);
                 // v1.13.5 T16b: composite gate key — every input that bakes
@@ -448,8 +478,15 @@ mod tests {
     /// frame performs NO rebuild (build count 0); a content bump inside the
     /// throttle window holds the old vertices; after the window it rebuilds;
     /// a rect-only delta rebuilds immediately.
+    // F7-2: this test OBSERVES the rewrap freeze flag (build_background_pane_content
+    // early-returns while armed), so it must hold the SHARED
+    // GLOBAL_ZOOM_STATE_LOCK — the zoom_render/macos_zoom flag tests flip it
+    // concurrently (rust-reviewer round 7's cross-module interleave shape).
     #[test]
     fn background_block_pane_cache_gates_rebuilds() {
+        let _zoom_guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(renderer) = headless_renderer_or_skip() else {
             eprintln!("skipping bg block cache test: no Metal device available");
             return;
@@ -546,8 +583,13 @@ mod tests {
     }
 
     /// T16b: the color/font invalidation hooks clear the whole map.
+    // F7-2: observes the freeze flag via build_background_pane_content —
+    // hold the SHARED GLOBAL_ZOOM_STATE_LOCK (zoom-flag tests flip it).
     #[test]
     fn theme_and_atlas_hooks_clear_background_block_caches() {
+        let _zoom_guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut renderer) = headless_renderer_or_skip() else {
             eprintln!("skipping bg block cache hook test: no Metal device available");
             return;
@@ -592,8 +634,13 @@ mod tests {
     }
 
     /// T16b: the draw()-side retain prunes closed/active panes' entries.
+    // F7-2: observes the freeze flag via build_background_pane_content —
+    // hold the SHARED GLOBAL_ZOOM_STATE_LOCK (zoom-flag tests flip it).
     #[test]
     fn background_block_caches_retain_live_panes_only() {
+        let _zoom_guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(renderer) = headless_renderer_or_skip() else {
             eprintln!("skipping bg block cache retain test: no Metal device available");
             return;
@@ -631,8 +678,13 @@ mod tests {
     /// entries (a closed pane's entry would otherwise pin its last window
     /// forever). Collection happens only on rebuild — a T16b cache-hit frame
     /// keeps the previous frame's set, matching the plan's "预热照跑" note.
+    // F7-2: observes the freeze flag via build_background_pane_content —
+    // hold the SHARED GLOBAL_ZOOM_STATE_LOCK (zoom-flag tests flip it).
     #[test]
     fn bg_visible_blocks_collected_on_rebuild_and_retained_live_panes_only() {
+        let _zoom_guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(renderer) = headless_renderer_or_skip() else {
             eprintln!("skipping bg visible-blocks test: no Metal device available");
             return;
@@ -694,3 +746,11 @@ mod tests {
         assert!(prompt.submit_on_ctrl_enter);
     }
 }
+
+// F7-2 freeze tests live in the gate-exempt sibling module (repo
+// test-module convention; grid_cache/budget_tests.rs precedent — the
+// #[path] is relative to renderer/ because panes.rs is a non-mod.rs file,
+// and the inline tests module above already sat near the 800-line gate).
+#[cfg(test)]
+#[path = "panes/freeze_tests.rs"]
+mod freeze_tests;

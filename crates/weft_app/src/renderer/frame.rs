@@ -272,6 +272,28 @@ impl crate::renderer::MetalRenderer {
         // (baseline :691/:713); `layout_ctx` is NOT Cell-ized.
         if !background_panes.is_empty() {
             let base_ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+            // F7-3 (PLAN_v1184 §2-F7-3, 病灶④取证 only — no behavior): one
+            // INFO line per background pane at each zoom-window EDGE (arm =
+            // first frame inside the window, flush = first frame after it).
+            // Carries the bg pane's rect, session id and the stash watermark
+            // so the next round's render-anomaly investigation has the exact
+            // split state. Zero output without a split (this block) or
+            // without a zoom window (the edge compare).
+            let zoom_window_open = crate::paint::zoom_render::self_zoom_window();
+            if zoom_window_open != self.zoom_split_probe_window_open {
+                let watermark = crate::paint::zoom_render::probe_stash_watermark();
+                for bg in background_panes {
+                    tracing::info!(
+                        probe = "ZOOM_SPLIT",
+                        edge = if zoom_window_open { "arm" } else { "flush" },
+                        bg_rect = ?bg.rect,
+                        pane_session_id = bg.pane_session_id,
+                        ?watermark,
+                        "zoom window edge: background pane state"
+                    );
+                }
+                self.zoom_split_probe_window_open = zoom_window_open;
+            }
             // Split-tree rects are absolute viewport coordinates; `for_pane`
             // converts them to the offset + clip expected by LayoutCtx.
             for bg in background_panes {

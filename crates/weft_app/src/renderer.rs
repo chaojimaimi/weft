@@ -335,6 +335,13 @@ pub struct MetalRenderer {
     /// `LaidRow::Output` block ids; the active pane never sets the sink, so
     /// it can never write here.
     pub(crate) bg_visible_blocks_sink: RefCell<Option<(u64, Vec<weft_core::blocks::BlockId>)>>,
+    /// F7-3 (PLAN_v1184 §2-F7-3, 病灶④取证 only): the zoom-window edge state
+    /// for the split-pane forensic probe — whether the LAST multi-pane frame
+    /// saw `self_zoom_window()` open. An open↔closed flip emits one INFO line
+    /// per background pane (rect + session id + stash watermark) at the arm
+    /// edge and at the flush edge; zero output without a split or without a
+    /// zoom window. Probe state only — no render decision reads it.
+    pub(crate) zoom_split_probe_window_open: bool,
     /// v1.0 P0-c: Pending scroll delta captured during build_grid_vertices
     /// (via grid.take_pending_scroll()). Used by the draw() epilogue to
     /// decide whether to issue a GPU blit before the render pass.

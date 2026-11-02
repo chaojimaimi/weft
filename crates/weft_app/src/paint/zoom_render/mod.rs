@@ -88,6 +88,13 @@ static PULL_LIVE_RESIZE_STAND_DOWN: AtomicBool = AtomicBool::new(false);
 /// ≤300 ms hot tail. Gates the C1 suppression and the C2 pull stand-down;
 /// `zoom_anim_active()` alone drops one step early (the F.0 defect).
 static SELF_ZOOM_WINDOW: AtomicBool = AtomicBool::new(false);
+/// F7-2 (PLAN_v1184 §2-F7-2): the block-rewrap freeze bit for the ZOOM leg.
+/// Frozen while the self-zoom window is open (arm → flush verdict).
+static REWRAP_FREEZE_ZOOM: AtomicBool = AtomicBool::new(false);
+/// F7-2: the freeze bit for the LIVE-RESIZE leg (drag gesture). Frozen while
+/// `live_resize_active` — the gesture-poll window, same scope as
+/// `set_pull_live_resize_stand_down`.
+static REWRAP_FREEZE_LIVE_RESIZE: AtomicBool = AtomicBool::new(false);
 /// WP2 F2 (PLAN_v1181_WP2 §5-F2): the instant the self-zoom window OPENED,
 /// as unix millis (0 = closed). The AX rebuild defer reads the window AGE
 /// off this stamp — its lifecycle guard needs the OPENED moment, not just
@@ -129,6 +136,14 @@ fn pull_live_resize_stand_down() -> bool {
 /// open (re-arm / trailing resize dispatch) — a naive overwrite would push
 /// the stamp forward and stretch the AX defer window on every re-arm.
 pub(crate) fn set_self_zoom_window(active: bool) {
+    // F7-2: the zoom freeze bit rides the SAME funnel — every open path
+    // (start_zoom_anim arm, resized.rs re-arm) and every close path
+    // (zoom_anim_cancel, flush verdict) passes through here, so the bit is
+    // paired by construction and a cancelled animation cannot leak `true`.
+    // Even a hypothetical stuck-open state is bounded: the flush verdict is
+    // driven by a deterministic WaitUntil deadline (window_event_controller),
+    // so the freeze window has a hard upper bound.
+    set_rewrap_freeze_zoom(active);
     if active {
         if !SELF_ZOOM_WINDOW.swap(true, Ordering::AcqRel) {
             SELF_ZOOM_WINDOW_OPENED_AT.store(now_unix_millis(), Ordering::Release);
@@ -141,6 +156,32 @@ pub(crate) fn set_self_zoom_window(active: bool) {
 
 pub(crate) fn self_zoom_window() -> bool {
     SELF_ZOOM_WINDOW.load(Ordering::Acquire)
+}
+
+/// F7-2 (PLAN_v1184 §2-F7-2): block-rewrap freeze writers. TWO bits, not
+/// one: the arming sources overlap (a drag gesture can start while the zoom
+/// flush tail is still open), and a single shared bit would let one source's
+/// reset clear the other's still-active freeze — a leaked `true` means
+/// permanent stale-cols rendering, so each source owns a bit and the reader
+/// ORs (same pairing precedent as `set_pull_live_resize_stand_down`).
+pub(crate) fn set_rewrap_freeze_zoom(active: bool) {
+    REWRAP_FREEZE_ZOOM.store(active, Ordering::Release);
+}
+
+/// F7-2: live-resize-site writer. Fed from `MetalRenderer::set_live_resize`,
+/// which forwards the gesture-only poll UNCONDITIONALLY (the false reset
+/// must not depend on a later RedrawRequested — the last drag event can be a
+/// Resized), so the bit cannot outlive the gesture.
+pub(crate) fn set_rewrap_freeze_live_resize(active: bool) {
+    REWRAP_FREEZE_LIVE_RESIZE.store(active, Ordering::Release);
+}
+
+/// F7-2 freeze predicate (read per sync call): the block layout layer
+/// (cols rewraps + bg-pane rebuilds) freezes during the self-zoom window
+/// AND during a live-resize drag. The terminal grid / per-cell vertices are
+/// NOT frozen — only block layout.
+pub(crate) fn rewrap_freeze_active() -> bool {
+    REWRAP_FREEZE_ZOOM.load(Ordering::Acquire) || REWRAP_FREEZE_LIVE_RESIZE.load(Ordering::Acquire)
 }
 
 /// WP2 F2: how long the self-zoom window has been open (`None` = closed).
@@ -159,6 +200,14 @@ pub(crate) fn self_zoom_window_open_for() -> Option<Duration> {
     Some(Duration::from_millis(
         now_unix_millis().saturating_sub(opened_ms),
     ))
+}
+
+/// F7-3 (PLAN_v1184 §2-F7-3, 病灶④取证 only — no behavior): the stash
+/// watermark (drawable size of the last stashed presented frame) for the
+/// split-pane forensic INFO line. Read-only; the probe never mutates cache
+/// state.
+pub(crate) fn probe_stash_watermark() -> Option<(f32, f32)> {
+    lock().last_presented
 }
 
 /// WP2 F2: the AX rebuild defer cap (plan §5-F2) — a zoom window younger
