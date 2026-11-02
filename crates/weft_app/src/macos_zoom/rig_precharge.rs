@@ -46,6 +46,13 @@ pub(crate) const PRECHARGE_ENV: &str = "WEFT_ZOOM_RIG_PRECHARGE";
 /// gate sets it when launching this process; the state machine reads it
 /// once at state creation.
 const INBAND_ENV: &str = "WEFT_ZOOM_RIG_GIANT_INBAND";
+/// F6-3 (PLAN_v1183_F6_CASCADE_TAB_SCOPE §2-F6-3): env key arming the
+/// double-tab variant — after the precharge sequence completes, open a
+/// fresh tab (`Action::NewTab`) and hold the zoom rig release until the
+/// new shell reaches its first prompt. Requires [`PRECHARGE_ENV`] (the
+/// pump is the only driver; without it this env stays inert) and composes
+/// with either giant variant: giant precharge first, then the new tab.
+const NEWTAB_ENV: &str = "WEFT_ZOOM_RIG_NEWTAB";
 
 /// Bounded wait for the first `ShellPhase::AtPrompt` (plan R2/R3 P2 guard):
 /// `NotIntegrated` is the tracker's `#[default]` initial state (blocks.rs),
@@ -80,12 +87,18 @@ const SEQ_ROUNDS: usize = 5;
 const GIANT_MIN_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// The state machine's step. `WaitShell` is the plan's front guard; `Await`
-/// carries the sequence index of the command in flight; `Done`/`Failed` are
+/// carries the sequence index of the command in flight; `OpenTab` /
+/// `AwaitNewTab` are the F6-3 double-tab legs; `Done`/`Failed` are
 /// terminal (the zoom rig is released either way — see [`precharge_done`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     WaitShell,
     Await(usize),
+    /// F6-3 NEWTAB leg: fire `Action::NewTab` once (thin pump shell).
+    OpenTab,
+    /// F6-3 NEWTAB leg: bounded wait for the fresh tab's first
+    /// `ShellPhase::AtPrompt` (SHELL_WAIT, TOTAL_BUDGET still above it).
+    AwaitNewTab,
     Done,
     Failed,
 }
@@ -95,6 +108,10 @@ enum Step {
 pub(crate) enum Action {
     /// Submit the sequence command at this index now.
     Submit(usize),
+    /// F6-3 NEWTAB variant: the sequence is complete — open a fresh tab
+    /// (pump executes `Action::NewTab`) and wait for its prompt before
+    /// releasing the zoom rig.
+    OpenTab,
     /// Nothing to do; keep waiting.
     Wait,
     /// Sequence complete — release the zoom rig.
@@ -113,7 +130,8 @@ pub(crate) struct ShellObs {
 }
 
 /// The precharge state machine. Construction is the plan's "state machine
-/// start"; `started` anchors both timeout bounds.
+/// start"; `started` anchors the total timeout bound, `phase_started` the
+/// current per-phase bound.
 pub(crate) struct Precharge {
     step: Step,
     /// Finished-block count at the moment the in-flight command was
@@ -122,15 +140,26 @@ pub(crate) struct Precharge {
     started: Instant,
     /// Sequence length: 1 (inband) or 1 + [`SEQ_ROUNDS`] (shaped).
     seq_len: usize,
+    /// F6-3: NEWTAB variant — after the sequence completes, open a fresh
+    /// tab and await its first prompt before releasing the zoom rig.
+    newtab: bool,
+    /// When the CURRENT bounded wait started: construction for the front
+    /// guard (the initial shell), the `Action::NewTab` execution instant
+    /// for the F6-3 new-tab wait. SHELL_WAIT measures from here.
+    phase_started: Instant,
 }
 
 impl Precharge {
-    fn new(inband: bool) -> Self {
+    fn new(inband: bool, newtab: bool) -> Self {
         Precharge {
             step: Step::WaitShell,
             baseline_blocks: 0,
             started: Instant::now(),
             seq_len: if inband { 1 } else { 1 + SEQ_ROUNDS },
+            newtab,
+            // The front guard's wait measures from construction; the F6-3
+            // new-tab wait re-stamps this at the NewTab execution.
+            phase_started: Instant::now(),
         }
     }
 
@@ -167,8 +196,29 @@ impl Precharge {
                 let next = index + 1;
                 if next < self.seq_len {
                     Action::Submit(next)
+                } else if self.newtab {
+                    // F6-3: hold the release — the fresh tab must be open
+                    // and at its first prompt first (the rig measures the
+                    // two-tab topology the field report described).
+                    Action::OpenTab
                 } else {
                     Action::Done
+                }
+            }
+            // F6-3 NEWTAB legs. The pump executes Action::NewTab and flips
+            // the state to AwaitNewTab in the same tick, so the OpenTab
+            // verdict is only re-consulted on a raced tick (idempotent).
+            Step::OpenTab => Action::OpenTab,
+            Step::AwaitNewTab => {
+                // The pump observes the ACTIVE tab — execute_action(NewTab)
+                // already switched it. The fresh shell's tracker starts
+                // NotIntegrated (the front guard's rationale) and the
+                // first-run banner may or may not have landed, so block
+                // counts are irrelevant here; AtPrompt is the release.
+                if obs.phase == ShellPhase::AtPrompt {
+                    Action::Done
+                } else {
+                    Action::Wait
                 }
             }
             // Pump stops visiting terminal states (checked before advance).
@@ -178,6 +228,9 @@ impl Precharge {
 }
 
 /// Shell-wait expiry (pure; the clock enters as an elapsed Duration).
+/// Serves BOTH bounded waits: the front guard's initial-shell integration
+/// and the F6-3 fresh-tab prompt wait (each measures from its own
+/// `phase_started`).
 fn shell_wait_expired(elapsed: Duration) -> bool {
     elapsed >= SHELL_WAIT
 }
@@ -185,6 +238,37 @@ fn shell_wait_expired(elapsed: Duration) -> bool {
 /// Total-budget expiry (pure; the clock enters as an elapsed Duration).
 fn total_budget_expired(elapsed: Duration) -> bool {
     elapsed >= TOTAL_BUDGET
+}
+
+/// The bounded-wait verdict for one pump tick (pure; both clocks enter as
+/// elapsed Durations). TOTAL_BUDGET dominates; the per-phase bound is
+/// [`SHELL_WAIT`] measured from the phase's own start (`phase_started` —
+/// construction for the front guard, the NewTab execution instant for the
+/// F6-3 new-tab wait). Truth-tabled so the F6-3 timeout path is pinned
+/// without the PTY shell (the H1-era lesson: every verdict binding gets a
+/// table before it is trusted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expiry {
+    /// The whole sequence blew its shared total bound.
+    Total,
+    /// The front guard: the initial shell never integrated.
+    ShellWait,
+    /// F6-3: the fresh tab's shell never integrated.
+    NewTabWait,
+    /// Everything still inside its bound.
+    None,
+}
+
+fn expiry_verdict(step: Step, total_elapsed: Duration, phase_elapsed: Duration) -> Expiry {
+    if total_budget_expired(total_elapsed) {
+        Expiry::Total
+    } else if step == Step::WaitShell && shell_wait_expired(phase_elapsed) {
+        Expiry::ShellWait
+    } else if step == Step::AwaitNewTab && shell_wait_expired(phase_elapsed) {
+        Expiry::NewTabWait
+    } else {
+        Expiry::None
+    }
 }
 
 /// The command for sequence index `index` (0 = giant, 1.. = seq shaping).
@@ -202,10 +286,15 @@ fn command_for(index: usize) -> &'static str {
 /// macos_zoom statics house style and guards any future second caller).
 static PRECHARGE: Mutex<Option<Precharge>> = Mutex::new(None);
 /// Completion stamp — also the zoom rig's timing anchor (see [`rig_anchor`]).
+/// With the F6-3 NEWTAB variant this stamps at the new-tab completion (or
+/// the bounded-wait failure), which is exactly the anchor rebase the gate's
+/// fire0/fire1 spacing needs.
 static DONE_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// Armed flag cached once: the env is fixed at process start, and the
 /// OnceLock fast path is one atomic load per event-loop pass.
 static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// F6-3 NEWTAB armed flag: same cached-env house shape as [`ARMED`].
+static NEWTAB_ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn armed() -> bool {
     *ARMED.get_or_init(|| std::env::var_os(PRECHARGE_ENV).as_deref() == Some(OsStr::new("1")))
@@ -213,6 +302,10 @@ fn armed() -> bool {
 
 fn inband() -> bool {
     std::env::var_os(INBAND_ENV).as_deref() == Some(OsStr::new("1"))
+}
+
+fn newtab_armed() -> bool {
+    *NEWTAB_ARMED.get_or_init(|| std::env::var_os(NEWTAB_ENV).as_deref() == Some(OsStr::new("1")))
 }
 
 /// Whether the zoom rig's first fire may proceed: always true when the
@@ -224,6 +317,18 @@ pub(crate) fn precharge_done() -> bool {
         return true;
     }
     DONE_AT.get().is_some()
+}
+
+/// Whether the zoom rig's first fire may proceed with respect to the F6-3
+/// NEWTAB variant: always true when [`NEWTAB_ENV`] is unset (byte-identical
+/// legacy), otherwise only after the state machine reached a terminal step.
+/// With `newtab` armed, `Done` is only reachable after the fresh tab sits at
+/// its first prompt — and the failure path releases through the same
+/// `finish()` stamp — so `DONE_AT` is exactly the new-tab completion/failure
+/// mark. Wired into `self_zoom_test_tick`'s fire0 gate next to
+/// [`precharge_done`].
+pub(crate) fn rig_newtab_ready() -> bool {
+    !newtab_armed() || DONE_AT.get().is_some()
 }
 
 /// The zoom rig's timing anchor (plan §4-A2 item 1: the anchor moves from
@@ -249,22 +354,32 @@ pub(crate) fn pump(app: &mut App) {
     let mut slot = PRECHARGE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state = slot.get_or_insert_with(|| Precharge::new(inband()));
+    let state = slot.get_or_insert_with(|| Precharge::new(inband(), newtab_armed()));
     if matches!(state.step, Step::Done | Step::Failed) {
         return;
     }
-    let elapsed = state.started.elapsed();
+    let total_elapsed = state.started.elapsed();
+    let phase_elapsed = state.phase_started.elapsed();
     // Shared total bound FIRST: it also covers a shell that integrated but
-    // stalled mid-sequence (e.g. the giant never finalizes).
-    if total_budget_expired(elapsed) {
-        tracing::error!("zoom rig precharge timeout");
-        release(state);
-        return;
-    }
-    if state.step == Step::WaitShell && shell_wait_expired(elapsed) {
-        tracing::error!("zoom rig precharge: shell not integrated");
-        release(state);
-        return;
+    // stalled mid-sequence (e.g. the giant never finalizes) and a fresh
+    // F6-3 tab that never reaches its first prompt.
+    match expiry_verdict(state.step, total_elapsed, phase_elapsed) {
+        Expiry::Total => {
+            tracing::error!("zoom rig precharge timeout");
+            release(state);
+            return;
+        }
+        Expiry::ShellWait => {
+            tracing::error!("zoom rig precharge: shell not integrated");
+            release(state);
+            return;
+        }
+        Expiry::NewTabWait => {
+            tracing::error!("zoom rig precharge: new tab shell not integrated");
+            release(state);
+            return;
+        }
+        Expiry::None => {}
     }
     let Some(tab) = app.sessions.active_mut() else {
         return;
@@ -311,7 +426,38 @@ pub(crate) fn pump(app: &mut App) {
                 log_giant_identity(tab);
             }
         }
+        Action::OpenTab => {
+            // F6-3: the sequence is complete; before releasing the zoom
+            // rig, open a fresh tab so the rig measures the two-tab
+            // topology the field report described (the giant tab goes
+            // background). execute_action is the MenuAction entry — the
+            // regular dispatch path, no new tab API. Two-tick pass-through
+            // so the state machine literally walks Done→OpenTab→
+            // AwaitNewTab: this tick executes the action and PARKS at
+            // Step::OpenTab; the next tick's OpenTab verdict flips to
+            // AwaitNewTab (execute_action switches the active tab
+            // synchronously, so the parked tick's observation is already
+            // the fresh tab and harmless to ignore).
+            if matches!(state.step, Step::Await(_)) {
+                // Inband: the giant's completion IS the sequence's
+                // completion, so the identity log would otherwise be
+                // skipped — keep it before the tab switch moves the
+                // observation window.
+                if state.step == Step::Await(0) {
+                    log_giant_identity(tab);
+                }
+                state.step = Step::OpenTab;
+                // The fresh-tab wait measures from THIS instant
+                // (SHELL_WAIT, TOTAL_BUDGET still above it).
+                state.phase_started = Instant::now();
+                app.execute_action(weft_core::config::Action::NewTab);
+                tracing::info!("zoom rig precharge: new tab requested");
+            } else {
+                state.step = Step::AwaitNewTab;
+            }
+        }
         Action::Done => {
+            let newtab_just_ready = state.step == Step::AwaitNewTab;
             let giant_just_finished = state.step == Step::Await(0);
             let elapsed_ms = state.started.elapsed().as_millis() as u64;
             state.step = Step::Done;
@@ -320,6 +466,12 @@ pub(crate) fn pump(app: &mut App) {
                 blocks = obs.finished_blocks,
                 "zoom rig precharge: complete"
             );
+            if newtab_just_ready {
+                // F6-4 criteria-② window anchor: the gate's ioctl counting
+                // starts AFTER this line (the giant tab is background from
+                // here on).
+                tracing::info!("zoom rig precharge: newtab ready");
+            }
             finish();
             if giant_just_finished {
                 log_giant_identity(tab);

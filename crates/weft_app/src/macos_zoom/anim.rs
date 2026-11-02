@@ -689,10 +689,22 @@ pub(crate) fn self_zoom_test_tick(window: &winit::window::Window) {
     // no longer collapses the gap between the two rig fires. Unarmed
     // sessions keep the startup anchor: byte-identical legacy semantics
     // (precharge_done is unconditionally true and the anchor is `started`).
+    // F6-3 (PLAN_v1183_F6_CASCADE_TAB_SCOPE §2-F6-3): with the double-tab
+    // rig armed (WEFT_ZOOM_RIG_NEWTAB=1), fire0 additionally waits for the
+    // fresh tab to reach its first prompt (rig_newtab_ready — always true
+    // when the env is unset). DONE_AT now stamps at the new-tab completion,
+    // so the anchor re-bases AGAIN at that instant: fire0/fire1 due run
+    // from the NEW anchor and a long AwaitNewTab cannot collapse the two
+    // fires into one window (the same "long precharge" argument, one leg
+    // deeper).
     let anchor = super::rig_anchor(started);
     let elapsed = anchor.elapsed();
     let due = match n {
-        0 => super::precharge_done() && elapsed >= std::time::Duration::from_secs(base),
+        0 => {
+            super::rig_newtab_ready()
+                && super::precharge_done()
+                && elapsed >= std::time::Duration::from_secs(base)
+        }
         1 => elapsed >= std::time::Duration::from_secs(base + 4),
         _ => false,
     };

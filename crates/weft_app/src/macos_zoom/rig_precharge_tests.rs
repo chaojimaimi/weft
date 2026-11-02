@@ -30,7 +30,7 @@ fn awaiting_giant(seq_len: usize, baseline: usize) -> Precharge {
 }
 
 fn awaiting(index: usize, seq_len: usize, baseline: usize) -> Precharge {
-    let mut state = Precharge::new(seq_len == 1);
+    let mut state = Precharge::new(seq_len == 1, false);
     state.step = super::Step::Await(index);
     state.baseline_blocks = baseline;
     state
@@ -42,7 +42,7 @@ fn awaiting(index: usize, seq_len: usize, baseline: usize) -> Precharge {
 fn waitshell_holds_until_first_prompt() {
     // NotIntegrated is the tracker's default initial state; an immediate
     // check must NOT submit (plan R2 P3 guard).
-    let state = Precharge::new(false);
+    let state = Precharge::new(false, false);
     assert_eq!(
         state.advance(obs(ShellPhase::NotIntegrated, 0)),
         Action::Wait
@@ -149,7 +149,7 @@ fn seq_round_completion_advances_and_final_round_completes() {
 
 #[test]
 fn shaped_sequence_walks_giant_then_five_seq_rounds() {
-    let mut state = Precharge::new(false);
+    let mut state = Precharge::new(false, false);
     let mut blocks = 0usize;
     let mut actions = Vec::new();
     // First observation: shell integrated.
@@ -187,7 +187,7 @@ fn shaped_sequence_walks_giant_then_five_seq_rounds() {
 
 #[test]
 fn inband_sequence_walks_giant_only() {
-    let mut state = Precharge::new(true);
+    let mut state = Precharge::new(true, false);
     assert_eq!(
         state.advance(obs(ShellPhase::AtPrompt, 0)),
         Action::Submit(0)
@@ -216,6 +216,137 @@ fn total_budget_expires_at_exactly_sixty_seconds() {
         59_999
     )));
     assert!(total_budget_expired(std::time::Duration::from_secs(60)));
+}
+
+// ── F6-3 NEWTAB variant (Done→OpenTab→AwaitNewTab→Done | timeout) ───────
+
+/// Full NEWTAB walk (inband): the giant's completion hands to OpenTab (not
+/// Done), the pump's NewTab execution is idempotently re-fireable from the
+/// OpenTab step, and the fresh tab's first prompt releases. The timeout
+/// leg rides [`expiry_verdict`] below (the pump's thin shell turns
+/// NewTabWait into `Step::Failed` + release).
+#[test]
+fn newtab_inband_walks_open_tab_then_releases_at_first_prompt() {
+    let mut state = Precharge::new(true, true);
+    assert_eq!(
+        state.advance(obs(ShellPhase::AtPrompt, 0)),
+        Action::Submit(0)
+    );
+    state.step = super::Step::Await(0);
+    state.baseline_blocks = 0;
+    // The giant's completion now hands to the NEWTAB leg, NOT Done.
+    assert_eq!(
+        state.advance(obs_sized(ShellPhase::AtPrompt, 1, 32 * 1024 * 1024)),
+        Action::OpenTab
+    );
+    // Pump shell: the state flips to AwaitNewTab after executing NewTab;
+    // a raced tick re-fires the OpenTab verdict idempotently.
+    state.step = super::Step::OpenTab;
+    assert_eq!(state.advance(obs(ShellPhase::AtPrompt, 1)), Action::OpenTab);
+    // The fresh tab's tracker starts NotIntegrated (pre-133;A) — hold.
+    state.step = super::Step::AwaitNewTab;
+    assert_eq!(
+        state.advance(obs(ShellPhase::NotIntegrated, 0)),
+        Action::Wait
+    );
+    assert_eq!(
+        state.advance(obs(ShellPhase::CommandExecuting, 0)),
+        Action::Wait
+    );
+    // First prompt on the fresh tab: release.
+    assert_eq!(state.advance(obs(ShellPhase::AtPrompt, 0)), Action::Done);
+}
+
+/// Shaped NEWTAB: the five seq rounds walk unchanged, only the LAST
+/// round's completion hands to OpenTab, and from AwaitNewTab the fresh-tab
+/// prompt releases.
+#[test]
+fn newtab_shaped_holds_open_tab_until_last_round_completes() {
+    let mut state = Precharge::new(false, true);
+    let mut blocks = 0usize;
+    assert_eq!(
+        state.advance(obs(ShellPhase::AtPrompt, blocks)),
+        Action::Submit(0)
+    );
+    for index in 0..6 {
+        state.step = super::Step::Await(index);
+        state.baseline_blocks = blocks;
+        blocks += 1;
+        let newest = if index == 0 { 32 * 1024 * 1024 } else { 140 };
+        let action = state.advance(obs_sized(ShellPhase::AtPrompt, blocks, newest));
+        if index < 5 {
+            assert_eq!(action, Action::Submit(index + 1));
+        } else {
+            assert_eq!(action, Action::OpenTab);
+        }
+    }
+    state.step = super::Step::AwaitNewTab;
+    assert_eq!(state.advance(obs(ShellPhase::AtPrompt, 0)), Action::Done);
+}
+
+/// Unarmed NEWTAB (the v1.18.1-style byte-identical invariant): the
+/// sequence completion is `Done` directly, no OpenTab leg.
+#[test]
+fn newtab_unarmed_completes_directly_without_open_tab() {
+    let state = awaiting_giant(1, 0);
+    assert_eq!(
+        state.advance(obs_sized(ShellPhase::AtPrompt, 1, 32 * 1024 * 1024)),
+        Action::Done
+    );
+}
+
+/// NEWTAB expiry truth table: TOTAL_BUDGET dominates every step; the
+/// fresh-tab wait fires at exactly SHELL_WAIT on its OWN clock
+/// (`phase_started`, stamped at the NewTab execution); mid-sequence Await
+/// steps carry no phase bound (only the total).
+#[test]
+fn newtab_expiry_verdict_truth_table() {
+    use std::time::Duration;
+    // Total dominates, including inside the AwaitNewTab leg.
+    assert_eq!(
+        super::expiry_verdict(
+            super::Step::AwaitNewTab,
+            Duration::from_secs(60),
+            Duration::from_secs(1)
+        ),
+        super::Expiry::Total
+    );
+    // Front guard unchanged: WaitShell at its 10s bound.
+    assert_eq!(
+        super::expiry_verdict(
+            super::Step::WaitShell,
+            Duration::from_secs(10),
+            Duration::from_secs(10)
+        ),
+        super::Expiry::ShellWait
+    );
+    // Fresh-tab wait on its own clock: 1ms before the bound holds, the
+    // bound itself fires.
+    assert_eq!(
+        super::expiry_verdict(
+            super::Step::AwaitNewTab,
+            Duration::from_secs(15),
+            Duration::from_millis(9_999)
+        ),
+        super::Expiry::None
+    );
+    assert_eq!(
+        super::expiry_verdict(
+            super::Step::AwaitNewTab,
+            Duration::from_secs(15),
+            Duration::from_secs(10)
+        ),
+        super::Expiry::NewTabWait
+    );
+    // Mid-sequence Await steps: no phase bound, only the total.
+    assert_eq!(
+        super::expiry_verdict(
+            super::Step::Await(0),
+            Duration::from_secs(30),
+            Duration::from_secs(30)
+        ),
+        super::Expiry::None
+    );
 }
 
 // ── Command map ─────────────────────────────────────────────────────────

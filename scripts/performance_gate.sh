@@ -522,6 +522,216 @@ if [ "${WEFT_PERF_SLACK:-1.0}" = "1.0" ]; then
         fi
         printf 'PERF_GATE PASS: zoom giant rig (%s) criteria met\n' "$GIANT_VARIANT" | tee -a "$PERF_LOG"
     fi
+
+    # ── F6 double-tab rig sub-variant (PLAN_v1183_F6_CASCADE_TAB_SCOPE §2-F6-4) ──
+    # local-only, opt-in: WEFT_ZOOM_RIG_NEWTAB=1 (requires
+    # WEFT_ZOOM_RIG_PRECHARGE=1 — the shaped giant precharge runs first,
+    # then the app opens a fresh tab, and the zoom fires measure the
+    # two-tab topology of the v1.18.3 field report: a large background
+    # document tab behind an active empty tab). Unset → inert; everything
+    # above stays byte-identical to the giant section's behavior.
+    if [ "${WEFT_ZOOM_RIG_NEWTAB:-0}" = "1" ]; then
+        if [ "${WEFT_ZOOM_RIG_PRECHARGE:-0}" != "1" ]; then
+            echo "zoom newtab rig: WEFT_ZOOM_RIG_NEWTAB requires WEFT_ZOOM_RIG_PRECHARGE=1" >&2
+            exit 1
+        fi
+
+        newtab_rig_round() {
+            # One double-tab rig session — the GIANT round's window shape,
+            # NOT the zoom rig round's 11s (the precharge budget 60s +
+            # AwaitNewTab <= 10s + both rig fires 2s/6s from the newtab
+            # anchor + animation/convergence margin; an 11s window would
+            # truncate the sequence into a false red). The fresh temp
+            # config is raised to the legal capture cap (the 32MB giant
+            # precharge block, same as the giant round). RUST_LOG adds
+            # weft=debug: criterion ② counts DEBUG-level RESIZE_PROBE
+            # ioctl_commit lines (tab=/pane_id= fields, app_runtime.rs) —
+            # info alone cannot attribute them.
+            local offset size zoom_tmp
+            if [ -f "${HOME}/Library/Logs/Weft/weft.log" ]; then
+                offset="$(wc -c < "${HOME}/Library/Logs/Weft/weft.log" | tr -d ' ')"
+            else
+                offset=0
+            fi
+            zoom_tmp="$(mktemp -d "${TMPDIR:-/tmp}/weft-zoom-rig.XXXXXX")"
+            mkdir -p "$zoom_tmp/cache" "$zoom_tmp/config/weft"
+            printf '[blocks]\noutput_cap_mib = 64\n' > "$zoom_tmp/config/weft/config.toml"
+            XDG_CACHE_HOME="$zoom_tmp/cache" \
+                XDG_CONFIG_HOME="$zoom_tmp/config" \
+                WEFT_ALLOW_SECOND_INSTANCE=1 \
+                WEFT_SELF_ZOOM_TEST=1 \
+                WEFT_ZOOM_RIG_PRECHARGE=1 \
+                WEFT_ZOOM_RIG_NEWTAB=1 \
+                RUST_LOG=info,weft=debug \
+                target/release/weft &
+            local rig_pid=$!
+            sleep 90
+            kill "$rig_pid" 2>/dev/null || true
+            wait "$rig_pid" 2>/dev/null || true
+            rm -rf "$zoom_tmp"
+            if [ -f "${HOME}/Library/Logs/Weft/weft.log" ]; then
+                size="$(wc -c < "${HOME}/Library/Logs/Weft/weft.log" | tr -d ' ')"
+                if [ "$size" -ge "$offset" ]; then
+                    tail -c "+$((offset + 1))" "${HOME}/Library/Logs/Weft/weft.log"
+                else
+                    cat "${HOME}/Library/Logs/Weft/weft.log"
+                fi
+            fi
+        }
+
+        newtab_rig_verdict() {
+            # Criteria (plan §2-F6-4), extraction shape copied from the
+            # giant verdict:
+            # ① both rig directions complete (completes >= 2) with every
+            #   steps >= 8 (fresh double-tab band lower bound; giant
+            #   rebuilds pause steps by design, so no upper band), and
+            #   every ANIMATION-phase `zoom frame draw` draw_ms < 33.
+            #   Settle-tail draws (lines between `self-zoom complete` and
+            #   `zoom settled:` — the SELF_ZOOM_WINDOW spans arm→flush) get
+            #   the single-frame exemption (settle_exempt / settle_slow):
+            #   the background giant tab's one settle commit reflow may
+            #   bill one flush frame per direction and a 9.2MB-scale
+            #   reflow must not贴线假红. They stay on the summary as
+            #   evidence.
+            # ② the background GIANT tab's RESIZE_PROBE ioctl_commit count
+            #   <= 2, counting window = AFTER the `zoom rig precharge:
+            #   newtab ready` marker line (the startup-convergence ioctl
+            #   lands OUTSIDE the window; the new tab's own per-step
+            #   commits are the ACTIVE tab and excluded by the tab-number
+            #   filter). The giant tab's number is learned from the ioctl
+            #   lines BEFORE the marker (fresh config: exactly one tab
+            #   until the rig opens the second). Expected composition:
+            #   zoom-in settle 1 + zoom-out settle 1 = exactly 2; the
+            #   retired force mechanism emitted ~18 (per-step) and must
+            #   red.
+            # ③ probe counters on the summary line: rebuild_slow (P1) /
+            #   pump_slow (P2) / degrades (P3) / exempt (P5) ride as
+            #   attribution evidence (the giant's own rebuild/drain costs
+            #   are the experiment's subject — same rationale as the
+            #   giant verdict's counters); `next drawable wait`
+            #   (wait_warn) HARD-fails: a drawable stall is exactly what
+            #   F6 exists to prevent. Any precharge/newtab error line is
+            #   an immediate FAIL — the red must carry attribution.
+            awk '
+                /block rebuild slow/ { rebuild_slow++ }
+                /pump drain slow/ { pump_slow++ }
+                /budget degrade/ { degrades++ }
+                /exempt tables/ { exempt++ }
+                /next drawable wait/ { wait_warn++ }
+                /zoom rig precharge timeout/ { precharge_errors++ }
+                /zoom rig precharge: shell not integrated/ { precharge_errors++ }
+                /zoom rig precharge: PTY write failed/ { precharge_errors++ }
+                /zoom rig precharge: new tab shell not integrated/ { precharge_errors++ }
+                /zoom rig precharge: newtab ready/ { newtab_ready++ }
+                /self-zoom complete steps=/ {
+                    n = $0
+                    sub(/.*steps=/, "", n)
+                    sub(/[^0-9].*$/, "", n)
+                    completes++
+                    if (!steps_seen || n + 0 < min_steps) {
+                        min_steps = n + 0
+                        steps_seen = 1
+                    }
+                    printf("zoom-newtab-rig: self-zoom complete steps=%s\n", n)
+                    in_settle = 1
+                }
+                /zoom settled:/ { in_settle = 0 }
+                /zoom frame draw draw_ms=/ {
+                    ms = $0
+                    sub(/.*draw_ms=/, "", ms)
+                    sub(/[^0-9].*$/, "", ms)
+                    draws++
+                    if (ms + 0 >= 33) {
+                        if (in_settle) { settle_slow++ } else { slow_draw++ }
+                    }
+                    if (in_settle) {
+                        settle_exempt++
+                    } else {
+                        if (ms + 0 > max_draw) max_draw = ms + 0
+                    }
+                    if (ms + 0 > max_overall_draw) max_overall_draw = ms + 0
+                }
+                /RESIZE_PROBE ioctl_commit/ {
+                    tab = $0
+                    sub(/^.* tab=/, "", tab)
+                    sub(/[^0-9].*$/, "", tab)
+                    if (tab == "") next
+                    if (newtab_ready + 0 == 0) {
+                        giant_tab = tab + 0
+                        giant_tab_seen = 1
+                    } else if (giant_tab_seen && tab + 0 == giant_tab) {
+                        giant_ioctl++
+                    }
+                }
+                END {
+                    printf("zoom-newtab-rig: completes=%d min_steps=%d draws=%d max_draw_ms=%d slow_draw=%d settle_exempt=%d settle_slow=%d newtab_ready=%d giant_tab=%s giant_ioctl=%d rebuild_slow=%d pump_slow=%d degrades=%d exempt=%d wait_warn=%d precharge_errors=%d\n", completes + 0, min_steps + 0, draws + 0, max_draw + 0, slow_draw + 0, settle_exempt + 0, settle_slow + 0, newtab_ready + 0, (giant_tab_seen ? giant_tab : "none"), giant_ioctl + 0, rebuild_slow + 0, pump_slow + 0, degrades + 0, exempt + 0, wait_warn + 0, precharge_errors + 0)
+                    if (precharge_errors + 0 > 0) {
+                        print "zoom-newtab-rig: FAIL precharge error present"
+                        exit 1
+                    }
+                    if (newtab_ready + 0 < 1) {
+                        print "zoom-newtab-rig: FAIL missing newtab ready marker"
+                        exit 1
+                    }
+                    if (!giant_tab_seen) {
+                        print "zoom-newtab-rig: FAIL giant tab not identified (no pre-window ioctl_commit line)"
+                        exit 1
+                    }
+                    if (completes + 0 < 2) {
+                        print "zoom-newtab-rig: FAIL fewer than 2 self-zoom complete lines"
+                        exit 1
+                    }
+                    if (min_steps + 0 < 8) {
+                        print "zoom-newtab-rig: FAIL steps < 8 (animation feel)"
+                        exit 1
+                    }
+                    if (slow_draw + 0 > 0) {
+                        print "zoom-newtab-rig: FAIL animation draw_ms >= 33 present"
+                        exit 1
+                    }
+                    if (giant_ioctl + 0 > 2) {
+                        print "zoom-newtab-rig: FAIL giant tab ioctl_commit > 2 (cross-tab cascade leaked)"
+                        exit 1
+                    }
+                    if (wait_warn + 0 > 0) {
+                        print "zoom-newtab-rig: FAIL next drawable wait present"
+                        exit 1
+                    }
+                    print "zoom-newtab-rig: PASS"
+                }
+            ' "$1"
+        }
+
+        newtab_rig_attempt() {
+            # One round: run the rig, slice the log, verify. The verdict and
+            # the raw slice land in PERF_LOG either way (F6 evidence); the
+            # exit code carries the verdict.
+            local slice rc
+            slice="$(mktemp "${TMPDIR:-/tmp}/weft-zoom-slice.XXXXXX")"
+            newtab_rig_round > "$slice"
+            if newtab_rig_verdict "$slice" | tee -a "$PERF_LOG"; then
+                rc=0
+            else
+                rc=1
+            fi
+            cat "$slice" >> "$PERF_LOG"
+            rm -f "$slice"
+            return "$rc"
+        }
+
+        echo "==> Performance gate: zoom double-tab rig (F6, local-only)"
+        if ! newtab_rig_attempt; then
+            # No auto-retry: a red here IS the F6 regression evidence.
+            # Triage order: precharge/newtab error lines first, then the
+            # giant_ioctl count, then the settle-frame draws.
+            {
+                printf 'PERF_GATE FAIL: zoom double-tab rig criteria not met\n'
+                printf 'context: %s\n' "$(uptime)"
+            } | tee -a "$PERF_LOG"
+            exit 1
+        fi
+        printf 'PERF_GATE PASS: zoom double-tab rig criteria met\n' | tee -a "$PERF_LOG"
+    fi
 fi
 
 python3 - "$PERF_LOG" "$REPORT_DIR/baseline.json" <<'PY'

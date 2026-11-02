@@ -623,7 +623,7 @@ mod anim;
 // unarmed (inert), a full injection sequence only under the gate's giant
 // envs. Kept out of anim.rs (module-size budget).
 mod rig_precharge;
-pub(crate) use rig_precharge::{precharge_done, pump, rig_anchor};
+pub(crate) use rig_precharge::{precharge_done, pump, rig_anchor, rig_newtab_ready};
 #[cfg(test)]
 mod tests;
 
