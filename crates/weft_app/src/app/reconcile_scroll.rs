@@ -222,6 +222,21 @@ pub(crate) fn block_reclamp_action(
     }
 }
 
+/// F7-1 (PLAN_v1184 §2-F7-1) loop-scope predicate (pure; truth-table
+/// tested): the three reconcile loops (the Resized site, `recompute_layout`,
+/// and the re-clamp consumer) run the block-metrics reconciliation for the
+/// ACTIVE tab ONLY. Non-active tabs keep their PTY/Grid resize queueing
+/// (callers preserve that around this check) but skip the metrics pass —
+/// for a retain-evicted cache entry it is an O(document)
+/// `completed_output_rows` fallback rebuild (RECONCILE_PROBE: ~170ms per
+/// event), and the tab is not painted (Warp background-freeze semantics). A
+/// background tab clamps on activation via the generation hook
+/// (`App::arm_reclamp_on_tab_activation`) or its next active pass here.
+#[must_use]
+pub(crate) fn reconcile_in_scope(tab_index: usize, active_index: usize) -> bool {
+    tab_index == active_index
+}
+
 // WP1.5 review follow-up: the WP1.5 test family (F4-1..6 + the harness)
 // pushed this file past the 800-line hard ceiling, so the tests moved to
 // the exempted sibling module (block_component/tests.rs convention,

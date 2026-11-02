@@ -28,6 +28,15 @@ pub struct SessionManager {
     tabs: Vec<Tab>,
     active_tab: usize,
     prev_drawn_tab: usize,
+    /// F7-1 (PLAN_v1184 §2-F7-1): activation generation counter — bumped by
+    /// every method that (re)assigns `active_tab` (open_tab / switch_to /
+    /// next / prev / close_active / close_background / set_active). A
+    /// VALUE comparison on `active_tab` would miss the activation where the
+    /// index happens to stay equal (close_background's pure re-index) and
+    /// false-fire on move_tab (index moves, tab identity does not — the one
+    /// method that must NOT arm the activation clamp). The dispatch layer
+    /// snapshots this counter and arms the re-clamp when it drifts.
+    active_generation: u64,
     block_store: Option<BlockStore>,
     /// v1.7.3-C: Sidecar annotation store (bookmark/note/tags) sharing the
     /// same `blocks.db` file. Opened alongside `BlockStore` so both see the
@@ -41,6 +50,7 @@ impl SessionManager {
             tabs: Vec::new(),
             active_tab: 0,
             prev_drawn_tab: 0,
+            active_generation: 0,
             block_store: None,
             annotation_store: None,
         }
@@ -63,6 +73,13 @@ impl SessionManager {
 
     pub fn active_idx(&self) -> usize {
         self.active_tab
+    }
+
+    /// F7-1: the activation generation — bumped by every tab-lifecycle method
+    /// that reassigns `active_tab` (see the field doc for the exact set and
+    /// the move_tab exclusion). Read by the dispatch layer's drift compare.
+    pub fn active_generation(&self) -> u64 {
+        self.active_generation
     }
 
     pub fn tabs(&self) -> &[Tab] {
@@ -208,6 +225,13 @@ pub struct WindowRuntimeState {
     /// advances past it (each cache entry rebuild can shift the stale
     /// scalars the clamps read).
     pub block_reconcile_epoch: u64,
+    /// F7-1 (PLAN_v1184 §2-F7-1): the `SessionManager::active_generation()`
+    /// value last seen by the activation-hook compare. A drift means the
+    /// active tab changed through one of the seven lifecycle entries since
+    /// the last look — the newly active tab's block scroll may be stale
+    /// (the F7-1 loop filter stopped reconciling non-active tabs), so the
+    /// compare arms the re-clamp double flags.
+    pub active_generation_seen: u64,
     pub last_system_appearance_dark: Option<bool>,
     pub last_appearance_check: Instant,
     pub current_logo_variant: weft_core::config::LogoVariant,
@@ -252,6 +276,7 @@ impl WindowRuntimeState {
             block_reconcile_pending: false,
             block_reclamp_reclamped: false,
             block_reconcile_epoch: 0,
+            active_generation_seen: 0,
             last_system_appearance_dark: None,
             last_appearance_check: Instant::now(),
             current_logo_variant: weft_core::config::LogoVariant::Cool,

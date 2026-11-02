@@ -299,6 +299,110 @@ fn move_tab_session_id_survives_reorder() {
     );
 }
 
+// ── F7-1 (PLAN_v1184 §2-F7-1): activation generation counter ────────────
+// Truth table ①: every one of the seven activation entries bumps the
+// counter; move_tab — which preserves the active tab's IDENTITY — never
+// does. The dispatch layer's drift compare keys on this exactly.
+
+#[test]
+fn activation_generation_starts_at_zero() {
+    let sm = SessionManager::new();
+    assert_eq!(sm.active_generation(), 0);
+}
+
+#[test]
+fn activation_generation_bumps_on_each_lifecycle_entry() {
+    let mut sm = SessionManager::new();
+    sm.push_tab(Tab::empty());
+    // set_active (restore path)
+    let before = sm.active_generation();
+    sm.set_active(0);
+    assert_eq!(
+        sm.active_generation(),
+        before + 1,
+        "set_active (restore path) must bump"
+    );
+
+    // switch_to
+    sm.push_tab(Tab::empty());
+    let before = sm.active_generation();
+    sm.switch_to(1);
+    assert_eq!(sm.active_generation(), before + 1, "switch_to must bump");
+
+    // next (wrap)
+    let before = sm.active_generation();
+    sm.next();
+    assert_eq!(sm.active_generation(), before + 1, "next must bump");
+
+    // prev (wrap)
+    let before = sm.active_generation();
+    sm.prev();
+    assert_eq!(sm.active_generation(), before + 1, "prev must bump");
+
+    // close_background (pure index adjust — the plan-accepted extra arm)
+    let before = sm.active_generation();
+    sm.close_background(0);
+    assert_eq!(
+        sm.active_generation(),
+        before + 1,
+        "close_background must bump (pure index adjust included — idempotent)"
+    );
+
+    // close_active (promotes a neighbor)
+    let before = sm.active_generation();
+    sm.close_active();
+    assert_eq!(sm.active_generation(), before + 1, "close_active must bump");
+}
+
+#[test]
+fn activation_generation_open_tab_entry_is_audited() {
+    // open_tab requires an EventLoopProxy (Tab::new spawns a PTY), so it has
+    // no unit-test path — same constraint as the rest of the SessionManager
+    // suite (push_tab + Tab::empty everywhere). Its bump line sits directly
+    // beside the `active_tab = idx` assignment in app_state/session.rs and is
+    // audited by this comment; the production new-tab path is exercised by
+    // the gate's zoom-newtab rig (Cmd+N runs open_tab per activation).
+    let sm = SessionManager::new();
+    assert_eq!(sm.active_generation(), 0);
+}
+
+#[test]
+fn activation_generation_skips_noop_next_prev() {
+    let mut sm = SessionManager::new();
+    sm.push_tab(Tab::empty());
+    let before = sm.active_generation();
+    sm.next();
+    sm.prev();
+    assert_eq!(
+        sm.active_generation(),
+        before,
+        "single-tab next/prev never reassign active_tab — no bump"
+    );
+}
+
+#[test]
+fn move_tab_never_bumps_activation_generation() {
+    let mut sm = SessionManager::new();
+    for _ in 0..4 {
+        sm.push_tab(Tab::empty());
+    }
+    sm.set_active(1);
+    let before = sm.active_generation();
+    // The active tab itself moves (its INDEX changes, its identity does
+    // not) — the exact case a naive `active_tab` value compare would
+    // false-fire on.
+    sm.move_tab(1, 3);
+    assert_eq!(sm.active_idx(), 3, "active follows the moved tab");
+    assert_eq!(
+        sm.active_generation(),
+        before,
+        "move_tab preserves tab identity — no bump, no activation arm"
+    );
+    // And a reorder that does not move the active tab either.
+    sm.move_tab(0, 2);
+    assert_eq!(sm.active_generation(), before);
+}
+
 #[test]
 fn adjust_index_after_move_rightward() {
     // Move from 1 to 3: [A,B,C,D,E] → [A,C,D,B,E]

@@ -21,6 +21,9 @@ impl SessionManager {
         self.tabs.push(tab);
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
+        // F7-1: activation entry — the new tab becomes active (see the
+        // `active_generation` field doc for the counter contract).
+        self.active_generation = self.active_generation.wrapping_add(1);
         idx
     }
 
@@ -30,6 +33,9 @@ impl SessionManager {
         let prev = self.active_tab;
         let new = idx.min(self.tabs.len().saturating_sub(1));
         self.active_tab = new;
+        // F7-1: activation entry. Unconditional (a same-index switch_to is an
+        // explicit activation intent); a redundant arm is idempotent.
+        self.active_generation = self.active_generation.wrapping_add(1);
         (new, prev)
     }
 
@@ -41,6 +47,9 @@ impl SessionManager {
         }
         let prev = self.active_tab;
         self.active_tab = (self.active_tab + 1) % n;
+        // F7-1: activation entry (the n <= 1 early return above never
+        // reassigns, so it correctly does not bump).
+        self.active_generation = self.active_generation.wrapping_add(1);
         (self.active_tab, prev)
     }
 
@@ -52,6 +61,8 @@ impl SessionManager {
         }
         let prev = self.active_tab;
         self.active_tab = (self.active_tab + n - 1) % n;
+        // F7-1: activation entry (n <= 1 early return does not bump).
+        self.active_generation = self.active_generation.wrapping_add(1);
         (self.active_tab, prev)
     }
 
@@ -65,6 +76,8 @@ impl SessionManager {
         self.tabs.remove(self.active_tab);
         if self.tabs.is_empty() {
             self.active_tab = 0;
+            // F7-1: activation entry — focus moved (to nothing).
+            self.active_generation = self.active_generation.wrapping_add(1);
             return true;
         }
         if self.active_tab > 0 {
@@ -72,6 +85,8 @@ impl SessionManager {
         } else {
             self.active_tab = self.tabs.len() - 1;
         }
+        // F7-1: activation entry — a close promotes a neighbor to active.
+        self.active_generation = self.active_generation.wrapping_add(1);
         false
     }
 
@@ -84,6 +99,8 @@ impl SessionManager {
         self.tabs.remove(idx);
         if self.tabs.is_empty() {
             self.active_tab = 0;
+            // F7-1: activation entry — focus moved (to nothing).
+            self.active_generation = self.active_generation.wrapping_add(1);
             return true;
         }
         if idx < self.active_tab {
@@ -91,6 +108,12 @@ impl SessionManager {
         } else if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
+        // F7-1: activation entry. NOTE: a pure index adjustment (closed tab
+        // AFTER the active one leaves `active_tab` unchanged) also bumps —
+        // an extra arm the dispatch compare cannot distinguish from a real
+        // promotion. Accepted by plan (§2-F7-1): the armed re-clamp is
+        // idempotent (a min-clamp on the unchanged active tab).
+        self.active_generation = self.active_generation.wrapping_add(1);
         false
     }
 
@@ -125,6 +148,10 @@ impl SessionManager {
     /// Set active tab (restore completion). Clamped to the last valid index.
     pub fn set_active(&mut self, idx: usize) {
         self.active_tab = idx.min(self.tabs.len().saturating_sub(1));
+        // F7-1: activation entry (restore path — the restored window's active
+        // tab lands here; the index may equal the previous value, the bump is
+        // still an explicit activation intent).
+        self.active_generation = self.active_generation.wrapping_add(1);
     }
 
     /// v1.11: Move a tab from `from` to `to` (drag-to-reorder). No-op when
@@ -136,6 +163,10 @@ impl SessionManager {
         }
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
+        // F7-1: NO generation bump here — move_tab preserves the ACTIVE TAB'S
+        // IDENTITY (only its index shifts). The activation clamp hook keys on
+        // identity changes; arming on a reorder would re-clamp a tab whose
+        // terminal geometry never left the active sync set.
         self.active_tab = adjust_index_after_move(self.active_tab, from, to);
     }
 }

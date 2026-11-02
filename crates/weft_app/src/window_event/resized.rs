@@ -85,57 +85,82 @@ impl crate::App {
                         None
                     }
                 };
+                // F7-1 (PLAN_v1184 §2-F7-1): the reconcile filter's predicate
+                // source — one snapshot before the loop (same judgment the
+                // recompute_layout loop's `i == active` log uses).
+                let active_tab_index = self.sessions.active_idx();
                 for (tab_index, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
                     if tab.has_terminal() {
+                        // F7-1: KEPT for every tab — the PTY+Grid resize
+                        // pending queue must still enqueue for background
+                        // panes (the cascade commits when the tab next
+                        // activates). Only the METRICS reconciliation below
+                        // is active-tab-scoped.
                         tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
 
-                        // `block_scroll_offset` is measured from the
-                        // bottom of a width-dependent document. A
-                        // larger viewport usually wraps fewer rows and
-                        // shows more of them, so an offset that was
-                        // valid before maximize can exceed the new
-                        // range and make the transcript tail
-                        // unreachable. Reconcile against the detached
-                        // snapshot now, before SIGWINCH causes the TUI
-                        // to repaint asynchronously.
-                        let previous = tab.block_scroll();
-                        let reconciliation = tab
-                            .with_terminal(|terminal| {
-                                crate::block_component::reconciled_terminal_block_scroll(
-                                    terminal,
-                                    &layout_ctx,
-                                    header_rows,
-                                    previous,
-                                    block_cache.as_deref(),
-                                )
-                            })
-                            .flatten();
-                        if let Some((reconciled, total, visible)) = reconciliation {
-                            // WP1.5 F3: this site just clamped from
-                            // (possibly cols-stale) cache scalars — arm
-                            // the epoch-driven re-clamp consumer so the
-                            // scroll offset converges once the layout
-                            // cache finishes rebuilding at the final
-                            // cols. Drag ticks arm here too (there is no
-                            // zoom flush on the drag path — the arming is
-                            // what keeps the post-gesture terminal state
-                            // exact, the pre-WP1.5 uncached behavior).
-                            // P1-1: every arm resets the "re-clamped since
-                            // arm" dimension so the consumer's FIRST pass
-                            // re-clamps unconditionally (see
-                            // block_reclamp_action).
-                            self.window_runtime.block_reconcile_pending = true;
-                            self.window_runtime.block_reclamp_reclamped = false;
-                            if previous != reconciled {
-                                info!(
-                                    tab = tab_index,
-                                    previous,
-                                    reconciled,
-                                    total,
-                                    visible,
-                                    "reconciled block scroll during resize"
-                                );
-                                tab.set_block_scroll(reconciled);
+                        // F7-1: background tabs skip the block-scroll
+                        // metrics reconciliation. For a retain-evicted cache
+                        // entry it degenerates into the O(document)
+                        // `completed_output_rows` fallback rebuild
+                        // (RECONCILE_PROBE: ~170ms/event), and the tab is
+                        // not painted anyway (Warp background-freeze
+                        // semantics). The ACTIVE tab reconciles exactly as
+                        // before; a background tab clamps on activation via
+                        // the generation hook
+                        // (`arm_reclamp_on_tab_activation`) or its next
+                        // Resized while active.
+                        if crate::app::reconcile_scroll::reconcile_in_scope(
+                            tab_index,
+                            active_tab_index,
+                        ) {
+                            // `block_scroll_offset` is measured from the
+                            // bottom of a width-dependent document. A
+                            // larger viewport usually wraps fewer rows and
+                            // shows more of them, so an offset that was
+                            // valid before maximize can exceed the new
+                            // range and make the transcript tail
+                            // unreachable. Reconcile against the detached
+                            // snapshot now, before SIGWINCH causes the TUI
+                            // to repaint asynchronously.
+                            let previous = tab.block_scroll();
+                            let reconciliation = tab
+                                .with_terminal(|terminal| {
+                                    crate::block_component::reconciled_terminal_block_scroll(
+                                        terminal,
+                                        &layout_ctx,
+                                        header_rows,
+                                        previous,
+                                        block_cache.as_deref(),
+                                    )
+                                })
+                                .flatten();
+                            if let Some((reconciled, total, visible)) = reconciliation {
+                                // WP1.5 F3: this site just clamped from
+                                // (possibly cols-stale) cache scalars — arm
+                                // the epoch-driven re-clamp consumer so the
+                                // scroll offset converges once the layout
+                                // cache finishes rebuilding at the final
+                                // cols. Drag ticks arm here too (there is no
+                                // zoom flush on the drag path — the arming is
+                                // what keeps the post-gesture terminal state
+                                // exact, the pre-WP1.5 uncached behavior).
+                                // P1-1: every arm resets the "re-clamped since
+                                // arm" dimension so the consumer's FIRST pass
+                                // re-clamps unconditionally (see
+                                // block_reclamp_action).
+                                self.window_runtime.block_reconcile_pending = true;
+                                self.window_runtime.block_reclamp_reclamped = false;
+                                if previous != reconciled {
+                                    info!(
+                                        tab = tab_index,
+                                        previous,
+                                        reconciled,
+                                        total,
+                                        visible,
+                                        "reconciled block scroll during resize"
+                                    );
+                                    tab.set_block_scroll(reconciled);
+                                }
                             }
                         }
                     }

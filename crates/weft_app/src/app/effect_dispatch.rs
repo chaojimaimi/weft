@@ -40,11 +40,62 @@ pub(crate) fn footer_feedback_expired(
     now.duration_since(shown_at) >= FOOTER_FEEDBACK_TTL
 }
 
+/// F7-1 (PLAN_v1184 §2-F7-1) pure arm decision (truth-table tested): the
+/// activation hook fires exactly when the observed activation generation
+/// differs from the last value seen. Inequality — not `>` — is the test: the
+/// counter is monotonic by construction (`wrapping_add`), and a u64 wrap
+/// around to a smaller value must still arm.
+pub(crate) fn activation_generation_drifted(last_seen: u64, current: u64) -> bool {
+    last_seen != current
+}
+
 impl crate::App {
+    /// F7-1 (PLAN_v1184 §2-F7-1): the activation clamp hook. Compares
+    /// `SessionManager::active_generation()` against the dispatch layer's
+    /// last-seen snapshot (`WindowRuntimeState::active_generation_seen`); on
+    /// drift the active tab changed through one of the seven lifecycle
+    /// entries (open_tab / switch_to / next / prev / close_active /
+    /// close_background / set_active — move_tab preserves identity and never
+    /// bumps), so the newly active tab's block scroll may be stale and the
+    /// epoch-driven re-clamp consumer must run.
+    ///
+    /// The arm is the DOUBLE flag (`block_reconcile_pending = true` +
+    /// `block_reclamp_reclamped = false`, the window_event/resized.rs:127-128
+    /// shape): arming `pending` alone would let
+    /// `reconcile_scroll::block_reclamp_action` fall into its Skip branch —
+    /// with a stale `reclamped_since_arm = true` carried over from a previous
+    /// arm and an unchanged epoch, the consumer defers the re-clamp
+    /// indefinitely; resetting `reclamped` forces the consumer's first pass
+    /// to re-clamp unconditionally.
+    ///
+    /// Called from the TOP of `drain_effects` (the plan-mandated dispatch
+    /// site) AND from the top of `reclamp_block_scroll_pending` (about_to_wait
+    /// runs every loop pass — the coverage guarantee for activation paths that
+    /// produce no effects at all, e.g. a tab-bar click). Both call this one
+    /// helper; the first compare consumes the drift (last-seen updates), so
+    /// the second is a no-op — the arm cannot double-fire.
+    pub(crate) fn arm_reclamp_on_tab_activation(&mut self) {
+        let current = self.sessions.active_generation();
+        if !activation_generation_drifted(self.window_runtime.active_generation_seen, current) {
+            return;
+        }
+        self.window_runtime.active_generation_seen = current;
+        self.window_runtime.block_reconcile_pending = true;
+        self.window_runtime.block_reclamp_reclamped = false;
+        tracing::info!(
+            generation = current,
+            "tab activation drift armed the block re-clamp"
+        );
+    }
+
     /// Fan out `effects` to their side effects. Each effect is dispatched
     /// exactly once; a failed dispatch logs but does not abort the remaining
     /// effects in the batch.
     pub(crate) fn drain_effects(&mut self, effects: impl IntoIterator<Item = Effect>) {
+        // F7-1: every effect round first services the activation hook — the
+        // generation compare covers ALL tab-activation entries (the effect
+        // fan-out itself only ever saw 2 of 7 via TabSwitched).
+        self.arm_reclamp_on_tab_activation();
         for effect in effects {
             match effect {
                 Effect::WritePty { session_id, bytes } => {
@@ -163,6 +214,11 @@ impl crate::App {
                 } => {
                     // close_tab already applied the synchronous mutations;
                     // retain this effect as the post-close extension point.
+                    // F7-1: this effect NO LONGER carries the activation arm
+                    // — it only ever covered next/prev-family switches, so
+                    // the arm moved to the generation compare (see
+                    // `arm_reclamp_on_tab_activation`). This log stays as a
+                    // corroborating trace only.
                     tracing::info!(removed_idx, new_active, is_last, "tab closed effect");
                 }
                 Effect::TabSwitched { new_idx, prev_idx } => {
@@ -170,6 +226,10 @@ impl crate::App {
                     // find refresh, tab-bar scroll) already ran in
                     // `next_tab`/`prev_tab`. Extension point for future
                     // post-switch consumers.
+                    // F7-1: same as TabClosed — corroborating trace only;
+                    // the activation arm rides the generation compare (the
+                    // tab click / AX / sidebar / restore entries never
+                    // emitted this effect at all).
                     tracing::info!(new_idx, prev_idx, "tab switched effect");
                 }
                 Effect::RequestRedraw => self.request_redraw(),

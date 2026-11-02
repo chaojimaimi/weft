@@ -195,3 +195,19 @@ fn footer_feedback_expires_at_the_three_second_boundary() {
         later(FOOTER_FEEDBACK_TTL.as_millis() as u64 + 999)
     ));
 }
+
+// ── F7-1 (PLAN_v1184 §2-F7-1): activation generation drift compare ──
+
+#[test]
+fn activation_generation_drift_arms_on_any_inequality() {
+    use super::activation_generation_drifted;
+    // Steady state: the dispatch layer has seen the current generation.
+    assert!(!activation_generation_drifted(0, 0));
+    assert!(!activation_generation_drifted(7, 7));
+    // A forward bump (any of the seven lifecycle entries ran).
+    assert!(activation_generation_drifted(7, 8));
+    // u64 wrap: the counter is monotonic via wrapping_add, so a wrap lands
+    // on a SMALLER value — the compare must still arm (that is exactly why
+    // the test is inequality, not `>`).
+    assert!(activation_generation_drifted(u64::MAX, 0));
+}

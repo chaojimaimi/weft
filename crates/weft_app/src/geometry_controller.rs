@@ -186,6 +186,10 @@ impl App {
         };
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
             if tab.has_terminal() {
+                // F7-1: KEPT for every tab — the PTY+Grid resize queue still
+                // enqueues for background panes, and a real resize still
+                // clears their content-anchored selections (the selection
+                // contract is resize-scoped, not metrics-scoped).
                 let resized = tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
                 if resized {
                     // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): a terminal
@@ -222,6 +226,19 @@ impl App {
                         let (new_rows, new_cols) = base_layout.dimensions();
                         info!(rows = new_rows, cols = new_cols, "terminal resized");
                     }
+                }
+                // F7-1 (PLAN_v1184 §2-F7-1): background tabs skip the
+                // block-scroll metrics reconciliation. This loop runs on the
+                // hot no-Resized families (sidebar 8ms tween, divider drag,
+                // font hotkeys, redraw-pump convergence checks) — for a
+                // retain-evicted cache entry `reconciled_with_memo` pays the
+                // O(document) `completed_output_rows` fallback rebuild, and
+                // the tab is not painted anyway. A background tab clamps on
+                // activation via the generation hook
+                // (`arm_reclamp_on_tab_activation`) or its next active-pass
+                // here.
+                if !crate::app::reconcile_scroll::reconcile_in_scope(i, active) {
+                    continue;
                 }
                 let pane_layout_ctx = tab
                     .split_tree()
@@ -305,13 +322,28 @@ impl App {
     ///
     /// Semantics (plan F3): re-clamps ONLY the scroll offset
     /// (`reconciled_block_scroll` pure fn) — no layout recompute, no
-    /// SIGWINCH; iterates ALL tabs (the Resized reconcile's G2 semantics —
-    /// the draw paints only the active tab, so a background tab's terminal
-    /// re-clamp cannot ride an active-tab consumer). Self-clear = at least
-    /// one re-clamp since the arm (P1-1) + epoch stable + quiescent — the
-    /// first pass after an arm re-clamps unconditionally and a SECOND pass
+    /// SIGWINCH. F7-1 (PLAN_v1184 §2-F7-1) narrows the iteration from ALL
+    /// tabs to the ACTIVE tab (the draw paints only the active tab, and a
+    /// background tab's re-clamp here would pay the O(document) metrics
+    /// fallback for its evicted cache entries); background tabs clamp on
+    /// activation via the generation hook. Self-clear = at least one
+    /// re-clamp since the arm (P1-1) + epoch stable + quiescent — the first
+    /// pass after an arm re-clamps unconditionally and a SECOND pass
     /// verifies and clears (`block_reclamp_action` truth table).
+    ///
+    /// F7-1 activation timing (truth table ③): the generation compare runs
+    /// BEFORE the pending early-return so a tab activation arms here even
+    /// when no effect batch drained first (tab-bar click et al.), and the
+    /// same pass performs the clamp. The clamp runs AFTER the frame's draw
+    /// (this is about_to_wait), so a real delta corrects a scroll the user
+    /// already SAW stale — the delta therefore requests a corrective
+    /// `request_redraw` (评审 P2-3).
     pub(super) fn reclamp_block_scroll_pending(&mut self) {
+        // F7-1: the activation hook's second (coverage) site — see
+        // `arm_reclamp_on_tab_activation` for why both sites share one
+        // helper. Placed before the early-return: the hook is what ARMS
+        // `block_reconcile_pending` for effect-less activation paths.
+        self.arm_reclamp_on_tab_activation();
         if !self.window_runtime.block_reconcile_pending {
             return;
         }
@@ -368,8 +400,18 @@ impl App {
         ];
         // No `resize_all_panes_for_rect` here (F3 re-clamps the scroll
         // offset only — no pane resize, no SIGWINCH).
-        for tab in self.sessions.tabs_mut().iter_mut() {
+        // F7-1: active tab only (see the doc comment) — the predicate is the
+        // shared scope fn the two reconcile loops use.
+        let active_tab_index = self.sessions.active_idx();
+        let mut clamp_delta = false;
+        for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
             if !tab.has_terminal() {
+                continue;
+            }
+            // F7-1: the epoch/quiescence arming is a SHARED-cache property and
+            // stays global; only the per-tab clamp is scoped. A background
+            // tab's stale scroll is picked up by its own activation hook.
+            if !crate::app::reconcile_scroll::reconcile_in_scope(i, active_tab_index) {
                 continue;
             }
             let pane_layout_ctx = tab
@@ -393,8 +435,16 @@ impl App {
             if let Some((reconciled, _total, _visible)) = reconciliation {
                 if previous != reconciled {
                     tab.set_block_scroll(reconciled);
+                    clamp_delta = true;
                 }
             }
+        }
+        // F7-1 (评审 P2-3): the clamp ran after this pass's draw — a real
+        // delta means the user saw a frame with the stale offset. One
+        // corrective redraw (draw only paints the active tab, which is
+        // exactly the tab that clamped).
+        if clamp_delta {
+            self.request_redraw();
         }
         self.window_runtime.block_reconcile_epoch = epoch;
         // P1-1: the arm's re-clamp obligation is now discharged — the NEXT

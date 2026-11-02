@@ -769,3 +769,18 @@ fn font_change_sequence_without_resized_converges() {
         uncached_clamp(&terminal, &layout, header_rows, seed),
     );
 }
+
+// ── F7-1 (PLAN_v1184 §2-F7-1): loop-scope predicate (truth table ④) ─────
+
+#[test]
+fn f7_1_reconcile_scope_is_active_tab_only() {
+    use super::reconcile_in_scope;
+    // The active tab reconciles exactly as before.
+    assert!(reconcile_in_scope(0, 0));
+    assert!(reconcile_in_scope(3, 3));
+    // Every non-active tab skips the metrics pass — a retain-evicted entry
+    // must never reach the O(document) fallback from these loops.
+    assert!(!reconcile_in_scope(0, 1));
+    assert!(!reconcile_in_scope(2, 1));
+    assert!(!reconcile_in_scope(5, 0));
+}
