@@ -387,8 +387,10 @@ fn build_prefix_sum_handles_collapsed_blocks() {
 // The freeze wraps the sync CALL SITE (block_view.rs / rows.rs construct
 // this band literal — grid_cache.rs itself is untouched). Truth table:
 // ② armed → every cols-stale entry defers (stale tables keep serving);
-// ④ armed → no entry eviction for a stable block set; ⑤ unfreeze → the
-// next real-band sync restores normal band semantics same-frame.
+// ④ armed → no entry rebuild for a stable block set (F7-1d: set rotation
+// itself no longer evicts — budget pressure is the only eviction path);
+// ⑤ unfreeze → the next real-band sync restores normal band semantics
+// same-frame.
 
 /// The freeze band the two sync call sites construct while armed:
 /// `high_rows = 0` makes `fully_above` true for every block.
@@ -463,13 +465,13 @@ fn unfreeze_first_real_band_sync_restores_normal_band_semantics() {
 }
 
 #[test]
-fn defer_all_band_cannot_prevent_set_rotation_eviction_hence_bg_skip() {
-    // Truth table ④'s mechanism note: the band only gates REBUILDS — the
-    // non-append sync's retain evicts a rotated set's absent ids REGARDLESS
-    // of band. This is exactly why the F7-2 bg-pane freeze SKIPS the rebuild
-    // wholesale (panes.rs early return) instead of only band-deferring it:
-    // a bg rebuild's sync_blocks would evict the active pane's entries even
-    // under the defer-all band.
+fn defer_all_band_frame_retains_the_other_panes_entries() {
+    // F7-1d budget retention (rewrites the pre-F7-1d cross-eviction pin):
+    // a pane's non-append sync RETAINS the other pane's entries within
+    // budget — regardless of band, since eviction now lives only in the
+    // budget-driven foreign-eviction arm. The F7-2 bg-pane freeze's early
+    // return (panes.rs) remains for the rebuild churn it stops, not for
+    // eviction.
     let pane_a: Vec<_> = (1..=2)
         .map(|id| mk_block_with_output(id, "echo", "a\n"))
         .collect();
@@ -480,8 +482,8 @@ fn defer_all_band_cannot_prevent_set_rotation_eviction_hence_bg_skip() {
     cache.sync_blocks(&pane_a, 80, full_band());
     cache.sync_blocks(&pane_b, 80, defer_all_band());
     assert!(
-        cache.get_if_cached(1).is_none() && cache.get_if_cached(2).is_none(),
-        "a different pane's sync evicts the other pane's entries even defer-all"
+        cache.get_if_cached(1).is_some() && cache.get_if_cached(2).is_some(),
+        "a different pane's sync retains the other pane's entries (mutual retention)"
     );
     assert!(cache.get_if_cached(3).is_some() && cache.get_if_cached(4).is_some());
 }

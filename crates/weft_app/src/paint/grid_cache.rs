@@ -263,22 +263,14 @@ impl BlockLayoutCache {
             }
         } else {
             self.sync_classified(blocks, cols, band);
-            // M5-b P2-1 (PLAN_M5 §二 内存): the set shrank or rotated (history
-            // retention, `clear`, tab switch) — evict entries for blocks no
-            // longer in the session set, or L1 tables (~8B/cluster) would
-            // accumulate across session lifetimes. The append-only scroll
-            // fast path above skips this (no shrink possible).
+            // F7-1d budget retention: entries outside this set survive tab
+            // switches (zero-rebuild re-entry; orphans and memory pressure are
+            // reclaimed by the foreign-eviction arm in enforce_table_budget).
             let ids: std::collections::HashSet<u64> =
                 blocks.iter().map(|block| block.id.0).collect();
-            let before = self.entries.len();
-            // M6-c byte-total subtraction + F7-1b tombstone capture share one
-            // evicted-entry walk (verbatim move into grid_cache/tombstone.rs).
-            self.evict_vanished_blocks(&ids);
-            if self.entries.len() != before {
-                // Evicted entries change what get_if_cached/metrics compute.
-                self.prefix_sum_dirty = true;
-                self.misses_total = self.misses_total.wrapping_add(1);
-            }
+            // Degraded markers for vanished blocks would be orphans (same as
+            // the pre-F7-1d eviction walk).
+            self.degraded_ids.retain(|id| ids.contains(id));
         }
 
         // M6-b B-1: pending band check runs on every sync (incl. the
@@ -602,6 +594,16 @@ impl BlockLayoutCache {
         // precede the memo short-circuit — otherwise the memo silences the
         // overview in exactly the regime it exists to report. 10s throttle.
         self.log_exempt_tables_overview();
+        // F7-1d: foreign entries (ids outside the current block set) are
+        // retained across tab switches for zero-rebuild re-entry; under budget
+        // pressure they are evicted OLDEST-FIRST (ascending BlockId; monotonic
+        // under the BlockStore pool — local fallback sequences may collide, in
+        // which case retention degrades to v1.18.5 behavior via the entry
+        // identity checks). Never evicts the current set.
+        self.evict_foreign_entries(blocks, budget);
+        if self.table_bytes_total <= budget {
+            return;
+        }
         // F1 steady-state memo: nothing degradable remains under any band.
         if self.no_degradable_candidates {
             return;

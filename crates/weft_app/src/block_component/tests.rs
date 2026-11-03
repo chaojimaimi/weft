@@ -530,17 +530,11 @@ fn f71b_terminal(output_lines: usize) -> Terminal {
     terminal
 }
 
-/// Production eviction walk, tab-switch shape: a non-append sync with an
-/// empty live set evicts every entry and captures tombstones (F7-1b).
-fn f71b_evict_all(cache: &mut crate::paint::grid_cache::BlockLayoutCache, cols: usize) {
-    cache.sync_blocks(
-        &[],
-        cols,
-        crate::paint::grid_cache::BandSync {
-            low_rows: 0,
-            high_rows: usize::MAX,
-        },
-    );
+/// Production eviction walk, F7-1d shape: set rotation itself retains, so
+/// the empty-current-set budget eviction arm (every entry foreign, budget 0)
+/// is what evicts every entry and captures tombstones (F7-1b capture reused).
+fn f71b_evict_all(cache: &mut crate::paint::grid_cache::BlockLayoutCache, _cols: usize) {
+    cache.evict_foreign_entries(&[], 0);
 }
 
 /// Truth table row — None + Some(tombstone), uncollapsed: the total equals

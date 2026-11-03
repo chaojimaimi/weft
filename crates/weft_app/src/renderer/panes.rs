@@ -186,16 +186,16 @@ impl MetalRenderer {
                 // armed — not merely fingerprint-gated. The rebuild runs
                 // `build_block_view_vertices`, whose internal `sync_blocks`
                 // pushes THIS pane's block set into the SHARED
-                // `block_layout_cache`; the non-append sync's retain evicts
-                // the active pane's entries (and the active sync evicts this
-                // pane's back) — the ≤15fps cross-eviction the freeze exists
-                // to stop. A band-defer alone would still pay the eviction,
-                // hence the early return. Trade (plan §2-F7-2): the previous
-                // build keeps serving (old rect/cols vertices, absolutely
-                // baked) for the whole freeze window (≤ the animation + flush
-                // tail) — the same stale-render the 60ms throttle already
-                // shows, widened; a cold pane (no cached entry) renders
-                // nothing until the freeze lifts.
+                // `block_layout_cache`; since F7-1d the panes' entries
+                // coexist within budget (mutual retention), but the
+                // over-budget foreign-eviction arm can still drop the
+                // active pane's tables mid-animation — churn the freeze
+                // exists to stop, so the early return stays. Trade (plan
+                // §2-F7-2): the previous build keeps serving (old rect/cols
+                // vertices, absolutely baked) for the whole freeze window
+                // (≤ the animation + flush tail) — the same stale-render
+                // the 60ms throttle already shows, widened; a cold pane (no
+                // cached entry) renders nothing until the freeze lifts.
                 if crate::paint::zoom_render::rewrap_freeze_active() {
                     if let Some(entry) = self
                         .background_block_caches

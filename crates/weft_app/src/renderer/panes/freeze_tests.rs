@@ -20,10 +20,13 @@ fn headless_renderer_or_skip() -> Option<MetalRenderer> {
 /// armed, the background BLOCK pane rebuild is skipped WHOLESALE — a
 /// cold pane creates no cache entry (nothing to serve), a warm pane
 /// keeps serving its previous (stale-rect) vertices without a rebuild.
-/// The wholesale skip (not a fingerprint skip) is what locks the shared
-/// `block_layout_cache` against cross-pane eviction: the rebuild's
-/// internal `sync_blocks` would evict the active pane's entries even
-/// under the defer-all band (see the grid_cache rotation test).
+/// The wholesale skip (not a fingerprint skip) is what keeps the shared
+/// `block_layout_cache` free of per-frame rebuild churn: a rebuild's
+/// internal `sync_blocks` would pay band-Both costs (and, over the table
+/// budget, budget-gated foreign evictions — F7-1d) at ≤15fps during the
+/// animation. Since F7-1d the sync no longer evicts cross-pane entries
+/// (budget retention — see the grid_cache retention test), so the skip is
+/// a pure performance lock, not a correctness one.
 /// GLOBAL_ZOOM_STATE_LOCK is mandatory — the freeze bits are
 /// process-global and shared with the zoom_render tests.
 #[test]
