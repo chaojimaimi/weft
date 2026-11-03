@@ -294,6 +294,9 @@ impl ApplicationHandler<AppEvent> for App {
                 .config
                 .window
                 .presents_with_transaction_live_resize,
+            // v1.18.7 (F7-1e): `[blocks].layout_table_budget_mib` — read once
+            // here, restart to change (no runtime hot reload, no UI row).
+            self.config_state.config.blocks.layout_table_budget_mib,
         );
         // v1.11.12 (PLAN_v11112 M-B): renderer-init phase boundary (shader
         // compile + pipelines happen inside `MetalRenderer::new`).

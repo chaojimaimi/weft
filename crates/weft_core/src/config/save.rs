@@ -333,6 +333,13 @@ pub(super) fn write_blocks_section(
             i64::try_from(b.output_cap_mib).unwrap_or(0),
             i64::try_from(d.output_cap_mib).unwrap_or(0),
         ),
+        // v1.18.7 (F7-1e): layout_table_budget_mib joins the non-default-only
+        // write (see the comment above — new keys must be added explicitly).
+        (
+            "layout_table_budget_mib",
+            i64::try_from(b.layout_table_budget_mib).unwrap_or(0),
+            i64::try_from(d.layout_table_budget_mib).unwrap_or(0),
+        ),
         (
             "history_max_age_days",
             i64::from(b.history_max_age_days),

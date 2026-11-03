@@ -16,6 +16,10 @@ use weft_core::blocks::Block;
 
 use band::{rebuild_kind, RebuildKind};
 mod band;
+// v1.18.7 (F7-1e): the layout-table budget (constants + effective static +
+// the throttled overview) lives in budget.rs — 800-line gate identity move.
+mod budget;
+pub(crate) use budget::init_effective_table_budget_mib;
 mod tombstone;
 mod visual_rows;
 pub(crate) use visual_rows::{char_offset_at, completed_output_rows, trimmed_output_line_count};
@@ -25,13 +29,6 @@ mod wrapping;
 pub(crate) use wrapping::{block_line_chunks, command_line_chunks, screen_origin_line_chunks};
 
 pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
-
-/// M6-c (PLAN_M6 §三): total byte budget across all cached L1/L2 layout
-/// tables. A 1MiB block's tables are ~6-8MB, so the budget tolerates ~30-40
-/// giant blocks; normal sessions never approach it. Exceeding it degrades
-/// the OLDEST non-exempt blocks to metrics-only shells (R5: a degraded block
-/// re-entering the band pays one ~15-20ms Both rebuild — accepted, single).
-const LAYOUT_TABLE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// M6-c: the newest K blocks always keep their tables (never degraded) — the
 /// live block's neighborhood is the highest-frequency render/hit-test target
@@ -52,15 +49,6 @@ const SLOW_REBUILD_WARN: std::time::Duration = std::time::Duration::from_millis(
 /// restored blocks (default `output_cap_mib = 1` caps new blocks at ~8MiB
 /// of tables, below this threshold).
 pub(crate) const GIANT_TABLE_EXEMPT_BYTES: usize = 32 * 1024 * 1024;
-
-/// WP2 A1 P5 (`exempt tables`) throttle: the overview logs at most once per
-/// 10s (it sits on the over-budget frame path).
-const EXEMPT_TABLES_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// WP2 A1 P5: last `exempt tables` emission. The cache lives on the render
-/// thread, so the mutex is uncontended in steady state.
-static EXEMPT_TABLES_LAST_LOG: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
 
 /// Cached layout for a single finished block.
 #[derive(Clone)]
@@ -285,7 +273,8 @@ impl BlockLayoutCache {
         // M6-c: budget enforcement runs LAST (after the band check and the
         // prefix-sum refresh). Degrading never touches scalars, so the just-
         // built prefix sum stays valid. One usize compare while under budget.
-        self.enforce_table_budget(blocks, band, LAYOUT_TABLE_BUDGET_BYTES);
+        // F7-1e: the budget comes from the budget.rs static (config-injected).
+        self.enforce_table_budget(blocks, band, budget::effective_table_budget());
         // M6-b P2-1: append-only is the cols-stable criterion — the pump
         // reads this to stay idle while `cols` keeps changing.
         self.last_sync_stable = append_only;
@@ -582,7 +571,7 @@ impl BlockLayoutCache {
     /// can change. Band changes cannot invalidate it: band-exempt entries
     /// still eligible elsewhere count as latent candidates (memo stays off).
     /// `budget` is a parameter so tests can pin the behavior with tiny
-    /// values; production passes [`LAYOUT_TABLE_BUDGET_BYTES`].
+    /// values; production passes [`budget::effective_table_budget`].
     fn enforce_table_budget(&mut self, blocks: &[Block], band: BandSync, budget: usize) {
         // Per-frame budget check: zero cost while under budget.
         if self.table_bytes_total <= budget {
@@ -661,33 +650,6 @@ impl BlockLayoutCache {
             }
         }
         self.no_degradable_candidates = exhausted && latent_candidates == 0;
-    }
-
-    /// WP2 A1 P5: the throttled `exempt tables` line (before the F1 memo skip).
-    fn log_exempt_tables_overview(&self) {
-        let mut last = EXEMPT_TABLES_LAST_LOG
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.is_some_and(|at| at.elapsed() < EXEMPT_TABLES_LOG_INTERVAL) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-        drop(last);
-        let mut giant_blocks = 0usize;
-        let mut giant_table_bytes = 0usize;
-        for entry in self.entries.values() {
-            let bytes = entry.estimated_table_bytes();
-            if bytes > GIANT_TABLE_EXEMPT_BYTES {
-                giant_blocks += 1;
-                giant_table_bytes += bytes;
-            }
-        }
-        tracing::info!(
-            total_table_bytes = self.table_bytes_total,
-            giant_blocks,
-            giant_table_bytes,
-            "exempt tables"
-        );
     }
 
     /// M6-c: full recompute of the byte total — the test-only oracle for the

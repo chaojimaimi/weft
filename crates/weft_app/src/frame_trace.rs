@@ -145,8 +145,8 @@ pub(crate) struct FrameCounters {
     pub(crate) grid_build_us: u64,
     /// M6-c (PLAN_M6 §三): total bytes held by the block layout cache's
     /// L1/L2 tables (`BlockLayoutCache::table_bytes_total`). Watch it
-    /// plateau under the 256MiB budget (R5): drops mean budget degradation,
-    /// one-frame jumps mean band-entry Both rebuilds of degraded blocks.
+    /// plateau under the configured budget ceiling (F7-1e, default 1GiB):
+    /// drops mean budget degradation, jumps mean band-entry Both rebuilds.
     pub(crate) layout_table_bytes: u64,
     /// M6-c: blocks currently deferred above the sync band (B-2). Grows with
     /// history size during a drag; the idle pump drains it after cols settle.

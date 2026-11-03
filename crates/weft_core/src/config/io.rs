@@ -71,6 +71,22 @@ pub fn normalize_blocks(config: &mut Config) {
         );
     }
     config.blocks.output_cap_mib = clamped;
+    // v1.18.7 (F7-1e): same canonical clamp point for the layout-table
+    // budget (weft_app injects it into the renderer at construction).
+    // `0` is not "off" — the budget has no off switch, so it floors to MIN.
+    let raw_budget = config.blocks.layout_table_budget_mib;
+    let clamped_budget = raw_budget.clamp(
+        crate::config::sections::LAYOUT_TABLE_BUDGET_MIN_MIB,
+        crate::config::sections::LAYOUT_TABLE_BUDGET_MAX_MIB,
+    );
+    if clamped_budget != raw_budget {
+        tracing::warn!(
+            raw = raw_budget,
+            clamped = clamped_budget,
+            "[blocks] layout_table_budget_mib out of range; clamping"
+        );
+    }
+    config.blocks.layout_table_budget_mib = clamped_budget;
 }
 
 // ── LoadedConfig ───────────────────────────────────────────────────────

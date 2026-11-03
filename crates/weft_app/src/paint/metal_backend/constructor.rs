@@ -37,6 +37,9 @@ impl MetalRenderer {
         // presents_with_transaction_live_resize`, injected once — flipping it
         // at runtime requires an app restart (documented on the config key).
         live_resize_flip_enabled: bool,
+        // v1.18.7 (F7-1e): `[blocks].layout_table_budget_mib` — read once at
+        // construction, restart to change (see paint/grid_cache/budget.rs).
+        layout_table_budget_mib: usize,
     ) -> Self {
         // v1.11.6 (PLAN_v1116 M3/D-b): the window-independent construction
         // core was extracted to `build_paint_core`; production `new()` is
@@ -50,6 +53,12 @@ impl MetalRenderer {
         crate::performance_probe::report_phase(crate::performance_probe::StartupPhase::MetalDevice);
         let scale = window.scale_factor();
         let size = window.inner_size();
+        // v1.18.7 (F7-1e): the layout-table budget is a process static read
+        // once per sync — inject it here, at the production construction
+        // point that owns the BlockLayoutCache (build_paint_core). The
+        // headless test constructors skip this on purpose and keep the 1GiB
+        // default, so golden tests never depend on config.
+        crate::paint::grid_cache::init_effective_table_budget_mib(layout_table_budget_mib);
         let renderer = Self::build_paint_core(
             device,
             font_config,

@@ -3472,3 +3472,127 @@ fn update_save_reload_round_trip() {
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
     let _ = std::fs::remove_dir_all(path2.parent().unwrap());
 }
+
+// ── v1.18.7 (F7-1e): [blocks].layout_table_budget_mib ──────────────────
+// Layout-table memory budget (MiB): default 1024 (1GiB), clamped
+// 64..=4096 at BOTH normalize_blocks call points (source + profile-resolved
+// effective). No Settings UI row — config-first power-user key.
+
+/// Values below the floor (0/1/63) clamp to MIN; `0` is NOT "off" — the
+/// budget has no off switch, so it floors like any other out-of-range value.
+#[test]
+fn layout_table_budget_mib_clamps_below_min() {
+    let case = |raw: usize| {
+        let mut cfg: Config =
+            toml::from_str(&format!("[blocks]\nlayout_table_budget_mib = {raw}\n")).unwrap();
+        io::normalize_blocks(&mut cfg);
+        cfg.blocks.layout_table_budget_mib
+    };
+    assert_eq!(
+        case(0),
+        sections::LAYOUT_TABLE_BUDGET_MIN_MIB,
+        "0 → 64 (floor; no off switch)"
+    );
+    assert_eq!(case(1), sections::LAYOUT_TABLE_BUDGET_MIN_MIB, "1 → 64");
+    assert_eq!(case(63), sections::LAYOUT_TABLE_BUDGET_MIN_MIB, "63 → 64");
+    assert_eq!(case(64), 64, "64 → 64 (floor kept, untouched)");
+}
+
+/// Values above the ceiling clamp to MAX.
+#[test]
+fn layout_table_budget_mib_clamps_above_max() {
+    let mut cfg: Config = toml::from_str("[blocks]\nlayout_table_budget_mib = 8192\n").unwrap();
+    io::normalize_blocks(&mut cfg);
+    assert_eq!(
+        cfg.blocks.layout_table_budget_mib,
+        sections::LAYOUT_TABLE_BUDGET_MAX_MIB,
+        "8192 → 4096 (ceiling)"
+    );
+    let mut edge: Config = toml::from_str("[blocks]\nlayout_table_budget_mib = 4096\n").unwrap();
+    io::normalize_blocks(&mut edge);
+    assert_eq!(edge.blocks.layout_table_budget_mib, 4096, "ceiling kept");
+}
+
+/// The Default impl and the unconfigured-load path both land on 1024.
+#[test]
+fn layout_table_budget_mib_default_is_1024() {
+    assert_eq!(Config::default().blocks.layout_table_budget_mib, 1024);
+    let loaded: Config = toml::from_str("").unwrap();
+    assert_eq!(loaded.blocks.layout_table_budget_mib, 1024);
+    // Pin against the exported constant so they can't drift apart.
+    assert_eq!(
+        Config::default().blocks.layout_table_budget_mib,
+        sections::LAYOUT_TABLE_BUDGET_DEFAULT_MIB
+    );
+}
+
+/// A non-default value survives save → reload; the default value never
+/// gains a key in the saved file (non-default-only write contract — the
+/// settings save must not start rewriting this key into every config).
+#[test]
+fn layout_table_budget_mib_save_round_trip_non_default_only() {
+    let path = unique_tmp_path("budget-roundtrip");
+    let mut cfg = Config::default();
+    cfg.blocks.layout_table_budget_mib = 2048;
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("layout_table_budget_mib = 2048"),
+        "non-default budget must persist: {text}"
+    );
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert_eq!(reloaded.blocks.layout_table_budget_mib, 2048);
+
+    // All-default config: no `layout_table_budget_mib` key on disk.
+    let path2 = unique_tmp_path("budget-default-save");
+    Config::default()
+        .save_to_path(&path2)
+        .expect("default save should succeed");
+    let text2 = std::fs::read_to_string(&path2).unwrap();
+    assert!(
+        !text2.contains("layout_table_budget_mib"),
+        "default budget must stay out of the saved file: {text2}"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(path2.parent().unwrap());
+}
+
+/// A profile override reintroduces the value AFTER the source clamp, so the
+/// second normalize_blocks pass (on the profile-resolved effective config)
+/// must re-clamp it — pinned via the full load path.
+#[test]
+fn layout_table_budget_mib_profile_override_reclamped() {
+    let path = unique_tmp_path("budget-profile-clamp");
+    let toml = r#"
+active_profile = "p"
+
+[profiles.p.blocks]
+layout_table_budget_mib = 9999
+"#;
+    std::fs::write(&path, toml).unwrap();
+    let loaded = io::load_resolved_from_path(&path).unwrap();
+    // Source itself was in-range (default); only the overlay went wild.
+    assert_eq!(loaded.source.blocks.layout_table_budget_mib, 1024);
+    assert_eq!(
+        loaded.effective.blocks.layout_table_budget_mib,
+        sections::LAYOUT_TABLE_BUDGET_MAX_MIB,
+        "profile override must be re-clamped after resolve_active_profile"
+    );
+    // And the sub-floor direction too.
+    let path2 = unique_tmp_path("budget-profile-floor");
+    let toml2 = r#"
+active_profile = "p"
+
+[profiles.p.blocks]
+layout_table_budget_mib = 0
+"#;
+    std::fs::write(&path2, toml2).unwrap();
+    let loaded2 = io::load_resolved_from_path(&path2).unwrap();
+    assert_eq!(
+        loaded2.effective.blocks.layout_table_budget_mib,
+        sections::LAYOUT_TABLE_BUDGET_MIN_MIB,
+        "0 floors to 64 through the profile path too"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(path2.parent().unwrap());
+}

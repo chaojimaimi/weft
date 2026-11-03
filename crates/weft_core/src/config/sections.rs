@@ -322,6 +322,16 @@ impl Default for PasteConfig {
 /// at consumption time (`runtime_paste_config`, PLAN_v1111 §4.2).
 pub const PASTE_SIZE_TIERS_KIB: [u32; 6] = [8, 16, 32, 64, 128, 256];
 
+/// v1.18.7 (F7-1e): `[blocks].layout_table_budget_mib` legal range floor
+/// (MiB) — the block layout-table memory budget consumed by weft_app's
+/// renderer at construction (restart to change; no Settings UI row,
+/// config-first cut, same power-user key shape as `output_cap_mib`).
+pub const LAYOUT_TABLE_BUDGET_MIN_MIB: usize = 64;
+/// v1.18.7 (F7-1e): ceiling, see [`LAYOUT_TABLE_BUDGET_MIN_MIB`].
+pub const LAYOUT_TABLE_BUDGET_MAX_MIB: usize = 4096;
+/// v1.18.7 (F7-1e): default (1GiB), see [`LAYOUT_TABLE_BUDGET_MIN_MIB`].
+pub const LAYOUT_TABLE_BUDGET_DEFAULT_MIB: usize = 1024;
+
 /// v1.11.2 X4 (PLAN_v1112 §1.2): in-memory command-block retention cap per
 /// tab. Blocks beyond the limit are evicted from memory (oldest first) but
 /// stay in SQLite and remain referenced by per-tab snapshots; the panel's
@@ -348,6 +358,13 @@ pub struct BlocksConfig {
     /// `blocks.db` file exceeds this budget (MiB). The gate is absolute —
     /// no age-window exemption. `0` = size gate off. Default 512.
     pub history_max_db_mb: u32,
+    /// v1.18.7 (F7-1e): block layout-table budget in MiB (default 1024 =
+    /// 1GiB). Clamped to
+    /// [`LAYOUT_TABLE_BUDGET_MIN_MIB`]..=[`LAYOUT_TABLE_BUDGET_MAX_MIB`] at
+    /// load (`normalize_blocks`); `0` is NOT "off" — the budget has no off
+    /// switch (degrade/evict must stay armed), so out-of-range floors to the
+    /// min. Read once at renderer construction: restart to change.
+    pub layout_table_budget_mib: usize,
 }
 
 impl Default for BlocksConfig {
@@ -357,6 +374,7 @@ impl Default for BlocksConfig {
             output_cap_mib: crate::blocks::OUTPUT_CAP_DEFAULT_MIB,
             history_max_age_days: 90,
             history_max_db_mb: 512,
+            layout_table_budget_mib: LAYOUT_TABLE_BUDGET_DEFAULT_MIB,
         }
     }
 }

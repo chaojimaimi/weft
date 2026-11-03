@@ -86,10 +86,10 @@ impl TombstoneMap {
 impl BlockLayoutCache {
     /// F7-1d: budget-driven foreign eviction — the retention counterpart of
     /// the retired `evict_vanished_blocks`. Mounted in `enforce_table_budget`
-    /// AFTER `log_exempt_tables_overview` (an eviction-met early return must
-    /// not swallow the overview — its regime IS persistent over-budget) and
-    /// BEFORE the `no_degradable_candidates` memo (an armed memo must not
-    /// skip newly arrived foreign entries); see the call-site comment.
+    /// AFTER `budget::log_exempt_tables_overview` (an eviction-met early
+    /// return must not swallow the overview — its regime IS persistent
+    /// over-budget) and BEFORE the `no_degradable_candidates` memo (an armed
+    /// memo must not skip newly arrived foreign entries); see the call site.
     ///
     /// Entries outside the current block set ("foreign": the previous tab's
     /// tables after a switch, history-retention orphans) are retained by
