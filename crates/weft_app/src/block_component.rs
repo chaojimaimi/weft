@@ -313,18 +313,31 @@ pub(crate) fn block_content_metrics_with_cache(
         // 1MiB block) is gone. Uncached blocks still fall back to a direct
         // computation (memo 兜底), counted by `metrics_fallback_rebuilds`.
         let cached = cache.and_then(|c| c.get_if_cached(block.id.0));
+        // F7-1b: tombstone lookup only pays O(1) when the entry is absent
+        // (the only branch that consumes it).
+        let tombstone = if cached.is_none() {
+            cache.and_then(|c| c.get_metrics_tombstone(block.id.0))
+        } else {
+            None
+        };
         let output_rows = match cached {
-            None => {
-                if let Some(c) = cache {
-                    c.note_metrics_fallback();
+            None => match tombstone {
+                Some(t) if !block.collapsed => t.output_rows,
+                Some(_) => 0, // collapsed：与 PRESENT 分支 `Some(_) if block.collapsed => 0` 同构
+                None => {
+                    if let Some(c) = cache {
+                        c.note_metrics_fallback();
+                    }
+                    crate::paint::grid_cache::completed_output_rows(block, cols, None)
+                    // v1.18.4 兜底
                 }
-                crate::paint::grid_cache::completed_output_rows(block, cols, None)
-            }
+            },
             Some(_) if block.collapsed => 0,
             Some(c) => c.stale_output_rows,
         };
         let command_wrap_rows = cached
             .map(|c| c.command_wrap_rows)
+            .or_else(|| tombstone.map(|t| t.command_wrap_rows))
             .unwrap_or_else(|| command_wrap_rows_for(block, cols, block_foldable(block)));
         total += completed_block_row_count(output_rows, header_rows, command_wrap_rows)
             + clear_block_spacer_rows(&block.command, viewport_rows);

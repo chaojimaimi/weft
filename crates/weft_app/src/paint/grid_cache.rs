@@ -16,6 +16,7 @@ use weft_core::blocks::Block;
 
 use band::{rebuild_kind, RebuildKind};
 mod band;
+mod tombstone;
 mod visual_rows;
 pub(crate) use visual_rows::{char_offset_at, completed_output_rows, trimmed_output_line_count};
 #[cfg(test)]
@@ -222,6 +223,8 @@ pub(crate) struct BlockLayoutCache {
     /// rebuild arms (the only ways the candidate pool can change) — not by
     /// the band, which the verdict accounts for via latent candidates.
     no_degradable_candidates: bool,
+    /// F7-1b: metric scalars of retain-evicted entries (see tombstone.rs).
+    tombstones: tombstone::TombstoneMap,
 }
 
 impl BlockLayoutCache {
@@ -268,16 +271,9 @@ impl BlockLayoutCache {
             let ids: std::collections::HashSet<u64> =
                 blocks.iter().map(|block| block.id.0).collect();
             let before = self.entries.len();
-            // M6-c: evicted entries' tables leave the running byte total.
-            self.table_bytes_total -= self
-                .entries
-                .iter()
-                .filter(|(id, _)| !ids.contains(id))
-                .map(|(_, c)| c.estimated_table_bytes())
-                .sum::<usize>();
-            self.entries.retain(|id, _| ids.contains(id));
-            // M6-c: degraded markers for vanished blocks would be orphans.
-            self.degraded_ids.retain(|id| ids.contains(id));
+            // M6-c byte-total subtraction + F7-1b tombstone capture share one
+            // evicted-entry walk (verbatim move into grid_cache/tombstone.rs).
+            self.evict_vanished_blocks(&ids);
             if self.entries.len() != before {
                 // Evicted entries change what get_if_cached/metrics compute.
                 self.prefix_sum_dirty = true;

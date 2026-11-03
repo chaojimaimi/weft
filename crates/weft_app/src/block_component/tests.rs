@@ -515,3 +515,158 @@ fn r22_collapsed_block_cache_reports_zero_output_rows() {
         "cached and uncached totals must match"
     );
 }
+
+// ---- F7-1b (PLAN_v1185_F7_1B_TOMBSTONES §2.5): tombstone truth table ----
+// 五条生产链统一收口:直接钉共享读点 `block_content_metrics_with_cache`。
+
+fn f71b_terminal(output_lines: usize) -> Terminal {
+    let mut terminal = Terminal::new(24, 80);
+    terminal.process(b"\x1b]133;A\x07echo doc\x1b]133;B\x07\x1b]133;C\x07");
+    let output: String = (0..output_lines)
+        .map(|index| format!("line {index}\r\n"))
+        .collect();
+    terminal.process(output.as_bytes());
+    terminal.process(b"\x1b]133;D;0\x07");
+    terminal
+}
+
+/// Production eviction walk, tab-switch shape: a non-append sync with an
+/// empty live set evicts every entry and captures tombstones (F7-1b).
+fn f71b_evict_all(cache: &mut crate::paint::grid_cache::BlockLayoutCache, cols: usize) {
+    cache.sync_blocks(
+        &[],
+        cols,
+        crate::paint::grid_cache::BandSync {
+            low_rows: 0,
+            high_rows: usize::MAX,
+        },
+    );
+}
+
+/// Truth table row — None + Some(tombstone), uncollapsed: the total equals
+/// the PRESENT golden and NO metrics fallback fires.
+#[test]
+fn f71b_tombstone_hit_uncollapsed_matches_present_golden_without_fallback() {
+    use crate::paint::grid_cache::BlockLayoutCache;
+    let terminal = f71b_terminal(4);
+    let cols = terminal.grid().num_cols;
+
+    // Golden: entry present (PRESENT branch, M6-b B-3 scalars).
+    let mut cache = BlockLayoutCache::default();
+    for blk in terminal.block_tracker().session_blocks() {
+        cache.ensure_cached(blk, cols);
+    }
+    let (golden, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(cache.metrics_fallback_rebuilds(), 0);
+
+    f71b_evict_all(&mut cache, cols);
+    let id = terminal.block_tracker().session_blocks()[0].id;
+    assert!(cache.get_if_cached(id.0).is_none());
+    assert!(cache.get_metrics_tombstone(id.0).is_some());
+
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(total, golden, "tombstone scalars == PRESENT-stale scalars");
+    assert_eq!(
+        cache.metrics_fallback_rebuilds(),
+        0,
+        "tombstone hit must NOT count as a metrics fallback"
+    );
+}
+
+/// Truth table row — None + Some(tombstone), collapsed: output rows read 0
+/// (PRESENT `Some(_) if block.collapsed => 0` isomorph); the remaining
+/// scalars come from the tombstone.
+#[test]
+fn f71b_tombstone_hit_collapsed_matches_present_golden_without_fallback() {
+    use crate::paint::grid_cache::BlockLayoutCache;
+    let mut terminal = f71b_terminal(4);
+    let cols = terminal.grid().num_cols;
+    let id = terminal.block_tracker().session_blocks()[0].id;
+    terminal.block_tracker_mut().toggle_collapse(id);
+
+    // Golden: PRESENT + collapsed.
+    let mut cache = BlockLayoutCache::default();
+    for blk in terminal.block_tracker().session_blocks() {
+        cache.ensure_cached(blk, cols);
+    }
+    let (golden, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(cache.metrics_fallback_rebuilds(), 0);
+
+    f71b_evict_all(&mut cache, cols);
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(
+        total, golden,
+        "collapsed tombstone read == PRESENT collapsed read"
+    );
+    assert_eq!(cache.metrics_fallback_rebuilds(), 0);
+}
+
+/// Truth table row — None + None, uncollapsed: v1.18.4 behavior preserved,
+/// the O(document) direct computation fires and counts.
+#[test]
+fn f71b_no_entry_no_tombstone_uncollapsed_counts_fallback() {
+    use crate::paint::grid_cache::BlockLayoutCache;
+    let terminal = f71b_terminal(4);
+    let cols = terminal.grid().num_cols;
+    let cache = BlockLayoutCache::default();
+
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert!(total > 0);
+    assert_eq!(
+        cache.metrics_fallback_rebuilds(),
+        1,
+        "None+None uncollapsed = one O(document) metrics fallback (v1.18.4)"
+    );
+}
+
+/// Truth table row — None + None, collapsed: `completed_output_rows`
+/// early-returns 0 for collapsed blocks (visual_rows.rs), but the direct
+/// fallback STILL counts (the miss happened).
+#[test]
+fn f71b_no_entry_no_tombstone_collapsed_zero_rows_but_counts_fallback() {
+    use crate::paint::grid_cache::BlockLayoutCache;
+    let mut terminal = f71b_terminal(4);
+    let cols = terminal.grid().num_cols;
+    let id = terminal.block_tracker().session_blocks()[0].id;
+    terminal.block_tracker_mut().toggle_collapse(id);
+    let cache = BlockLayoutCache::default();
+
+    // Collapsed: output rows direct-compute to 0 (early return), leaving
+    // header(1) + collapsed command(1) + separator(1) = 3 rows.
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(
+        total, 3,
+        "collapsed output rows early-return 0; command+separator remain"
+    );
+    assert_eq!(cache.metrics_fallback_rebuilds(), 1);
+}
+
+/// F7-1b acceptance shape: a large evicted block must read its tombstone —
+/// if the read point fell through to `completed_output_rows` the fallback
+/// counter would bump (and the scan would cost O(document), the exact
+/// regression this plan removes).
+#[test]
+fn f71b_large_block_tombstone_hit_avoids_completed_output_rows_fallback() {
+    use crate::paint::grid_cache::BlockLayoutCache;
+    let terminal = f71b_terminal(5000);
+    let cols = terminal.grid().num_cols;
+
+    let mut cache = BlockLayoutCache::default();
+    for blk in terminal.block_tracker().session_blocks() {
+        cache.ensure_cached(blk, cols);
+    }
+    let (golden, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(cache.metrics_fallback_rebuilds(), 0);
+
+    f71b_evict_all(&mut cache, cols);
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    assert_eq!(
+        total, golden,
+        "5000-line block reads stale scalars, not a re-wrap"
+    );
+    assert_eq!(
+        cache.metrics_fallback_rebuilds(),
+        0,
+        "tombstone hit: no O(document) fallback"
+    );
+}
