@@ -6,7 +6,7 @@
             <sparkle:version>1.18.7</sparkle:version>
             <sparkle:shortVersionString>1.18.7</sparkle:shortVersionString>
             <link>https://github.com/chaojimaimi/weft/releases/download/v1.18.7/Weft-1.18.7.dmg</link>
-            <enclosure url="https://github.com/chaojimaimi/weft/releases/download/v1.18.7/Weft-1.18.7.dmg" length="8408800" type="application/x-bzip2-diskimage" sparkle:edSignature="i4NCuceHA5dJWg4T5HDw0rsKBeHiY9Lx3uo9Ta27uUQsnLV7X5K/I/JjQUnByIVyTZ0mpD6KGJ8WvdfGbZ5WCw==" />
+            <enclosure url="https://github.com/chaojimaimi/weft/releases/download/v1.18.7/Weft-1.18.7.dmg" length="8408432" type="application/x-bzip2-diskimage" sparkle:edSignature="E+Rrxw1hxGIO1aHjCDuBOquHEoFKU7Yj1ubYGkQ48ytIPgCazstE8n88U0/4XkNLKiLeChx4uBAR+SQS0Xz9AA==" />
             <description><![CDATA[
                 <h2>Weft 1.18.7</h2>
                 <p>See the <a href="https://github.com/chaojimaimi/weft/releases/tag/v1.18.7">release notes</a>.</p>
