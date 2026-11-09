@@ -102,3 +102,176 @@ fn background_block_pane_rebuild_is_wholesale_skipped_while_rewrap_frozen() {
     // Clean slate for the other tests under the shared lock.
     crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
 }
+
+/// One 6-vertex quad (12 floats per vertex: pos + tex + fg + bg) with
+/// per-corner tex sentinels so the UV bit-equality assertions bite.
+fn push_quad(out: &mut Vec<f32>, x0: f32, y0: f32, x1: f32, y1: f32) {
+    for (i, (x, y)) in [(x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1)]
+        .into_iter()
+        .enumerate()
+    {
+        out.extend_from_slice(&[
+            x,
+            y,
+            i as f32 * 0.25,
+            1.0 - i as f32 * 0.125,
+            0.25,
+            0.5,
+            0.75,
+            1.0,
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+        ]);
+    }
+}
+
+/// v1.18.10 (PLAN_v11810_FROZEN_BG_VERTEX_AFFINE §2.1): rendering-level
+/// freeze assertions. The cache entry is CONSTRUCTED directly (a header
+/// band + a content quad hand-baked under rect A) so the served geometry is
+/// exact by construction and independent of build_block_view internals;
+/// the code under test is the frozen-serve path (entry bytes + rect pair in
+/// → stream out). GLOBAL_ZOOM_STATE_LOCK is mandatory — the freeze bits are
+/// process-global and shared with the zoom_render tests.
+#[test]
+fn frozen_serve_follows_pane_rect_and_identity_stays_byte_exact() {
+    let Some(renderer) = headless_renderer_or_skip() else {
+        eprintln!("skipping frozen affine serve test: no Metal device available");
+        return;
+    };
+    let _guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::paint::zoom_render::set_self_zoom_window(false);
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
+
+    const VERTEX_FLOATS: usize = 12;
+    const QUAD_FLOATS: usize = 6 * VERTEX_FLOATS;
+
+    // Rect A: the bake. Rect B: 0.5x re-base onto an offset origin — every
+    // mapped coordinate below is exactly representable, so the spot checks
+    // use `==` (stronger than the plan's ±1e-3 windows).
+    let rect_a: crate::layout::Rect = [0.0, 0.0, 400.0, 300.0];
+    let rect_b: crate::layout::Rect = [40.0, 30.0, 240.0, 180.0];
+    let mut baked: Vec<f32> = Vec::new();
+    push_quad(&mut baked, 0.0, 0.0, 400.0, 24.0); // header band: A's full width
+    push_quad(&mut baked, 8.0, 40.0, 392.0, 64.0); // content quad inside A
+    renderer.background_block_caches.borrow_mut().insert(
+        9100,
+        crate::renderer::bg_block_cache::BgBlockCache {
+            vertices: baked.clone(),
+            fingerprint: crate::renderer::bg_block_cache::BgBlockFingerprint {
+                live_output_version: 1,
+                screen_head_lines: 0,
+                cwd: None,
+                git_branch: None,
+                theme_generation: 0,
+                cell_dims: (8, 16),
+                rect: rect_a,
+                block_scroll: 0.0,
+                editor_mode: false,
+            },
+            last_rebuild: std::time::Instant::now(),
+        },
+    );
+
+    let mut terminal = weft_core::vt::Terminal::new(6, 40);
+    terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07seq 3\n\x1b]133;C\x07a\nb\n");
+    let pane = |rect: crate::layout::Rect| PaneRenderInfo {
+        rect,
+        terminal: &terminal,
+        block_scroll: 0.0,
+        submit_on_ctrl_enter: true,
+        pane_session_id: 9100,
+    };
+
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(true);
+
+    // ① Identity rect (pane.rect == fingerprint.rect): the serve must take
+    // the untouched extend path — byte-for-byte the baked entry (the
+    // stale-rect-free twin of the :97-100 sentinel above).
+    let mut served: Vec<f32> = Vec::new();
+    assert!(
+        !renderer.build_background_pane_content(
+            &pane(rect_a),
+            &mut served,
+            &mut Vec::new(),
+            &mut Vec::new()
+        ),
+        "the frozen path must report no rebuild"
+    );
+    assert_eq!(
+        served, baked,
+        "identity rect: the frozen serve must be byte-for-byte the baked entry"
+    );
+
+    // ② Re-based rect (pane.rect = B ≠ A): every vertex moves inside B
+    // (x ∈ [B.x, B.x+B.w], y likewise — ±1e-3), every non-position float
+    // stays bit-identical, and the cache entry itself is untouched.
+    let mut mapped: Vec<f32> = Vec::new();
+    assert!(
+        !renderer.build_background_pane_content(
+            &pane(rect_b),
+            &mut mapped,
+            &mut Vec::new(),
+            &mut Vec::new()
+        ),
+        "the frozen path must report no rebuild"
+    );
+    assert_eq!(
+        mapped.len(),
+        baked.len(),
+        "the affine must not change the stream length"
+    );
+    let span = |stream: &[f32], quad: usize, axis: usize| {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for v in 0..6 {
+            let a = stream[quad * QUAD_FLOATS + v * VERTEX_FLOATS + axis];
+            lo = lo.min(a);
+            hi = hi.max(a);
+        }
+        (lo, hi)
+    };
+    // Exact re-base expectations: A→B is origin (40, 30) at exactly 0.5x.
+    assert_eq!(span(&mapped, 0, 0), (40.0, 240.0), "band quad x span");
+    assert_eq!(span(&mapped, 0, 1), (30.0, 42.0), "band quad y span");
+    assert_eq!(span(&mapped, 1, 0), (44.0, 236.0), "content quad x span");
+    assert_eq!(span(&mapped, 1, 1), (50.0, 62.0), "content quad y span");
+    for (qi, quad) in mapped.chunks_exact(QUAD_FLOATS).enumerate() {
+        let baked_quad = &baked[qi * QUAD_FLOATS..(qi + 1) * QUAD_FLOATS];
+        for v in 0..6 {
+            let x = quad[v * VERTEX_FLOATS];
+            let y = quad[v * VERTEX_FLOATS + 1];
+            assert!(
+                x >= rect_b[0] - 1e-3 && x <= rect_b[2] + 1e-3,
+                "quad {qi} vertex {v}: x {x} outside B"
+            );
+            assert!(
+                y >= rect_b[1] - 1e-3 && y <= rect_b[3] + 1e-3,
+                "quad {qi} vertex {v}: y {y} outside B"
+            );
+            assert_eq!(
+                quad[v * VERTEX_FLOATS + 2..(v + 1) * VERTEX_FLOATS],
+                baked_quad[v * VERTEX_FLOATS + 2..(v + 1) * VERTEX_FLOATS],
+                "quad {qi} vertex {v}: the 10 non-position floats must be bit-identical"
+            );
+        }
+    }
+    {
+        let caches = renderer.background_block_caches.borrow();
+        let entry = caches.get(&9100).expect("entry must survive the serves");
+        assert_eq!(
+            entry.fingerprint.rect, rect_a,
+            "the freeze must not mutate the entry"
+        );
+        assert_eq!(
+            entry.vertices, baked,
+            "the freeze must not mutate the baked bytes"
+        );
+    }
+
+    // Clean slate for the other tests under the shared lock.
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
+}

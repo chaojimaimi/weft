@@ -191,18 +191,29 @@ impl MetalRenderer {
                 // over-budget foreign-eviction arm can still drop the
                 // active pane's tables mid-animation — churn the freeze
                 // exists to stop, so the early return stays. Trade (plan
-                // §2-F7-2): the previous build keeps serving (old rect/cols
-                // vertices, absolutely baked) for the whole freeze window
-                // (≤ the animation + flush tail) — the same stale-render
-                // the 60ms throttle already shows, widened; a cold pane (no
-                // cached entry) renders nothing until the freeze lifts.
+                // §2-F7-2): the previous build keeps serving (content
+                // frozen, absolutely baked) for the whole freeze window (≤
+                // the animation + flush tail) — the same stale-render the
+                // 60ms throttle already shows, widened. v1.18.10: the
+                // served stream is re-based onto the current pane rect at
+                // draw time (renderer/panes/affine.rs — identity rect keeps
+                // the byte-for-byte path), so the window shows
+                // proportionally stretched-in-place content instead of
+                // misplaced blocks; a cold pane (no cached entry) renders
+                // nothing until the freeze lifts.
                 if crate::paint::zoom_render::rewrap_freeze_active() {
                     if let Some(entry) = self
                         .background_block_caches
                         .borrow()
                         .get(&pane.pane_session_id)
                     {
-                        background_vertices.extend_from_slice(&entry.vertices);
+                        // v1.18.10: identity rect keeps the byte-for-byte serve.
+                        affine::extend_cached_vertices(
+                            &entry.vertices,
+                            entry.fingerprint.rect,
+                            pane.rect,
+                            background_vertices,
+                        );
                     }
                     tracing::debug!(
                         bg_rect = ?pane.rect,
@@ -246,12 +257,20 @@ impl MetalRenderer {
                     bg_block_cache::BgBlockCacheAction::Reuse
                         | bg_block_cache::BgBlockCacheAction::Throttled
                 ) {
-                    // Reuse (or throttle-hold): serve the previous build.
+                    // Reuse (or throttle-hold): serve the previous build —
+                    // same v1.18.10 rect rule as the freeze branch (Reuse
+                    // implies equal rects; a Throttled rect delta inside the
+                    // 60ms composite window serves the affine re-base).
                     let caches = self.background_block_caches.borrow();
                     let entry = caches
                         .get(&pane.pane_session_id)
                         .expect("Reuse/Throttled imply a cache entry");
-                    background_vertices.extend_from_slice(&entry.vertices);
+                    affine::extend_cached_vertices(
+                        &entry.vertices,
+                        entry.fingerprint.rect,
+                        pane.rect,
+                        background_vertices,
+                    );
                     tracing::debug!(
                         bg_rect = ?pane.rect,
                         ?action,
@@ -754,3 +773,13 @@ mod tests {
 #[cfg(test)]
 #[path = "panes/freeze_tests.rs"]
 mod freeze_tests;
+
+// v1.18.10 (PLAN_v11810_FROZEN_BG_VERTEX_AFFINE): frozen-rect affine —
+// pure position map + cached-serve helper (identity short-circuit); the
+// truth table lives in the gate-counted affine_tests.rs.
+#[path = "panes/affine.rs"]
+mod affine;
+
+#[cfg(test)]
+#[path = "panes/affine_tests.rs"]
+mod affine_tests;
