@@ -367,3 +367,8 @@ mod tracker_impl;
 
 #[cfg(test)]
 mod tracker_tests;
+
+// v1.18.9: capture-cursor caret anchor tests (split from tracker_tests.rs
+// for the line-count gate; see docs/PLAN_v1189_CAPTURE_CURSOR_CARET.md).
+#[cfg(test)]
+mod tracker_cursor_anchor_tests;

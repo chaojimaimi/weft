@@ -121,6 +121,38 @@ impl BlockTracker {
             .saturating_sub(usize::from(self.output.as_str().ends_with('\n')))
     }
 
+    /// v1.18.9: display column of the capture's own edit head when it sits
+    /// on the tail line — the nested-shell readline case (`sudo su`): bash
+    /// moves the caret via CUB/ICH/DCH, all mirrored into the capture since
+    /// v1.18.7/v1.18.8. Returns the raw (unwrapped) tail-line display
+    /// column; the renderer applies wrap-pending clamping (paint-layer
+    /// convention — it knows `cols`).
+    ///
+    /// `None` keeps the v1.18.8 tail-end formula anchor:
+    /// - the mirrored cursor moved off the tail line (CSI A/B/E/F progress
+    ///   repaints park it on an early row — brew/ollama frames);
+    /// - phantom row: a trailing `\n` leaves the head past the last
+    ///   complete line.
+    pub fn live_cursor_capture_anchor_col(&self) -> Option<usize> {
+        let text = self.output.as_str();
+        let cursor = self.output.cursor_byte().min(text.len());
+        if !text.is_char_boundary(cursor) {
+            return None;
+        }
+        // Tail line start. N2: deliberately `rfind`, NOT the capture's
+        // `line_start()` — the latter tracks the CURSOR's row, which loops
+        // back into this very predicate while a progress repaint parks the
+        // cursor on an early row.
+        let tail_start = text.rfind('\n').map_or(0, |i| i + 1);
+        if cursor < tail_start {
+            return None;
+        }
+        if cursor == text.len() && text.ends_with('\n') {
+            return None;
+        }
+        Some(crate::grid::terminal_text_width(&text[tail_start..cursor]))
+    }
+
     // ── ShellPhase accessors ─────────────────────────────────────────────
 
     pub fn phase(&self) -> ShellPhase {

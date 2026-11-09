@@ -28,6 +28,12 @@ mod runtime;
 mod tui_caret_anchor;
 pub use panes::PaneRenderInfo;
 
+// v1.18.9 (PLAN_v1189 §2 T8/T9): capture-cursor anchor rendering tests,
+// gate-exempt sibling module (panes/freeze_tests.rs precedent).
+#[cfg(test)]
+#[path = "renderer/tui_caret_anchor_tests.rs"]
+mod tui_caret_anchor_tests;
+
 /// Metal GPU renderer: draws the terminal Grid to screen.
 pub struct MetalRenderer {
     pub(crate) device: Device,

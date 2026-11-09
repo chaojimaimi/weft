@@ -66,6 +66,33 @@ fn display_col_of_line_text(text: &str, cols: usize) -> usize {
     }
 }
 
+/// v1.18.9 B1' (PLAN_v1189 §2): wrap-pending clamp for the capture-cursor
+/// anchor path ONLY. When the caret column is exactly the tail line's full
+/// width AND that width is an exact multiple of `cols` (a multi-chunk row
+/// whose end lands on a wrap boundary), the painter's chunk map
+/// (`chunk_idx == cursor_col / cols` @ output_paint.rs:178) addresses a
+/// nonexistent chunk `k` — the caret quad vanishes — while the real
+/// terminal sits wrap-pending: its visual caret is the LAST cell of the
+/// previous visual row. Clamp one cell back in exactly that shape;
+/// everything else passes through bare:
+/// - `k == 1` full-width row (width == cols): bare — T16c right-edge park
+///   (the whole-line painter path clamps it inside the right edge);
+/// - mid-row boundary (col % cols == 0, col < line_width): the row really
+///   folded; the painter maps to the next visual row, col 0 — the true
+///   position;
+/// - ordinary columns: bare.
+///
+/// MUST NOT be wired into the formula path: `display_col_of_line_text`'s
+/// single-chunk `cols` semantics are pinned by T16c geometry and the IME
+/// preedit clamp.
+pub(crate) fn wrap_pending_clamp(col: usize, cols: usize, line_width: usize) -> usize {
+    if col > 0 && col == line_width && line_width > cols && col % cols == 0 {
+        col - 1
+    } else {
+        col
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +170,29 @@ mod tests {
         assert_eq!(tui_cursor_tail_display_col("abc\n", 80), 3);
         assert_eq!(tui_cursor_tail_display_col("", 80), 0);
         assert_eq!(tui_cursor_tail_display_col("\n\n", 80), 0);
+    }
+
+    /// v1.18.9 B1' (PLAN_v1189 §2 T5b): wrap_pending_clamp truth table —
+    /// only the exact-multiple multi-chunk row END clamps one cell back
+    /// (wrap-pending); k=1 full rows, mid-row boundaries, and ordinary
+    /// columns all pass through bare.
+    #[test]
+    fn wrap_pending_clamp_only_bites_on_exact_multi_chunk_row_end() {
+        // The clamp shape: caret at a multi-chunk row's full width, width an
+        // exact multiple of cols → painter would address a nonexistent chunk
+        // k → park one cell back (the terminal sits wrap-pending).
+        assert_eq!(wrap_pending_clamp(220, 110, 220), 219);
+        assert_eq!(wrap_pending_clamp(240, 80, 240), 239);
+        // k=1 exact full row: bare (T16c right-edge park; gate needs > cols).
+        assert_eq!(wrap_pending_clamp(80, 80, 80), 80);
+        // Mid-row boundary (row really folded, col 0 of next visual row):
+        // bare — the modulo map is exact there.
+        assert_eq!(wrap_pending_clamp(110, 110, 220), 110);
+        // Non-multiple row end: bare.
+        assert_eq!(wrap_pending_clamp(180, 110, 180), 180);
+        // Ordinary mid-row columns: bare.
+        assert_eq!(wrap_pending_clamp(37, 110, 180), 37);
+        // Empty line at col 0: bare.
+        assert_eq!(wrap_pending_clamp(0, 80, 0), 0);
     }
 }

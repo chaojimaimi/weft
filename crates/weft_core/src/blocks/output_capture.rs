@@ -169,6 +169,24 @@ impl OutputCapture {
         self.text_char_count
     }
 
+    /// v1.18.9: raw byte position of the capture's own edit head — the
+    /// CUB/CUF/ICH/DCH-mirrored cursor maintained by `set_cursor_column`
+    /// and friends (unlike the renderer's grid cursor, this one survives
+    /// nested-shell inline editing). Read-only accessor for the tracker's
+    /// capture-cursor anchor.
+    pub(crate) fn cursor_byte(&self) -> usize {
+        self.cursor
+    }
+
+    /// v1.18.9: test-only twin of [`Self::cursor_byte`] — injects a raw byte
+    /// cursor to exercise the anchor's defensive branches (torn char
+    /// boundary, past-the-end). Production never leaves a torn cursor: the
+    /// mirrored edit ops all maintain char boundaries.
+    #[cfg(test)]
+    pub(crate) fn set_cursor_byte_for_test(&mut self, byte: usize) {
+        self.cursor = byte;
+    }
+
     /// PLAN_v11217 §3.5 (T4): record the cap the finalize truncation marker
     /// should report. Metadata sync only — the tracker calls this from
     /// `set_output_cap` (live cap change) and from `on_orphan_command_end`

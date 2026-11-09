@@ -5840,3 +5840,44 @@ fn sudo_su_inline_edit_replay_keeps_tail_in_capture() {
     assert_eq!(t.grid().row_text(0), "sudo su");
     assert_eq!(t.grid().row_text(1), "sh-3.2$ ls -al |ssssssss grep \"\"");
 }
+
+/// v1.18.9 E2E (PLAN_v1189 §2): the same `sudo su` inline-edit replay as
+/// v1.18.8's `sudo_su_inline_edit_replay_keeps_tail_in_capture`, now
+/// asserting the capture-cursor ANCHOR the caret renderer consumes. Before
+/// this fix the anchor ignored the mirrored cursor entirely (always pinned
+/// at the tail end), so the block-view caret never followed ← ×8. The
+/// fixture's forensics note lives on the v1.18.8 twin above (deterministic
+/// PLAN §C byte stream, not a raw /tmp/root_session_csi.bin transcription).
+#[test]
+fn sudo_su_cub_edit_moves_capture_cursor_anchor() {
+    let mut t = Terminal::new(62, 200);
+    t.process(b"\x1b]133;A\x07");
+    t.process(b"sudo su\r\n");
+    t.process(b"\x1b]133;B\x07");
+    t.process(b"\x1b[?1034hsh-3.2$ ls -al | grep \"\"");
+    // Tail-end anchor before any cursor traffic (the old formula value —
+    // streaming shapes stay byte-identical to v1.18.8).
+    assert_eq!(t.block_tracker().live_cursor_capture_anchor_col(), Some(24));
+    for _ in 0..8 {
+        t.process(b"\x1b[D"); // ← — CUB 1, mirrored into the capture
+    }
+    assert_eq!(
+        t.block_tracker().live_cursor_capture_anchor_col(),
+        Some(16),
+        "anchor column must equal bash's visual caret after ← ×8"
+    );
+    for _ in 0..8 {
+        t.process(b"\x1b[1@s"); // ICH 1, then 's' — caret walks back out
+    }
+    assert_eq!(
+        t.block_tracker().live_cursor_capture_anchor_col(),
+        Some(24),
+        "each ICH+'s' round parks the anchor on the fresh edit head"
+    );
+    // The v1.18.8 content invariant still holds (insertion, not overwrite).
+    let output = t.block_tracker().in_flight().unwrap().output.to_string();
+    assert!(
+        output.contains("sh-3.2$ ls -al |ssssssss grep \"\""),
+        "capture lost the inline-edit tail: {output:?}"
+    );
+}

@@ -47,10 +47,29 @@ impl MetalRenderer {
                 // O(capture) passes per frame (seq bench top hotspot:
                 // 2.1ms/frame at the 1 MiB capture cap).
                 let line = terminal.block_tracker().live_cursor_tail_line();
-                let col = crate::paint::tui_caret::tui_cursor_tail_display_col(
-                    live.output,
-                    grid.num_cols,
-                );
+                // v1.18.9: prefer the capture's OWN cursor when it sits on
+                // the tail line — the nested-shell readline case (`sudo su`):
+                // bash moves its caret with CUB/ICH/DCH, mirrored into the
+                // capture (v1.18.7/v1.18.8), so the caret can finally follow
+                // the real edit head instead of the pinned tail end. None
+                // (cursor moved off the tail line for a progress repaint, or
+                // phantom trailing-newline row) keeps the formula anchor;
+                // wrap-pending exact-multiple ends clamp one cell (B1').
+                let text = live.output;
+                let tail_start = text.rfind('\n').map_or(0, |i| i + 1);
+                let line_width = weft_core::grid::terminal_text_width(&text[tail_start..]);
+                let col = terminal
+                    .block_tracker()
+                    .live_cursor_capture_anchor_col()
+                    .map(|col| {
+                        crate::paint::tui_caret::wrap_pending_clamp(col, grid.num_cols, line_width)
+                    })
+                    .unwrap_or_else(|| {
+                        crate::paint::tui_caret::tui_cursor_tail_display_col(
+                            live.output,
+                            grid.num_cols,
+                        )
+                    });
                 (line, col)
             }
         };
