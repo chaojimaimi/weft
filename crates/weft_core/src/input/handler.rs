@@ -389,12 +389,28 @@ impl InputHandler {
         }
     }
 
+    /// v1.18.8 (PLAN_v1188 §4.5): Home/End were the last encoders emitting
+    /// the RXVT-flavoured `CSI 1~` / `CSI 4~`. Standard xterm family sends
+    /// `ESC[H` / `ESC[F` (terminfo khome/kend), which is what `sudo su`'s
+    /// emacs bindings bind to beginning/end-of-line; mods ride the arrow-key
+    /// form `CSI 1;<m>H` / `CSI 1;<m>F`. See the v1.11.13 PageUp note above
+    /// for the inverse precedent (`khome=\E[H` mis-reading cut the other way).
     fn encode_home(&self, mods: Modifiers) -> Vec<u8> {
-        self.encode_csi_tilde_or_mod(1, mods)
+        self.encode_nav_hf(b'H', mods)
     }
 
     fn encode_end(&self, mods: Modifiers) -> Vec<u8> {
-        self.encode_csi_tilde_or_mod(4, mods)
+        self.encode_nav_hf(b'F', mods)
+    }
+
+    fn encode_nav_hf(&self, final_byte: u8, mods: Modifiers) -> Vec<u8> {
+        let has_mods = mods.intersects(Modifiers::SHIFT | Modifiers::ALT | Modifiers::CONTROL);
+        if has_mods {
+            let m = self.modifier_code(mods);
+            self.csi_with_mod(1, final_byte, m)
+        } else {
+            vec![0x1b, b'[', final_byte]
+        }
     }
 
     fn encode_insert(&self, mods: Modifiers) -> Vec<u8> {
@@ -438,8 +454,9 @@ impl InputHandler {
         self.csi_tilde(code, mods)
     }
 
-    /// Build `\x1b[<param>;<mod><final>` — used by arrow keys and F1–F4 when a
-    /// modifier is held. Writes bytes directly instead of going through `format!`
+    /// Build `\x1b[<param>;<mod><final>` — used by arrow keys, F1–F4 and
+    /// Home/End when a modifier is held. Writes bytes directly instead of
+    /// going through `format!`
     /// (no `String` allocation, no formatter machinery).
     fn csi_with_mod(&self, param: u8, final_byte: u8, mod_code: u8) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8);

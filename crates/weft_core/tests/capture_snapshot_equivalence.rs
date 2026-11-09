@@ -41,12 +41,12 @@
 //! |----|-----------|---------|---------------------------|----------------|
 //! | D1 | soft wrap: snapshot = physical rows, capture = logical lines | 设计内 | line-domain canonical normalization | EQUAL (s03, s13) |
 //! | D2 | empty-line handling: snapshot drops edge empties, keeps internal 1:1 per physical row | 设计内 — with an internal-empty ACCOUNTING subclass: when a capture mirror folds a physical row (see D9), the canonical form cannot restore it | canonical form strips edge empties both sides only | EQUAL for pure-LF streams (s04); internal-empty divergences are catalog D9 (s14) |
-//! | D3 | CSI 2J / 3J / ECH `X` have no capture mirror | 真分歧待裁 | Phase 1 decides: mirror or exemption | EXPECTED DIFFERENCE (s05, s06, s07) — capture keeps cleared content |
+//! | D3 | CSI 2J / 3J have no capture mirror — 维持待裁；ECH `X` mirrored since v1.18.8 (edit_ops erase_chars) → s07 turned EQUAL | 真分歧待裁（仅剩 2J/3J） | Phase 1 decides: mirror or exemption | EXPECTED DIFFERENCE (s05, s06) — capture keeps cleared content |
 //! | D4 | wide-char cell layout: grid +2 cols, capture +1 char; grid wraps whole glyphs at line end, capture never wraps | 预期等价 after canonical form | none needed if equal | EQUAL (s08) |
 //! | D5 | orphan combining scalar: grid drops (no base cell), capture keeps | 设计内 (directional) | capture keeps the mark the grid drops | EXPECTED DIFFERENCE (s09) |
 //! | D6 | hyperlink / SGR styles | no text channel on capture | pure-text comparison rules them out | (no text scenario — styles never change text) |
 //! | D7 | 1 MiB budget: capture appends `\n…(block excerpt truncated at 1 MiB — full output remains in scrollback)`, snapshot appends a single space + drops styles | 设计内 | budget overflow is catalog-specific | EXPECTED DIFFERENCE (s10) |
-//! | D8 | absolute addressing / edit ops (CUP `H`/`f`, ICH/DCH/IL/DL/SU/SD `@ P L M S T`) have no capture mirror | 设计内 | screen-owned channel exists for exactly this | EXPECTED DIFFERENCE (s12) |
+//! | D8 | absolute addressing / edit ops (CUP `H`/`f`, IL/DL/SU/SD `L M S T`) have no capture mirror — 维持设计内；ICH/DCH `@ P` mirrored since v1.18.8 (edit_ops insert_blank/delete_chars) → s12 turned EQUAL | 设计内（仅剩 CUP/IL/DL/SU/SD） | screen-owned channel exists for exactly this | s12 now EQUAL; remaining windows are fuzz-only |
 //! | D9 | vertical moves (CUU/CUD) mirror onto the capture WITHOUT writing the rows they cross, so the capture folds physical blank rows the snapshot keeps | 设计内/待裁 (Phase 1: either the capture materializes folded rows, or the snapshot walk folds empty rows for plain commands) | the D2 canonical normalization does NOT absorb internal empties | EXPECTED DIFFERENCE (s14) |
 //! | D4b | wide-glyph overwrite: a glyph landing on a pair's lead blanks the orphaned spacer in the grid while the capture keeps the overwritten char | 设计内 (D4 cell-model subclass) | no capture channel for pair cleanup | fuzz-verified (fuzz_lite predicate ⑧, seed 11916113683178599450) |
 //! | D10 | TAB/positional fills: the capture writes a space per advanced column (destructive) while the grid TAB/CUF only move | 设计内 | capture positional mirrors over-write; grid moves don't | fuzz-verified (fuzz_lite predicate ⑨) |
@@ -281,21 +281,18 @@ fn scenarios() -> Vec<Scenario> {
             },
         },
         Scenario {
-            name: "s07_d3_ech_x_no_capture_mirror",
-            catalog: "D3(X)",
+            name: "s07_d3_ech_x_capture_mirror_v1188",
+            catalog: "D3(X) (mirrored since v1.18.8)",
             rows: 6,
             cols: 40,
             scrollback: 50,
             // BS×3 moves the cursor to column 2 (BS *is* mirrored in the
-            // capture, so the capture cursor rewinds too); ECH then erases
-            // "CDE" from the grid — and the capture keeps it.
+            // capture, so the capture cursor rewinds too); ECH erases "CDE".
+            // Since v1.18.8 ECH is mirrored on the capture side as well
+            // (edit_ops erase_chars), so both truths erase down to "AB".
             output: "ABCDE\x08\x08\x08\x1b[3X".to_string(),
             forbidden: None,
-            verdict: Verdict::Diverged {
-                capture: vec!["ABCDE".to_string()],
-                snapshot: vec!["AB".to_string()],
-                retained: Some("ABCDE"),
-            },
+            verdict: Verdict::Equal,
         },
         Scenario {
             name: "s08_d4_cjk_wide_wrap",
@@ -354,22 +351,19 @@ fn scenarios() -> Vec<Scenario> {
             verdict: Verdict::Equal,
         },
         Scenario {
-            name: "s12_d8_edit_sequence_catalog_skip_demo",
+            name: "s12_d8_ich_capture_mirror_v1188",
             catalog: "D8",
             rows: 6,
             cols: 40,
             scrollback: 50,
-            // BS×2 rewinds to column 2, ICH inserts two blanks there. ICH
-            // ('@' ∈ the D8 opcode set) has no capture mirror, so the
-            // snapshot shows the gap and the capture does not. This window's
-            // byte shape is what the fuzz skip predicate ① excludes.
+            // BS×2 rewinds to column 2, ICH inserts two blanks there. Since
+            // v1.18.8 ICH is mirrored on the capture side, so the capture
+            // shows the same "AB  CD" gap. This window's byte shape is what
+            // the fuzz skip predicate ① excludes; the skip is now merely
+            // conservative — the windows it skips have become equal scenarios.
             output: "ABCD\x08\x08\x1b[2@".to_string(),
             forbidden: None,
-            verdict: Verdict::Diverged {
-                capture: vec!["ABCD".to_string()],
-                snapshot: vec!["AB  CD".to_string()],
-                retained: None,
-            },
+            verdict: Verdict::Equal,
         },
         Scenario {
             name: "s13_d1_wrap_between_plain_lines",
@@ -530,8 +524,8 @@ fn s06_d3_csi_3j_no_capture_mirror() {
 }
 
 #[test]
-fn s07_d3_ech_x_no_capture_mirror() {
-    run_scenario(&scenario("s07_d3_ech_x_no_capture_mirror"));
+fn s07_d3_ech_x_capture_mirror_v1188() {
+    run_scenario(&scenario("s07_d3_ech_x_capture_mirror_v1188"));
 }
 
 #[test]
@@ -555,8 +549,8 @@ fn s11_alt_screen_output_dropped_both_sides() {
 }
 
 #[test]
-fn s12_d8_edit_sequence_catalog_skip_demo() {
-    run_scenario(&scenario("s12_d8_edit_sequence_catalog_skip_demo"));
+fn s12_d8_ich_capture_mirror_v1188() {
+    run_scenario(&scenario("s12_d8_ich_capture_mirror_v1188"));
 }
 
 #[test]

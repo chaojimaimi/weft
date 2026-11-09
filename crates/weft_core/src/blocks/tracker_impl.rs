@@ -427,6 +427,30 @@ impl BlockTracker {
         }
     }
 
+    pub fn on_insert_blank(&mut self, count: usize) {
+        if self.is_capturing() {
+            self.output.insert_blank(count, self.output_cap);
+            self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.boundary_publish_live_styled();
+        }
+    }
+
+    pub fn on_delete_chars(&mut self, count: usize) {
+        if self.is_capturing() {
+            self.output.delete_chars(count);
+            self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.boundary_publish_live_styled();
+        }
+    }
+
+    pub fn on_erase_chars(&mut self, count: usize) {
+        if self.is_capturing() {
+            self.output.erase_chars(count);
+            self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.boundary_publish_live_styled();
+        }
+    }
+
     /// Mirror CSI A/B/E/F (cursor up/down) into the capture buffer so
     /// multi-line progress bars (`ollama pull`, `brew upgrade`) repaint
     /// in place instead of appending new rows on every update.

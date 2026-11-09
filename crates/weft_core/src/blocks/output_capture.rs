@@ -28,6 +28,9 @@ fn truncation_marker(cap_bytes: usize) -> String {
 #[cfg(test)]
 mod crlf_tests;
 mod cursor;
+mod edit_ops;
+#[cfg(test)]
+mod edit_ops_tests;
 #[cfg(test)]
 mod line_ledger_tests;
 #[cfg(test)]

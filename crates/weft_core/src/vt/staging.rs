@@ -143,6 +143,34 @@ impl Terminal {
         }
     }
 
+    /// Sink for ICH (`CSI @`).
+    pub(super) fn capture_insert_blank(&mut self, count: usize) {
+        if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
+            self.block_tracker.on_insert_blank(count);
+        } else if self.staging_active() {
+            self.preexec_staging
+                .insert_blank(count, self.block_tracker.output_cap());
+        }
+    }
+
+    /// Sink for DCH (`CSI P`).
+    pub(super) fn capture_delete_chars(&mut self, count: usize) {
+        if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
+            self.block_tracker.on_delete_chars(count);
+        } else if self.staging_active() {
+            self.preexec_staging.delete_chars(count);
+        }
+    }
+
+    /// Sink for ECH (`CSI X`).
+    pub(super) fn capture_erase_chars(&mut self, count: usize) {
+        if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
+            self.block_tracker.on_erase_chars(count);
+        } else if self.staging_active() {
+            self.preexec_staging.erase_chars(count);
+        }
+    }
+
     /// Drop any staged bytes and return how many there were. Callers choose
     /// the log level: `trace!` at the normal `133;B` discard, `warn!` at the
     /// `133;A` stale-leak fallback.

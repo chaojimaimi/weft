@@ -129,6 +129,26 @@ impl Terminal {
         }
     }
 
+    pub(in crate::vt) fn capture_primary_screen_interrupt_insert_blank(&mut self, count: usize) {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
+            capture
+                .tail
+                .insert_blank(count, self.block_tracker.output_cap());
+        }
+    }
+
+    pub(in crate::vt) fn capture_primary_screen_interrupt_delete_chars(&mut self, count: usize) {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
+            capture.tail.delete_chars(count);
+        }
+    }
+
+    pub(in crate::vt) fn capture_primary_screen_interrupt_erase_chars(&mut self, count: usize) {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
+            capture.tail.erase_chars(count);
+        }
+    }
+
     pub(in crate::vt) fn capture_primary_screen_interrupt_cursor_position(
         &mut self,
         clear_line: bool,

@@ -55,9 +55,12 @@ fn legacy_twin_flags_zero_byte_identical() {
         (KeyCode::Up, Modifiers::SHIFT, None, b"\x1b[1;2A"),
         (KeyCode::Right, Modifiers::CONTROL, None, b"\x1b[1;5C"),
         (KeyCode::Left, Modifiers::ALT, None, b"\x1b[1;3D"),
-        (KeyCode::Home, Modifiers::empty(), None, b"\x1b[1~"),
-        (KeyCode::End, Modifiers::empty(), None, b"\x1b[4~"),
-        (KeyCode::Home, Modifiers::SHIFT, None, b"\x1b[1;2~"),
+        // v1.18.8 (PLAN_v1188 §4.5): Home/End legacy twins now emit the
+        // xterm `ESC[H` / `ESC[F` (+ `CSI 1;<m>H/F` with mods) — logged in
+        // docs/PROGRESS.md like the v1.11.13 PageUp change below.
+        (KeyCode::Home, Modifiers::empty(), None, b"\x1b[H"),
+        (KeyCode::End, Modifiers::empty(), None, b"\x1b[F"),
+        (KeyCode::Home, Modifiers::SHIFT, None, b"\x1b[1;2H"),
         // v1.11.13 (PLAN_v11113 §M3): PageUp/PageDown quirk fix — the
         // legacy twin regenerates with the standard xterm `CSI 5~`/`CSI 6~`
         // (intentional behavior change, logged in docs/PROGRESS.md).

@@ -5802,3 +5802,41 @@ fn hyperlink_unlink_survives_multiline_overwrite() {
         }
     }
 }
+
+/// v1.18.8 E2E replay (PLAN_v1188 §C, docs/FIX_SUDO_SU_ICH_DCH_CAPTURE_MIRROR.md):
+/// the `sudo su` inline edit. After the root-shell prompt line echoes, the
+/// user hits ← ×8 (CUB) then types 8×s; bash redraws with ICH (`CSI 1@s`)
+/// at column 16. Before the fix the capture pipe had no ICH/DCH/ECH mirror,
+/// so each `s` overwrote the tail and the live block ended at
+/// `ls -al |ssssssss` with `grep ""` gone.
+///
+/// Byte stream is constructed deterministically per PLAN §C. Forensics on
+/// /tmp/root_session_csi.bin confirm the visible text (`sh-3.2$ ls -al |
+/// grep ""`, `ESC[1@s` redraws) but the raw file carries no OSC 133
+/// wrappers (a real session provides them around the replay window) and its
+/// left-arrow echo variant is backspaces (`\x08`) rather than `CSI D`; this
+/// sandbox has no `xxd`, so the invisible control bytes follow the
+/// PLAN-specified sequence instead of raw file transcription.
+#[test]
+fn sudo_su_inline_edit_replay_keeps_tail_in_capture() {
+    let mut t = Terminal::new(62, 200);
+    t.process(b"\x1b]133;A\x07");
+    t.process(b"sudo su\r\n"); // PTY ONLCR echo of the su command line
+    t.process(b"\x1b]133;B\x07"); // CommandExecuting — capture active
+    t.process(b"\x1b[?1034hsh-3.2$ ls -al | grep \"\"");
+    for _ in 0..8 {
+        t.process(b"\x1b[D"); // ← — CUB 1
+    }
+    for _ in 0..8 {
+        t.process(b"\x1b[1@s"); // ICH 1, then 's' overwrites the fresh blank
+    }
+    t.process(b"\r");
+
+    let output = t.block_tracker().in_flight().unwrap().output.to_string();
+    assert!(
+        output.contains("sh-3.2$ ls -al |ssssssss grep \"\""),
+        "capture lost the inline-edit tail: {output:?}"
+    );
+    assert_eq!(t.grid().row_text(0), "sudo su");
+    assert_eq!(t.grid().row_text(1), "sh-3.2$ ls -al |ssssssss grep \"\"");
+}

@@ -204,6 +204,8 @@ impl Terminal {
             'X' => {
                 let count = param(params, 0, 1) as usize;
                 self.grid.erase_chars(count);
+                self.capture_erase_chars(count);
+                self.capture_primary_screen_interrupt_erase_chars(count);
             }
 
             // SGR
@@ -314,8 +316,18 @@ impl Terminal {
             }
 
             // Insert/delete
-            '@' => self.grid.insert_blank(param(params, 0, 1) as usize),
-            'P' => self.grid.delete_chars(param(params, 0, 1) as usize),
+            '@' => {
+                let count = param(params, 0, 1) as usize;
+                self.grid.insert_blank(count);
+                self.capture_insert_blank(count);
+                self.capture_primary_screen_interrupt_insert_blank(count);
+            }
+            'P' => {
+                let count = param(params, 0, 1) as usize;
+                self.grid.delete_chars(count);
+                self.capture_delete_chars(count);
+                self.capture_primary_screen_interrupt_delete_chars(count);
+            }
             'L' => self.insert_primary_screen_lines(param(params, 0, 1) as usize),
             'M' => self.delete_primary_screen_lines(param(params, 0, 1) as usize),
 

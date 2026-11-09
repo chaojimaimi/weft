@@ -216,12 +216,15 @@ mod tests {
     }
 
     // ── Home / End / Insert / Delete ──────────────────────────────
+    // v1.18.8 (PLAN_v1188 §4.5): Home/End now emit the standard xterm
+    // `ESC[H` / `ESC[F` (was RXVT-flavoured `CSI 1~` / `CSI 4~`); mods
+    // ride `CSI 1;<m>H` / `CSI 1;<m>F` like the arrow keys.
 
     #[test]
     fn home_key() {
         assert_eq!(
             handler().encode_key(KeyCode::Home, Modifiers::empty()),
-            b"\x1b[1~"
+            b"\x1b[H"
         );
     }
 
@@ -229,7 +232,7 @@ mod tests {
     fn end_key() {
         assert_eq!(
             handler().encode_key(KeyCode::End, Modifiers::empty()),
-            b"\x1b[4~"
+            b"\x1b[F"
         );
     }
 
@@ -253,7 +256,31 @@ mod tests {
     fn home_with_shift() {
         assert_eq!(
             handler().encode_key(KeyCode::Home, Modifiers::SHIFT),
-            b"\x1b[1;2~"
+            b"\x1b[1;2H"
+        );
+    }
+
+    #[test]
+    fn home_end_with_ctrl() {
+        assert_eq!(
+            handler().encode_key(KeyCode::Home, Modifiers::CONTROL),
+            b"\x1b[1;5H"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::End, Modifiers::CONTROL),
+            b"\x1b[1;5F"
+        );
+    }
+
+    #[test]
+    fn home_end_plain_csi_hf() {
+        assert_eq!(
+            handler().encode_key(KeyCode::Home, Modifiers::empty()),
+            b"\x1b[H"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::End, Modifiers::empty()),
+            b"\x1b[F"
         );
     }
 

@@ -112,10 +112,12 @@ fn home_end_pgup_pgdn_ins_del_plain() {
     for flags in [0b1, 0b11] {
         assert_eq!(
             enc_h(flags, KeyCode::Home, Modifiers::empty()),
-            b"\x1b[1~",
+            b"\x1b[H",
             "0b{flags:b}"
         );
-        assert_eq!(enc_h(flags, KeyCode::End, Modifiers::empty()), b"\x1b[4~");
+        assert_eq!(enc_h(flags, KeyCode::End, Modifiers::empty()), b"\x1b[F");
+        // v1.18.8 (PLAN_v1188 §4.5): the fallback chain now emits the
+        // standard xterm H/F form (was RXVT-flavoured `CSI 1~`/`4~`).
         // v1.11.13 (PLAN_v11113 §M3): the handler fallback chain now emits
         // the standard xterm tilde form (PageUp quirk fix — was `CSI H`/`I`).
         assert_eq!(
@@ -152,7 +154,7 @@ fn home_end_pgup_pgdn_ins_del_plain() {
 #[test]
 fn modified_navigation_keys_l1_legacy_l4_kitty() {
     // L1: legacy shapes for shift/alt; ctrl points at the ctrl row
-    assert_eq!(enc_h(0b1, KeyCode::Home, Modifiers::SHIFT), b"\x1b[1;2~");
+    assert_eq!(enc_h(0b1, KeyCode::Home, Modifiers::SHIFT), b"\x1b[1;2H");
     assert_eq!(
         enc(0b1, KeyCode::F(5), Modifiers::CONTROL),
         b"\x1b[15;5~",
