@@ -332,6 +332,7 @@ impl MetalRenderer {
             cursor_blink_on: true,
             block_layout_cache: RefCell::new(BlockLayoutCache::default()),
             live_layout_cache: RefCell::new(crate::paint::live_cache::LiveLayoutCache::default()),
+            region_live_cache: crate::paint::region_cache::RegionLiveCache::default(),
             resize_present_probe: std::cell::Cell::new(None),
             // v1.11.6 (PLAN_v1116 M2): polled per-frame by the redraw
             // controller; flipped through `set_live_resize` (runtime.rs).

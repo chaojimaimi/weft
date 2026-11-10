@@ -147,6 +147,9 @@ pub(crate) fn reconciled_with_memo(
             header_rows,
             cache,
             None,
+            // No region snapshot on the reconcile path (see block_component.rs
+            // reconciled_terminal_block_scroll 备案).
+            None,
         )
         .0
     });

@@ -81,6 +81,8 @@ fn b_path_live_row_lands_on_composed_cursor_anchor() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        region: None,
+        region_state: None,
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -152,6 +154,8 @@ fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        region: None,
+        region_state: None,
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -210,6 +214,8 @@ fn b_path_anchor_never_falls_below_layout_window_base() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        region: None,
+        region_state: None,
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -273,6 +279,8 @@ fn b_path_wrapped_row_caret_chunk_selection_is_consistent() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        region: None,
+        region_state: None,
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -408,6 +416,8 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        region: None,
+        region_state: None,
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());

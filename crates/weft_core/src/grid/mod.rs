@@ -5,6 +5,7 @@ mod display;
 mod editing;
 pub mod flat;
 mod reflow;
+pub mod region;
 mod resize;
 mod row;
 mod row_extras;
@@ -31,6 +32,8 @@ pub(crate) mod snapshot; // PLAN_v11217 §3.5: budget helper reachable crate-wid
 use flat::FlatStorage;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod region_tests;
 #[cfg(test)]
 mod snapshot_cursor_tests;
 #[cfg(test)]
@@ -72,6 +75,11 @@ pub struct Grid {
     /// top). The renderer reads this via [`take_pending_scroll`] to shift
     /// its per-row vertex cache, avoiding a full rebuild on scroll.
     pending_scroll: std::cell::Cell<i32>,
+    /// v1.19.0 (PLAN_v1190 §3 P0-1/D7): content revision, bumped on every
+    /// document mutation (cell write, row insert/scroll, clear, reflow) —
+    /// the live-block region cache keys on `(revision, begin_position)`.
+    /// `wrapping_add` on overflow; not an occupancy counter (no occ role).
+    pub revision: u64,
 }
 
 impl Grid {
@@ -96,6 +104,7 @@ impl Grid {
             history_window: Vec::new(),
             history_window_valid: true,
             pending_scroll: std::cell::Cell::new(0),
+            revision: 0,
         }
     }
 
@@ -139,6 +148,8 @@ impl Grid {
         // of a no-op write is occ slightly high = encode walks dead tail
         // cells, never truncation).
         r.cell_written(col);
+        // v1.19.0 D7: in-place viewport writes invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
         &mut r.cells[col]
     }
 
@@ -603,6 +614,9 @@ impl Grid {
         self.cursor.wrap_pending = false;
 
         self.mark_all_dirty();
+        // v1.19.0 D7: dimension-only resize is still a document mutation
+        // (row reshape/add/truncate) — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 
@@ -618,5 +632,7 @@ impl Grid {
             row.mark_dirty(self.num_cols - 1);
         }
         self.cursor = Cursor::default();
+        // v1.19.0 D7: full-screen erase rewrites every cell.
+        self.revision = self.revision.wrapping_add(1);
     }
 }

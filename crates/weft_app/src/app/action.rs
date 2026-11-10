@@ -229,6 +229,10 @@ impl crate::App {
                             pane.set_tui_render_mode(
                                 self.config_state.config.experimental.tui_render_mode,
                             );
+                            // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
+                            pane.set_live_block_grid_render(
+                                self.config_state.config.experimental.live_block_grid_render,
+                            );
                         }
                         if let Some(tab2) = self.sessions.active() {
                             tracing::info!(

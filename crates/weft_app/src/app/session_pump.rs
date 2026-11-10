@@ -40,6 +40,12 @@ impl App {
             &mut tab,
             self.config_state.config.experimental.tui_render_mode,
         );
+        // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag with the
+        // tier injection (same chokepoint discipline).
+        crate::config_controller::apply_live_block_grid_render(
+            &mut tab,
+            self.config_state.config.experimental.live_block_grid_render,
+        );
         // v1.0 V13: On first launch, inject a welcome banner via PTY.
         // The printf is prefixed with a space (HIST_IGNORE_SPACE keeps it
         // out of zsh history). The marker file is created in

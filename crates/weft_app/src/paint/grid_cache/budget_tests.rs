@@ -329,7 +329,7 @@ fn metrics_read_stale_scalars_for_degraded_blocks_without_rebuilds() {
     assert_eq!(cache.degraded_count(), 2);
     assert_eq!(cache.metrics_fallback_rebuilds(), 0);
 
-    let (total, _) = block_content_metrics_with_cache(&terminal, 80, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, 80, 1, Some(&cache), None, None);
     assert_eq!(
         cache.metrics_fallback_rebuilds(),
         0,

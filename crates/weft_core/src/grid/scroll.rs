@@ -47,6 +47,9 @@ impl Grid {
                     self.viewport[i].mark_dirty(self.num_cols - 1);
                 }
             }
+            // v1.19.0 D7: rows pushed into scrollback (row insert) —
+            // invalidate the region cache.
+            self.revision = self.revision.wrapping_add(1);
             return;
         }
 
@@ -87,6 +90,9 @@ impl Grid {
                 self.viewport[i].mark_dirty(self.num_cols - 1);
             }
         }
+        // v1.19.0 D7: viewport rotation + scrollback push — invalidate the
+        // region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Scroll the scroll region down by n lines.
@@ -111,6 +117,8 @@ impl Grid {
                     self.viewport[i].mark_dirty(self.num_cols - 1);
                 }
             }
+            // v1.19.0 D7: scroll-down blanking — invalidate the region cache.
+            self.revision = self.revision.wrapping_add(1);
             return;
         }
 
@@ -127,6 +135,8 @@ impl Grid {
                 self.viewport[i].mark_dirty(self.num_cols - 1);
             }
         }
+        // v1.19.0 D7: viewport rotation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Set scroll region (CSI r). Parameters are 1-based.

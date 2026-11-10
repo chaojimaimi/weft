@@ -113,6 +113,7 @@ impl MetalRenderer {
             cursor_blink_on: _,
             is_alt: _,
             now,
+            region,
         } = model;
 
         let cw = self.cell_width() as f32;
@@ -161,6 +162,12 @@ impl MetalRenderer {
             cache.sync_blocks(blocks, cols, band);
         }
         let cache = self.block_layout_cache.borrow();
+        // v1.19.0 (PLAN_v1190 §4 P1-1): hit-test geometry mirrors the paint
+        // path — same region sync + snapshot borrow before the layout pass.
+        if let Some(region) = &region {
+            self.region_live_cache.sync(cache_namespace, region, cols);
+        }
+        let region_state = self.region_live_cache.state(cache_namespace);
         let layout_out = compute_block_layout_pass(
             LayoutPassInput {
                 blocks,
@@ -180,6 +187,8 @@ impl MetalRenderer {
                 styled_lookup_counter: None,
                 block_diagnose_state,
                 now,
+                region,
+                region_state: region_state.as_deref(),
             },
             &cache,
             &mut self.live_layout_cache.borrow_mut(),

@@ -212,6 +212,8 @@ impl Terminal {
             // content — one O(1) occupancy extension per row segment.
             debug_assert!(count >= 1);
             self.grid.viewport[row].cell_written(col + count - 1);
+            // v1.19.0 D7: in-place write — invalidate the region cache.
+            self.grid.revision = self.grid.revision.wrapping_add(1);
 
             self.grid.cursor.col += count;
             offset += count;
@@ -447,6 +449,9 @@ impl Terminal {
             if new_col + 1 < num_cols {
                 self.grid.viewport[new_row].cell_written(new_col + 1);
             }
+            // v1.19.0 D7: wide pair written on the wrap row — invalidate the
+            // region cache.
+            self.grid.revision = self.grid.revision.wrapping_add(1);
 
             self.grid.cursor.col = new_col + 2;
             if self.grid.cursor.col >= num_cols {
@@ -583,6 +588,8 @@ impl Terminal {
             if width == CellWidth::Full && col + 1 < num_cols {
                 self.grid.viewport[row].cell_written(col + 1);
             }
+            // v1.19.0 D7: in-place write — invalidate the region cache.
+            self.grid.revision = self.grid.revision.wrapping_add(1);
         }
         self.grid.cursor.col += width as usize;
 

@@ -32,6 +32,8 @@ impl Grid {
             self.viewport[r].recompute_tail();
             self.viewport[r].mark_dirty(self.num_cols - 1);
         }
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Clear screen from top to cursor (CSI 1 J).
@@ -55,6 +57,8 @@ impl Grid {
         }
         self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(col);
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Clear entire screen (CSI 2 J).
@@ -68,12 +72,17 @@ impl Grid {
             row.mark_dirty(self.num_cols - 1);
         }
         // Note: does NOT reset cursor position (VT behavior)
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Clear scrollback buffer (CSI 3 J).
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
         self.set_scroll_offset(0);
+        // v1.19.0 D7: the flat document is wiped (region anchors fall back
+        // to index_since's retention clamp — see region.rs).
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Clear line from cursor to end (CSI 0 K).
@@ -88,6 +97,8 @@ impl Grid {
         // v1.15.3 P1a: EL erase shrinks the occupancy tail.
         self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(self.num_cols - 1);
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Clear line from start to cursor (CSI 1 K).
@@ -101,6 +112,8 @@ impl Grid {
         }
         self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(col);
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Clear entire line (CSI 2 K).
@@ -120,6 +133,8 @@ impl Grid {
         // may truncate) — shrink the occupancy tail.
         self.viewport[row].recompute_tail();
         self.viewport[row].mark_dirty(self.num_cols.saturating_sub(1));
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Erase `count` characters starting at cursor (CSI X).
@@ -141,6 +156,8 @@ impl Grid {
         if end > 0 {
             self.viewport[row].mark_dirty(end - 1);
         }
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     // ── Character insertion/deletion ─────────────────────────────
@@ -166,6 +183,8 @@ impl Grid {
         // O(cols) class as the shift loop itself).
         self.viewport[row].recompute_full();
         self.viewport[row].mark_dirty(self.num_cols - 1);
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Delete `count` cells at cursor, shifting remaining cells left (CSI P).
@@ -187,6 +206,8 @@ impl Grid {
         // v1.15.3 P1a: DCH recomputes from scratch — same rationale as ICH.
         self.viewport[row].recompute_full();
         self.viewport[row].mark_dirty(self.num_cols - 1);
+        // v1.19.0 D7: document mutation — invalidate the region cache.
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Insert `count` blank lines at cursor row, within scroll region (CSI L).
@@ -213,6 +234,8 @@ impl Grid {
             for i in row..=bottom {
                 self.viewport[i].mark_dirty(self.num_cols - 1);
             }
+            // v1.19.0 D7: line insert — invalidate the region cache.
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -239,6 +262,8 @@ impl Grid {
             for i in row..=bottom {
                 self.viewport[i].mark_dirty(self.num_cols - 1);
             }
+            // v1.19.0 D7: line delete — invalidate the region cache.
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 }

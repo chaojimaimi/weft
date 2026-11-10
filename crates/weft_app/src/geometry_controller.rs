@@ -825,6 +825,13 @@ impl App {
                 // cross-event value sharing needed; only the label's shape
                 // matters here.
                 now: std::time::SystemTime::now(),
+                // v1.19.0 (PLAN_v1190 §4 P1-1): region track gated exactly
+                // like `live` (hit-test geometry mirrors the paint path).
+                region: (!editor_mode)
+                    .then(|| {
+                        crate::paint::region_cache::region_source_for(terminal, terminal.grid())
+                    })
+                    .flatten(),
             }),
         )
     }

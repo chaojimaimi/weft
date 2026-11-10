@@ -42,14 +42,14 @@ fn tui_caret_col_follows_cub_in_nested_shell_edit() {
     assert!(terminal.show_block_view());
     // Pre-CUB: anchor at the tail end, same value the formula produced.
     assert_eq!(
-        renderer.block_view_tui_cursor(&terminal, terminal.grid()),
+        renderer.block_view_tui_cursor(&terminal, terminal.grid(), None),
         Some((0, 24))
     );
     for _ in 0..8 {
         terminal.process(b"\x1b[D"); // ← — CUB 1, mirrored on_set_cursor_column
     }
     assert_eq!(
-        renderer.block_view_tui_cursor(&terminal, terminal.grid()),
+        renderer.block_view_tui_cursor(&terminal, terminal.grid(), None),
         Some((0, 16)),
         "caret must follow the CUB-mirrored edit head (v1.18.9 fix)"
     );
@@ -68,7 +68,7 @@ fn tui_caret_keeps_formula_anchor_after_csi_a_repaint() {
     terminal.process(b"\x1b[1A"); // CUU — the progress-frame repaint move
                                   // Cursor parked on the early row → None → formula anchor = "frame b" end.
     assert_eq!(
-        renderer.block_view_tui_cursor(&terminal, terminal.grid()),
+        renderer.block_view_tui_cursor(&terminal, terminal.grid(), None),
         Some((1, 7))
     );
 }
@@ -87,7 +87,7 @@ fn tui_caret_clamps_wrap_pending_exact_multiple_row_end() {
     terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07");
     terminal.process(b"x".repeat(220).as_slice());
     assert_eq!(
-        renderer.block_view_tui_cursor(&terminal, terminal.grid()),
+        renderer.block_view_tui_cursor(&terminal, terminal.grid(), None),
         Some((0, 219)),
         "wrap-pending exact-multiple end parks one cell back (B1')"
     );
@@ -123,7 +123,7 @@ fn tui_caret_streaming_shapes_stay_equivalent_to_formula() {
         );
         let line = terminal.block_tracker().live_cursor_tail_line();
         assert_eq!(
-            renderer.block_view_tui_cursor(&terminal, terminal.grid()),
+            renderer.block_view_tui_cursor(&terminal, terminal.grid(), None),
             Some((line, old_col)),
             "streaming equivalence for {text:?} @ {cols} cols"
         );

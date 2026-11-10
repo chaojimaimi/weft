@@ -197,6 +197,17 @@ pub(super) fn apply_tui_render_mode(tab: &mut Tab, mode: weft_core::vt::TuiRende
     }
 }
 
+/// v1.19.0 (PLAN_v1190 §4 D10): apply the user's
+/// `[experimental] live_block_grid_render` to every pane's terminal of one
+/// tab — same injection shape as [`apply_tui_render_mode`]; `Tab::new`'s
+/// Terminal starts core-default OFF, so every factory-created pane must be
+/// re-injected here.
+pub(super) fn apply_live_block_grid_render(tab: &mut Tab, enabled: bool) {
+    for pane in tab.panes_mut() {
+        pane.set_live_block_grid_render(enabled);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ConfigApplyDelta {
     rebuild_font: bool,

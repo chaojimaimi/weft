@@ -24,9 +24,16 @@ pub(crate) mod bounds;
 #[path = "layout_pass/window_tests.rs"]
 mod window_tests;
 use crate::paint::live_cache::LiveLayoutCache;
+use crate::paint::region_cache::{PaneRegionState, RegionSource};
 use crate::paint::ui_helpers::{live_context_label, live_elapsed_label, strip_prompt_prefix};
 use bounds::{lower_bound_height, upper_bound_height};
 use weft_core::blocks::{Block, BlockId, InFlightBlock, StyledLine};
+
+// v1.19.0 (PLAN_v1190 §4 P1-1): flag-gated region-track live layout.
+#[path = "layout_pass/region_pass.rs"]
+mod region_pass;
+#[path = "layout_pass/region_rows.rs"]
+mod region_rows;
 
 /// A laid-out row in the block view. Paint-superset fields (`line`/`style`/
 /// `collapsed`/`foldable`/`tone`) are ignored by hit-testing.
@@ -107,7 +114,7 @@ pub(super) struct LayoutPassOutput<'a> {
 }
 
 /// Parameters for the shared layout pass (subset of `BlockViewPaintModel`).
-pub(super) struct LayoutPassInput<'a, 'b> {
+pub(super) struct LayoutPassInput<'a, 'b, 'c> {
     pub(super) blocks: &'a [Block],
     pub(super) live: Option<InFlightBlock<'a>>,
     /// Pane session scope for the live-layout cache key (the cache is
@@ -135,6 +142,11 @@ pub(super) struct LayoutPassInput<'a, 'b> {
     /// P1: frame clock for the live header's elapsed label (passed through
     /// from `BlockViewPaintModel::now`, so paint and hit-test share one read).
     pub(super) now: std::time::SystemTime,
+    /// v1.19.0 (PLAN_v1190 §4 P1-1): flag-ON region track — grid-region
+    /// source and its synced snapshot (`RegionLiveCache`). Both `None` on
+    /// the capture path (flag OFF); `region` borrows the grid (`'c`).
+    pub(super) region: Option<RegionSource<'c>>,
+    pub(super) region_state: Option<&'a PaneRegionState>,
 }
 
 /// Run the shared layout pass: walk blocks bottom-to-top, accumulate
@@ -146,11 +158,19 @@ pub(super) struct LayoutPassInput<'a, 'b> {
 /// borrow from `cache` now (row text derives from `CachedBlockLayout`),
 /// so the cache borrow must outlive the laid rows. Live rows materialize
 /// per-chunk strings as before (`LiveLayoutCache` is out of M5 scope).
-pub(super) fn compute_block_layout_pass<'a, 'b>(
-    input: LayoutPassInput<'a, 'b>,
+pub(super) fn compute_block_layout_pass<'a, 'b, 'c>(
+    input: LayoutPassInput<'a, 'b, 'c>,
     cache: &'a BlockLayoutCache,
     live_cache: &mut LiveLayoutCache,
 ) -> LayoutPassOutput<'a> {
+    // v1.19.0 (PLAN_v1190 §4 P1-1): region-track dispatch — under the flag
+    // the live block renders from the grid-region snapshot; the capture
+    // branch below stays byte-for-byte untouched (flag OFF path).
+    if let (Some(_), Some(_)) = (&input.region, input.region_state) {
+        if input.live.is_some() {
+            return region_pass::compute_region_layout_pass(&input, cache);
+        }
+    }
     let LayoutPassInput {
         blocks,
         live,
@@ -169,6 +189,8 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         styled_lookup_counter,
         block_diagnose_state,
         now,
+        region: _,
+        region_state: _,
     } = input;
 
     let mut rows: Vec<f32> = Vec::new();
@@ -619,6 +641,8 @@ mod tests {
             styled_lookup_counter: None,
             block_diagnose_state: &std::collections::HashMap::new(),
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            region: None,
+            region_state: None,
         };
         let cache = BlockLayoutCache::default();
         let mut live_cache = LiveLayoutCache::default();
@@ -661,6 +685,8 @@ mod tests {
             styled_lookup_counter: None,
             block_diagnose_state: &std::collections::HashMap::new(),
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            region: None,
+            region_state: None,
         };
         let cache = BlockLayoutCache::default();
         let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());

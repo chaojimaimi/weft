@@ -333,7 +333,17 @@ impl MetalRenderer {
         // mid-command invalidates the memo.
         let in_flight = terminal.block_tracker().in_flight();
         let (live_version, cwd_present) = match &in_flight {
-            Some(live) => (Some(live.version), live.cwd.or(terminal.cwd()).is_some()),
+            Some(live) => {
+                // v1.19.0 (PLAN_v1190 §4 P1-8/O2/N6): flag ON keys the memo on
+                // `grid.revision` (what the region track renders from); flag
+                // OFF keeps the capture-stream version byte-identically.
+                let version = if terminal.is_live_block_grid_render() {
+                    terminal.grid().revision
+                } else {
+                    live.version
+                };
+                (Some(version), live.cwd.or(terminal.cwd()).is_some())
+            }
             None => (None, false),
         };
         let key = crate::paint::live_cache::BlockScrollMetricsKey {
@@ -375,12 +385,29 @@ impl MetalRenderer {
                 live.take_min_write_offset(),
             );
         }
+        // v1.19.0 (PLAN_v1190 §4 P1-8): region track — sync the snapshot the
+        // layout pass consumes, then derive the live total from it so the
+        // scrollbar extent matches the laid rows. Flag OFF → `region_rows`
+        // is `None` and the capture-track total below is untouched.
+        let region_for_metrics =
+            crate::paint::region_cache::region_source_for(terminal, terminal.grid());
+        if let Some(region) = &region_for_metrics {
+            self.region_live_cache.sync(pane_session_id, region, cols);
+        }
+        let region_rows = self
+            .region_live_cache
+            .state(pane_session_id)
+            .as_deref()
+            .map(|state| {
+                crate::paint::region_cache::region_display_chunk_total(state, cols) as usize
+            });
         let (total, _) = crate::block_component::block_content_metrics_with_cache(
             terminal,
             cols,
             header_rows,
             Some(&*cache),
             Some(&live_cache),
+            region_rows,
         );
         let max_scroll = total.saturating_sub(visible);
         let result = (total, visible, max_scroll);

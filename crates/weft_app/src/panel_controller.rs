@@ -323,6 +323,7 @@ impl App {
                     header_rows,
                     cache.as_deref(),
                     None,
+                    None,
                 );
                 // Compute visible rows from the renderer's actual geometry.
                 let prompt_lines = crate::block_component::block_prompt_lines(&terminal);

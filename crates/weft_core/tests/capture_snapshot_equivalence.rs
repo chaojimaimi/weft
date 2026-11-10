@@ -488,6 +488,37 @@ fn run_scenario(scenario: &Scenario) {
             );
         }
     }
+
+    // v1.19.0 (PLAN_v1190 §3 P3-13): the grid-region read model
+    // (`grid::region::logical_lines`, D4 half-open [index_since(begin),
+    // head) with the inclusive-end correction) must equal the snapshot-side
+    // canonical form for EVERY scenario — including the cataloged
+    // divergences, whose divergence is against the CAPTURE side only.
+    // Region lines are trim_end per line and keep edge empties, so the
+    // same `normalize` alignment applies (与套件既有比对同口径).
+    let grid = terminal.grid();
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let region = normalize(
+        weft_core::grid::region::logical_lines(
+            grid,
+            weft_core::grid::region::GridRegionSource {
+                begin_position: anchor,
+                head: Some(head),
+            },
+            |_| None,
+        )
+        .into_iter()
+        .map(|line| line.text)
+        .collect(),
+    );
+    assert_eq!(
+        region, snapshot,
+        "{label}: region truth must equal the snapshot canonical form"
+    );
 }
 
 // One #[test] per scenario keeps failure isolation; the table above stays the
@@ -561,6 +592,105 @@ fn s13_d1_wrap_between_plain_lines() {
 #[test]
 fn s14_d9_vertical_move_folds_blank_row() {
     run_scenario(&scenario("s14_d9_vertical_move_folds_blank_row"));
+}
+
+/// v1.19.0 (PLAN_v1190 §3 P3-13, D5): resize/reflow against a sampled
+/// begin anchor — the D5 filing evidence. Rewrapping changes the
+/// physical-row mapping under a stable `begin_position`, so the region's
+/// begin boundary DRIFTS (a different amount of content maps below it).
+/// The contract under scrutiny: the region read must not panic, the drift
+/// is non-zero (a zero drift would make this filing stale), and it is
+/// explainable — the anchor is a PHYSICAL index while the rewrap changes
+/// the physical-rows-per-line mapping (100-char pre lines: 3 rows at 40
+/// cols → 5 at 20), so the fixed anchor reaches further UP into the
+/// pre-command content (more "L" lines inside the region) while the
+/// command payload survives verbatim at the head.
+#[test]
+fn s15_resize_reflow_begin_drift_documented() {
+    let mut terminal = Terminal::with_scrollback(8, 40, 200);
+    // Pre-command content that rewraps: twelve "L"*100 lines → 3 physical
+    // rows each at 40 cols (40+40+20). The block is deliberately long: the
+    // 40→20 rewrap shifts the anchor's content mapping by two physical rows
+    // per line, and the accumulated drift must exceed one full line (5 rows
+    // at 20 cols) for the direction assertion below to be meaningful.
+    let mut pre = String::new();
+    for _ in 0..12 {
+        pre.push_str(&"L".repeat(100));
+        pre.push('\n');
+    }
+    terminal.process(pre.as_bytes());
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07");
+    let anchor = terminal.grid().scrollback.position();
+    // Wrapped command payload: six lines of 101 chars → 3 physical rows
+    // each at 40 cols (40+40+21).
+    let mut payload = String::new();
+    for i in 0..6 {
+        payload.push_str(&format!("{i}{}", "W".repeat(100)));
+        payload.push('\n');
+    }
+    terminal.process(payload.as_bytes());
+    terminal.process(b"\x1b]133;D;0\x07");
+
+    let region_text = |terminal: &Terminal, anchor: u64| -> Vec<String> {
+        let grid = terminal.grid();
+        let sb_len = grid.scrollback.len();
+        let head = (0..grid.num_rows)
+            .rev()
+            .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+            .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+        normalize(
+            weft_core::grid::region::logical_lines(
+                grid,
+                weft_core::grid::region::GridRegionSource {
+                    begin_position: anchor,
+                    head: Some(head),
+                },
+                |_| None,
+            )
+            .into_iter()
+            .map(|line| line.text)
+            .collect(),
+        )
+    };
+    let before = region_text(&terminal, anchor);
+
+    // Rewrap 40 → 20 cols: every pre-command line now needs 5 physical
+    // rows instead of 3, every payload line 6 instead of 3 (the D4
+    // protocol pushes the whole document through the rewrap).
+    terminal.resize(8, 20);
+    // Same anchor, drifted mapping — this read must not panic (D5).
+    let after = region_text(&terminal, anchor);
+
+    // The drift is REAL (non-zero). If this ever becomes equal, the
+    // reflow stopped shifting the begin boundary and the filing is stale.
+    assert_ne!(
+        before, after,
+        "D5: reflow must shift the begin boundary's content mapping"
+    );
+    // …and explainable (documented mechanism + direction): the anchor is a
+    // physical index, and the rewrap packs MORE pre-command content per
+    // anchor offset (3 → 5 physical rows per 100-char line), so strictly
+    // more pre-command "L" lines fall inside the region after the rewrap.
+    let l_lines = |lines: &[String]| lines.iter().filter(|l| l.starts_with('L')).count();
+    assert!(
+        l_lines(&after) > l_lines(&before),
+        "D5: the drifted anchor must reach further up into pre-command \
+         content (before: {before:?} / after: {after:?})"
+    );
+    // The payload tail still reaches the head verbatim.
+    let payload_last = format!("5{}", "W".repeat(100));
+    assert_eq!(
+        after.last().map(String::as_str),
+        Some(payload_last.as_str()),
+        "D5: the region must still reach the document head: {after:?}"
+    );
+    assert!(
+        before
+            .iter()
+            .chain(after.iter())
+            .all(|line| !line.is_empty()),
+        "region lines are trim_end — this fixture has no blank lines"
+    );
 }
 
 /// The façade contract: the resolver variant the differential uses produces

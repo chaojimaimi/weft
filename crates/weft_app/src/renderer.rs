@@ -161,6 +161,11 @@ pub struct MetalRenderer {
     /// v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): live-block cumulative layout
     /// cache (visible-window O(log n), see paint::live_cache).
     pub(crate) live_layout_cache: RefCell<LiveLayoutCache>,
+    /// v1.19.0 (PLAN_v1190 §4 P1-1/O3): region-track snapshot cache (one
+    /// entry per pane, keyed by `(grid.revision, begin_position)` + cols).
+    /// Separate `RefCell` from `live_layout_cache` so both tracks' borrows
+    /// coexist during a frame.
+    pub(crate) region_live_cache: crate::paint::region_cache::RegionLiveCache,
     /// v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): RESIZE_PROBE
     /// stage-4 gate — armed on resize(), consumed once at the next draw to
     /// log the first present after a Resized.

@@ -42,6 +42,9 @@ pub(crate) mod primitives;
 // v1.11.3 (PLAN_v1113 §3.1): underline geometry + bold→bright helpers —
 // own module so primitives.rs stays within the gate's 800-line budget.
 pub(crate) mod prompt;
+// v1.19.0 (PLAN_v1190 §4 P1-2/O3): region-track snapshot cache (flag-gated
+// grid-region live rendering).
+pub(crate) mod region_cache;
 pub(crate) mod selection_color;
 pub(crate) mod settings;
 pub(crate) mod settings_profiles;

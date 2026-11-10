@@ -125,6 +125,10 @@ impl BlockTracker {
         // `pending_command = None` early-return below is title-neutral (the
         // live command was already gone).
         self.title_generation = self.title_generation.wrapping_add(1);
+        // v1.19.0 (D3): the live block's grid-region begin anchor dies with
+        // the command (covers every finalize caller: 133;D, interrupted
+        // 133;A, deferred screen-exit finish, orphan path).
+        self.command_begin_position = None;
         let Some(command) = self.pending_command.take() else {
             self.clear_pending_capture();
             return;

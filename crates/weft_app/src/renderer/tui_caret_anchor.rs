@@ -5,6 +5,7 @@
 //! (T16b formula-fallback seam).
 
 use super::MetalRenderer;
+use crate::paint::region_cache::{document_index_of_cursor, PaneRegionState};
 use weft_core::vt::Terminal;
 
 impl MetalRenderer {
@@ -12,10 +13,17 @@ impl MetalRenderer {
     /// into the live block's snapshot text. v1.10.6 prefers the precisely
     /// tracked snapshot line over the formula (which breaks when the
     /// snapshot skips empty rows).
+    ///
+    /// v1.19.0 (PLAN_v1190 §4 P1-3/D6): `region_state` is this frame's
+    /// region-track snapshot (the paint path syncs it before the model is
+    /// built). When the flag is ON and a `133;B` anchor is sampled, the
+    /// caret anchors in the region track's logical-row domain; the capture-
+    /// domain anchors below are only authoritative for the flag-OFF path.
     pub(super) fn block_view_tui_cursor(
         &self,
         terminal: &Terminal,
         grid: &weft_core::grid::Grid,
+        region_state: Option<&PaneRegionState>,
     ) -> Option<(usize, usize)> {
         let live = terminal.block_tracker().in_flight()?;
         if !terminal.show_block_view() {
@@ -27,6 +35,35 @@ impl MetalRenderer {
         // nothing is drawn on top of the browsed history.
         if terminal.is_alt_screen_active() {
             return None;
+        }
+        // v1.19.0 (PLAN_v1190 §4 P1-3/D6): the region track lays out logical
+        // rows, so the caret maps into that domain — the cursor's document
+        // index (`scrollback.len() + cursor.row`, scrollback-oldest domain)
+        // locates its owning RegionSlot via physical-row bounds, and the
+        // slot's P1-6 display ordinal becomes the anchor line. Columns reuse
+        // the capture path's wrap-pending clamp (B1') against the logical
+        // row's own width.
+        let begin = terminal.block_tracker().region_begin_position();
+        if terminal.is_live_block_grid_render() {
+            if let Some(state) = region_state {
+                if begin.is_some() {
+                    let cursor_doc_idx = document_index_of_cursor(grid, grid.cursor.row);
+                    let row = state.display_logical_row_of_cursor(cursor_doc_idx)?;
+                    let width = state.logical_row_width(row);
+                    let col = crate::paint::tui_caret::wrap_pending_clamp(
+                        grid.cursor.col,
+                        grid.num_cols,
+                        width,
+                    );
+                    return Some((row, col));
+                }
+            }
+            if begin.is_some() {
+                // Anchor sampled but no snapshot to match against (sync not
+                // seen this frame): the capture-track formula anchors in a
+                // different line domain — suppress instead of guessing.
+                return None;
+            }
         }
         let tracked = terminal.primary_screen_cursor_snapshot_line();
         let (line, col) = match tracked {

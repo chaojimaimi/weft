@@ -240,6 +240,21 @@ impl crate::renderer::MetalRenderer {
         let mut bv_rows_count: usize = 0;
 
         let active_vertices: Vec<f32> = if show_blocks {
+            // v1.19.0 (PLAN_v1190 §4 P1-1/P1-3): sync the region track BEFORE
+            // the model is built — the TUI caret field is evaluated during
+            // construction and must see this frame's snapshot, not last
+            // frame's. Same cols as the paint path: the CommandExecuting
+            // block view never activates the CWD header, so the frame layout
+            // is authoritative for both. (`build_block_view_vertices` re-syncs
+            // with identical inputs → D7 cache hit, no double work.)
+            let region_for_frame = crate::paint::region_cache::region_source_for(terminal, grid);
+            if let Some(region) = &region_for_frame {
+                let frame_cols =
+                    crate::layout::layout_block_view(&draw_ctx, draw_ctx.bottom(), false).cols;
+                self.region_live_cache
+                    .sync(active_pane_session_id, region, frame_cols);
+            }
+            let region_state = self.region_live_cache.state(active_pane_session_id);
             let (v, regions, bv_rows) = if let Some(p) = prompt {
                 // v1.3 multi-pane: use the active pane's LayoutCtx (which
                 // carries pane_origin + clip set by the background-pane block
@@ -275,6 +290,9 @@ impl crate::renderer::MetalRenderer {
                         cursor_blink_on: false,
                         is_alt: terminal.is_alt_screen_active(),
                         now: std::time::SystemTime::now(),
+                        // Editor-mode block view has no live block — the
+                        // region track never applies (PLAN_v1190 §4 P1-1).
+                        region: None,
                     },
                     selection,
                 )
@@ -322,11 +340,19 @@ impl crate::renderer::MetalRenderer {
                         // snapshot skips empty rows; the tracked value is
                         // exact. Fallback to the formula + clamp when no
                         // snapshot has been taken yet.
-                        tui_cursor: self.block_view_tui_cursor(terminal, grid),
+                        tui_cursor: self.block_view_tui_cursor(
+                            terminal,
+                            grid,
+                            region_state.as_deref(),
+                        ),
                         tui_preedit: tui_preedit.map(|p| (p.text, p.cursor)),
                         cursor_blink_on,
                         is_alt: terminal.is_alt_screen_active(),
                         now: std::time::SystemTime::now(),
+                        // v1.19.0 (PLAN_v1190 §4 P1-1): flag-ON region track —
+                        // `None` when the flag is OFF or no `133;B` anchor is
+                        // sampled (capture path, byte-identical rendering).
+                        region: region_for_frame,
                     },
                     selection,
                 )

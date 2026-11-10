@@ -472,6 +472,33 @@ impl Config {
             }
         }
 
+        // v1.19.0 (PLAN_v1190 §4 D10): same minimal-write contract for the
+        // live-block grid render switch (factory default `true` — write only
+        // an explicit `false` rollback).
+        {
+            let default_exp = ExperimentalConfig::default();
+            if self.experimental.live_block_grid_render != default_exp.live_block_grid_render {
+                let exp_entry = doc.entry("experimental").or_insert_with(toml_edit::table);
+                if exp_entry.is_none() {
+                    *exp_entry = toml_edit::table();
+                }
+                match exp_entry.as_table_mut() {
+                    Some(t) => {
+                        t["live_block_grid_render"] =
+                            toml_edit::value(self.experimental.live_block_grid_render);
+                    }
+                    None => {
+                        tracing::warn!("[experimental] section is not a table; skipping write");
+                    }
+                }
+            } else if let Some(t) = doc.get_mut("experimental").and_then(|i| i.as_table_mut()) {
+                t.remove("live_block_grid_render");
+                if t.iter().count() == 0 {
+                    doc.remove("experimental");
+                }
+            }
+        }
+
         // [session] section — v1.12.19 (PLAN_v11217 §3.8 T13a): only write
         // `recovery` when it differs from the default (ask); remove the
         // key/table otherwise so a stale file never pins a changed default

@@ -269,6 +269,11 @@ pub struct BlockTracker {
     screen_rewrite_epoch: u64,
     /// Absolute document position where primary-screen output begins.
     screen_document_start: Option<u64>,
+    /// v1.19.0 (PLAN_v1190 §3 P0-3/D3): scrollback `position()` sampled at
+    /// `133;B` — the live block's grid-region begin anchor. `None` when no
+    /// plain command is in flight; screen-owned blocks keep using
+    /// `screen_document_start` as the anchor (see `region_begin_position`).
+    command_begin_position: Option<u64>,
     /// Session-local primary-screen blocks eligible for replay continuation.
     screen_owned_blocks: HashSet<u64>,
     continuation_candidate: Option<BlockId>,

@@ -139,6 +139,11 @@ impl Grid {
         // v1.0 P0-b: all rows are new/rearranged after a reflow.
         self.mark_all_dirty();
         self.scrollback.apply_max_rows();
+        // v1.19.0 D7: reflow rewrote the whole document — invalidate the
+        // region cache (this is the s15 begin-drift case: sampled
+        // begin_positions keep their numeric value but may land on
+        // different physical rows after the rewrap).
+        self.revision = self.revision.wrapping_add(1);
 
         GridRowMap {
             old_row_new_range: map,

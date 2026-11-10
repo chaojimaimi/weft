@@ -93,6 +93,7 @@ impl crate::App {
             self.config_state.config.blocks.output_cap_mib,
         );
         let tui_mode = self.config_state.config.experimental.tui_render_mode;
+        let live_grid_render = self.config_state.config.experimental.live_block_grid_render;
         let theme = self
             .renderer
             .as_ref()
@@ -111,6 +112,7 @@ impl crate::App {
             fresh.set_blocks_retained_limit(retained);
             fresh.set_block_output_cap(output_cap);
             fresh.set_tui_render_mode(tui_mode);
+            fresh.set_live_block_grid_render(live_grid_render);
             if let Some((palette, background)) = theme {
                 fresh.set_palette(palette);
                 fresh.set_background_color(background);

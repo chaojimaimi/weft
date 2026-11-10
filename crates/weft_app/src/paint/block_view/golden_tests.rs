@@ -138,6 +138,8 @@ fn s1_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        // Golden fixtures pin the capture track (flag-OFF shape).
+        region: None,
     }
 }
 
@@ -174,6 +176,8 @@ fn s2_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        // Golden fixtures pin the capture track (flag-OFF shape).
+        region: None,
     }
 }
 
@@ -218,6 +222,8 @@ fn s3_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        // Golden fixtures pin the capture track (flag-OFF shape).
+        region: None,
     }
 }
 
@@ -256,6 +262,8 @@ fn s4_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        // Golden fixtures pin the capture track (flag-OFF shape).
+        region: None,
     }
 }
 

@@ -34,6 +34,7 @@ impl BlockTracker {
             command_generation: 0,
             screen_rewrite_epoch: 0,
             screen_document_start: None,
+            command_begin_position: None,
             screen_owned_blocks: HashSet::new(),
             continuation_candidate: None,
             continuation_base: None,
@@ -186,6 +187,28 @@ impl BlockTracker {
 
     pub fn screen_document_start(&self) -> Option<u64> {
         self.screen_document_start
+    }
+
+    /// v1.19.0 (PLAN_v1190 §3 P0-3/D3): sample the grid-region begin anchor
+    /// at `133;B`. Idempotent (first sample wins) and a no-op for
+    /// screen-owned blocks — those keep `screen_document_start` as their
+    /// anchor (`begin_screen_owned_output` precedent).
+    pub fn note_command_begin_position(&mut self, position: u64) {
+        if self.command_begin_position.is_none() && self.screen_document_start.is_none() {
+            self.command_begin_position = Some(position);
+        }
+    }
+
+    /// v1.19.0 (D3): the live block's grid-region begin anchor — the plain
+    /// `133;B` sample, or the screen-owned document start.
+    pub fn region_begin_position(&self) -> Option<u64> {
+        self.command_begin_position.or(self.screen_document_start)
+    }
+
+    /// v1.19.0 (D3): clear the plain-command begin anchor (command end /
+    /// finalize / new command start).
+    pub fn clear_command_begin_position(&mut self) {
+        self.command_begin_position = None;
     }
 
     /// All finished blocks (newest last). The history panel / search read this
@@ -344,8 +367,12 @@ impl BlockTracker {
         // the next command's first printed byte publishes immediately.
         self.last_live_styled_publish = None;
         self.screen_document_start = None;
-        self.live_output_version = self.live_output_version.wrapping_add(1);
         // v1.13.11 P1-1: a new command invalidates the renderer's in-flight
+        // live block (layout caches key on this version).
+        self.live_output_version = self.live_output_version.wrapping_add(1);
+        // v1.19.0 (D3): a new command resets the region begin anchor — it
+        // is re-sampled by the `133;B` caller right after this returns.
+        self.command_begin_position = None;
         // sentinel warm watermark (see the field doc — chained commands can
         // cross the D→A/B boundary inside one batch with no intervening
         // frame, so the forget-on-idle path alone is not enough).

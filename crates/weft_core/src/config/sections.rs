@@ -586,12 +586,20 @@ pub struct ExperimentalConfig {
     /// keeping interactive TUIs on the classic takeover path; `all` is the
     /// Warp-terminal dogfood tier; `classic` is the v1.11.6 one-key rollback.
     pub tui_render_mode: TuiRenderMode,
+    /// v1.19.0 (PLAN_v1190 §4 D10): live-block grid render track — the
+    /// in-flight block's document comes from grid-region logical rows
+    /// instead of the byte capture. Config default `true` (new architecture
+    /// on by default; set `false` to roll back to the capture path).
+    /// `Terminal::new` stays `false` (core-neutral) — the app injects this
+    /// value at construction, same shape as `tui_render_mode`.
+    pub live_block_grid_render: bool,
 }
 
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
             tui_render_mode: TuiRenderMode::Noninteractive,
+            live_block_grid_render: true,
         }
     }
 }

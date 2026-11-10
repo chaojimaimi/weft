@@ -74,6 +74,13 @@ impl App {
                 tab,
                 self.config_state.config.experimental.tui_render_mode,
             );
+            // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag with the
+            // tier injection — same v1.11.7 P0-1 lesson (a missed injection
+            // site leaves new tabs on the wrong track).
+            crate::config_controller::apply_live_block_grid_render(
+                tab,
+                self.config_state.config.experimental.live_block_grid_render,
+            );
         }
         if let Some(mut t) = self
             .sessions

@@ -231,7 +231,7 @@ fn metrics_read_stale_scalars_for_deferred_blocks_without_rebuilds() {
 
     // Metrics path: every block has an entry → scalar reads, zero fallbacks.
     assert_eq!(cache.metrics_fallback_rebuilds(), 0);
-    let (total, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None, None);
     assert_eq!(
         cache.metrics_fallback_rebuilds(),
         0,
@@ -292,8 +292,14 @@ fn deferred_prefix_sum_stays_monotonic_and_metrics_stay_computable() {
     assert!(ps.windows(2).all(|w| w[0] <= w[1]), "monotonic: {ps:?}");
     assert_eq!(ps.last().copied(), Some(7 + 8 + 9));
 
-    let (total, visible) =
-        block_content_metrics_with_cache(&terminal_for_blocks(&blocks), 78, 1, Some(&cache), None);
+    let (total, visible) = block_content_metrics_with_cache(
+        &terminal_for_blocks(&blocks),
+        78,
+        1,
+        Some(&cache),
+        None,
+        None,
+    );
     assert!(total > 0);
     assert!(total >= visible);
 }
@@ -670,7 +676,7 @@ fn reconcile_metrics_equal_stale_scalar_composition_then_the_uncached_total() {
         composed += completed_block_row_count(output_rows, 1, entry.command_wrap_rows)
             + clear_block_spacer_rows(&blk.command, viewport_rows);
     }
-    let (total, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None, None);
     assert_eq!(cache.metrics_fallback_rebuilds(), 0, "scalar reads only");
     assert_eq!(
         total, composed,
@@ -679,7 +685,7 @@ fn reconcile_metrics_equal_stale_scalar_composition_then_the_uncached_total() {
 
     // Full fresh sync at the new cols → equals the uncached direct total.
     cache.sync_blocks(&blocks, 60, full_band());
-    let (fresh, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None);
+    let (fresh, _) = block_content_metrics_with_cache(&terminal, 60, 1, Some(&cache), None, None);
     let (direct, _) = crate::block_component::block_content_metrics(&terminal, 60, 1);
     assert_eq!(fresh, direct, "fresh entries must equal the direct scan");
 }

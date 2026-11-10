@@ -276,6 +276,7 @@ fn command_wrap_rows_counts_wrapped_commands_and_stays_consistent() {
         1,
         Some(&cache),
         None,
+        None,
     );
     assert_eq!(cached, direct);
 }

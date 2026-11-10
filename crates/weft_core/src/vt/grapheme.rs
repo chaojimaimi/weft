@@ -127,6 +127,9 @@ impl Terminal {
                     self.grid.cursor.col = num_cols - 1;
                 }
             }
+            // v1.19.0 D7: spacer insertion mutated the row — invalidate the
+            // region cache.
+            self.grid.revision = self.grid.revision.wrapping_add(1);
         }
         self.grid.viewport[row].mark_dirty(col);
         true
@@ -251,5 +254,8 @@ impl Terminal {
             self.grid.cursor.wrap_pending = true;
             self.grid.cursor.col = self.grid.num_cols - 1;
         }
+        // v1.19.0 D7: the pair move rewrote two rows — invalidate the
+        // region cache.
+        self.grid.revision = self.grid.revision.wrapping_add(1);
     }
 }

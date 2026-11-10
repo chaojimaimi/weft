@@ -6,6 +6,7 @@ use crate::glyph::GlyphAtlas;
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::overlays::FindDrawState;
 use crate::paint::prompt::PromptDrawParams;
+use crate::paint::region_cache::{live_output_version_source, region_source_for};
 use crate::paint::tab_bar::TabBarDrawState;
 use crate::renderer::bg_block_cache;
 use crate::renderer::MetalRenderer;
@@ -227,7 +228,12 @@ impl MetalRenderer {
                 // v1.13.5 T16b: composite gate key — every input that bakes
                 // into the vertices (see BgBlockFingerprint's field docs).
                 let fingerprint = bg_block_cache::BgBlockFingerprint {
-                    live_output_version: pane.terminal.block_tracker().live_output_version(),
+                    // v1.19.0 (PLAN_v1190 §4 P1-4/O2/N6): when the region
+                    // track is ON the live block's geometry derives from the
+                    // grid, so the version component rides `grid.revision`
+                    // (any layout-affecting grid mutation bumps it); flag OFF
+                    // keeps the capture ledger's `live_output_version`.
+                    live_output_version: live_output_version_source(pane.terminal),
                     screen_head_lines: pane.terminal.screen_head_lines(),
                     cwd: pane.terminal.cwd().map(str::to_string),
                     git_branch: pane.terminal.git_branch().map(str::to_string),
@@ -320,6 +326,12 @@ impl MetalRenderer {
                         cursor_blink_on: false,
                         is_alt: pane.terminal.is_alt_screen_active(),
                         now: std::time::SystemTime::now(),
+                        // v1.19.0 (PLAN_v1190 §4 P1-1): region track gated
+                        // exactly like `live` — editor-mode panes never enter
+                        // the region layout guard.
+                        region: (!editor_mode)
+                            .then(|| region_source_for(pane.terminal, pane.terminal.grid()))
+                            .flatten(),
                     },
                     &mut selection,
                 );

@@ -411,6 +411,15 @@ impl Pane {
         self.with_terminal(|t| t.set_tui_render_mode(mode));
     }
 
+    /// v1.19.0 (PLAN_v1190 §4 D10): inject the user's
+    /// `[experimental] live_block_grid_render` into this pane's terminal
+    /// (config factory default is `true`; `Terminal::new` itself stays OFF
+    /// so weft_core tests keep the capture-path baseline). Mirror of
+    /// `set_tui_render_mode` — same chokepoints.
+    pub(crate) fn set_live_block_grid_render(&mut self, enabled: bool) {
+        self.with_terminal(|t| t.set_live_block_grid_render(enabled));
+    }
+
     /// Queue a geometry transaction without resizing the Grid ahead of its PTY.
     /// Overwriting an older pending size coalesces resize cascades. The effect
     /// dispatcher applies `TIOCSWINSZ` first and only then commits the Grid,

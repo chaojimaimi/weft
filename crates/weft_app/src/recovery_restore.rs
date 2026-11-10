@@ -43,6 +43,8 @@ impl App {
                     let cwd_to_apply = crate::pane::restore_spawn_cwd(saved_cwd.as_deref());
                     let blocks_limit = self.config_state.config.blocks.retained_limit;
                     let render_mode = self.config_state.config.experimental.tui_render_mode;
+                    let live_grid_render =
+                        self.config_state.config.experimental.live_block_grid_render;
                     if i == 0 {
                         if cwd_to_apply.is_some() {
                             let mut tab = Tab::new(
@@ -59,6 +61,8 @@ impl App {
                                 ));
                                 // v1.11.7 (P2-3): inject the user's TUI tier.
                                 t.set_tui_render_mode(render_mode);
+                                // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
+                                t.set_live_block_grid_render(live_grid_render);
                                 if let Some(r) = &self.renderer {
                                     t.set_palette(r.theme().palette);
                                     t.set_background_color(r.theme().background);
@@ -85,6 +89,8 @@ impl App {
                             ));
                             // v1.11.7 (P2-3): inject the user's TUI tier.
                             t.set_tui_render_mode(render_mode);
+                            // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
+                            t.set_live_block_grid_render(live_grid_render);
                             if let Some(r) = &self.renderer {
                                 t.set_palette(r.theme().palette);
                                 t.set_background_color(r.theme().background);
@@ -135,6 +141,7 @@ impl App {
         let blocks_limit = self.config_state.config.blocks.retained_limit;
         let output_cap_mib = self.config_state.config.blocks.output_cap_mib;
         let render_mode = self.config_state.config.experimental.tui_render_mode;
+        let live_grid_render = self.config_state.config.experimental.live_block_grid_render;
 
         // Root leaf spawns the initial tab. `root_leaf_spawn_cwd` returns ""
         // for an absent cwd → `restore_spawn_cwd` → None → inherit weft cwd.
@@ -152,6 +159,8 @@ impl App {
             t.set_block_output_cap(crate::config_controller::output_cap_bytes(output_cap_mib));
             // v1.11.7 (P2-3): inject the user's TUI tier.
             t.set_tui_render_mode(render_mode);
+            // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
+            t.set_live_block_grid_render(live_grid_render);
             if let Some(r) = &self.renderer {
                 t.set_palette(r.theme().palette);
                 t.set_background_color(r.theme().background);
@@ -183,6 +192,8 @@ impl App {
             new_pane
                 .set_blocks_output_cap(crate::config_controller::output_cap_bytes(output_cap_mib));
             new_pane.set_tui_render_mode(render_mode);
+            // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
+            new_pane.set_live_block_grid_render(live_grid_render);
             tab.split_pane_with_pane(leaf, dir, ratio.clamp(0.1, 0.9), new_pane)
                 .map_err(|e| {
                     warn!(?e, "tab snapshot restore: split failed, skipping subtree");

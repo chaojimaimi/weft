@@ -71,6 +71,7 @@ impl MetalRenderer {
             cursor_blink_on: _,
             is_alt,
             now,
+            region,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -223,6 +224,12 @@ impl MetalRenderer {
         // v1.10.26: the live composed document (selection source) is extracted
         // BEFORE the layout pass moves `live` (its &str outlives the frame).
         let live_output_for_source = live.as_ref().map(|live| live.output);
+        // v1.19.0 (PLAN_v1190 §4 P1-1): sync the region snapshot (internal
+        // RefCell) before borrowing it — the Ref feeds the layout pass.
+        if let Some(region) = &region {
+            self.region_live_cache.sync(cache_namespace, region, cols);
+        }
+        let region_state = self.region_live_cache.state(cache_namespace);
         // M5-b: laid rows borrow from the cache (zero-copy) until `row_data`'s last read.
         let cache = self.block_layout_cache.borrow();
         let layout_out = compute_block_layout_pass(
@@ -244,6 +251,8 @@ impl MetalRenderer {
                 styled_lookup_counter: Some(&self.styled_lookup_counter),
                 block_diagnose_state,
                 now,
+                region,
+                region_state: region_state.as_deref(),
             },
             &cache,
             &mut self.live_layout_cache.borrow_mut(),

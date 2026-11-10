@@ -136,6 +136,8 @@ fn run_pass<'a>(
             styled_lookup_counter: None,
             block_diagnose_state: &std::collections::HashMap::new(),
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            region: None,
+            region_state: None,
         },
         cache,
         live_cache,

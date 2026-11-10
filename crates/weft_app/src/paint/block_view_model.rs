@@ -75,4 +75,9 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// paths. Golden/bench fixtures pass fixed values so output stays
     /// clock-independent.
     pub(crate) now: SystemTime,
+    /// v1.19.0 (PLAN_v1190 §4 P1-1): flag-ON region track — grid-region
+    /// source (borrows the pane's grid). `None` on the capture path (flag
+    /// OFF) and in golden/bench fixtures; the synced snapshot travels via
+    /// the renderer's `RegionLiveCache` (not through the model).
+    pub(crate) region: Option<crate::paint::region_cache::RegionSource<'a>>,
 }

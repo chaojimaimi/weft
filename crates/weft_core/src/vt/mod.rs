@@ -155,6 +155,8 @@ pub struct Terminal {
     /// `[experimental] tui_render_mode` (serde default `noninteractive`) at
     /// every construction site (P2-3).
     tui_render_mode: TuiRenderMode,
+    /// v1.19.0 (D10): live block draws from grid row regions (app injects; core default false).
+    live_block_grid_render: bool,
     /// v1.11.15 (FIX A, PLAN_v11115 §1.2): the pane's reader-side mouse
     /// suppression flag. The reader sets it on the first mouse-disable byte;
     /// THIS parser is the authoritative undo (h and l alike). `None` until
@@ -222,6 +224,7 @@ impl Terminal {
             kitty: kitty_keyboard::KittyKeyboardState::default(),
             kitty_protocol_enabled: true,
             tui_render_mode: TuiRenderMode::Classic,
+            live_block_grid_render: false,
             mouse_suppress: None,
             #[cfg(test)]
             print_fast_lanes_for_test: true,
@@ -399,6 +402,17 @@ impl Terminal {
         // v1.11.8 (M-B): the tier decides every `show_block_view()` answer —
         // log the injection point (per Terminal construction, not a hot path).
         tracing::debug!(?mode, "tui render mode set");
+    }
+
+    /// v1.19.0 (D10): live block draws from `grid::region` row snapshots.
+    pub fn is_live_block_grid_render(&self) -> bool {
+        self.live_block_grid_render
+    }
+
+    pub fn set_live_block_grid_render(&mut self, enabled: bool) {
+        self.live_block_grid_render = enabled;
+        // v1.11.8 (M-B) precedent: log per-Terminal injection points.
+        tracing::debug!(enabled, "live block grid render set");
     }
 
     /// Whether SGR-1006 mouse-report encoding is selected (DEC mode 1006).

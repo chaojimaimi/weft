@@ -99,6 +99,8 @@ fn frame_model<'a>(
         is_alt: false,
         // Fixed clock: golden/bench output must not depend on wall time.
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        // Bench the capture track (flag-OFF shape).
+        region: None,
     }
 }
 
@@ -367,6 +369,8 @@ fn run_frame_banded(
             is_alt: false,
             // Fixed clock: golden/bench output must not depend on wall time.
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            // Bench the capture track (flag-OFF shape).
+            region: None,
         },
         &mut SelectionHandler::new(),
     );

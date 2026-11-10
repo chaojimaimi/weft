@@ -280,18 +280,23 @@ pub(crate) fn block_content_metrics(
     cols: usize,
     header_rows: usize,
 ) -> (usize, usize) {
-    block_content_metrics_with_cache(terminal, cols, header_rows, None, None)
+    block_content_metrics_with_cache(terminal, cols, header_rows, None, None, None)
 }
 
 /// R2-2: 缓存变体。缓存命中时 O(1) 读 `output_rows`,否则回退直接计算
 /// (如最后一帧后才 finalized 的块,或无渲染器访问权的调用方)。
 /// v1.10.23: `live_cache`(调用方已 sync)让 live 分支 O(1) 读累计行数;`None` 回退旧路径。
+/// v1.19.0 (PLAN_v1190 §4 P1-8): `region_live_rows` 是 region 轨（flag ON）
+/// 的 live 显示行总数（P1-6 域，组装体同源）——优先于捕获轨行数，使
+/// block_scroll_metrics 的 total 与 laid rows 一致；`None`（flag OFF 或无
+/// 快照）保持捕获轨行为 byte-identical。
 pub(crate) fn block_content_metrics_with_cache(
     terminal: &Terminal,
     cols: usize,
     header_rows: usize,
     cache: Option<&crate::paint::grid_cache::BlockLayoutCache>,
     live_cache: Option<&crate::paint::live_cache::LiveLayoutCache>,
+    region_live_rows: Option<usize>,
 ) -> (usize, usize) {
     use weft_core::blocks::ShellPhase;
 
@@ -344,8 +349,11 @@ pub(crate) fn block_content_metrics_with_cache(
     }
     if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
         if let Some(live) = terminal.block_tracker().in_flight() {
-            let output_rows = live_cache
-                .map(|c| c.total_display_rows())
+            // v1.19.0 (PLAN_v1190 §4 P1-8): region track total wins when
+            // supplied (same snapshot the layout pass lays out); the capture
+            // branches below are the flag-OFF path, untouched.
+            let output_rows = region_live_rows
+                .or_else(|| live_cache.map(|c| c.total_display_rows()))
                 .unwrap_or_else(|| {
                     let lines: Vec<&str> = live.output.lines().collect();
                     let start = lines
@@ -441,6 +449,10 @@ pub(crate) fn reconciled_terminal_block_scroll(
         terminal.grid().num_cols,
         header_rows,
         cache,
+        None,
+        // Reconcile path has no renderer region snapshot access — flag ON
+        // falls back to the capture total here (memo + scrollbar stay
+        // authoritative; see PLAN_v1190 §4 P1-8 备案).
         None,
     );
     let cwd_header = crate::layout::block_cwd_header_active(

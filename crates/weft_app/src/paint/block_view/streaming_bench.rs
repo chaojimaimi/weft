@@ -170,6 +170,8 @@ fn active_pane_model<'a>(
         cursor_blink_on: false,
         is_alt: terminal.is_alt_screen_active(),
         now: std::time::SystemTime::now(),
+        // Bench isolates the capture-track cost (flag-OFF shape).
+        region: None,
     }
 }
 

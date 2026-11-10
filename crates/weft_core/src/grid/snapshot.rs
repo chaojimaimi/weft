@@ -6,7 +6,8 @@ use super::{Grid, Row};
 use crate::blocks::{StyledLine, StyledOutput};
 use std::sync::Arc;
 
-const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
+// v1.19.0: pub(crate) — grid/region.rs reuses the same per-row span budget.
+pub(crate) const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
 /// v1.6.1: Maximum link spans per captured row. Prevents a malicious TUI
 /// from spamming tiny links that bloat the snapshot. 256 is generous — a
 /// typical line has 0-2 links.

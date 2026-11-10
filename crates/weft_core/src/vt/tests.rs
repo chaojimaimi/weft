@@ -5881,3 +5881,120 @@ fn sudo_su_cub_edit_moves_capture_cursor_anchor() {
         "capture lost the inline-edit tail: {output:?}"
     );
 }
+
+/// v1.19.0 E2E (PLAN_v1190 §3 P3-14, D10): the same `sudo su` inline-edit
+/// replay as `sudo_su_inline_edit_replay_keeps_tail_in_capture`, now with
+/// the live-grid flag ON (the app injects `[experimental]
+/// live_block_grid_render`; core defaults off). The grid-region read model
+/// must keep the ICH-edited tail intact — the D8 guarantee that in-place
+/// rewrites are visible and never break the row.
+#[test]
+fn sudo_su_inline_edit_grid_region_display_keeps_tail() {
+    let mut t = Terminal::new(62, 200);
+    t.set_live_block_grid_render(true);
+    assert!(t.is_live_block_grid_render());
+    t.process(b"\x1b]133;A\x07");
+    t.process(b"sudo su\r\n");
+    t.process(b"\x1b]133;B\x07"); // CommandExecuting — region anchor sampled here
+    let begin = t.grid().scrollback.position();
+    t.process(b"\x1b[?1034hsh-3.2$ ls -al | grep \"\"");
+    for _ in 0..8 {
+        t.process(b"\x1b[D"); // ← — CUB 1
+    }
+    for _ in 0..8 {
+        t.process(b"\x1b[1@s"); // ICH 1, then 's' overwrites the fresh blank
+    }
+    t.process(b"\r");
+
+    // D4 head: bottom-up first non-empty viewport row's document_index + 1.
+    let grid = t.grid();
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert_eq!(
+        t.block_tracker().region_begin_position(),
+        Some(begin),
+        "the live block's region anchor must equal the sampled position"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.contains("sh-3.2$ ls -al |ssssssss grep \"\"")),
+        "region lost the inline-edit tail: {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+    // ICH must not break the row: the edited command line stays ONE row
+    // (rows 0/1 exactly as the capture twin asserts via row_text).
+    assert_eq!(t.grid().row_text(0), "sudo su");
+    assert_eq!(t.grid().row_text(1), "sh-3.2$ ls -al |ssssssss grep \"\"");
+}
+
+/// v1.19.0 E2E (PLAN_v1190 §3 P3-14, D6): the same `sudo su` CUB/ICH edit
+/// replay, flag ON, asserting the caret formula's INPUT — the grid caret's
+/// logical row inside the region is
+/// `document_index(cursor.row) − index_since(begin)` and it lands on the
+/// edited line (the column twin lives in
+/// `sudo_su_cub_edit_moves_capture_cursor_anchor`).
+#[test]
+fn sudo_su_cub_edit_grid_region_caret_anchor() {
+    let mut t = Terminal::new(62, 200);
+    t.set_live_block_grid_render(true);
+    assert!(t.is_live_block_grid_render());
+    t.process(b"\x1b]133;A\x07");
+    t.process(b"sudo su\r\n");
+    t.process(b"\x1b]133;B\x07");
+    let begin = t.grid().scrollback.position();
+    t.process(b"\x1b[?1034hsh-3.2$ ls -al | grep \"\"");
+    for _ in 0..8 {
+        t.process(b"\x1b[D");
+    }
+    for _ in 0..8 {
+        t.process(b"\x1b[1@s");
+    }
+    t.process(b"\r");
+
+    // D6 formula input: logical row of the grid caret within the region.
+    let grid = t.grid();
+    let sb_len = grid.scrollback.len();
+    let document_index = sb_len as u64 + grid.cursor.row as u64;
+    let logical_row = (document_index - grid.scrollback.index_since(begin) as u64) as usize;
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert_eq!(grid.cursor.row, 1, "the caret sits on the command line");
+    assert!(
+        logical_row < lines.len(),
+        "caret logical row {logical_row} outside the region ({:?})",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        lines[logical_row].text, "sh-3.2$ ls -al |ssssssss grep \"\"",
+        "the caret formula must land on the (ICH-rewritten) command line"
+    );
+    // Tail kept (same invariant as the flag-off capture twin).
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.contains("sh-3.2$ ls -al |ssssssss grep \"\"")),
+        "region lost the inline-edit tail"
+    );
+}

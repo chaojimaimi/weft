@@ -482,7 +482,11 @@ impl LiveLayoutCache {
 /// - every structure kind (PureBox / ProgressGauge under tolerance /
 ///   TableRow) emits `once(0..grapheme_prefix_end(entries, cols))`, which
 ///   consumes the whole line when it fits.
-fn count_line_chunks(line: &str, cols: usize) -> u32 {
+///
+/// v1.19.0: `pub(crate)` — the region-track snapshot (`paint/region_cache`)
+/// re-chunks its cached logical rows with the same function so both tracks
+/// agree on display-row counts.
+pub(crate) fn count_line_chunks(line: &str, cols: usize) -> u32 {
     if cols == 0 || terminal_text_width(line) <= cols {
         1
     } else {

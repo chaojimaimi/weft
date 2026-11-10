@@ -275,3 +275,124 @@ fn frozen_serve_follows_pane_rect_and_identity_stays_byte_exact() {
     // Clean slate for the other tests under the shared lock.
     crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
 }
+
+/// v1.19.0 (PLAN_v1190 §4 P1-4/O2/N6): with the grid-render flag ON the
+/// fingerprint's `live_output_version` component switches its value source
+/// to `grid.revision` (`region_cache::live_output_version_source` — no new
+/// fingerprint field). A hand-baked cache entry whose fingerprint pins the
+/// CURRENT revision must be reused; any grid mutation (revision bump) must
+/// invalidate it. Mirror of the hand-baked-entry precedent above
+/// (frozen_serve_follows_pane_rect_and_identity_stays_byte_exact).
+#[test]
+fn bg_fingerprint_tracks_grid_revision_while_grid_render_flag_on() {
+    let Some(renderer) = headless_renderer_or_skip() else {
+        eprintln!("skipping grid-revision fingerprint test: no Metal device available");
+        return;
+    };
+    let _guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::paint::zoom_render::set_self_zoom_window(false);
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
+
+    let mut terminal = weft_core::vt::Terminal::new(6, 40);
+    terminal.set_live_block_grid_render(true);
+    terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07seq 3\n");
+    let revision = terminal.grid().revision;
+    // Sanity: under the flag the version source really is the grid revision.
+    assert_eq!(
+        crate::paint::region_cache::live_output_version_source(&terminal),
+        revision,
+        "flag ON must ride grid.revision, not the capture ledger version"
+    );
+
+    // Hand-bake an entry whose fingerprint pins the current revision and
+    // matches every other composite-key input of the pane below.
+    let rect_a: crate::layout::Rect = [0.0, 0.0, 400.0, 300.0];
+    let baked: Vec<f32> = vec![1.0; 24];
+    renderer.background_block_caches.borrow_mut().insert(
+        9200,
+        crate::renderer::bg_block_cache::BgBlockCache {
+            vertices: baked.clone(),
+            fingerprint: crate::renderer::bg_block_cache::BgBlockFingerprint {
+                live_output_version: revision,
+                screen_head_lines: terminal.screen_head_lines(),
+                cwd: None,
+                git_branch: None,
+                theme_generation: renderer.background_grid_generation.get(),
+                cell_dims: (renderer.cell_width(), renderer.cell_height()),
+                rect: rect_a,
+                block_scroll: 0.0,
+                editor_mode: false,
+            },
+            // Backdate past the 60ms content throttle: after the revision
+            // bump below the gate must reach RebuildNow, not the Throttled
+            // serve window.
+            last_rebuild: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        },
+    );
+
+    // Same revision → fingerprint hit → cached serve, no rebuild. The pane
+    // holds `&terminal`, so each serve phase gets its own scoped value and
+    // the borrow ends before `terminal.process` below needs `&mut`.
+    let served: Vec<f32> = {
+        let pane = PaneRenderInfo {
+            rect: rect_a,
+            terminal: &terminal,
+            block_scroll: 0.0,
+            submit_on_ctrl_enter: true,
+            pane_session_id: 9200,
+        };
+        let mut served: Vec<f32> = Vec::new();
+        assert!(
+            !renderer.build_background_pane_content(
+                &pane,
+                &mut served,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            "same-revision fingerprint must reuse the hand-baked entry"
+        );
+        served
+    };
+    assert_eq!(
+        served, baked,
+        "identity rect: the reuse serve must be byte-for-byte the baked entry"
+    );
+
+    // A grid mutation bumps the revision → fingerprint miss → rebuild.
+    terminal.process(b"more output\n");
+    assert_ne!(
+        terminal.grid().revision,
+        revision,
+        "content writes must bump grid.revision"
+    );
+    let rebuilt: Vec<f32> = {
+        let pane = PaneRenderInfo {
+            rect: rect_a,
+            terminal: &terminal,
+            block_scroll: 0.0,
+            submit_on_ctrl_enter: true,
+            pane_session_id: 9200,
+        };
+        let mut rebuilt: Vec<f32> = Vec::new();
+        assert!(
+            renderer.build_background_pane_content(
+                &pane,
+                &mut rebuilt,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            "bumped revision must invalidate the entry and rebuild"
+        );
+        rebuilt
+    };
+    assert_ne!(
+        rebuilt, baked,
+        "the rebuild must replace the stale baked bytes, not re-serve them"
+    );
+
+    // Clean slate for the other tests under the shared lock.
+    renderer.background_block_caches.borrow_mut().remove(&9200);
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
+}

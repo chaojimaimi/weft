@@ -333,6 +333,11 @@ impl App {
                 tab,
                 self.config_state.config.experimental.tui_render_mode,
             );
+            // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
+            crate::config_controller::apply_live_block_grid_render(
+                tab,
+                self.config_state.config.experimental.live_block_grid_render,
+            );
         }
 
         // Apply block_id_allocator + palette (mirrors new_tab).
@@ -398,6 +403,10 @@ impl App {
                     // v1.11.7 (P2-3): TUI render tier on restored splits.
                     new_pane
                         .set_tui_render_mode(self.config_state.config.experimental.tui_render_mode);
+                    // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
+                    new_pane.set_live_block_grid_render(
+                        self.config_state.config.experimental.live_block_grid_render,
+                    );
                     tab.split_pane_with_pane(leaf, dir, ratio, new_pane)
                         .map_err(|e| {
                             warn!(?e, "workspace restore: split failed, skipping subtree");

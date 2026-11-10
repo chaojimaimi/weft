@@ -274,6 +274,11 @@ impl Terminal {
                                 self.capabilities.primary_screen_relative_addressing_seen = false;
                                 self.reset_primary_screen_synchronized_frame();
                                 self.shell_markers.push(ShellMarker::CommandStart);
+                                // v1.19.0 (D3): defensive — the guard makes
+                                // this a no-op while a screen-owned block is
+                                // live (its anchor stays screen_document_start).
+                                self.block_tracker
+                                    .note_command_begin_position(self.grid.scrollback.position());
                             } else {
                                 self.settle_primary_screen_exit();
                                 self.capabilities.primary_history_view = false;
@@ -295,6 +300,11 @@ impl Terminal {
                                 };
                                 self.freeze_primary_screen_document_candidate();
                                 self.block_tracker.on_command_start(command);
+                                // v1.19.0 (D3): sample the grid-region begin
+                                // anchor after `on_command_start` (which resets
+                                // it) — scrollback.position() at 133;B.
+                                self.block_tracker
+                                    .note_command_begin_position(self.grid.scrollback.position());
                                 // v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三
                                 // M1.1, P1-2): real command boundary — clear
                                 // the interactive-stdin exemption. Deliberately
@@ -348,6 +358,12 @@ impl Terminal {
                             };
                             self.shell_markers
                                 .push(ShellMarker::CommandEnd { exit_code });
+                            // v1.19.0 (D3): the command ended — retire the
+                            // plain-command region anchor here so the deferred
+                            // finalize window never serves a stale begin
+                            // position (screen-owned blocks keep their
+                            // `screen_document_start` anchor).
+                            self.block_tracker.clear_command_begin_position();
                             if defer_screen_exit {
                                 self.defer_primary_screen_exit(Some(exit_code));
                             } else if self.capabilities.primary_screen_exit.is_some()

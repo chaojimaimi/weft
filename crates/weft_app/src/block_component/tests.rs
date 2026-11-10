@@ -224,7 +224,7 @@ fn reconcile_clamp_total_matches_the_scrollbar_metrics_source() {
     let (_, clamp_total, _) =
         reconciled_terminal_block_scroll(&terminal, &layout, 1, 0, Some(&cache)).unwrap();
     let (metrics_total, _) =
-        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(clamp_total, metrics_total);
 
     // Stale-deferred variant: narrow the cache entries (deferral shape), the
@@ -236,7 +236,7 @@ fn reconcile_clamp_total_matches_the_scrollbar_metrics_source() {
     let (_, stale_clamp_total, _) =
         reconciled_terminal_block_scroll(&terminal, &layout, 1, 0, Some(&cache)).unwrap();
     let (stale_metrics_total, _) =
-        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(stale_clamp_total, stale_metrics_total);
     assert_ne!(
         stale_clamp_total, clamp_total,
@@ -509,7 +509,7 @@ fn r22_collapsed_block_cache_reports_zero_output_rows() {
         blk_cache.ensure_cached(blk, 80);
     }
     let (total_some, _) =
-        block_content_metrics_with_cache(&terminal, 80, 1, Some(&blk_cache), None);
+        block_content_metrics_with_cache(&terminal, 80, 1, Some(&blk_cache), None, None);
     assert_eq!(
         total_none, total_some,
         "cached and uncached totals must match"
@@ -550,7 +550,8 @@ fn f71b_tombstone_hit_uncollapsed_matches_present_golden_without_fallback() {
     for blk in terminal.block_tracker().session_blocks() {
         cache.ensure_cached(blk, cols);
     }
-    let (golden, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (golden, _) =
+        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(cache.metrics_fallback_rebuilds(), 0);
 
     f71b_evict_all(&mut cache, cols);
@@ -558,7 +559,7 @@ fn f71b_tombstone_hit_uncollapsed_matches_present_golden_without_fallback() {
     assert!(cache.get_if_cached(id.0).is_none());
     assert!(cache.get_metrics_tombstone(id.0).is_some());
 
-    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(total, golden, "tombstone scalars == PRESENT-stale scalars");
     assert_eq!(
         cache.metrics_fallback_rebuilds(),
@@ -583,11 +584,12 @@ fn f71b_tombstone_hit_collapsed_matches_present_golden_without_fallback() {
     for blk in terminal.block_tracker().session_blocks() {
         cache.ensure_cached(blk, cols);
     }
-    let (golden, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (golden, _) =
+        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(cache.metrics_fallback_rebuilds(), 0);
 
     f71b_evict_all(&mut cache, cols);
-    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(
         total, golden,
         "collapsed tombstone read == PRESENT collapsed read"
@@ -604,7 +606,7 @@ fn f71b_no_entry_no_tombstone_uncollapsed_counts_fallback() {
     let cols = terminal.grid().num_cols;
     let cache = BlockLayoutCache::default();
 
-    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert!(total > 0);
     assert_eq!(
         cache.metrics_fallback_rebuilds(),
@@ -627,7 +629,7 @@ fn f71b_no_entry_no_tombstone_collapsed_zero_rows_but_counts_fallback() {
 
     // Collapsed: output rows direct-compute to 0 (early return), leaving
     // header(1) + collapsed command(1) + separator(1) = 3 rows.
-    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(
         total, 3,
         "collapsed output rows early-return 0; command+separator remain"
@@ -649,11 +651,12 @@ fn f71b_large_block_tombstone_hit_avoids_completed_output_rows_fallback() {
     for blk in terminal.block_tracker().session_blocks() {
         cache.ensure_cached(blk, cols);
     }
-    let (golden, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (golden, _) =
+        block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(cache.metrics_fallback_rebuilds(), 0);
 
     f71b_evict_all(&mut cache, cols);
-    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None);
+    let (total, _) = block_content_metrics_with_cache(&terminal, cols, 1, Some(&cache), None, None);
     assert_eq!(
         total, golden,
         "5000-line block reads stale scalars, not a re-wrap"
