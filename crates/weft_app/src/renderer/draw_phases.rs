@@ -255,6 +255,19 @@ impl crate::renderer::MetalRenderer {
                     .sync(active_pane_session_id, region, frame_cols);
             }
             let region_state = self.region_live_cache.state(active_pane_session_id);
+            // v1.19.1 (hotfix): evaluate the D6 caret anchor while the Ref is
+            // alive, then drop it BEFORE the paint path runs —
+            // `build_block_view_vertices` re-syncs the region cache
+            // (block_view.rs), and `sync` unconditionally `borrow_mut`s even
+            // on a D7 hit, so a live `Ref` here panics ("RefCell already
+            // borrowed", region_cache.rs:152) on every 133;B command frame
+            // (2026-11-10 field crash, v1.19.0).
+            let tui_cursor = if prompt.is_none() {
+                self.block_view_tui_cursor(terminal, grid, region_state.as_deref())
+            } else {
+                None
+            };
+            drop(region_state);
             let (v, regions, bv_rows) = if let Some(p) = prompt {
                 // v1.3 multi-pane: use the active pane's LayoutCtx (which
                 // carries pane_origin + clip set by the background-pane block
@@ -285,7 +298,7 @@ impl crate::renderer::MetalRenderer {
                         cache_namespace: active_pane_session_id,
                         block_diagnose_state: &self.block_diagnose_state,
                         ai_configured: self.ai_configured,
-                        tui_cursor: None,
+                        tui_cursor,
                         tui_preedit: None,
                         cursor_blink_on: false,
                         is_alt: terminal.is_alt_screen_active(),
@@ -340,11 +353,7 @@ impl crate::renderer::MetalRenderer {
                         // snapshot skips empty rows; the tracked value is
                         // exact. Fallback to the formula + clamp when no
                         // snapshot has been taken yet.
-                        tui_cursor: self.block_view_tui_cursor(
-                            terminal,
-                            grid,
-                            region_state.as_deref(),
-                        ),
+                        tui_cursor,
                         tui_preedit: tui_preedit.map(|p| (p.text, p.cursor)),
                         cursor_blink_on,
                         is_alt: terminal.is_alt_screen_active(),

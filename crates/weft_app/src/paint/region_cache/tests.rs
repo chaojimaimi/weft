@@ -233,6 +233,37 @@ fn cols_only_change_rechunks_without_grid_reread() {
     assert_eq!(st.cumulative, vec![0u32, 1, 2]);
 }
 
+// ── v1.19.1 borrow contract ─────────────────────────────────────────────
+
+#[test]
+fn sync_panics_while_a_state_ref_is_alive_borrow_contract() {
+    // v1.19.1 (field crash 2026-11-10, v1.19.0): `sync` unconditionally
+    // `borrow_mut`s the pane map — even on a D7 hit — so NO caller may hold
+    // a `state()` Ref across a `sync` call. draw_phases.rs violated this on
+    // every 133;B command frame (the D6 caret anchor was evaluated with the
+    // Ref alive, then `build_block_view_vertices` re-synced beneath it →
+    // "RefCell already borrowed" at region_cache.rs:152, exit 101). The fix
+    // drops the Ref before building the paint model; this test freezes the
+    // contract so a future tolerant `sync` (try_borrow) is a deliberate,
+    // reviewed semantic change — not an accident that silently re-opens the
+    // crash window.
+    let t = live_terminal(2, 20, &["alpha", "beta", "gamma", "delta"]);
+    let cache = RegionLiveCache::default();
+    snapshot(&cache, &t, 1);
+    let grid = t.grid();
+    let source = region_source_for(&t, grid).unwrap();
+    let guard: Ref<PaneRegionState> = cache.state(1).expect("state after sync");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // D7-hit inputs (same begin/revision/cols) — still borrow_mut → panic.
+        cache.sync(1, &source, 20);
+    }));
+    drop(guard);
+    assert!(
+        outcome.is_err(),
+        "sync must panic while a state() Ref is alive (borrow contract)"
+    );
+}
+
 #[test]
 fn new_begin_anchor_rebuilds_wholesale() {
     let mut t = live_terminal(2, 20, &["alpha", "beta", "gamma"]);
