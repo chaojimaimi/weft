@@ -1,3 +1,7 @@
+//! Cursor-state method family of `OutputCapture` (v1.13.9 split; v1.19.3
+//! hygiene car completed the family — the remaining cursor-position methods
+//! moved verbatim from `output_capture.rs`, whose module doc points here).
+
 use std::sync::atomic::Ordering;
 
 use super::{CapturedStyle, OutputCapture};
@@ -117,6 +121,151 @@ impl OutputCapture {
         // early row, pulling the watermark below the sync boundary so the
         // live layout cache's append fast path falls back to a full rebuild.
         self.min_write_offset.fetch_min(target, Ordering::Relaxed);
+    }
+
+    /// v1.18.9: raw byte position of the capture's own edit head — the
+    /// CUB/CUF/ICH/DCH-mirrored cursor maintained by `set_cursor_column`
+    /// and friends (unlike the renderer's grid cursor, this one survives
+    /// nested-shell inline editing). Read-only accessor for the tracker's
+    /// capture-cursor anchor.
+    pub(crate) fn cursor_byte(&self) -> usize {
+        self.cursor
+    }
+
+    /// v1.18.9: test-only twin of [`Self::cursor_byte`] — injects a raw byte
+    /// cursor to exercise the anchor's defensive branches (torn char
+    /// boundary, past-the-end). Production never leaves a torn cursor: the
+    /// mirrored edit ops all maintain char boundaries.
+    #[cfg(test)]
+    pub(crate) fn set_cursor_byte_for_test(&mut self, byte: usize) {
+        self.cursor = byte;
+    }
+
+    pub(crate) fn newline(&mut self, max_bytes: usize) {
+        if self.truncated {
+            return;
+        }
+        // M6-a watermark: pre-write cursor — the LF may overwrite from the
+        // cursor to the line end and the cursor is always within the tail
+        // line (>= the sync boundary), so this records conservatively.
+        self.note_min_write_offset(self.cursor);
+        let line_start = self.line_start();
+        self.cursor = self.line_end();
+        // PTYs commonly translate LF to CRLF. The preceding CR leaves the
+        // capture cursor at column zero, so advance the parallel character
+        // cursor across the existing line before consuming/appending LF.
+        // Otherwise every following ANSI run is indexed near the start of
+        // the transcript even though the plain text remains correct.
+        self.char_cursor =
+            self.line_start_char + self.text[line_start..self.cursor].chars().count() as u32;
+        if self.text.as_bytes().get(self.cursor) == Some(&b'\n') {
+            self.cursor += 1;
+            self.char_cursor += 1;
+            self.line_start_char = self.char_cursor;
+            return;
+        }
+        if self.text.len() < max_bytes {
+            self.text.push('\n');
+            self.cursor = self.text.len();
+            self.char_cursor += 1;
+            self.line_start_char = self.char_cursor;
+            // T16a ledger: a fresh LF appended (the consume branch above
+            // steps over an LF the ledger already counted).
+            self.text_line_count += 1;
+            self.text_char_count += 1;
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    /// Move the capture cursor to a zero-based terminal row/column.
+    /// Missing rows and columns are materialized as newlines/spaces so
+    /// cursor-addressed primary-screen exit tails retain their visual line
+    /// structure instead of concatenating text from separate rows.
+    pub(crate) fn goto(&mut self, row: usize, col: usize, max_bytes: usize) {
+        if self.truncated {
+            return;
+        }
+        // T16a ledger: the O(text) rescan is replaced by the maintained
+        // newline count (identical semantics: rows == newlines + 1).
+        let existing_rows = self.text_line_count + 1;
+        for _ in existing_rows..=row {
+            if self.text.len() >= max_bytes {
+                self.truncated = true;
+                return;
+            }
+            self.text.push('\n');
+            self.char_cursor += 1;
+            self.line_start_char = self.char_cursor;
+            self.text_line_count += 1;
+            self.text_char_count += 1;
+        }
+
+        let line_start = if row == 0 {
+            0
+        } else {
+            self.text
+                .match_indices('\n')
+                .nth(row - 1)
+                .map_or(self.text.len(), |(index, _)| index + 1)
+        };
+        // M6-a watermark: the TARGET row's start — every byte this op touches
+        // (column-walk inserts, subsequent prints at the landed cursor) is at
+        // or after it, and the row-materialization loop above only appends at
+        // the document end. An early-row jump records below the consumption
+        // boundary, which invalidates the append fast path (the intent).
+        self.note_min_write_offset(line_start);
+        let line_end = self.text[line_start..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| line_start + offset);
+
+        // Recompute line_start_char for the target row by counting chars
+        // from the buffer start up to line_start.
+        let mut new_line_start_char = 0u32;
+        for _ in self.text[..line_start].chars() {
+            new_line_start_char += 1;
+        }
+        self.line_start_char = new_line_start_char;
+
+        let mut cursor = line_start;
+        let mut char_offset_in_line = 0u32;
+        for _ in 0..col {
+            if cursor < line_end {
+                let step = self.text[cursor..line_end]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+                cursor += step;
+                char_offset_in_line += 1;
+            } else if self.text.len() < max_bytes {
+                self.text.insert(cursor, ' ');
+                cursor += 1;
+                char_offset_in_line += 1;
+                self.text_char_count += 1;
+            } else {
+                self.truncated = true;
+                return;
+            }
+        }
+        self.cursor = cursor;
+        self.char_cursor = self.line_start_char + char_offset_in_line;
+    }
+
+    pub(super) fn line_start(&self) -> usize {
+        self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    pub(super) fn line_end(&self) -> usize {
+        self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| self.cursor + offset)
+    }
+
+    pub(super) fn char_end_at_cursor(&self) -> Option<usize> {
+        let c = self.text.get(self.cursor..)?.chars().next()?;
+        Some(self.cursor + c.len_utf8())
     }
 }
 
@@ -357,5 +506,18 @@ mod tests {
             "line-confined moves must not lower the watermark"
         );
         assert_eq!(output.as_str(), "one\ntwo");
+    }
+
+    #[test]
+    fn absolute_cursor_rows_preserve_line_structure() {
+        let mut output = OutputCapture::default();
+        output.goto(0, 0, 1024);
+        output.print_ascii(b"first", CapturedStyle::default(), 1024);
+        output.goto(2, 3, 1024);
+        output.print_ascii(b"third", CapturedStyle::default(), 1024);
+        output.goto(1, 1, 1024);
+        output.print_ascii(b"second", CapturedStyle::default(), 1024);
+
+        assert_eq!(output.as_str(), "first\n second\n   third");
     }
 }

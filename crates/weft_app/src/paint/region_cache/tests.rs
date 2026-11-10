@@ -403,6 +403,7 @@ fn d6_display_domain_skips_dropped_blanks() {
     let state = PaneRegionState {
         begin_position: 0,
         grid_revision: 0,
+        registry_generation: 0,
         cols: 20,
         anchor_idx: 0,
         anchor_position: 0,
@@ -467,6 +468,7 @@ fn trim_cap_preserves_suffix_and_rebases_prefix_sums() {
     let mut state = PaneRegionState {
         begin_position: 0,
         grid_revision: 0,
+        registry_generation: 0,
         cols: 20,
         anchor_idx: 30,
         anchor_position: 30,
@@ -574,4 +576,181 @@ fn hyperlinks_resolve_into_slot_styles_on_both_sync_tiers() {
         .expect("the advance tier keeps resolved links");
     assert_eq!(link.url, "https://weft.dev/region");
     assert_eq!((link.start, link.end), (0, 6));
+}
+
+// ── v1.19.3 WP2 (PLAN_v1193 §2.2): whitespace-aware region head ────────
+
+#[test]
+fn region_head_ignores_ideographic_space_rows() {
+    // U+3000 is Unicode White_Space: an ideographic-space-only viewport row
+    // must not count as content (the pre-v1.19.3 `!= ' '` predicate wrongly
+    // extended the head past it).
+    let mut t = live_terminal(2, 20, &["alpha"]);
+    t.process("\u{1b}[2;1H\u{3000}".as_bytes());
+    assert_eq!(
+        region_head(t.grid()),
+        1,
+        "the U+3000 row must not extend the head past the scrollback"
+    );
+
+    // Positive control: real text in the same row still extends the head.
+    t.process(b"\x1b[2;1Hbeta");
+    assert_eq!(region_head(t.grid()), 2, "real content must still extend");
+}
+
+#[test]
+fn region_head_collapses_an_all_ideographic_space_viewport() {
+    // Every viewport row is U+3000-only → the region collapses to the
+    // scrollback prefix (the `map_or(sb_len)` branch): head == sb length.
+    let mut t = live_terminal(2, 20, &["alpha"]);
+    t.process("\u{1b}[1;1H\u{3000}".as_bytes());
+    t.process("\u{1b}[2;1H\u{3000}".as_bytes());
+    assert_eq!(
+        region_head(t.grid()),
+        1,
+        "all-U+3000 viewport must collapse the head to the scrollback"
+    );
+}
+
+#[test]
+fn region_head_collapses_an_all_nbsp_viewport() {
+    // U+00A0 is White_Space too (width 1 — no spacer half involved).
+    let mut t = live_terminal(2, 20, &["alpha"]);
+    t.process("\u{1b}[1;1H\u{a0}".as_bytes());
+    t.process("\u{1b}[2;1H\u{a0}".as_bytes());
+    assert_eq!(
+        region_head(t.grid()),
+        1,
+        "all-NBSP viewport must collapse the head to the scrollback"
+    );
+}
+
+#[test]
+fn region_head_still_collapses_plain_space_rows() {
+    // Regression guard: the fix must not make plain spaces count as
+    // content — the pre-v1.19.3 behavior for `' '` rows is preserved.
+    let mut t = live_terminal(2, 20, &["alpha"]);
+    t.process(b"\x1b[1;1H ");
+    t.process(b"\x1b[2;1H ");
+    assert_eq!(
+        region_head(t.grid()),
+        1,
+        "plain-space rows must stay non-content"
+    );
+}
+
+// ── v1.19.3 WP3-B (PLAN_v1193 §3): registry generation sync key ────────
+
+#[test]
+fn cell_map_churn_does_not_drift_the_sync_key() {
+    // v1.19.3 verification fix (PLAN_v1193 WP3): the cell map is
+    // viewport-relative index state — vt/screen_exit/scroll.rs clears it on
+    // every scroll — so tracking its churn in `generation` would make the
+    // advance tier unreachable for link-bearing viewports (the regression
+    // the v1.19.2 scroll-advance test caught). Resolution reads the
+    // append-only `urls` table (review N7), so a registry-only cell-map
+    // clear must leave the sync key AND the resolved links untouched: the
+    // next sync stays a D7 hit.
+    let mut t = live_terminal(2, 40, &[]);
+    t.process(b"\x1b]8;;https://weft.dev/region\x1b\\anchor\x1b]8;;\x1b\\");
+
+    let cache = RegionLiveCache::default();
+    {
+        let st = snapshot(&cache, &t, 1);
+        assert_eq!(cache.rebuilds(), 1);
+        let linked = st.dyn_slots.first().expect("linked dyn slot");
+        assert_eq!(
+            linked.style.links.first().expect("resolved").url,
+            "https://weft.dev/region"
+        );
+    }
+
+    let revision_before = t.grid().revision;
+    t.clear_hyperlink_cell_map();
+    assert_eq!(
+        t.grid().revision,
+        revision_before,
+        "the mutation must be registry-only (revision untouched)"
+    );
+    {
+        let st = snapshot(&cache, &t, 1);
+        assert_eq!(
+            cache.rebuilds(),
+            1,
+            "index churn must not rebuild — the sync stays a D7 hit"
+        );
+        assert_eq!(
+            cache.advances(),
+            1,
+            "and no advance either — a plain D7 hit"
+        );
+        let linked = st.dyn_slots.first().expect("text preserved");
+        assert_eq!(linked.text, "anchor", "texts must not change");
+        let link = linked
+            .style
+            .links
+            .first()
+            .expect("links keep resolving — the urls table is append-only");
+        assert_eq!(link.url, "https://weft.dev/region");
+    }
+}
+
+#[test]
+fn registry_drift_during_scroll_forces_wholesale_not_advance() {
+    // Revision and generation change together (scroll + a fresh OSC-8
+    // registration): the advance tier must be skipped — the wholesale
+    // rebuild re-supplies the whole link chain instead (contrast
+    // hyperlinks_resolve_into_slot_styles_on_both_sync_tiers, whose
+    // revision-only scroll still advances).
+    let mut t = live_terminal(2, 40, &[]);
+    t.process(b"\x1b]8;;https://weft.dev/one\x1b\\first\x1b]8;;\x1b\\\r\n");
+
+    let cache = RegionLiveCache::default();
+    {
+        let st = snapshot(&cache, &t, 1);
+        assert_eq!(cache.rebuilds(), 1);
+        assert_eq!(st.dyn_slots.first().expect("dyn slot").text, "first");
+    }
+
+    // One process call: registers a new URL (generation bump), prints
+    // "second", scrolls "first" into the scrollback (revision bump), and
+    // prints "third".
+    t.process(b"\x1b]8;;https://weft.dev/two\x1b\\second\x1b]8;;\x1b\\\r\nthird");
+
+    {
+        let st = snapshot(&cache, &t, 1);
+        assert_eq!(
+            cache.rebuilds(),
+            2,
+            "generation drift must force a wholesale even mid-scroll"
+        );
+        assert_eq!(cache.advances(), 2, "each wholesale still anchors");
+        assert_eq!(
+            texts(&st),
+            &["first", "second", "third"],
+            "texts must not change"
+        );
+        assert_eq!(
+            st.slots
+                .first()
+                .expect("scrolled slot")
+                .style
+                .links
+                .first()
+                .expect("wholesale re-resolves scrolled links")
+                .url,
+            "https://weft.dev/one"
+        );
+        assert_eq!(
+            st.dyn_slots
+                .first()
+                .expect("viewport slot")
+                .style
+                .links
+                .first()
+                .expect("wholesale re-resolves viewport links")
+                .url,
+            "https://weft.dev/two"
+        );
+    }
 }

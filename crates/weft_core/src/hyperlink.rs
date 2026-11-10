@@ -46,6 +46,14 @@ pub struct HyperlinkRegistry {
     /// `(row, col) → id` for cells currently tagged with HYPERLINK.
     /// Maintained by `print()` in vt.rs as cells are written.
     cell_map: HashMap<(usize, usize), u32>,
+    /// v1.19.3 (PLAN_v1193 WP3, semantics fixed in verification): the
+    /// `urls` table's version — bumped only when `register` allocates a
+    /// genuinely new id (hyperlink.rs register). The `cell_map` is
+    /// viewport-relative index state churned by scroll/print mechanics and
+    /// is deliberately NOT tracked here: it never changes what any slot
+    /// resolves to (see `link_cell`). Downstream caches (the region sync)
+    /// key on it to force a wholesale rebuild on drift.
+    generation: u64,
 }
 
 impl HyperlinkRegistry {
@@ -85,6 +93,7 @@ impl HyperlinkRegistry {
         let id = self.next_id;
         self.urls.insert(id, url.clone());
         self.url_to_id.insert(url, id);
+        self.generation += 1;
         id
     }
 
@@ -96,6 +105,15 @@ impl HyperlinkRegistry {
     /// Tag cell `(row, col)` with hyperlink `id`. The cell's HYPERLINK flag
     /// is set separately by the vt parser when writing the cell.
     pub fn link_cell(&mut self, row: usize, col: usize, id: u32) {
+        // v1.19.3 verification fix: cell-map mutations deliberately do NOT
+        // bump `generation`. The map is viewport-relative index state —
+        // vt/screen_exit/scroll.rs clears it on every scroll, the print path
+        // unlinks/relinks per character — while slot resolution reads the
+        // append-only `urls` table, so map churn never changes what any slot
+        // resolves to. Tracking it here would make the region advance tier
+        // unreachable for link-bearing viewports (the regression the v1.19.2
+        // scroll-advance test caught). The same-id relink — tmux repaints the
+        // same URL every frame — stays a plain idempotent overwrite.
         self.cell_map.insert((row, col), id);
     }
 
@@ -110,11 +128,14 @@ impl HyperlinkRegistry {
         if self.cell_map.is_empty() {
             return;
         }
+        // No generation bump — see `link_cell` (index churn, not
+        // resolution-affecting state).
         self.cell_map.remove(&(row, col));
     }
 
     /// Remove every viewport-relative hyperlink mapping on one row.
     pub fn unlink_row(&mut self, row: usize) {
+        // No generation bump — see `link_cell`.
         self.cell_map
             .retain(|&(mapped_row, _), _| mapped_row != row);
     }
@@ -129,6 +150,11 @@ impl HyperlinkRegistry {
     /// resizes, or is cleared — the URL→id table is preserved so future
     /// prints of the same URL reuse the existing id (cheap dedup).
     pub fn clear_cell_map(&mut self) {
+        if self.cell_map.is_empty() {
+            return;
+        }
+        // No generation bump — see `link_cell`. scroll.rs calls this on
+        // every scroll; tracking it would kill the advance tier.
         self.cell_map.clear();
     }
 
@@ -143,6 +169,18 @@ impl HyperlinkRegistry {
     /// Number of currently tagged cells (for diagnostics / tests).
     pub fn tagged_cell_count(&self) -> usize {
         self.cell_map.len()
+    }
+
+    /// v1.19.3 (PLAN_v1193 WP3): the URL table's version. The `urls` map is
+    /// the only registry state that affects slot resolution (it is
+    /// append-only; `register` of a genuinely new URL is the sole bump), so
+    /// an equal generation guarantees equal resolution. The `cell_map` is
+    /// viewport-relative index state churned by scroll/print mechanics
+    /// (vt/screen_exit/scroll.rs clears it on every scroll) and is guarded
+    /// by the grid revision instead — see `link_cell`. Consumers compare
+    /// snapshots; they never diff contents.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -206,5 +244,51 @@ mod tests {
         // URL persists — registering again returns the same id.
         let id2 = r.register("u".into());
         assert_eq!(id, id2);
+    }
+
+    // ── v1.19.3 (PLAN_v1193 WP3): generation invariant ──────────────────
+
+    #[test]
+    fn register_bumps_generation_only_on_new_id() {
+        let mut r = HyperlinkRegistry::new();
+        assert_eq!(r.generation(), 0);
+        r.register("https://weft.dev".into());
+        assert_eq!(r.generation(), 1, "a new URL id must bump");
+        r.register("https://weft.dev".into());
+        assert_eq!(r.generation(), 1, "a dedup re-register must not bump");
+        let long = "x".repeat(MAX_HYPERLINK_URL_LEN + 1);
+        r.register(long);
+        assert_eq!(r.generation(), 1, "a rejected URL must not bump");
+        r.register("https://other.dev".into());
+        assert_eq!(r.generation(), 2);
+    }
+
+    #[test]
+    fn cell_map_mutations_do_not_bump_generation() {
+        // v1.19.3 verification fix: only URL-table growth bumps. The cell
+        // map is viewport-relative index state (vt/screen_exit/scroll.rs
+        // clears it on every scroll) and never changes what slots resolve
+        // to, so none of its mutations may drift the sync key.
+        let mut r = HyperlinkRegistry::new();
+        let id = r.register("u".into());
+        assert_eq!(r.generation(), 1, "the new-URL register bumps");
+        r.link_cell(0, 0, id);
+        r.link_cell(0, 0, id);
+        assert_eq!(r.generation(), 1, "relinks do not bump");
+        let other = r.register("v".into());
+        assert_eq!(r.generation(), 2, "a second new URL bumps");
+        r.link_cell(0, 0, other);
+        r.unlink_cell(0, 0);
+        r.unlink_cell(5, 5);
+        r.link_cell(3, 0, id);
+        r.unlink_row(3);
+        r.unlink_row(9);
+        r.clear_cell_map();
+        r.clear_cell_map();
+        assert_eq!(
+            r.generation(),
+            2,
+            "index churn (link/unlink/row-clear/map-clear) never bumps"
+        );
     }
 }

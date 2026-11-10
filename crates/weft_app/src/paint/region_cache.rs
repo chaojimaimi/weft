@@ -39,6 +39,9 @@ pub(crate) struct RegionSource<'g> {
     /// v1.19.2 (WP3-A): the terminal's OSC-8 registry, threaded into the
     /// `logical_lines` calls so synced slots carry resolved `LinkSpan`s.
     pub(crate) hyperlinks: &'g HyperlinkRegistry,
+    /// v1.19.3 (WP3-B): the registry's mutation generation at build time —
+    /// a sync fast-tier key so registry drift alone forces a wholesale.
+    pub(crate) registry_generation: u64,
 }
 
 /// One logical row of the region snapshot. `start_idx`/`end_idx` delimit the
@@ -60,6 +63,9 @@ pub(crate) struct RegionSlot {
 pub(crate) struct PaneRegionState {
     pub(crate) begin_position: u64,
     pub(crate) grid_revision: u64,
+    /// v1.19.3 (WP3-B): OSC-8 registry generation this snapshot was built
+    /// from (part of every sync fast-tier key).
+    pub(crate) registry_generation: u64,
     pub(crate) cols: usize,
     /// First physical row NOT covered by `slots` (document-index domain),
     /// always positioned on a logical-row boundary (its row does not extend
@@ -147,10 +153,11 @@ impl Default for RegionLiveCache {
 
 impl RegionLiveCache {
     /// Bring the pane's snapshot up to date with `source` at chunk width
-    /// `cols`. Hit: `(revision, begin, cols)` unchanged (D7). Mutating only
-    /// the revision transfers newly scrolled-in scrollback rows into
-    /// `slots` (D8 append) and re-reads the viewport tail; mutating `cols`
-    /// only re-chunks the cached texts; mutating `begin` rebuilds wholesale.
+    /// `cols`. Hit: `(revision, begin, cols, registry_generation)` unchanged
+    /// (D7). Mutating only the revision transfers newly scrolled-in scrollback
+    /// rows into `slots` (D8 append) and re-reads the viewport tail; mutating
+    /// `cols` only re-chunks the cached texts; registry drift falls through
+    /// every tier to the wholesale rebuild; mutating `begin` rebuilds wholesale.
     pub(crate) fn sync(&self, pane_session_id: u64, source: &RegionSource, cols: usize) {
         let revision = source.grid.revision;
         let mut map = self.panes.borrow_mut();
@@ -158,11 +165,14 @@ impl RegionLiveCache {
             st.begin_position == source.begin_position
                 && st.grid_revision == revision
                 && st.cols == cols
+                && st.registry_generation == source.registry_generation
         }) {
             return; // D7 hit.
         }
         if map.get(&pane_session_id).is_some_and(|st| {
-            st.begin_position == source.begin_position && st.grid_revision == revision
+            st.begin_position == source.begin_position
+                && st.grid_revision == revision
+                && st.registry_generation == source.registry_generation
         }) {
             // cols-only change: re-chunk cached texts, no grid re-read.
             let st = map.get_mut(&pane_session_id).unwrap();
@@ -170,10 +180,11 @@ impl RegionLiveCache {
             rebuild_cumulative(st);
             return;
         }
-        if map
-            .get(&pane_session_id)
-            .is_some_and(|st| st.begin_position == source.begin_position && st.cols == cols)
-        {
+        if map.get(&pane_session_id).is_some_and(|st| {
+            st.begin_position == source.begin_position
+                && st.cols == cols
+                && st.registry_generation == source.registry_generation
+        }) {
             let st = map.get_mut(&pane_session_id).unwrap();
             if advance_anchor(st, source.grid, source.head, source.hyperlinks) {
                 // Persist the revision or the D7 hit tier above becomes
@@ -191,6 +202,7 @@ impl RegionLiveCache {
         let mut st = PaneRegionState {
             begin_position: source.begin_position,
             grid_revision: revision,
+            registry_generation: source.registry_generation,
             cols,
             anchor_idx: source.grid.scrollback.index_since(source.begin_position) as u64,
             anchor_position: source.begin_position,
@@ -239,8 +251,8 @@ impl RegionLiveCache {
 
 /// D4 head: bottom-up first non-empty viewport row's document index + 1; an
 /// all-empty viewport collapses the region to the scrollback prefix. Empty
-/// means "no non-space cell" (matches the core reference's
-/// `trim_end().is_empty()` discriminator).
+/// means "no non-whitespace cell" — `char::is_whitespace`, the same Unicode
+/// White_Space set the core reference's `trim_end().is_empty()` trims.
 pub(crate) fn region_head(grid: &Grid) -> u64 {
     let sb_len = grid.scrollback.len() as u64;
     (0..grid.num_rows)
@@ -248,7 +260,7 @@ pub(crate) fn region_head(grid: &Grid) -> u64 {
         .find(|&row| {
             grid.viewport
                 .get(row)
-                .is_some_and(|r| r.cells.iter().any(|c| c.character != ' '))
+                .is_some_and(|r| r.cells.iter().any(|c| !c.character.is_whitespace()))
         })
         .map_or(sb_len, |row| sb_len + row as u64 + 1)
 }
@@ -354,6 +366,7 @@ pub(crate) fn region_source_for<'a>(
         begin_position,
         head: region_head(grid),
         hyperlinks: terminal.hyperlinks(),
+        registry_generation: terminal.hyperlinks().generation(),
     })
 }
 

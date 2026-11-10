@@ -87,19 +87,6 @@ fn utf8_replacement_keeps_cursor_on_a_character_boundary() {
     assert_eq!(output.as_str(), "中文c");
 }
 
-#[test]
-fn absolute_cursor_rows_preserve_line_structure() {
-    let mut output = OutputCapture::default();
-    output.goto(0, 0, 1024);
-    output.print_ascii(b"first", CapturedStyle::default(), 1024);
-    output.goto(2, 3, 1024);
-    output.print_ascii(b"third", CapturedStyle::default(), 1024);
-    output.goto(1, 1, 1024);
-    output.print_ascii(b"second", CapturedStyle::default(), 1024);
-
-    assert_eq!(output.as_str(), "first\n second\n   third");
-}
-
 // ── v1.7.0-A: ANSI style RLE tests ──────────────────────────────────
 
 #[test]

@@ -56,6 +56,7 @@ fn state(slots: Vec<RegionSlot>, dyn_slots: Vec<RegionSlot>, cols: usize) -> Pan
     PaneRegionState {
         begin_position: 0,
         grid_revision: 0,
+        registry_generation: 0,
         cols,
         anchor_idx: slots.last().map_or(0, |s| s.end_idx),
         anchor_position: 0,
