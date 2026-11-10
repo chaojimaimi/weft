@@ -596,6 +596,29 @@ impl App {
             );
         let terminal = self.sessions.active().and_then(|tab| tab.lock_terminal())?;
         let tracker = terminal.block_tracker();
+        // v1.19.2 (PLAN_v1192 §3 WP3-B): on the region track (flag ON + a
+        // `133;B` begin anchor — exactly when `compute_block_view_rows` above
+        // synced this pane's RegionLiveCache snapshot), a live row's `line`
+        // is the P1-6 display-domain logical row, NOT a capture-stream index,
+        // so `in_flight().styled_output.line()` would hit the wrong line.
+        // Resolve through the synced snapshot instead; flag OFF / no snapshot
+        // (capture track) keeps the capture-domain path below untouched.
+        // Borrow order is the pinned contract: the region sync already ran
+        // inside `compute_block_view_rows` (block_view/rows.rs) and its Ref
+        // was dropped on return, so this `state()` borrow cannot race a sync.
+        // Invariant: begin anchor and in_flight share a lifetime (set together
+        // on 133;A, cleared together on finalize), so a live row here always
+        // resolves through the cached state; if that coupling ever decouples,
+        // gate this branch on the region source too.
+        let region_state = if row.block_id.is_none() && terminal.is_live_block_grid_render() {
+            self.renderer.as_ref().and_then(|renderer| {
+                self.sessions
+                    .active()
+                    .and_then(|tab| renderer.region_live_cache.state(tab.pane_session_id))
+            })
+        } else {
+            None
+        };
         // Resolve the StyledLine from either a finalized block or the live
         // in-flight block (block_id is None for live rows).
         let styled_line = if let Some(block_id) = row.block_id {
@@ -608,8 +631,29 @@ impl App {
                 .find(|b| b.id == block_id)
                 .and_then(|b| b.styled_output.as_deref())
                 .and_then(|s| s.line(line_idx))
+        } else if let Some(state) = region_state.as_ref() {
+            // Region-track live row: display row k ↔ slot `first + k`
+            // (region_rows.rs stamps `line: k` over the P1-6 display range,
+            // which drops leading/trailing blank slots).
+            let slot_at = |i: usize| {
+                if i < state.slots.len() {
+                    state.slots.get(i)
+                } else {
+                    state.dyn_slots.get(i - state.slots.len())
+                }
+            };
+            let total = state.slots.len() + state.dyn_slots.len();
+            let (first, last) = crate::paint::region_cache::region_display_range(total, |i| {
+                slot_at(i).map_or(true, |slot| slot.text.is_empty())
+            });
+            let slot_idx = first + line_idx;
+            (slot_idx < last)
+                .then(|| slot_at(slot_idx))
+                .flatten()
+                .map(|slot| &slot.style)
         } else {
-            // Live in-flight block: styled_output is on InFlightBlock.
+            // Live in-flight block (capture track): styled_output is on
+            // InFlightBlock.
             tracker
                 .in_flight()
                 .and_then(|live| live.styled_output)

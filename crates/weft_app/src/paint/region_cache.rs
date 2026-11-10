@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use weft_core::blocks::StyledLine;
 use weft_core::grid::region::{logical_lines, GridRegionSource};
 use weft_core::grid::Grid;
+use weft_core::hyperlink::HyperlinkRegistry;
 use weft_core::vt::Terminal;
 
 use crate::paint::grid_cache::MAX_LAYOUT_LINES_LIVE;
@@ -35,6 +36,9 @@ pub(crate) struct RegionSource<'g> {
     pub(crate) grid: &'g Grid,
     pub(crate) begin_position: u64,
     pub(crate) head: u64,
+    /// v1.19.2 (WP3-A): the terminal's OSC-8 registry, threaded into the
+    /// `logical_lines` calls so synced slots carry resolved `LinkSpan`s.
+    pub(crate) hyperlinks: &'g HyperlinkRegistry,
 }
 
 /// One logical row of the region snapshot. `start_idx`/`end_idx` delimit the
@@ -171,12 +175,12 @@ impl RegionLiveCache {
             .is_some_and(|st| st.begin_position == source.begin_position && st.cols == cols)
         {
             let st = map.get_mut(&pane_session_id).unwrap();
-            if advance_anchor(st, source.grid, source.head) {
+            if advance_anchor(st, source.grid, source.head, source.hyperlinks) {
                 // Persist the revision or the D7 hit tier above becomes
                 // unreachable: every subsequent idle frame would rescan the
                 // anchor and re-decode the viewport (review N1).
                 st.grid_revision = revision;
-                rebuild_dyn(st, source.grid, source.head);
+                rebuild_dyn(st, source.grid, source.head, source.hyperlinks);
                 #[cfg(test)]
                 self.advances.set(self.advances.get() + 1);
                 return;
@@ -198,7 +202,7 @@ impl RegionLiveCache {
         // the per-frame logical_lines calls start exactly at the anchor row
         // even when `begin_position` predates the scrollback window.
         st.anchor_position = position_of(source.grid, st.anchor_idx);
-        if advance_anchor(&mut st, source.grid, source.head) {
+        if advance_anchor(&mut st, source.grid, source.head, source.hyperlinks) {
             #[cfg(test)]
             self.advances.set(self.advances.get() + 1);
         } else {
@@ -210,7 +214,7 @@ impl RegionLiveCache {
             st.anchor_idx = source.grid.scrollback.index_since(source.begin_position) as u64;
             st.anchor_position = position_of(source.grid, st.anchor_idx);
         }
-        rebuild_dyn(&mut st, source.grid, source.head);
+        rebuild_dyn(&mut st, source.grid, source.head, source.hyperlinks);
         rebuild_cumulative(&mut st);
         map.insert(pane_session_id, st);
         #[cfg(test)]
@@ -256,22 +260,6 @@ pub(crate) fn document_index_of_cursor(grid: &Grid, cursor_row: usize) -> u64 {
     grid.scrollback.len() as u64 + cursor_row as u64
 }
 
-/// D6 logical-row lookup: the region row that owns the cursor's physical
-/// row (mid-wrap-chain rows resolve to their owning logical row). `slots`
-/// is the P1-6-dropped display sequence so the returned index matches the
-/// assembled `LaidRow::Output::line` domain.
-/// (Test-only: production uses `PaneRegionState::display_logical_row_of_cursor`,
-/// which layers the P1-6 display domain on top of this bare lookup.)
-#[cfg(test)]
-pub(crate) fn region_logical_row_of_cursor(
-    slots: &[RegionSlot],
-    cursor_doc_idx: u64,
-) -> Option<usize> {
-    slots
-        .iter()
-        .position(|slot| slot.start_idx <= cursor_doc_idx && cursor_doc_idx < slot.end_idx)
-}
-
 /// P1-6 shared boundary: `(first, last)` (half-open) of the non-blank core
 /// of a logical-row sequence — leading/trailing blank rows dropped. The
 /// assembly consumes slots through this range so the caret mapping and the
@@ -282,15 +270,6 @@ pub(crate) fn region_display_range(len: usize, is_blank: impl Fn(usize) -> bool)
         .rposition(|i| !is_blank(i))
         .map_or(first, |rel| first + rel + 1);
     (first, last)
-}
-
-/// P1-6: drop leading/trailing blank logical rows at assembly time (the core
-/// region keeps them so the D8 append boundary stays stable).
-/// (Test-only: production slices through `region_display_range` directly.)
-#[cfg(test)]
-pub(crate) fn region_display_slots(slots: &[RegionSlot]) -> &[RegionSlot] {
-    let (first, last) = region_display_range(slots.len(), |i| slots[i].text.is_empty());
-    &slots[first..last]
 }
 
 /// P1-4/O2 (zoom fingerprint): the `live_output_version` component's value
@@ -320,6 +299,30 @@ pub(crate) fn region_display_chunk_total(state: &PaneRegionState, cols: usize) -
         }
     };
     let (first, last) = region_display_range(total_slots, |i| slot_at(i).text.is_empty());
+    // v1.19.2 (PLAN_v1192 §2) fast path: slots contribute through the
+    // maintained `cumulative` prefix sums (O(1) each side) and only the
+    // viewport tail (`dyn_slots`, viewport-bounded) counts row by row. The
+    // guard is exactly the invariant that makes the table authoritative:
+    // same `cols` (the prefix sums are cols-keyed), table covering every
+    // slot, and a non-empty display core. ANY miss — including the all-blank
+    // boundary (`first == last == total_slots`, review B1: the original loop
+    // returns the whole chunk sum there) — routes to the full scan below;
+    // no silent side-picking. NR-1: when `last` crosses the slots/dyn
+    // boundary the slots term clamps to `cumulative[slots.len()]` and dyn
+    // rows count individually.
+    if cols == state.cols && state.cumulative.len() == state.slots.len() + 1 && first < last {
+        // Both ends clamp to the table (NR-1) then scan the dyn tail:
+        // leading dyn blanks carry one chunk each (WP4 session-test catch).
+        let mut cum_last = state.cumulative[last.min(state.slots.len())];
+        for i in state.slots.len()..last {
+            cum_last += count_line_chunks(&slot_at(i).text, cols);
+        }
+        let mut cum_first = state.cumulative[first.min(state.slots.len())];
+        for i in state.slots.len()..first {
+            cum_first += count_line_chunks(&slot_at(i).text, cols);
+        }
+        return cum_last.saturating_sub(cum_first);
+    }
     let mut acc: u32 = 0;
     let mut cum_first = 0u32;
     let mut cum_last = 0u32;
@@ -350,6 +353,7 @@ pub(crate) fn region_source_for<'a>(
         grid,
         begin_position,
         head: region_head(grid),
+        hyperlinks: terminal.hyperlinks(),
     })
 }
 
@@ -407,7 +411,12 @@ fn scan_logical_ranges(grid: &Grid, start_idx: u64, end_idx: u64) -> (Vec<(u64, 
 /// scrollback (immutable domain) from the per-frame tail into `slots`.
 /// `anchor_idx` only advances onto logical-row boundaries, so `slots` and
 /// the rebuilt `dyn_slots` keep tiling the region seamlessly.
-fn advance_anchor(state: &mut PaneRegionState, grid: &Grid, head: u64) -> bool {
+fn advance_anchor(
+    state: &mut PaneRegionState,
+    grid: &Grid,
+    head: u64,
+    hyperlinks: &HyperlinkRegistry,
+) -> bool {
     let sb_len = grid.scrollback.len() as u64;
     let limit = head.min(sb_len);
     if limit <= state.anchor_idx {
@@ -434,7 +443,9 @@ fn advance_anchor(state: &mut PaneRegionState, grid: &Grid, head: u64) -> bool {
             begin_position: state.anchor_position,
             head: Some(end_doc),
         },
-        |_| None,
+        // WP3-A: real resolver — slot styles carry resolved URLs. It only
+        // feeds `style_runs.links`; row splitting/counting stays wrapped-only.
+        |id| hyperlinks.url(id).map(std::sync::Arc::<str>::from),
     );
     if lines.len() != transferable.len() {
         return false;
@@ -461,7 +472,12 @@ fn advance_anchor(state: &mut PaneRegionState, grid: &Grid, head: u64) -> bool {
 
 /// Re-read the viewport tail `[anchor_idx, head)` (D8: every mutation, the
 /// viewport segment is re-taken wholesale).
-fn rebuild_dyn(state: &mut PaneRegionState, grid: &Grid, head: u64) {
+fn rebuild_dyn(
+    state: &mut PaneRegionState,
+    grid: &Grid,
+    head: u64,
+    hyperlinks: &HyperlinkRegistry,
+) {
     state.dyn_slots.clear();
     if head <= state.anchor_idx {
         return;
@@ -476,7 +492,8 @@ fn rebuild_dyn(state: &mut PaneRegionState, grid: &Grid, head: u64) {
             begin_position: state.anchor_position,
             head: Some(head),
         },
-        |_| None,
+        // WP3-A: real resolver (see advance_anchor).
+        |id| hyperlinks.url(id).map(std::sync::Arc::<str>::from),
     );
     if lines.len() != ranges.len() {
         return;

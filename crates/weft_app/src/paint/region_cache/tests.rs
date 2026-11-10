@@ -11,10 +11,36 @@ use weft_core::blocks::StyledLine;
 use weft_core::vt::Terminal;
 
 use super::{
-    document_index_of_cursor, live_output_version_source, region_display_range,
-    region_display_slots, region_head, region_logical_row_of_cursor, region_source_for, trim_cap,
-    PaneRegionState, RegionLiveCache, RegionSlot,
+    document_index_of_cursor, live_output_version_source, region_display_range, region_head,
+    region_source_for, trim_cap, PaneRegionState, RegionLiveCache, RegionSlot,
 };
+
+// ── test-only helpers (moved here v1.19.2, PLAN_v1192 task 0) ───────────
+
+/// D6 logical-row lookup: the region row that owns the cursor's physical
+/// row (mid-wrap-chain rows resolve to their owning logical row). `slots`
+/// is the P1-6-dropped display sequence so the returned index matches the
+/// assembled `LaidRow::Output::line` domain.
+/// (Test-only: production uses `PaneRegionState::display_logical_row_of_cursor`,
+/// which layers the P1-6 display domain on top of this bare lookup.)
+#[cfg(test)]
+pub(crate) fn region_logical_row_of_cursor(
+    slots: &[RegionSlot],
+    cursor_doc_idx: u64,
+) -> Option<usize> {
+    slots
+        .iter()
+        .position(|slot| slot.start_idx <= cursor_doc_idx && cursor_doc_idx < slot.end_idx)
+}
+
+/// P1-6: drop leading/trailing blank logical rows at assembly time (the core
+/// region keeps them so the D8 append boundary stays stable).
+/// (Test-only: production slices through `region_display_range` directly.)
+#[cfg(test)]
+pub(crate) fn region_display_slots(slots: &[RegionSlot]) -> &[RegionSlot] {
+    let (first, last) = region_display_range(slots.len(), |i| slots[i].text.is_empty());
+    &slots[first..last]
+}
 
 // ── fixtures ────────────────────────────────────────────────────────────
 
@@ -491,4 +517,61 @@ fn empty_region_syncs_to_an_empty_snapshot() {
     let st = snapshot(&cache, &t, 1);
     assert_eq!(texts(&st), Vec::<String>::new());
     assert_eq!(st.slots.len() + st.dyn_slots.len(), 0);
+}
+
+// ── v1.19.2 WP3-A (PLAN_v1192 §3): hyperlink resolver ──────────────────
+
+#[test]
+fn hyperlinks_resolve_into_slot_styles_on_both_sync_tiers() {
+    // `RegionSource.hyperlinks` threads the terminal's real OSC-8 registry
+    // into `logical_lines`, so synced slots carry resolved LinkSpans in
+    // `style` — on the wholesale rebuild tier AND on the D8 advance tier
+    // (byte-style precedent: vt/tests.rs
+    // osc8_link_at_block_capture_resolves_url).
+    let mut t = live_terminal(2, 40, &[]);
+    t.process(b"\x1b]8;;https://weft.dev/region\x1b\\anchor\x1b]8;;\x1b\\\r\n");
+
+    // Wholesale tier: the first sync rebuilds from scratch; the linked row
+    // (the only non-blank one) lands in the viewport tail as a dyn slot.
+    let cache = RegionLiveCache::default();
+    {
+        let st = snapshot(&cache, &t, 1);
+        assert_eq!(cache.rebuilds(), 1);
+        let linked = st
+            .dyn_slots
+            .first()
+            .expect("the linked row lives in the viewport tail");
+        assert_eq!(linked.text, "anchor");
+        let link = linked
+            .style
+            .links
+            .first()
+            .expect("the real resolver must fill the slot's style links");
+        assert_eq!(link.url, "https://weft.dev/region");
+        assert_eq!((link.start, link.end), (0, 6));
+    }
+
+    // Advance tier: scroll the linked row into the scrollback; the next
+    // sync must transfer it into `slots` with its links intact and still
+    // not rebuild (drop the Ref first — borrow contract).
+    t.process(b"\r\nfiller\r\nmore");
+    let st = snapshot(&cache, &t, 1);
+    assert_eq!(
+        cache.rebuilds(),
+        1,
+        "the scroll sync must advance, not rebuild"
+    );
+    assert_eq!(cache.advances(), 2, "wholesale + one advance");
+    let linked = st
+        .slots
+        .first()
+        .expect("the linked row scrolled into slots");
+    assert_eq!(linked.text, "anchor");
+    let link = linked
+        .style
+        .links
+        .first()
+        .expect("the advance tier keeps resolved links");
+    assert_eq!(link.url, "https://weft.dev/region");
+    assert_eq!((link.start, link.end), (0, 6));
 }

@@ -5998,3 +5998,157 @@ fn sudo_su_cub_edit_grid_region_caret_anchor() {
         "region lost the inline-edit tail"
     );
 }
+
+// ── v1.19.2 WP3-A / WP4 (PLAN_v1192 §3-§4): region-track hyperlinks and
+// finalize equivalence, at the core resolver layer ──────────────────────
+
+/// WP3-A: the region track's resolver layer. The app threads
+/// `Terminal::hyperlinks()` into `logical_lines` (region_cache.rs
+/// `RegionSource.hyperlinks`); at the core boundary the same real resolver
+/// must fill `RegionLine.style_runs.links` with resolved URLs — the
+/// resolver-layer twin of `osc8_link_at_block_capture_resolves_url` (the
+/// click path itself is weft_app-typed and lives in geometry_controller).
+#[test]
+fn region_track_logical_lines_resolve_hyperlink_urls() {
+    let mut t = Terminal::new(3, 40);
+    t.set_live_block_grid_render(true);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07");
+    t.process(b"\x1b]8;;https://weft.dev/region\x1b\\docs\x1b]8;;\x1b\\");
+    let grid = t.grid();
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("133;B samples the begin anchor");
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |id| t.hyperlinks().url(id).map(std::sync::Arc::<str>::from),
+    );
+    assert_eq!(
+        lines.len(),
+        1,
+        "one logical row — the resolver must not re-split"
+    );
+    assert_eq!(lines[0].text, "docs");
+    let link = lines[0]
+        .style_runs
+        .links
+        .first()
+        .expect("the real resolver must fill style_runs.links");
+    assert_eq!(link.url, "https://weft.dev/region");
+    assert_eq!((link.start, link.end), (0, 4));
+    // Negative control: pre-WP3-A call sites passed the `|_| None` stub —
+    // it must leave the very same row link-free.
+    let stubbed = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert!(
+        stubbed[0].style_runs.links.is_empty(),
+        "the stub resolver must leave links empty"
+    );
+}
+
+/// WP4: the finalize switch (in_flight → session_blocks) must not change
+/// the row truth — the tracker migrates cleanly, and the region source's
+/// logical rows agree with the completed block's capture rows (modulo the
+/// prompt-merged oldest row, by design for D6). Plain-core capture keeps no
+/// styled spans (`plain_streaming_keeps_styled_output_none`), so resolved
+/// hyperlink survival across finalize is owned by the region track — pinned
+/// here on the last live frame. The rendered-frame equivalence across the
+/// switch is pinned app-side: region_rows_tests.rs
+/// `region_track_completed_block_session_equivalence`.
+#[test]
+fn region_track_finalize_preserves_completed_rows() {
+    let mut t = Terminal::new(4, 20);
+    t.set_live_block_grid_render(true);
+    t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    // A linked line, an interior blank, and a soft-wrapped line.
+    t.process(b"\x1b]8;;https://weft.dev/finalize\x1b\\linked\x1b]8;;\x1b\\");
+    t.process(b"\r\n\r\n");
+    let wrapped = format!("{}tail\r\n", "w".repeat(24));
+    t.process(wrapped.as_bytes());
+    t.process(b"gamma");
+
+    // Last live frame: region truth over [begin, head) with the real
+    // resolver — same [begin, head) recipe as
+    // sudo_su_cub_edit_grid_region_caret_anchor.
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("133;B samples the begin anchor");
+    let region_texts = {
+        let grid = t.grid();
+        let sb_len = grid.scrollback.len();
+        let head = (0..grid.num_rows)
+            .rev()
+            .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+            .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+        crate::grid::region::logical_lines(
+            grid,
+            crate::grid::region::GridRegionSource {
+                begin_position: begin,
+                head: Some(head),
+            },
+            |id| t.hyperlinks().url(id).map(std::sync::Arc::<str>::from),
+        )
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+    };
+    assert!(
+        t.block_tracker().in_flight().is_some(),
+        "the live block is in flight before finalize"
+    );
+
+    // Finalize: 133;D retires the in-flight block into session_blocks.
+    t.process(b"\x1b]133;D;0\x07");
+    let tracker = t.block_tracker();
+    assert!(
+        tracker.in_flight().is_none(),
+        "finalize retires the live block"
+    );
+    let blocks = tracker.session_blocks();
+    assert_eq!(
+        blocks.len(),
+        1,
+        "the finished block moved to session_blocks"
+    );
+    let output_lines = blocks[0]
+        .output
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        region_texts,
+        vec![
+            "$ linked".to_string(),
+            String::new(),
+            format!("{}tail", "w".repeat(24)),
+            "gamma".to_string(),
+        ],
+        "region truth: prompt-merged first row, interior blank, merged wrap, gamma"
+    );
+    assert_eq!(output_lines[0], "linked", "capture starts at 133;B");
+    assert_eq!(
+        region_texts[1..],
+        output_lines[1..],
+        "capture truth = region truth minus the prompt-merged oldest row"
+    );
+    assert!(
+        blocks[0].styled_output.is_none(),
+        "plain-core capture keeps no styled spans; link survival is the region track's job"
+    );
+}
