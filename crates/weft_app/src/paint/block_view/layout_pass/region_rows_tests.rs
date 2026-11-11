@@ -485,9 +485,11 @@ fn region_track_rows_match_capture_track_rows() {
     // The tracks assemble the same rows EXCEPT the oldest one: the 133;B
     // in-flight line (the prompt "$ ") commits together with the first
     // output line, so the region's oldest row is "$ alpha" while the
-    // capture track — which starts AT B — records "alpha". By design: the
-    // command line belongs to the live view so the D6 caret can anchor to
-    // it (see vt::sudo_su_cub_edit_grid_region_caret_anchor).
+    // capture track — which starts AT B — records "alpha". This fixture's
+    // `133;B` arrives while the cursor still sits ON the prompt line (no
+    // newline before preexec), so v1.20.2's cursor-row anchor legitimately
+    // includes it; real shells emit the newline first and the two tracks
+    // align exactly (see vt::sudo_su_echo_line_excluded_from_grid_region).
     assert_eq!(
         region_rows,
         vec![

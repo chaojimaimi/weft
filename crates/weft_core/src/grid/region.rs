@@ -40,10 +40,12 @@ use std::sync::Arc;
 /// document. Stateless: every read re-derives the row range from the grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridRegionSource {
-    /// Scrollback `position()` sampled at `133;B` *plus the command line's
-    /// viewport row* — the command line's future insert position (v1.20.1;
-    /// the bare `position()` sample anchored fresh panes at the top of the
-    /// pane history). See `BlockTracker::region_begin_position`.
+    /// Scrollback `position()` sampled at `133;B` *plus the cursor's
+    /// viewport row* — the insert position of the row where post-marker
+    /// bytes land (v1.20.2; v1.20.1 anchored at the command line's row,
+    /// which pulled the PTY echo of the command into the region, and the
+    /// bare `position()` sample before that anchored fresh panes at the
+    /// top of the pane history). See `BlockTracker::region_begin_position`.
     pub begin_position: u64,
     /// Exclusive end as a unified document index. `None` extends to the
     /// document tail (extension slot; v1.19.0 always passes `Some`).
@@ -74,8 +76,8 @@ where
     F: Fn(u32) -> Option<Arc<str>>,
 {
     // Anchor beyond the document's future: `position() + num_rows - 1` is
-    // the largest legitimate anchor (the command line's future position at
-    // the viewport's bottom row), so anything at or past
+    // the largest legitimate anchor (the `133;B` cursor row at the
+    // viewport's bottom row), so anything at or past
     // `position() + num_rows` is stale (cleared-and-recreated buffer) —
     // empty region, never a clamp (D4; v1.20.1 admits in-viewport anchors).
     if source.begin_position

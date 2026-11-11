@@ -194,10 +194,14 @@ impl BlockTracker {
     /// screen-owned blocks — those keep `screen_document_start` as their
     /// anchor (`begin_screen_owned_output` precedent).
     ///
-    /// v1.20.1 fix: the caller passes the document position of the command
-    /// line itself (committed rows + the command line's viewport row), not
-    /// bare scrollback.position() — which stays 0 until the session's first
-    /// scroll and anchored every fresh-pane block at the top of the history.
+    /// v1.20.1 fix: the caller adds a viewport row to bare
+    /// scrollback.position() — which stays 0 until the session's first
+    /// scroll and anchored every fresh-pane block at the top of the history
+    /// (v1.20.1 specifically passed `position() + region_begin_viewport_row()`,
+    /// the command line found by walking up from the cursor).
+    /// v1.20.2 fix: the anchor is the cursor row itself (where post-marker
+    /// bytes land), so the command line and its PTY echo stay outside the
+    /// region and the live block shows the command only once.
     pub fn note_command_begin_position(&mut self, position: u64) {
         if self.command_begin_position.is_none() && self.screen_document_start.is_none() {
             self.command_begin_position = Some(position);

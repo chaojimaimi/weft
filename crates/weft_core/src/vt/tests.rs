@@ -5896,7 +5896,13 @@ fn sudo_su_inline_edit_grid_region_display_keeps_tail() {
     t.process(b"\x1b]133;A\x07");
     t.process(b"sudo su\r\n");
     t.process(b"\x1b]133;B\x07"); // CommandExecuting — region anchor sampled here
-    let begin = t.grid().scrollback.position();
+                                  // v1.20.2: the anchor is the cursor row at 133;B (the row below the
+                                  // committed "sudo su" line), so the command line stays outside the
+                                  // region and the edit tail is the region's oldest row.
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("133;B samples the begin anchor");
     t.process(b"\x1b[?1034hsh-3.2$ ls -al | grep \"\"");
     for _ in 0..8 {
         t.process(b"\x1b[D"); // ← — CUB 1
@@ -5953,7 +5959,12 @@ fn sudo_su_cub_edit_grid_region_caret_anchor() {
     t.process(b"\x1b]133;A\x07");
     t.process(b"sudo su\r\n");
     t.process(b"\x1b]133;B\x07");
-    let begin = t.grid().scrollback.position();
+    // v1.20.2: feed the sampled anchor (cursor row at 133;B) — the formula
+    // below is what the production caret path evaluates against.
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("133;B samples the begin anchor");
     t.process(b"\x1b[?1034hsh-3.2$ ls -al | grep \"\"");
     for _ in 0..8 {
         t.process(b"\x1b[D");
@@ -5999,17 +6010,22 @@ fn sudo_su_cub_edit_grid_region_caret_anchor() {
     );
 }
 
-// ── v1.20.1: the region begin anchor must land on the command line ───────
+// ── v1.20.1/v1.20.2: the region begin anchor and the live-block command ──
 
 /// v1.20.1 regression (user report: the `sudo su` live block repeated the
 /// whole pane history while earlier blocks stayed intact). v1.19.0 sampled
 /// the bare `scrollback.position()` at `133;B`, which stays 0 until the
 /// session's first scroll — in a fresh pane every block's live region then
-/// spanned `[0, head)` = the entire visible history. The anchor must be the
-/// command line's *future* position (`position() + its viewport row`), so
-/// the region starts at the command line itself.
+/// spanned `[0, head)` = the entire visible history.
+///
+/// v1.20.2 (user report: the live block repeated the `sudo su` command
+/// line): the anchor is now the cursor row at `133;B` — the point
+/// post-marker bytes are written to — so the command line (committed above
+/// the cursor by the shell's newline before preexec) stays outside the
+/// region and the live block shows the command only once (via the
+/// app-side LiveHeader row).
 #[test]
-fn region_track_begin_anchors_at_command_line_in_fresh_pane() {
+fn region_track_begin_anchors_below_command_line_in_fresh_pane() {
     let mut t = Terminal::new(40, 120);
     t.set_live_block_grid_render(true);
     // Three committed blocks; a 40-row viewport means nothing scrolls.
@@ -6024,14 +6040,15 @@ fn region_track_begin_anchors_at_command_line_in_fresh_pane() {
     t.process(b"\x1b]133;D;0\x07");
     assert_eq!(t.grid().scrollback.position(), 0, "nothing has scrolled");
 
-    // The live `sudo su` block: the anchor must be its command line's
-    // future position, not the top of the pane history.
+    // The live `sudo su` block: the anchor must sit BELOW the command line
+    // (the cursor row at 133;B) — not on it, not at the pane top.
     t.process(b"\x1b]133;A\x07$ sudo su\r\n");
     t.process(b"\x1b]133;B\x07");
     let begin = t
         .block_tracker()
         .region_begin_position()
         .expect("live block must carry a region begin anchor");
+    t.process(b"Password:\r\n");
     let grid = t.grid();
     let cmd_row = (0..grid.num_rows)
         .rev()
@@ -6039,8 +6056,8 @@ fn region_track_begin_anchors_at_command_line_in_fresh_pane() {
         .expect("command line row in viewport");
     assert_eq!(
         begin as usize,
-        grid.scrollback.position() as usize + cmd_row,
-        "anchor = committed rows + command line viewport row"
+        grid.scrollback.position() as usize + cmd_row + 1,
+        "anchor = committed rows + the row below the command line (the 133;B cursor row)"
     );
 
     let sb_len = grid.scrollback.len();
@@ -6058,23 +6075,26 @@ fn region_track_begin_anchors_at_command_line_in_fresh_pane() {
     );
     assert_eq!(
         lines[0].text,
-        "$ sudo su",
-        "region starts at the command line, got {:?}",
+        "Password:",
+        "region starts at the first post-marker row, got {:?}",
         lines.iter().map(|line| &line.text).collect::<Vec<_>>()
     );
     assert!(
-        lines.iter().all(|line| !line.text.contains("cd ~")
+        lines.iter().all(|line| !line.text.contains("sudo su")
+            && !line.text.contains("cd ~")
             && !line.text.contains("ls -l")
             && !line.text.contains("hello")),
-        "region must exclude earlier blocks: {:?}",
+        "region must exclude the command line and earlier blocks: {:?}",
         lines.iter().map(|line| &line.text).collect::<Vec<_>>()
     );
 }
 
 /// v1.20.1 regression, scrolled variant: with committed history in the
-/// scrollback (`position() > 0`) the anchor `position() + viewport_row`
-/// still names the command line — its virtual index is `len + row` and the
-/// region excludes every earlier block.
+/// scrollback (`position() > 0`) the anchor `position() + cursor_row`
+/// still names a stable document position — its virtual index is
+/// `len + row` and the region excludes every earlier block. v1.20.2: the
+/// cursor row at `133;B` sits BELOW the committed command line, so the
+/// region also excludes the command line itself.
 #[test]
 fn region_track_begin_excludes_scrolled_history() {
     let mut t = Terminal::new(6, 80);
@@ -6102,6 +6122,7 @@ fn region_track_begin_excludes_scrolled_history() {
         .block_tracker()
         .region_begin_position()
         .expect("live block must carry a region begin anchor");
+    t.process(b"waiting\r\n");
     let grid = t.grid();
     let cmd_row = (0..grid.num_rows)
         .rev()
@@ -6109,8 +6130,8 @@ fn region_track_begin_excludes_scrolled_history() {
         .expect("command line row in viewport");
     assert_eq!(
         begin,
-        grid.scrollback.position() + cmd_row as u64,
-        "anchor = committed rows + command line viewport row"
+        grid.scrollback.position() + cmd_row as u64 + 1,
+        "anchor = committed rows + the row below the command line (the 133;B cursor row)"
     );
 
     let sb_len = grid.scrollback.len();
@@ -6128,32 +6149,34 @@ fn region_track_begin_excludes_scrolled_history() {
     );
     assert_eq!(
         lines[0].text,
-        "$ sleep 999",
-        "region starts at the command line, got {:?}",
+        "waiting",
+        "region starts at the first post-marker row, got {:?}",
         lines.iter().map(|line| &line.text).collect::<Vec<_>>()
     );
     assert!(
-        lines.iter().all(|line| !line.text.contains("echo one")
+        lines.iter().all(|line| !line.text.contains("sleep 999")
+            && !line.text.contains("echo one")
             && !line.text.contains("echo two")
             && !line.text.contains("echo three")
             && !line.text.contains("echo four")),
-        "region must exclude scrolled-out blocks: {:?}",
+        "region must exclude the command line and scrolled-out blocks: {:?}",
         lines.iter().map(|line| &line.text).collect::<Vec<_>>()
     );
 }
 
-/// v1.20.1: a soft-wrapped command line anchors at its FIRST segment — the
-/// viewport-row walk follows `Row::wrapped` up the chain — so the region's
-/// first logical line is the whole wrapped command.
+/// v1.20.1 pinned that a soft-wrapped command line anchored at its FIRST
+/// segment (the viewport-row walk followed `Row::wrapped` up the chain).
+/// v1.20.2: the anchor is the cursor row at `133;B` — below the whole
+/// wrap chain once the shell's newline landed — so EVERY segment of the
+/// wrapped command stays outside the region.
 #[test]
-fn region_track_begin_walks_wrapped_command_chain() {
+fn region_track_begin_excludes_wrapped_command_chain() {
     let mut t = Terminal::new(20, 40);
     t.set_live_block_grid_render(true);
-    // A committed block first: with position()>0 and first_seg>0 the
-    // anchor assertion discriminates the v1.20.1 sampling
-    // (position + command viewport row) from the pre-fix bare
-    // position() (which would anchor at the viewport top and red both
-    // asserts below).
+    // A committed block first: with position()>0 and chain_bottom>0 the
+    // anchor assertion discriminates the cursor-row sampling from the
+    // pre-fix bare position() (which would anchor at the viewport top
+    // and red both asserts below).
     t.process(b"\x1b]133;A\x07echo ready\r\n");
     t.process(b"\x1b]133;B\x07ready\r\n\x1b]133;D;0\x07");
     // 52 chars > 40 cols: the command line wraps into two physical rows.
@@ -6166,15 +6189,16 @@ fn region_track_begin_walks_wrapped_command_chain() {
         .block_tracker()
         .region_begin_position()
         .expect("live block must carry a region begin anchor");
+    t.process(b"done\r\n");
     let grid = t.grid();
-    let first_seg = (0..grid.num_rows)
+    let chain_bottom = (0..grid.num_rows)
         .rev()
-        .find(|&row| grid.row_text(row).starts_with("$ "))
-        .expect("first wrapped segment row");
+        .find(|&row| grid.row_text(row).contains("aaa"))
+        .expect("last wrapped segment row");
     assert_eq!(
         begin as usize,
-        grid.scrollback.position() as usize + first_seg,
-        "anchor lands on the first wrapped segment"
+        grid.scrollback.position() as usize + chain_bottom + 1,
+        "anchor lands below the whole wrapped command chain (the 133;B cursor row)"
     );
 
     let sb_len = grid.scrollback.len();
@@ -6192,8 +6216,70 @@ fn region_track_begin_walks_wrapped_command_chain() {
     );
     assert_eq!(
         lines[0].text,
-        long_cmd,
-        "wrapped segments merge into one logical line, got {:?}",
+        "done",
+        "region starts at the first post-marker row, got {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().all(|line| !line.text.contains("aaa")),
+        "no wrapped command segment may enter the region: {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+}
+
+/// v1.20.2 (user report): the real `sudo su` byte order — the PTY echoes
+/// the command line BEFORE `133;B` (recorded verbatim from a real root
+/// session, same fixture bytes as
+/// `sudo_su_inline_edit_replay_keeps_tail_in_capture`; note there is no
+/// prompt prefix — the line IS the PTY echo). The echo row sits above the
+/// 133;B cursor, so the region must start at the first post-marker row
+/// ("Password:") and never contain the command text — the live block
+/// shows the command only once, via the app-side LiveHeader row.
+#[test]
+fn sudo_su_echo_line_excluded_from_grid_region() {
+    let mut t = Terminal::new(40, 120);
+    t.set_live_block_grid_render(true);
+    t.process(b"\x1b]133;A\x07");
+    t.process(b"sudo su\r\n"); // PTY ONLCR echo of the command line
+    t.process(b"\x1b]133;B\x07");
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("live block must carry a region begin anchor");
+    t.process(b"Password:\r\n");
+    let grid = t.grid();
+    let echo_row = (0..grid.num_rows)
+        .rev()
+        .find(|&row| grid.row_text(row).contains("sudo su"))
+        .expect("echo row in viewport");
+    assert_eq!(
+        begin as usize,
+        grid.scrollback.position() as usize + echo_row + 1,
+        "anchor = the row below the echoed command line"
+    );
+
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert_eq!(
+        lines[0].text,
+        "Password:",
+        "region starts at the first post-marker row, got {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().all(|line| !line.text.contains("sudo su")),
+        "the echoed command line must stay outside the region: {:?}",
         lines.iter().map(|line| &line.text).collect::<Vec<_>>()
     );
 }
@@ -6263,7 +6349,10 @@ fn region_track_logical_lines_resolve_hyperlink_urls() {
 /// WP4: the finalize switch (in_flight → session_blocks) must not change
 /// the row truth — the tracker migrates cleanly, and the region source's
 /// logical rows agree with the completed block's capture rows (modulo the
-/// prompt-merged oldest row, by design for D6). Plain-core capture keeps no
+/// prompt-merged oldest row: this fixture's `133;B` arrives while the
+/// cursor still sits ON the prompt line — no newline before preexec — so
+/// v1.20.2's cursor-row anchor legitimately includes it; real shells emit
+/// the newline first and the two tracks align exactly). Plain-core capture keeps no
 /// styled spans (`plain_streaming_keeps_styled_output_none`), so resolved
 /// hyperlink survival across finalize is owned by the region track — pinned
 /// here on the last live frame. The rendered-frame equivalence across the
