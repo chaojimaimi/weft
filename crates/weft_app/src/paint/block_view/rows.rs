@@ -8,6 +8,15 @@ use weft_core::selection::{BlockViewRow, BlockViewRowKind};
 use super::actions::block_header_band_height;
 use super::layout_pass::{compute_block_layout_pass, LaidRow, LayoutPassInput};
 
+/// Hit-test tuple: laid rows + clip band + overlay header bands (v1.20.0 D8).
+#[allow(clippy::type_complexity)]
+pub(crate) type BlockViewHitRows = (
+    Vec<BlockViewRow>,
+    f32,
+    f32,
+    Vec<crate::block_component::BlockChromeBand>,
+);
+
 /// Return the block whose output is clipped by the top edge while its command
 /// row is already offscreen. That block owns the sticky CWD/command header.
 pub(crate) fn sticky_block_id(
@@ -81,15 +90,18 @@ impl MetalRenderer {
     /// Shares the layout pass with `build_block_view_vertices` via
     /// `compute_block_layout_pass`, so y-bands are identical between paint
     /// and hit-testing. Only the bv_rows extraction is specific to this path.
-    /// Returns `(rows, clip_top, clip_bottom)`: the laid-out rows plus the
-    /// visible content band's clip boundaries from the layout pass. Callers
+    /// Returns `BlockViewHitRows` = `(rows, clip_top, clip_bottom,
+    /// chrome_bands)`: the laid-out rows, the visible content band's clip
+    /// boundaries from the layout pass, and the overlay header bands for
+    /// hover (v1.20.0 D8; empty when `complete_block_overlay` is off).
+    /// Callers
     /// that need the visible content edge (e.g. autoscroll) must use the clip
     /// values, not rows first/last — bv_rows carries overscan, so its topmost
     /// row can sit above `clip_top - overscan`.
     pub(crate) fn compute_block_view_rows(
         &self,
         model: BlockViewPaintModel<'_>,
-    ) -> (Vec<weft_core::selection::BlockViewRow>, f32, f32) {
+    ) -> BlockViewHitRows {
         let BlockViewPaintModel {
             blocks,
             live_head_lines: _,
@@ -121,12 +133,12 @@ impl MetalRenderer {
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return (Vec::new(), 0.0, 0.0);
+            return (Vec::new(), 0.0, 0.0, Vec::new());
         }
 
         let ctx = match self.layout_ctx {
             Some(c) => c,
-            None => return (Vec::new(), 0.0, 0.0),
+            None => return (Vec::new(), 0.0, 0.0, Vec::new()),
         };
         let cwd_header_active = cwd.is_some() && live.is_none();
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
@@ -141,6 +153,9 @@ impl MetalRenderer {
         // borrow lives until bv_rows (owning Strings) is built.
         {
             let mut cache = self.block_layout_cache.borrow_mut();
+            // v1.20.0 (PLAN_v1200 §4 D2e): same flag-fold as the paint path —
+            // hit-test and paint agree on the sync domain.
+            cache.set_complete_block_overlay(self.complete_block_overlay);
             // M6-b B-1: same band derivation as the paint path (block_view.rs)
             // so hit-testing geometry matches what sync classified.
             // F7-2 (PLAN_v1184 §2-F7-2): the freeze band twin of the paint
@@ -185,6 +200,10 @@ impl MetalRenderer {
                 clip_bottom: content_bottom_y,
                 resolve_styles: false,
                 styled_lookup_counter: None,
+                // v1.20.0 (PLAN_v1200 §4 D10): hit-test mirrors the paint
+                // frame's flag (renderer state) so both passes agree on the
+                // stream shape.
+                complete_block_overlay: self.complete_block_overlay,
                 block_diagnose_state,
                 now,
                 region,
@@ -198,6 +217,29 @@ impl MetalRenderer {
         // historical full-row set (cull=false) so pointer mapping is
         // unchanged; the paint path culls, see `build_bv_rows`.
         let scroll_px = block_scroll * pitch;
+        // v1.20.0 (PLAN_v1200 D8): screen-space header bands for hover — the
+        // overlay track paints chrome where no laid row exists, so the
+        // laid-row scan in `block_at` cannot see them. Same formula as the
+        // paint emission (`build_block_view_vertices`) so they can't drift.
+        let chrome_bands: Vec<crate::block_component::BlockChromeBand> = layout_out
+            .overlay_rows
+            .iter()
+            .filter_map(|chrome| {
+                let block_id = chrome.block_id?;
+                chrome.header.as_ref()?;
+                let y_top = content_bottom_y - chrome.dist_px + scroll_px;
+                let y_bottom = y_top + chrome.height_px;
+                // Strict on purpose: zero-height overlap has no hoverable
+                // interior, so hit-testing is stricter than the paint clip.
+                (y_bottom > layout.clip_top && y_top < layout.clip_bottom).then_some(
+                    crate::block_component::BlockChromeBand {
+                        y_top,
+                        y_bottom,
+                        block_id,
+                    },
+                )
+            })
+            .collect();
         let bv_rows = build_bv_rows(
             &layout_out.rows,
             &layout_out.row_data,
@@ -212,7 +254,7 @@ impl MetalRenderer {
             },
         );
 
-        (bv_rows, layout.clip_top, layout.clip_bottom)
+        (bv_rows, layout.clip_top, layout.clip_bottom, chrome_bands)
     }
 }
 

@@ -411,8 +411,9 @@ fn r22_clear_command_height_depends_on_viewport_rows() {
     let cols = 80;
     let header_rows = 2;
 
-    let h_30 = completed_block_layout_rows(&b, cols, header_rows, 30);
-    let h_50 = completed_block_layout_rows(&b, cols, header_rows, 50);
+    // v1.20.0 (D2f): legacy (flag OFF) domain keeps the chrome-row counts.
+    let h_30 = completed_block_layout_rows(&b, cols, header_rows, 30, false);
+    let h_50 = completed_block_layout_rows(&b, cols, header_rows, 50, false);
 
     // clear 产生整屏 spacer,高度必须随 viewport_rows 变化。
     assert_ne!(
@@ -430,8 +431,8 @@ fn r22_non_clear_command_height_independent_of_viewport_rows() {
     let cols = 80;
     let header_rows = 2;
 
-    let h_30 = completed_block_layout_rows(&b, cols, header_rows, 30);
-    let h_50 = completed_block_layout_rows(&b, cols, header_rows, 50);
+    let h_30 = completed_block_layout_rows(&b, cols, header_rows, 30, false);
+    let h_50 = completed_block_layout_rows(&b, cols, header_rows, 50, false);
 
     assert_eq!(
         h_30, h_50,

@@ -581,10 +581,10 @@ impl App {
                     }
                     renderer.panel_highlight = self.panel.highlight;
                     renderer.block_hovered = self.interaction.block_hovered;
-                    // v1.14.0 (T6): the active pane's grid sub-row scroll
-                    // remainder, projected per-frame (consumed by
-                    // build_grid_instances; zero outside the grid px path).
-                    renderer.grid_scroll_px = pane.grid_scroll_px;
+                    // v1.14.0 (T6) grid sub-row scroll remainder per-frame; v1.20.0 (D10)
+                    // same projection carries complete_block_overlay (sync_pane_frame_state).
+                    renderer
+                        .sync_pane_frame_state(pane.grid_scroll_px, pane.complete_block_overlay());
                     renderer.block_selected = self.interaction.block_selected;
                     renderer.block_action_hovered = self.interaction.block_action_hovered;
                     // v1.14.0 (PLAN_v1140 T4): hover fade progress snapshot —

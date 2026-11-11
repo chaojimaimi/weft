@@ -582,7 +582,7 @@ impl App {
     /// `chunk_char_offset` is added to the click's `char_index` to compute
     /// the full-line char index that `StyledLine::link_at` expects.
     pub(super) fn block_view_hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
-        let (rows, _, _) = self.compute_block_view_rows()?;
+        let (rows, _, _, _) = self.compute_block_view_rows()?;
         let row = rows.iter().find(|r| r.contains_y(y as f32))?;
         let line_idx = row.line?;
         let char_index = row.chunk_char_offset
@@ -689,7 +689,7 @@ impl App {
             return None;
         }
         let ctx = renderer.layout_ctx?;
-        let (rows, _, _) = self.compute_block_view_rows()?;
+        let (rows, _, _, _) = self.compute_block_view_rows()?;
         if rows.is_empty() {
             return None;
         }
@@ -805,7 +805,7 @@ impl App {
     /// not in block view / no renderer / no terminal.
     pub(super) fn compute_block_view_rows(
         &self,
-    ) -> Option<(Vec<weft_core::selection::BlockViewRow>, f32, f32)> {
+    ) -> Option<crate::paint::block_view::BlockViewHitRows> {
         let tab = self.sessions.active()?;
         let terminal = tab.lock_terminal()?;
         self.compute_block_view_rows_for(tab, &terminal)
@@ -819,7 +819,7 @@ impl App {
         &self,
         tab: &Tab,
         terminal: &Terminal,
-    ) -> Option<(Vec<weft_core::selection::BlockViewRow>, f32, f32)> {
+    ) -> Option<crate::paint::block_view::BlockViewHitRows> {
         let renderer = self.renderer.as_ref()?;
         if !terminal.show_block_view() {
             return None;
@@ -905,30 +905,29 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Which foldable block (if any) owns the physical-pixel y in the last
-    /// rendered block view. `None` outside the block view or off every block.
-    /// Find the block at vertical position `y`. Returns `Some(id)` for
-    /// completed blocks, `Some(None)` for the in-flight (running) command,
-    /// or `None` when not on a block row.
+    /// Which foldable block (if any) owns the physical-pixel `y`. Returns
+    /// `Some(id)` for completed blocks, `Some(None)` for the in-flight
+    /// command, or `None` when not on a block/chrome row.
     pub(super) fn block_at(&self, y: f32) -> Option<Option<BlockId>> {
-        let (rows, _, _) = self.compute_block_view_rows()?;
+        let (rows, _, _, chrome_bands) = self.compute_block_view_rows()?;
         // Find the row whose y-range contains `y`. Header/Command/Output rows
         // retain their owning finalized block; LiveCommand is in-flight.
+        // v1.20.0 (D8): under the overlay flag chrome bands are screen-space
+        // overlays with no laid row — the band scan below keeps header hover
+        // (and its inline actions) reachable; gap/separator stay no-hover.
         for row in &rows {
             if y >= row.y_top && y < row.y_bottom {
                 use weft_core::selection::BlockViewRowKind;
-                match &row.kind {
-                    BlockViewRowKind::LiveCommand => return Some(None),
-                    _ => {
-                        return crate::block_component::hovered_block_for_row(
-                            &row.kind,
-                            row.block_id,
-                        )
-                        .map(Some)
-                    }
+                if matches!(&row.kind, BlockViewRowKind::LiveCommand) {
+                    return Some(None);
+                }
+                if let Some(id) =
+                    crate::block_component::hovered_block_for_row(&row.kind, row.block_id)
+                {
+                    return Some(Some(id));
                 }
             }
         }
-        None
+        crate::block_component::hovered_block_in_chrome_bands(&chrome_bands, y).map(Some)
     }
 }

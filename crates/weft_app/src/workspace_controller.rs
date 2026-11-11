@@ -338,6 +338,11 @@ impl App {
                 tab,
                 self.config_state.config.experimental.live_block_grid_render,
             );
+            // v1.20.0 (PLAN_v1200 §4 D10): pair the overlay flag.
+            crate::config_controller::apply_complete_block_overlay(
+                tab,
+                self.config_state.config.experimental.complete_block_overlay,
+            );
         }
 
         // Apply block_id_allocator + palette (mirrors new_tab).
@@ -406,6 +411,10 @@ impl App {
                     // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
                     new_pane.set_live_block_grid_render(
                         self.config_state.config.experimental.live_block_grid_render,
+                    );
+                    // v1.20.0 (PLAN_v1200 §4 D10): pair the overlay flag.
+                    new_pane.set_complete_block_overlay(
+                        self.config_state.config.experimental.complete_block_overlay,
                     );
                     tab.split_pane_with_pane(leaf, dir, ratio, new_pane)
                         .map_err(|e| {

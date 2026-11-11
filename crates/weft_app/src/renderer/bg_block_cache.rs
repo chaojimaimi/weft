@@ -62,6 +62,11 @@ pub(crate) struct BgBlockFingerprint {
     pub(crate) block_scroll: f32,
     /// Integrated-prompt on/off (changes the region layout + prompt rows).
     pub(crate) editor_mode: bool,
+    /// v1.20.0 (PLAN_v1200 §4 D2e): the pane's `complete_block_overlay`
+    /// flag — the background block vertices bake the finished-block chrome
+    /// (overlay rows vs laid Header/Separator/Blank rows), so a toggle must
+    /// rebuild.
+    pub(crate) complete_block_overlay: bool,
 }
 
 impl BgBlockFingerprint {
@@ -76,6 +81,7 @@ impl BgBlockFingerprint {
             && self.theme_generation == other.theme_generation
             && self.cell_dims == other.cell_dims
             && self.editor_mode == other.editor_mode
+            && self.complete_block_overlay == other.complete_block_overlay
     }
 }
 
@@ -142,6 +148,7 @@ mod tests {
             rect: [0.0, 0.0, 400.0, 300.0],
             block_scroll: 0.0,
             editor_mode: false,
+            complete_block_overlay: true,
         }
     }
 

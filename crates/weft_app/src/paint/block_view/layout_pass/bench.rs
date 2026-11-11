@@ -73,6 +73,7 @@ fn bench_layout_pass() {
                     clip_bottom: 1e9,
                     resolve_styles: true,
                     styled_lookup_counter: None,
+                    complete_block_overlay: false, // v1.20.0 (D10): legacy domain
                     block_diagnose_state: &std::collections::HashMap::new(),
                     now: std::time::SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(1_700_000_000),
@@ -104,6 +105,7 @@ fn bench_layout_pass() {
                     clip_bottom: 800.0,
                     resolve_styles: true,
                     styled_lookup_counter: None,
+                    complete_block_overlay: false, // v1.20.0 (D10): legacy domain
                     block_diagnose_state: &std::collections::HashMap::new(),
                     now: std::time::SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(1_700_000_000),

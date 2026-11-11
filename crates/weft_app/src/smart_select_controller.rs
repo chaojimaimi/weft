@@ -53,7 +53,7 @@ impl App {
             // v1.10.26: hit-test the row band directly (the anchor API no
             // longer carries a row index; the target needs the row's
             // (block_id, line) key to build anchors).
-            let (rows, _, _) = self.compute_block_view_rows()?;
+            let (rows, _, _, _) = self.compute_block_view_rows()?;
             let row_index = rows.iter().position(|r| r.contains_y(y as f32))?;
             let row = &rows[row_index];
             let renderer = self.renderer.as_ref()?;

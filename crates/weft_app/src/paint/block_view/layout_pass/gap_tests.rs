@@ -70,6 +70,7 @@ fn scrolling_past_clear_keeps_older_output_visible() {
             clip_bottom: 800.0,
             resolve_styles: false,
             styled_lookup_counter: None,
+            complete_block_overlay: false, // v1.20.0 (D10): legacy domain
             block_diagnose_state: &empty_map,
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
             region: None,
@@ -117,6 +118,7 @@ fn completed_layout_cols<'a>(
             clip_bottom: 800.0,
             resolve_styles: false,
             styled_lookup_counter: None,
+            complete_block_overlay: false, // v1.20.0 (D10): legacy domain
             block_diagnose_state: &empty_map,
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
             region: None,
@@ -254,6 +256,7 @@ fn live_layout<'a>(
             clip_bottom: 800.0,
             resolve_styles: false,
             styled_lookup_counter: None,
+            complete_block_overlay: false, // v1.20.0 (D10): legacy domain
             block_diagnose_state: &empty_map,
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
             region: None,
@@ -303,6 +306,7 @@ fn live_output_culls_offscreen_lines_but_keeps_positions() {
                 clip_bottom: 120.0,
                 resolve_styles: false,
                 styled_lookup_counter: None,
+                complete_block_overlay: false, // v1.20.0 (D10): legacy domain
                 block_diagnose_state: &std::collections::HashMap::new(),
                 now: std::time::SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_secs(1_700_000_000),

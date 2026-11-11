@@ -138,7 +138,7 @@ fn s1_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-        // Golden fixtures pin the capture track (flag-OFF shape).
+        // Golden fixtures pin the capture track, overlay domain (D9 re-baseline).
         region: None,
     }
 }
@@ -176,7 +176,7 @@ fn s2_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-        // Golden fixtures pin the capture track (flag-OFF shape).
+        // Golden fixtures pin the capture track, overlay domain (D9 re-baseline).
         region: None,
     }
 }
@@ -222,7 +222,7 @@ fn s3_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-        // Golden fixtures pin the capture track (flag-OFF shape).
+        // Golden fixtures pin the capture track, overlay domain (D9 re-baseline).
         region: None,
     }
 }
@@ -262,7 +262,7 @@ fn s4_model<'a>(
         // Fixed clock: pairs with the fixtures' started_at (same constant),
         // so the live elapsed label is deterministic ("0s").
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-        // Golden fixtures pin the capture track (flag-OFF shape).
+        // Golden fixtures pin the capture track, overlay domain (D9 re-baseline).
         region: None,
     }
 }
@@ -388,7 +388,13 @@ fn run_golden_with_selection(
 }
 
 fn renderer_headless() -> MetalRenderer {
-    MetalRenderer::new_headless_paint(Theme::weft_dark())
+    // v1.20.0 (PLAN_v1200 §5/D9): S2 re-baselined the goldens onto the
+    // overlay track — `complete_block_overlay = true` is the product default,
+    // so the recorded domain IS the shipped domain. Pre-v1.20.0 bytes live
+    // in git history.
+    let mut renderer = MetalRenderer::new_headless_paint(Theme::weft_dark());
+    renderer.sync_pane_frame_state(0.0, true);
+    renderer
 }
 
 /// Mirrors the offscreen_snapshots skip precedent: no Metal device (CI
@@ -422,7 +428,8 @@ fn block_view_no_ansi_fallback_uses_theme_foreground_not_output_default() {
     theme_b.output.output_default = Color::rgb(0x11, 0x22, 0x33);
 
     let verts_for = |theme: &Theme| {
-        let renderer = MetalRenderer::new_headless_paint(theme.clone());
+        let mut renderer = MetalRenderer::new_headless_paint(theme.clone());
+        renderer.sync_pane_frame_state(0.0, true); // v1.20.0: overlay domain (D9 re-baseline)
         let blocks = vec![block_literal(9, "echo hi", None, "plain output\n", Some(0))];
         let empty = HashMap::new();
         let palette = palette_literal();

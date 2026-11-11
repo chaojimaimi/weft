@@ -18,9 +18,14 @@ mod find;
 // layout-pass height bounds (the visible-window computation's source of
 // truth). Items inside keep their own visibility.
 pub(crate) mod layout_pass;
+// v1.20.0 (PLAN_v1200 §4 D1): screen-space completed-block chrome carrier.
+// crate-visible: surfaces.rs types its `overlay_rows` param against it.
 mod output_paint;
+pub(crate) mod overlay;
 mod row_paint;
 mod rows;
+// v1.20.0 (D8): crate-visible hit-test tuple (laid rows + clip band + chrome).
+pub(crate) use rows::BlockViewHitRows;
 mod style;
 mod surfaces;
 
@@ -175,6 +180,10 @@ impl MetalRenderer {
 
         {
             let mut cache = self.block_layout_cache.borrow_mut();
+            // v1.20.0 (PLAN_v1200 §4 D2e): the overlay flag joins the sync
+            // state — a toggle marks the derived prefix sums dirty so the
+            // next build_prefix_sum re-derives them O(n).
+            cache.set_complete_block_overlay(self.complete_block_overlay);
             // M6-b B-1: same band as rows.rs; B-5 pump gate also in rows.rs.
             // F7-2 (PLAN_v1184 §2-F7-2): during the rewrap freeze (self-zoom
             // window / live-resize drag) the band is DEFER-ALL — `high_rows=0`
@@ -249,6 +258,9 @@ impl MetalRenderer {
                 clip_bottom: content_bottom_y,
                 resolve_styles: true,
                 styled_lookup_counter: Some(&self.styled_lookup_counter),
+                // v1.20.0 (PLAN_v1200 §4 D10): renderer frame state synced
+                // from the pane each redraw (redraw_controller.rs).
+                complete_block_overlay: self.complete_block_overlay,
                 block_diagnose_state,
                 now,
                 region,
@@ -261,6 +273,7 @@ impl MetalRenderer {
             rows,
             row_data,
             expanded_block_count,
+            overlay_rows,
         } = layout_out;
         self.last_expanded_block_count.set(expanded_block_count);
 
@@ -341,6 +354,7 @@ impl MetalRenderer {
             &mut verts,
             &rows,
             &row_data,
+            &overlay_rows,
             &layout,
             surfaces::BlockSurfaceState {
                 scroll_px,
@@ -487,6 +501,40 @@ impl MetalRenderer {
                 ),
             }
         }
+        // Under the overlay flag the gap/Header/Separator LaidRows are
+        // absent from the stream; their painters run here, after the content
+        // rows and before the sticky header (layer order: content < overlay
+        // < sticky < panel). Same painters, same arguments as the flag-OFF
+        // stream arms above, so a flag toggle is paint-identical (P1). Gap
+        // rows are vertex-free placeholders (the gap paints nothing — same
+        // as LaidRow::Blank's no-op).
+        for chrome in &overlay_rows {
+            let y = content_bottom_y - chrome.dist_px + scroll_px;
+            let chrome_bottom = y + chrome.height_px;
+            if chrome_bottom < clip_top || y > clip_bottom {
+                continue;
+            }
+            match chrome.kind {
+                overlay::OverlayChromeKind::Gap => {}
+                overlay::OverlayChromeKind::Header => {
+                    if let (Some(params), Some(id)) = (&chrome.header, chrome.block_id) {
+                        row_paint::paint_header(
+                            &mut pctx,
+                            &params.cwd,
+                            &params.duration,
+                            &params.status,
+                            params.tone,
+                            id,
+                            y,
+                        );
+                    }
+                }
+                overlay::OverlayChromeKind::Separator => {
+                    let key = chrome.block_id.map(|id| id.0);
+                    row_paint::paint_separator(&mut pctx, key, y);
+                }
+            }
+        }
 
         // v1.10.26 (FIX_IME_PREEDIT): B-path diagnostic — emitted once per
         // frame while a BlockView-mode TUI preedit is active. The NORMAL
@@ -495,6 +543,9 @@ impl MetalRenderer {
         // under the default log level leaves evidence without users needing
         // `RUST_LOG=weft_app=debug`. "empty-text" is a macOS-internal marked-
         // text lifecycle event, not a bug — keep it quiet.
+        // v1.20.0: moved after the overlay emission loop so the three
+        // RowPaintCtx &mut sinks (first/last_live_line, caret_painted) are
+        // released before these reads — order is log-only, zero render impact.
         if let Some((preedit, _)) = tui_preedit {
             let empty = preedit.is_empty();
             let path = if empty {

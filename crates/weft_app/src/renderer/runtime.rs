@@ -10,6 +10,21 @@ use crate::renderer::MetalRenderer;
 use weft_core::config::{FontConfig, Theme};
 
 impl MetalRenderer {
+    /// v1.20.0 (PLAN_v1200 §4 D10): per-frame pane-state projection. The
+    /// redraw path calls this once per pane bind; `complete_block_overlay` is
+    /// the paint-path single source (overlay emission, surfaces geometry,
+    /// cache sync and metrics all read it). Companion of the
+    /// `grid_scroll_px` projection it replaces — one call, zero net lines in
+    /// the caller (redraw_controller.rs is at its line ceiling).
+    pub(crate) fn sync_pane_frame_state(
+        &mut self,
+        grid_scroll_px: f32,
+        complete_block_overlay: bool,
+    ) {
+        self.grid_scroll_px = grid_scroll_px;
+        self.complete_block_overlay = complete_block_overlay;
+    }
+
     /// Swap the active theme. Recolors the whole screen on the next draw
     /// (colors are resolved per-frame from cells' color-origins + this theme +
     /// the terminal palette, so no rebuild is needed).
@@ -358,6 +373,9 @@ impl MetalRenderer {
             header_rows: header_rows as u32,
             visible: visible as u32,
             cwd_present,
+            // v1.20.0 (D2e): the flag routes the metrics domain — a toggle
+            // must invalidate the memo.
+            complete_block_overlay: self.complete_block_overlay,
         };
         if let Some((cached_key, cached)) = self.scroll_metrics_memo.get() {
             if cached_key == key {
@@ -401,13 +419,18 @@ impl MetalRenderer {
             .map(|state| {
                 crate::paint::region_cache::region_display_chunk_total(state, cols) as usize
             });
-        let (total, _) = crate::block_component::block_content_metrics_with_cache(
+        let (total, _) = crate::block_component::block_content_metrics_with_overlay(
             terminal,
             cols,
             header_rows,
             Some(&*cache),
             Some(&live_cache),
             region_rows,
+            // v1.20.0 (PLAN_v1200 §4 D2a/D2e): the scrollbar total lives in
+            // the domain the layout pass lays out — flag + diagnose map ride
+            // the renderer's per-frame pane projection.
+            self.complete_block_overlay,
+            Some(&self.block_diagnose_state),
         );
         let max_scroll = total.saturating_sub(visible);
         let result = (total, visible, max_scroll);

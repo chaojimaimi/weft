@@ -1100,8 +1100,11 @@ fn live_split_stream_drains_heads_and_compensates_anchor() {
     tab.process_messages();
 
     // The detached anchor advanced by (heads_1 + heads_2) chrome rows — the
-    // user's visual row is preserved across both splits.
-    let expected_anchor = 100 + (heads_1 + heads_2) * crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS;
+    // user's visual row is preserved across both splits. v1.20.0 (D2d):
+    // panes built here default to complete_block_overlay, so the overlay
+    // carries the Header/Separator chrome and the advance is one row per
+    // head (flag OFF would advance by BLOCK_SPLIT_HEAD_CHROME_ROWS × heads).
+    let expected_anchor = 100 + heads_1 + heads_2;
     assert_eq!(
         tab.block_scroll_anchor(),
         BlockScrollAnchor::FixedDocumentRow(expected_anchor),

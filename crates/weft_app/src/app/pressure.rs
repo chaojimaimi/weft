@@ -288,6 +288,7 @@ mod tests {
             rect: [0.0; 4],
             block_scroll: 0.0,
             editor_mode: false,
+            complete_block_overlay: true,
         }
     }
 

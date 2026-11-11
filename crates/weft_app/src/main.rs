@@ -125,7 +125,6 @@ use app_state::{
     ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, NoteEditorState,
     PanelState, SessionManager, SettingsState, TabBarState, WindowRuntimeState,
 };
-use block_component::block_content_metrics_with_cache;
 use effect::Effect;
 use macos_system::{
     clipboard_copy, clipboard_paste, load_window_icon, open_url, reveal_path_in_finder,

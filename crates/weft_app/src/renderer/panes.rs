@@ -242,6 +242,8 @@ impl MetalRenderer {
                     rect: pane.rect,
                     block_scroll: pane.block_scroll,
                     editor_mode,
+                    // v1.20.0 (D2e): the chrome bakes into these vertices.
+                    complete_block_overlay: self.complete_block_overlay,
                 };
                 let now = std::time::Instant::now();
                 let action = {

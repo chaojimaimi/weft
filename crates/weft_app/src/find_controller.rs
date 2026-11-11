@@ -7,6 +7,9 @@ pub(crate) fn toggled_find_option(current: bool) -> bool {
     !current
 }
 
+// v1.20.0 (D2f): overlay flag + header px join the jump-target parameters;
+// allow matches the build_row_instances precedent.
+#[allow(clippy::too_many_arguments)]
 fn block_find_scroll_target(
     blocks: &[weft_core::blocks::Block],
     hit: &weft_core::find::BlockMatch,
@@ -15,14 +18,28 @@ fn block_find_scroll_target(
     viewport_rows: usize,
     visible: usize,
     max_scroll: usize,
+    complete_block_overlay: bool,
 ) -> Option<usize> {
     let block_idx = blocks.iter().position(|block| block.id == hit.block_id)?;
     let rows_below = blocks
         .iter()
         .skip(block_idx + 1)
-        .map(|block| completed_block_layout_rows(block, cols, header_rows, viewport_rows))
+        .map(|block| {
+            completed_block_layout_rows(
+                block,
+                cols,
+                header_rows,
+                viewport_rows,
+                complete_block_overlay,
+            )
+        })
         .sum::<usize>();
-    let row_in_block = completed_block_match_row_from_bottom(&blocks[block_idx], hit, cols);
+    let row_in_block = completed_block_match_row_from_bottom(
+        &blocks[block_idx],
+        hit,
+        cols,
+        complete_block_overlay,
+    );
     Some(
         (rows_below + row_in_block)
             .saturating_sub(visible * 2 / 3)
@@ -432,13 +449,17 @@ impl App {
                 // up from the bottom", so target = rows_from_bottom - visible*2/3.
                 let cols = term.grid().num_cols;
                 let cache = renderer.block_layout_cache.borrow();
-                let (total, _) = block_content_metrics_with_cache(
+                let (total, _) = crate::block_component::block_content_metrics_with_overlay(
                     &term,
                     cols,
                     renderer.block_header_rows(),
                     Some(&*cache),
                     None,
                     None,
+                    // v1.20.0 (D2a/D2f): jump geometry reads the same domain
+                    // the layout pass lays out (overlay flag routed).
+                    renderer.complete_block_overlay,
+                    Some(&renderer.block_diagnose_state),
                 );
                 let max_scroll = total.saturating_sub(visible);
                 let Some(target) = block_find_scroll_target(
@@ -449,6 +470,7 @@ impl App {
                     term.grid().num_rows,
                     visible,
                     max_scroll,
+                    renderer.complete_block_overlay,
                 ) else {
                     return;
                 };
@@ -522,18 +544,18 @@ mod tests {
             len: 1,
         };
         assert_eq!(
-            block_find_scroll_target(&blocks, &hit, 1, 80, 24, 6, 100),
+            block_find_scroll_target(&blocks, &hit, 1, 80, 24, 6, 100, false),
             Some(5)
         );
         assert_eq!(
-            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 6, 100),
+            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 6, 100, false),
             Some(6)
         );
 
         let mut blocks_with_clear = blocks;
         blocks_with_clear[1].command = "clear".into();
         assert_eq!(
-            block_find_scroll_target(&blocks_with_clear, &hit, 1, 80, 24, 6, 100),
+            block_find_scroll_target(&blocks_with_clear, &hit, 1, 80, 24, 6, 100, false),
             Some(29)
         );
     }
@@ -549,12 +571,12 @@ mod tests {
             len: 1,
         };
         assert_eq!(
-            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 3, 100),
+            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 3, 100, false),
             Some(0)
         );
         hit.is_command = true;
         assert_eq!(
-            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 3, 100),
+            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 3, 100, false),
             Some(3)
         );
     }
@@ -573,17 +595,58 @@ mod tests {
             col: 20,
             len: 4,
         };
-        let wide =
-            block_find_scroll_target(&[older.clone(), newer.clone()], &hit, 1, 80, 24, 3, 100)
-                .unwrap();
-        let narrow =
-            block_find_scroll_target(&[older.clone(), newer], &hit, 1, 8, 24, 3, 100).unwrap();
+        let wide = block_find_scroll_target(
+            &[older.clone(), newer.clone()],
+            &hit,
+            1,
+            80,
+            24,
+            3,
+            100,
+            false,
+        )
+        .unwrap();
+        let narrow = block_find_scroll_target(
+            &[older.clone(), newer.clone()],
+            &hit,
+            1,
+            8,
+            24,
+            3,
+            100,
+            false,
+        )
+        .unwrap();
         assert!(narrow > wide);
 
         older.command = "opencode".into();
         older.exit_code = Some(130);
-        let with_hints = block_find_scroll_target(&[older], &hit, 1, 8, 24, 3, 100).unwrap();
+        let with_hints = block_find_scroll_target(&[older], &hit, 1, 8, 24, 3, 100, false).unwrap();
         assert!(with_hints > 0, "resume hints must contribute visual rows");
+
+        // v1.20.0 (D2f): overlay twin — same fixture, flag ON drops the
+        // gap/separator chrome from the jump distances (still > 0 and still
+        // monotone wide < narrow).
+        let older = block(
+            1,
+            "first row is deliberately much longer than eight columns\nlast",
+        );
+        let overlay_wide = block_find_scroll_target(
+            &[older.clone(), newer.clone()],
+            &hit,
+            1,
+            80,
+            24,
+            3,
+            100,
+            true,
+        )
+        .unwrap();
+        let overlay_narrow =
+            block_find_scroll_target(&[older.clone(), newer], &hit, 1, 8, 24, 3, 100, true)
+                .unwrap();
+        assert!(overlay_narrow > overlay_wide);
+        assert!(overlay_wide <= wide, "overlay domain drops chrome rows");
     }
 
     #[test]

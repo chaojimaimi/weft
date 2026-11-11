@@ -14,6 +14,9 @@ use super::{
     bounds::{lower_bound_height, upper_bound_height},
     LaidRow,
 };
+// v1.20.0 (PLAN_v1200 §4 D1): chrome rows detour through the screen-space
+// overlay carrier under `complete_block_overlay`.
+use super::super::overlay::OverlayChromeRow;
 use crate::block_component::{
     block_presentation, clear_block_spacer_rows, command_output_gap_rows, command_resume_hints,
 };
@@ -41,7 +44,8 @@ pub(crate) struct CompletedPassCtx<'a, 'b> {
     pub(crate) content_bottom_y: f32,
     /// `block_scroll * pitch` — both callers precompute it for the live segment.
     pub(crate) scroll_px: f32,
-    /// `header_height + pitch * 2.0` — ditto.
+    /// `header_height + pitch * 2.0` plus the overlay chrome pixel height
+    /// when the flag is ON (D6) — both callers precompute it.
     pub(crate) overscan: f32,
     pub(crate) clip_top: f32,
     pub(crate) clip_bottom: f32,
@@ -53,6 +57,11 @@ pub(crate) struct CompletedPassCtx<'a, 'b> {
     /// :313 / `region_pass.rs`:102). The value after the finished-blocks walk
     /// is dead on both tracks (only three fields return) — not propagated.
     pub(crate) cursor_dist: f32,
+    /// v1.20.0 (PLAN_v1200 §4 D10): flag ON detours gap/Header/Separator out
+    /// of the row stream into `OverlayChromeRow`s (D1); Command rows and the
+    /// clear spacer stay in the stream (D3/D4); resume hints are untouched
+    /// content rows (D7).
+    pub(crate) complete_block_overlay: bool,
 }
 
 /// Assemble the finished-blocks segment: binary-search the prefix sum for
@@ -65,12 +74,14 @@ pub(crate) struct CompletedPassCtx<'a, 'b> {
 /// `ensure_cached` every block. A missing/stale prefix sum is tolerated —
 /// the visible-window search falls back to a full walk.
 ///
-/// Appends to `rows`/`row_data` and returns the expanded-block count.
+/// Appends to `rows`/`row_data` and returns the expanded-block count plus
+/// the screen-space chrome rows (empty under flag OFF — chrome stays in the
+/// stream).
 pub(crate) fn assemble_completed_rows<'a, 'b>(
     ctx: CompletedPassCtx<'a, 'b>,
     rows: &mut Vec<f32>,
     row_data: &mut Vec<LaidRow<'a>>,
-) -> usize {
+) -> (usize, Vec<OverlayChromeRow>) {
     let CompletedPassCtx {
         blocks,
         cache,
@@ -87,9 +98,13 @@ pub(crate) fn assemble_completed_rows<'a, 'b>(
         resolve_styles,
         styled_lookup_counter,
         cursor_dist: live_cursor_dist,
+        complete_block_overlay,
     } = ctx;
     let mut cursor_dist = live_cursor_dist;
     let mut expanded_block_count = 0usize;
+    // v1.20.0 (D1): screen-space chrome (gap/header/separator) per walked
+    // block. Only populated when `complete_block_overlay` is ON.
+    let mut overlay_rows: Vec<OverlayChromeRow> = Vec::new();
     let bump_styled = |n: usize| {
         if let Some(c) = styled_lookup_counter {
             c.set(c.get().saturating_add(n));
@@ -156,25 +171,12 @@ pub(crate) fn assemble_completed_rows<'a, 'b>(
 
         // Diagnose panel lines must be computed before block_total_height
         // so the panel's rows count toward visibility culling.
-        let diagnose_lines: Vec<String> = if let Some(ds) = block_diagnose_state.get(&b.id) {
-            if ds.is_thinking() {
-                vec!["Diagnosing…".to_string()]
-            } else if let Some(result) = &ds.result {
-                let text = match result {
-                    Ok(explanation) => format!("AI: {}", explanation),
-                    Err(err) => format!("AI error: {}", err),
-                };
-                text.lines()
-                    .flat_map(|line| {
-                        block_line_chunks(line, cols.saturating_sub(2)).collect::<Vec<_>>()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+        // v1.20.0 (D2a): single source in block_component — the metrics
+        // sister domain counts the exact same chunks.
+        let diagnose_lines: Vec<String> = block_diagnose_state
+            .get(&b.id)
+            .map(|ds| crate::block_component::diagnose_panel_chunks(ds, cols))
+            .unwrap_or_default();
         let diagnose_rows = if b.collapsed { 0 } else { diagnose_lines.len() };
         let is_diagnose_error = block_diagnose_state
             .get(&b.id)
@@ -348,8 +350,15 @@ pub(crate) fn assemble_completed_rows<'a, 'b>(
         }
         if output_gap_rows > 0 {
             cursor_dist += output_gap_rows as f32 * pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Blank);
+            // v1.20.0 (D1/D3): flag ON detours the inter-command gap out of
+            // the stream — the overlay Gap row costs distance only (vertex-
+            // free placeholder); the cursor advance is byte-identical.
+            if complete_block_overlay {
+                overlay_rows.push(OverlayChromeRow::gap(cursor_dist, pitch));
+            } else {
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::Blank);
+            }
         }
         // Command wrap rows: same `command_line_chunks` call + args as
         // grid_cache::compute_block_layout so prefix-sum matches runtime.
@@ -376,23 +385,43 @@ pub(crate) fn assemble_completed_rows<'a, 'b>(
         // M5-b: surviving source-line count reads L1 (no legacy lines vec).
         let presentation = block_presentation(b, cached.content.line_meta.len());
         cursor_dist += header_height;
-        rows.push(cursor_dist);
-        row_data.push(LaidRow::Header {
-            cwd: presentation.cwd,
-            duration: presentation.duration,
-            status: presentation.status,
-            tone: presentation.tone,
-            block_id: b.id,
-        });
+        // v1.20.0 (D1/D8): flag ON detours the header band into the overlay
+        // (same dist, same presentation payload → paint_header); the band's
+        // hover surface returns in S2 (D8).
+        if complete_block_overlay {
+            overlay_rows.push(OverlayChromeRow::header(
+                cursor_dist,
+                header_height,
+                b.id,
+                presentation,
+            ));
+        } else {
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Header {
+                cwd: presentation.cwd,
+                duration: presentation.duration,
+                status: presentation.status,
+                tone: presentation.tone,
+                block_id: b.id,
+            });
+        }
         cursor_dist += pitch;
-        rows.push(cursor_dist);
-        row_data.push(LaidRow::Separator);
+        // v1.20.0 (D1): flag ON detours the separator (1×pitch) into the
+        // overlay.
+        if complete_block_overlay {
+            overlay_rows.push(OverlayChromeRow::separator(cursor_dist, pitch, b.id));
+        } else {
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Separator);
+        }
         if clear_rows > 0 {
             cursor_dist += clear_rows as f32 * pitch;
+            // v1.20.0 (D4): the clear-command spacer Blank stays IN the row
+            // stream under both flags (unlike the gap Blank).
             rows.push(cursor_dist);
             row_data.push(LaidRow::Blank);
         }
     }
 
-    expanded_block_count
+    (expanded_block_count, overlay_rows)
 }

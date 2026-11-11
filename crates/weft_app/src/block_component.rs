@@ -3,11 +3,14 @@
 use crate::paint::grid_cache::{block_line_chunks, command_line_chunks};
 use crate::paint::ui_helpers::{abbreviate_path, block_duration_str, strip_prompt_prefix};
 use weft_core::blocks::continuation::{classify_exit, ExitClass};
-use weft_core::blocks::Block;
+use weft_core::blocks::{Block, BlockId};
 use weft_core::vt::Terminal;
 
 mod hover;
-pub(crate) use hover::{block_header_action_at, hovered_block_for_row, BlockHeaderAction};
+pub(crate) use hover::{
+    block_header_action_at, hovered_block_for_row, hovered_block_in_chrome_bands, BlockChromeBand,
+    BlockHeaderAction,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockTone {
@@ -125,6 +128,25 @@ pub(crate) fn completed_block_row_count(
         + 1
 }
 
+/// v1.20.0 (PLAN_v1200 §4 D2/D2f): flag-routed twin of
+/// [`completed_block_row_count`] — the unified chokepoint every completed
+/// row-count consumer (scrollbar metrics, find jump, panel jump) goes
+/// through. Overlay ON reads the sister domain (output + wrap; the gap /
+/// header band / separator rows no longer exist in the laid stream), OFF is
+/// byte-identical to the legacy formula.
+pub(crate) fn completed_block_row_count_for(
+    output_lines: usize,
+    header_rows: usize,
+    command_wrap_rows: usize,
+    complete_block_overlay: bool,
+) -> usize {
+    if complete_block_overlay {
+        output_lines + command_wrap_rows
+    } else {
+        completed_block_row_count(output_lines, header_rows, command_wrap_rows)
+    }
+}
+
 /// Warp 风格:命令与其首行输出之间的留白;空/折叠命令无输出,保持紧凑。
 pub(crate) fn command_output_gap_rows(output_rows: usize) -> usize {
     usize::from(output_rows > 0)
@@ -163,6 +185,36 @@ pub(crate) fn clear_block_spacer_rows(command: &str, viewport_rows: usize) -> us
     usize::from(command.split_whitespace().next() == Some("clear")) * viewport_rows.max(1)
 }
 
+/// v1.20.0 (PLAN_v1200 §4 D2a): diagnose-panel chunk texts — the SINGLE
+/// source shared by the layout pass (`completed_pass.rs` lays these rows)
+/// and the overlay-flag metrics sister domain (counts `chunks.len()`).
+/// Mirrors the v1.8.2 panel content contract: thinking → one placeholder
+/// row, result → one "AI: …"/"AI error: …" logical line wrapped at
+/// `cols - 2` (panel padding). Collapsed blocks show no panel (callers
+/// gate on `collapsed` themselves, same as the layout pass).
+pub(crate) fn diagnose_panel_chunks(
+    state: &crate::app_state::BlockDiagnoseState,
+    cols: usize,
+) -> Vec<String> {
+    if state.is_thinking() {
+        return vec!["Diagnosing…".to_string()];
+    }
+    match &state.result {
+        Some(result) => {
+            let text = match result {
+                Ok(explanation) => format!("AI: {}", explanation),
+                Err(err) => format!("AI error: {}", err),
+            };
+            text.lines()
+                .flat_map(|line| {
+                    block_line_chunks(line, cols.saturating_sub(2)).collect::<Vec<_>>()
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    }
+}
+
 /// M5-b (PLAN_M5 §三): the row count reads the L1/L2 tables via the shared
 /// machine (`hint_rows + rows.len()`); the legacy per-line collect +
 /// re-wrap (`completed_block_visible_lines`) is deleted.
@@ -175,19 +227,25 @@ pub(crate) fn completed_block_layout_rows(
     cols: usize,
     header_rows: usize,
     viewport_rows: usize,
+    complete_block_overlay: bool,
 ) -> usize {
-    completed_block_row_count(
+    completed_block_row_count_for(
         completed_block_output_rows(block, cols),
         header_rows,
         command_wrap_rows_for(block, cols, block_foldable(block)),
+        complete_block_overlay,
     ) + clear_block_spacer_rows(&block.command, viewport_rows)
 }
 
 /// 块底到 Find 命中视觉行的距离,镜像渲染器自底向上的顺序(含折行输出与恢复提示)。
+/// v1.20.0 (D2f): routed through the flag chokepoint — overlay ON drops the
+/// gap/separator (+1) chrome from the distance (the laid stream no longer
+/// contains it).
 pub(crate) fn completed_block_match_row_from_bottom(
     block: &Block,
     hit: &weft_core::find::BlockMatch,
     cols: usize,
+    complete_block_overlay: bool,
 ) -> usize {
     if block.collapsed {
         return 1;
@@ -208,7 +266,11 @@ pub(crate) fn completed_block_match_row_from_bottom(
                 .iter()
                 .map(|line| block_line_chunks(line, cols).count())
                 .sum::<usize>();
-        return output_rows + command_output_gap_rows(output_rows) + 1;
+        return if complete_block_overlay {
+            output_rows
+        } else {
+            output_rows + command_output_gap_rows(output_rows) + 1
+        };
     }
 
     let line_index = hit.line.min(lines.len().saturating_sub(1));
@@ -231,7 +293,12 @@ pub(crate) fn completed_block_match_row_from_bottom(
             owns
         })
         .unwrap_or_else(|| chunks.len().saturating_sub(1));
-    hints + rows_after + chunks.len().saturating_sub(chunk_index + 1) + 1
+    let row_from_chunk = hints + rows_after + chunks.len().saturating_sub(chunk_index + 1);
+    if complete_block_overlay {
+        row_from_chunk
+    } else {
+        row_from_chunk + 1
+    }
 }
 
 /// 把按字符索引的命中转成折行后的视觉行范围;列/长度均为显示列,保证 CJK 与绘制的字形对齐。
@@ -298,6 +365,43 @@ pub(crate) fn block_content_metrics_with_cache(
     live_cache: Option<&crate::paint::live_cache::LiveLayoutCache>,
     region_live_rows: Option<usize>,
 ) -> (usize, usize) {
+    block_content_metrics_with_overlay(
+        terminal,
+        cols,
+        header_rows,
+        cache,
+        live_cache,
+        region_live_rows,
+        false,
+        None,
+    )
+}
+
+/// v1.20.0 (PLAN_v1200 §4 D2a): flag-routed twin of
+/// [`block_content_metrics_with_cache`]. `complete_block_overlay = true`
+/// reads the sister domain (per completed block: hint + output + wrap +
+/// diagnose + clear; NO gap / header band / separator rows) so the
+/// scrollbar total matches what the layout pass actually lays out under
+/// the overlay track. `false` (legacy callers: reconciled_terminal_block_scroll,
+/// reconcile_scroll memo, every existing test) is byte-identical to the
+/// pre-v1.20.0 behavior. `block_diagnose_state` feeds the diagnose rows of
+/// the sister domain (mirror of `completed_pass.rs`' panel rows via
+/// [`diagnose_panel_chunks`]).
+/// v1.20.0 (D2f): the overlay flag + diagnose map join the parameter list
+/// of the legacy twin; the allow matches the build_row_instances precedent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_content_metrics_with_overlay(
+    terminal: &Terminal,
+    cols: usize,
+    header_rows: usize,
+    cache: Option<&crate::paint::grid_cache::BlockLayoutCache>,
+    live_cache: Option<&crate::paint::live_cache::LiveLayoutCache>,
+    region_live_rows: Option<usize>,
+    complete_block_overlay: bool,
+    block_diagnose_state: Option<
+        &std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
+    >,
+) -> (usize, usize) {
     use weft_core::blocks::ShellPhase;
 
     // WP1.5 acceptance-2 probe (PLAN_v1180_WP15_G4_RECONCILE_CACHE §3-2):
@@ -344,8 +448,22 @@ pub(crate) fn block_content_metrics_with_cache(
             .map(|c| c.command_wrap_rows)
             .or_else(|| tombstone.map(|t| t.command_wrap_rows))
             .unwrap_or_else(|| command_wrap_rows_for(block, cols, block_foldable(block)));
-        total += completed_block_row_count(output_rows, header_rows, command_wrap_rows)
-            + clear_block_spacer_rows(&block.command, viewport_rows);
+        // v1.20.0 (D2a): unified chokepoint — the overlay flag routes to the
+        // sister domain (output + wrap; the gap / header band / separator
+        // rows no longer exist in the laid stream) and the diagnose panel
+        // rows join the total (same chunks the layout pass lays; collapsed
+        // blocks show no panel, same gate as `completed_pass.rs`).
+        total += completed_block_row_count_for(
+            output_rows,
+            header_rows,
+            command_wrap_rows,
+            complete_block_overlay,
+        ) + clear_block_spacer_rows(&block.command, viewport_rows);
+        if complete_block_overlay && !block.collapsed {
+            if let Some(state) = block_diagnose_state.and_then(|m| m.get(&block.id)) {
+                total += diagnose_panel_chunks(state, cols).len();
+            }
+        }
     }
     if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
         if let Some(live) = terminal.block_tracker().in_flight() {

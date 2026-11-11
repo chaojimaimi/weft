@@ -55,7 +55,13 @@ pub(super) fn compute_region_layout_pass<'a, 'b>(
     // P1-6 blank-trimmed, chunk prefix sums from the snapshot's immutable
     // prefix plus the per-frame viewport tail (D8).
     let scroll_px = input.block_scroll * pitch;
-    let overscan = header_height + pitch * 2.0;
+    // v1.20.0 (PLAN_v1200 §4 D6): same flag-gated overscan growth as the
+    // capture track (uniform per-block overlay chrome px).
+    let overscan = if input.complete_block_overlay {
+        header_height + pitch * 2.0 + header_height + pitch * 2.0
+    } else {
+        header_height + pitch * 2.0
+    };
     let segment = region_rows::region_live_segment(
         live,
         region_state,
@@ -83,7 +89,7 @@ pub(super) fn compute_region_layout_pass<'a, 'b>(
     // to the capture track's — now lives in the shared
     // `assemble_completed_rows`; this track contributes only its live
     // segment (above, from the grid-region snapshot).
-    let expanded_block_count = assemble_completed_rows(
+    let (expanded_block_count, overlay_rows) = assemble_completed_rows(
         CompletedPassCtx {
             blocks,
             cache,
@@ -100,6 +106,7 @@ pub(super) fn compute_region_layout_pass<'a, 'b>(
             resolve_styles,
             styled_lookup_counter: counter,
             cursor_dist,
+            complete_block_overlay: input.complete_block_overlay,
         },
         &mut rows,
         &mut row_data,
@@ -109,6 +116,7 @@ pub(super) fn compute_region_layout_pass<'a, 'b>(
         rows,
         row_data,
         expanded_block_count,
+        overlay_rows,
     }
 }
 

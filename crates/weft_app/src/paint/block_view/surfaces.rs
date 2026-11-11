@@ -109,6 +109,7 @@ pub(super) fn push_block_surfaces(
     vertices: &mut Vec<f32>,
     rows: &[f32],
     row_data: &[LaidRow<'_>],
+    overlay_rows: &[crate::paint::block_view::overlay::OverlayChromeRow],
     layout: &crate::layout::BlockViewLayout,
     state: BlockSurfaceState,
 ) -> HashMap<BlockId, [f32; 4]> {
@@ -126,6 +127,25 @@ pub(super) fn push_block_surfaces(
         scale: renderer.scale as f32,
         background_uv: [su, sv + svh, su + suw, sv],
     };
+    // v1.20.0 (PLAN_v1200 §4 D5): under the overlay flag the Header rows are
+    // absent from the stream; tone rides the overlay chrome rows instead and
+    // each block's top bound is extended by the SAME header band px the
+    // emission paints (single geometry source — the uniform header_height /
+    // pitch pair, no second derivation). Flag OFF: empty slice, zero effect.
+    let complete_block_overlay = renderer.complete_block_overlay;
+    // BlockTone is PartialEq-only (no Hash) — a tiny Vec beats deriving.
+    // First chrome header per block wins (matches the OFF stream's first
+    // Header row semantics).
+    let mut overlay_tones: Vec<(BlockId, BlockTone)> = Vec::new();
+    if complete_block_overlay {
+        for chrome in overlay_rows {
+            if let (Some(id), Some(params)) = (chrome.block_id, &chrome.header) {
+                if !overlay_tones.iter().any(|(seen, _)| seen == &id) {
+                    overlay_tones.push((id, params.tone));
+                }
+            }
+        }
+    }
     let mut bounds: HashMap<BlockId, (f32, f32, BlockTone)> = HashMap::new();
     for (distance, row) in rows.iter().copied().zip(row_data) {
         // M5-b: Output entries are per-visual-row — the entry's own band
@@ -165,6 +185,26 @@ pub(super) fn push_block_surfaces(
                 }
             })
             .or_insert((top, bottom, tone));
+    }
+    // v1.20.0 (D5): flag ON — restore flag-OFF bounds parity. Every block
+    // loses its Header entry from the ON stream, so the band is folded back
+    // with constant arithmetic: header_top = topmost laid row top −
+    // header_height (the band sits directly above the command row, same
+    // distances the emission used). Separator/gap segments stay excluded
+    // under both flags.
+    if complete_block_overlay {
+        for (id, range) in bounds.iter_mut() {
+            // Every block loses its Header entry from the ON stream, and the
+            // topmost laid row is always the command (output rows sit below
+            // it), so band top − header_height reproduces the OFF header top
+            // exactly for blocks with and without laid output alike.
+            range.0 -= paint.header_height;
+            if let Some((_, tone)) = overlay_tones.iter().find(|(seen, _)| seen == id) {
+                if *tone != BlockTone::Success {
+                    range.2 = *tone;
+                }
+            }
+        }
     }
 
     let mut canvases = HashMap::with_capacity(bounds.len());

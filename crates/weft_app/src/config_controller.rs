@@ -208,6 +208,17 @@ pub(super) fn apply_live_block_grid_render(tab: &mut Tab, enabled: bool) {
     }
 }
 
+/// v1.20.0 (PLAN_v1200 §4 D10): apply the user's
+/// `[experimental] complete_block_overlay` to every pane of one tab — same
+/// injection shape as [`apply_live_block_grid_render`]; the flag lives on
+/// the Pane (app-layer), `Pane::placeholder` starts at the config default,
+/// and every factory-created pane is re-injected here for consistency.
+pub(super) fn apply_complete_block_overlay(tab: &mut Tab, enabled: bool) {
+    for pane in tab.panes_mut() {
+        pane.set_complete_block_overlay(enabled);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ConfigApplyDelta {
     rebuild_font: bool,

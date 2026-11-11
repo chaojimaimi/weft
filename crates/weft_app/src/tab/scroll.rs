@@ -127,13 +127,21 @@ pub(crate) fn block_completion_should_snap(
 
 /// v1.10.26 Batch D (D-3): the block-scroll offset shift that keeps the
 /// user's viewport steady when a 1MiB history split settles `heads` new
-/// finished blocks. Each head adds [`BLOCK_SPLIT_HEAD_CHROME_ROWS`] structural
-/// rows (Command + Header + Separator) above the live tail in the block view,
-/// so a detached anchor must advance by `heads × chrome` — the content below
-/// the inserted chrome is untouched, so this re-points the anchor at the same
-/// visual row the user was reading.
-pub(crate) fn split_head_anchor_compensation(heads: usize) -> usize {
-    heads.saturating_mul(crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS)
+/// finished blocks. Flag OFF: each head adds [`BLOCK_SPLIT_HEAD_CHROME_ROWS`]
+/// structural rows (Command + Header + Separator) above the live tail in the
+/// block view, so a detached anchor must advance by `heads × chrome` — the
+/// content below the inserted chrome is untouched, so this re-points the
+/// anchor at the same visual row the user was reading. v1.20.0
+/// (PLAN_v1200 §4 D2d, F14): with `complete_block_overlay` the Header and
+/// Separator chrome leaves the row stream (screen-space overlay), leaving one
+/// row per head, so the advance collapses to `heads × 1`.
+pub(crate) fn split_head_anchor_compensation(heads: usize, complete_block_overlay: bool) -> usize {
+    let chrome_rows = if complete_block_overlay {
+        1
+    } else {
+        crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS
+    };
+    heads.saturating_mul(chrome_rows)
 }
 
 impl Tab {
@@ -350,7 +358,7 @@ impl Pane {
         if heads == 0 {
             return;
         }
-        let delta = split_head_anchor_compensation(heads);
+        let delta = split_head_anchor_compensation(heads, self.complete_block_overlay);
         if delta == 0 {
             return;
         }
@@ -496,13 +504,19 @@ mod tests {
     // ── v1.10.26 Batch D (D-3): split-head chrome compensation ───────────
 
     /// The per-head chrome rows a settled 1MiB split head adds to the block
-    /// view above the live tail (Command + Header + Separator, layout_pass).
+    /// view above the live tail. Flag OFF: Command + Header + Separator
+    /// (layout_pass). Flag ON (v1.20.0 D2d): Header/Separator ride the
+    /// screen-space overlay — one row per head.
     #[test]
     fn split_head_anchor_compensation_scales_with_heads() {
         assert_eq!(crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS, 3);
-        assert_eq!(split_head_anchor_compensation(0), 0);
-        assert_eq!(split_head_anchor_compensation(1), 3);
-        assert_eq!(split_head_anchor_compensation(2), 6);
+        // Truth table, both flag states.
+        assert_eq!(split_head_anchor_compensation(0, true), 0);
+        assert_eq!(split_head_anchor_compensation(1, true), 1);
+        assert_eq!(split_head_anchor_compensation(2, true), 2);
+        assert_eq!(split_head_anchor_compensation(0, false), 0);
+        assert_eq!(split_head_anchor_compensation(1, false), 3);
+        assert_eq!(split_head_anchor_compensation(2, false), 6);
     }
 
     /// Split-head settlement must advance a DETACHED anchor by the inserted
@@ -517,13 +531,20 @@ mod tests {
             BlockScrollAnchor::FixedDocumentRow(100)
         ));
 
-        // 2 heads settle → the view advances by 2 × per-head chrome rows so
-        // the user keeps reading the same visual row.
+        // Flag ON (pane default): 2 heads settle → advance 2 × 1.
+        tab.compensate_anchor_for_split(2);
+        assert_eq!(
+            tab.block_scroll_anchor(),
+            BlockScrollAnchor::FixedDocumentRow(102)
+        );
+
+        // Flag OFF: same settlement advances by the legacy 3-row chrome.
+        tab.active_mut().set_complete_block_overlay(false);
         tab.compensate_anchor_for_split(2);
         assert_eq!(
             tab.block_scroll_anchor(),
             BlockScrollAnchor::FixedDocumentRow(
-                100 + 2 * crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS
+                102 + 2 * crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS
             )
         );
 

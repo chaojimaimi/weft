@@ -3093,6 +3093,46 @@ fn save_writes_live_block_grid_render_only_when_non_default() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ── v1.20.0 (PLAN_v1200 §4 D10): [experimental] complete_block_overlay ──
+
+#[test]
+fn experimental_complete_block_overlay_defaults_true() {
+    // Factory default is ON (S1 overlay rail; `false` is the rollback).
+    // The flag lives on the app-layer Pane, not the Terminal.
+    let c = Config::default();
+    assert!(c.experimental.complete_block_overlay);
+    let c: Config = toml::from_str("").unwrap();
+    assert!(
+        c.experimental.complete_block_overlay,
+        "missing [experimental] section deserializes to the factory default"
+    );
+    let off: Config = toml::from_str("[experimental]\ncomplete_block_overlay = false\n").unwrap();
+    assert!(!off.experimental.complete_block_overlay);
+}
+
+#[test]
+fn save_writes_complete_block_overlay_only_when_non_default() {
+    // The default (true) is never written; an explicit `false` rollback is.
+    let mut cfg = Config::default();
+    cfg.experimental.complete_block_overlay = false;
+    let path = std::env::temp_dir().join(format!("weft_cfg_v1200_{}.toml", std::process::id()));
+    cfg.save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("[experimental]") && text.contains("complete_block_overlay = false"),
+        "non-default rollback switch must be written: {text}"
+    );
+    // Back to default → the key disappears on the next save.
+    cfg.experimental.complete_block_overlay = true;
+    cfg.save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("complete_block_overlay"),
+        "default flag must be dropped from the file: {text}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── v1.11.12 (PLAN_v11112 M-E): save skip-ledger tests ──────────────────
 // A hand-written scalar where a table belongs must still save successfully —
 // the writer skips that segment, leaves it untouched on disk, and records the

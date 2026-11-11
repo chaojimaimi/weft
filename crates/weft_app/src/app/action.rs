@@ -233,6 +233,10 @@ impl crate::App {
                             pane.set_live_block_grid_render(
                                 self.config_state.config.experimental.live_block_grid_render,
                             );
+                            // v1.20.0 (PLAN_v1200 §4 D10): pair the overlay flag.
+                            pane.set_complete_block_overlay(
+                                self.config_state.config.experimental.complete_block_overlay,
+                            );
                         }
                         if let Some(tab2) = self.sessions.active() {
                             tracing::info!(

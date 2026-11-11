@@ -24,6 +24,7 @@ fn empty_layout_pass_produces_empty_output() {
         clip_bottom: 800.0,
         resolve_styles: false,
         styled_lookup_counter: None,
+        complete_block_overlay: false, // v1.20.0 (D10): legacy domain
         block_diagnose_state: &std::collections::HashMap::new(),
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         region: None,
@@ -68,6 +69,7 @@ fn live_output_keeps_newest_row_complete_at_viewport_bottom() {
         clip_bottom: 120.0,
         resolve_styles: false,
         styled_lookup_counter: None,
+        complete_block_overlay: false, // v1.20.0 (D10): legacy domain
         block_diagnose_state: &std::collections::HashMap::new(),
         now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         region: None,

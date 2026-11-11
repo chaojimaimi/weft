@@ -385,7 +385,8 @@ impl App {
                     if self.accessibility.block_text_key == Some(key) {
                         return self.accessibility.block_text.clone();
                     }
-                    let Some((mut rows, _, _)) = self.compute_block_view_rows_for(tab, &terminal)
+                    let Some((mut rows, _, _, _)) =
+                        self.compute_block_view_rows_for(tab, &terminal)
                     else {
                         return String::new();
                     };

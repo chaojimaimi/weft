@@ -81,6 +81,11 @@ impl App {
                 tab,
                 self.config_state.config.experimental.live_block_grid_render,
             );
+            // v1.20.0 (PLAN_v1200 §4 D10): same pairing for the overlay flag.
+            crate::config_controller::apply_complete_block_overlay(
+                tab,
+                self.config_state.config.experimental.complete_block_overlay,
+            );
         }
         if let Some(mut t) = self
             .sessions

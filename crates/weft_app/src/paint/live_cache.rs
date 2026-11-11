@@ -48,7 +48,7 @@ use crate::paint::grid_cache::{
 /// Memoized `block_scroll_metrics` result: `(key, (total, visible, max))`.
 pub(crate) type BlockScrollMetricsMemo = Option<(BlockScrollMetricsKey, (usize, usize, usize))>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct BlockScrollMetricsKey {
     /// Pane session scope. Without it, the empty-block-set key
     /// `(len, first, last) = (0, None, None)` of two fresh tabs is identical
@@ -68,6 +68,10 @@ pub(crate) struct BlockScrollMetricsKey {
     /// adds `usize::from(live.cwd.or(terminal.cwd()).is_some())` to the total, so
     /// an OSC 7 cwd change mid-command must invalidate the memo.
     pub(crate) cwd_present: bool,
+    /// v1.20.0 (PLAN_v1200 §4 D2e): the overlay flag routes the metrics
+    /// domain (sister formula) — a toggle changes the total, so it must
+    /// invalidate the memo.
+    pub(crate) complete_block_overlay: bool,
 }
 
 /// One line of the bounded suffix window.

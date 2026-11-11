@@ -263,7 +263,7 @@ impl App {
         // 可见 block 内容区 = 布局 clip。用 bv_rows first/last 会带 overscan
         // (最顶行可到 clip_top - overscan),把向上滚动的触发阈值抬到窗口外。
         self.compute_block_view_rows()
-            .map(|(_, clip_top, clip_bottom)| (clip_top, clip_bottom))
+            .map(|(_, clip_top, clip_bottom, _)| (clip_top, clip_bottom))
     }
 
     /// Vertical physical-pixel bounds of the grid content area (the visible

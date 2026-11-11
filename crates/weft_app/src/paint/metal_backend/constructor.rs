@@ -320,6 +320,9 @@ impl MetalRenderer {
             block_action_hovered: None,
             hover_fades: Vec::new(),
             grid_scroll_px: 0.0,
+            // v1.20.0: config default (ExperimentalConfig::complete_block_overlay);
+            // projected per-frame from the active pane by the redraw path.
+            complete_block_overlay: true,
             bookmarked_blocks: std::sync::Arc::new(std::collections::HashSet::new()),
             block_diagnose_state: std::collections::HashMap::new(),
             ai_configured: false,

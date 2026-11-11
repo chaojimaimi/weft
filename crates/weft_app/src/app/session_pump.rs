@@ -46,6 +46,11 @@ impl App {
             &mut tab,
             self.config_state.config.experimental.live_block_grid_render,
         );
+        // v1.20.0 (PLAN_v1200 §4 D10): same pairing for the overlay flag.
+        crate::config_controller::apply_complete_block_overlay(
+            &mut tab,
+            self.config_state.config.experimental.complete_block_overlay,
+        );
         // v1.0 V13: On first launch, inject a welcome banner via PTY.
         // The printf is prefixed with a space (HIST_IGNORE_SPACE keeps it
         // out of zsh history). The marker file is created in

@@ -129,7 +129,7 @@ impl App {
                 let yf = y as f32;
                 // Chevron occupies the first cell [content_left, content_left + cw).
                 if xf >= content_left && xf < content_left + cw {
-                    let Some((rows, _, _)) = self.compute_block_view_rows() else {
+                    let Some((rows, _, _, _)) = self.compute_block_view_rows() else {
                         return PressOutcome::Consumed;
                     };
                     for row in &rows {

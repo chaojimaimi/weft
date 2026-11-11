@@ -206,6 +206,13 @@ pub struct Pane {
     /// v1.14.3 (T2): Pane 级对账判重 memo (`app::reconcile_scroll`); dies
     /// with the pane.
     pub(crate) reconcile_memo: crate::app::reconcile_scroll::ReconcileMemo,
+    /// v1.20.0 (PLAN_v1200 §4 D10): whether finished-block chrome rows
+    /// (gap / header band / separator) render as screen-space overlay instead
+    /// of laid rows. App-layer render flag only — unlike
+    /// `live_block_grid_render` it never enters the Terminal. Defaults true
+    /// (config default); the config apply chokepoints re-inject the real
+    /// value, so restored/split/spawned panes stay consistent (v1.11.7 P0-1).
+    pub(crate) complete_block_overlay: bool,
 }
 
 impl Pane {
@@ -304,6 +311,7 @@ impl Pane {
             pending_stdin: Vec::new(),
             child_pid: None,
             reconcile_memo: None,
+            complete_block_overlay: true,
         }
     }
 
@@ -418,6 +426,28 @@ impl Pane {
     /// `set_tui_render_mode` — same chokepoints.
     pub(crate) fn set_live_block_grid_render(&mut self, enabled: bool) {
         self.with_terminal(|t| t.set_live_block_grid_render(enabled));
+    }
+
+    /// v1.20.0 (PLAN_v1200 §4 D10): inject the user's
+    /// `[experimental] complete_block_overlay` into this pane (config
+    /// factory default is `true`; the flag lives on the Pane — app-layer
+    /// render switch, never in the Terminal). Mirror of
+    /// `set_live_block_grid_render` — same chokepoints. Trailing
+    /// `tracing::debug!` follows the v1.11.8 M-B setter-instrumentation
+    /// precedent so config loads are traceable per pane.
+    pub(crate) fn set_complete_block_overlay(&mut self, enabled: bool) {
+        tracing::debug!(
+            enabled,
+            pane = self.pane_session_id,
+            "complete_block_overlay injected"
+        );
+        self.complete_block_overlay = enabled;
+    }
+
+    /// v1.20.0 (PLAN_v1200 §4 D10): read the pane's overlay flag (paint
+    /// path projection: redraw → renderer; metrics → block_scroll_metrics).
+    pub(crate) fn complete_block_overlay(&self) -> bool {
+        self.complete_block_overlay
     }
 
     /// Queue a geometry transaction without resizing the Grid ahead of its PTY.

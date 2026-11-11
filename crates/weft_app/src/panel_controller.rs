@@ -212,13 +212,25 @@ impl App {
             // For each block BELOW the target (i.e. with higher index), add its
             // full height using the renderer's current Header row span.
             let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
+            // v1.20.0 (PLAN_v1200 §4 D2f): the jump distance is measured in
+            // the SAME domain the layout pass lays out — route through the
+            // overlay flag chokepoint.
+            let complete_block_overlay = self
+                .renderer
+                .as_ref()
+                .map_or(true, |r| r.complete_block_overlay);
             let mut rows_from_bottom = 0usize;
             for (i, b) in blocks.iter().enumerate().rev() {
                 if i == block_idx {
                     break;
                 }
-                rows_from_bottom +=
-                    completed_block_layout_rows(b, cols, header_rows, viewport_rows);
+                rows_from_bottom += completed_block_layout_rows(
+                    b,
+                    cols,
+                    header_rows,
+                    viewport_rows,
+                    complete_block_overlay,
+                );
             }
             rows_from_bottom += completed_block_output_rows(&blocks[block_idx], cols);
             // Position the block's command line at ~1/3 from the bottom of the
@@ -317,13 +329,19 @@ impl App {
                     .renderer
                     .as_ref()
                     .map(|r| r.block_layout_cache.borrow());
-                let (total, _) = block_content_metrics_with_cache(
+                let (total, _) = crate::block_component::block_content_metrics_with_overlay(
                     &terminal,
                     cols,
                     header_rows,
                     cache.as_deref(),
                     None,
                     None,
+                    // v1.20.0 (D2a): the clamp total lives in the same domain
+                    // the layout pass lays out (overlay flag routed).
+                    self.renderer
+                        .as_ref()
+                        .map_or(true, |r| r.complete_block_overlay),
+                    self.renderer.as_ref().map(|r| &r.block_diagnose_state),
                 );
                 // Compute visible rows from the renderer's actual geometry.
                 let prompt_lines = crate::block_component::block_prompt_lines(&terminal);

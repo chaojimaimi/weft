@@ -106,6 +106,11 @@ pub struct MetalRenderer {
     /// Consumed by `build_grid_instances` — bg instances shift by the exact
     /// px, glyph instances by `floor(px)`. Always 0.0 outside the grid view.
     pub(crate) grid_scroll_px: f32,
+    /// v1.20.0 (PLAN_v1200 §4 D10): per-frame `complete_block_overlay` flag,
+    /// projected from `Pane::complete_block_overlay` by the redraw path (see
+    /// `sync_pane_frame_state`). Paint-path single source: overlay emission,
+    /// surfaces geometry, cache sync and metrics all read this one bit.
+    pub(crate) complete_block_overlay: bool,
     /// v1.14.0 (PLAN_v1140 T4): per-frame hover fade progress snapshot
     /// ((key, progress) pairs projected off `InteractionState.hover_fades`)
     /// — block action buttons + the scrollbar thumb lerp their idle/hover

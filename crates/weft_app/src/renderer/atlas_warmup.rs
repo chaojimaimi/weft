@@ -726,6 +726,15 @@ impl MetalRenderer {
 /// formula drift risk is the v1 draft's P0). Returns `(0, n)` (full scan)
 /// when the prefix sum doesn't cover the block set. Unit-tested in
 /// `atlas_warmup_tests.rs` (window-superset suite).
+///
+/// v1.20.0 (PLAN_v1200 §4 D2c, review N1): flag-agnostic BY CONSTRUCTION —
+/// prefix-sum values are identical under both flag states (`base_row_count =
+/// content + gap + wrap + 1`; overlay chrome px folds to `(gap+1) rows +
+/// header band`, and `header_height` is a whole-pitch multiple, so the
+/// `j*header_height` term equals the per-block overlay header px). A toggle
+/// rebuilds the caller's arrays O(n) (the `BlockLayoutCache` setter) but the
+/// warm window stays byte-identical — pinned by
+/// `overlay_tests.rs::atlas_warmup_window_flag_identity`.
 #[allow(clippy::too_many_arguments)] // pure geometry kernel; mirrors layout_pass's bound fns
 fn block_warm_window(
     n: usize,

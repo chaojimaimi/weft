@@ -490,6 +490,7 @@ fn giant_layout(cols: usize) -> CachedBlockLayout {
         cols,
         foldable: false,
         base_row_count: 0,
+        content_row_count: 0,
         is_clear: false,
         command_wrap_rows: 0,
         content: visual_rows::ContentTable {

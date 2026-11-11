@@ -97,6 +97,23 @@ pub(crate) struct CachedBlockLayout {
     /// even when the entry's `cols` are stale (band-deferred; M6-c degraded)
     /// so metrics stay同源 with the prefix sum's stale `base_row_count`.
     pub(crate) stale_output_rows: usize,
+    /// v1.20.0 (PLAN_v1200 §4 D2b): sister-domain content row count —
+    /// `hint_rows + output_rows` WITHOUT the gap / wrap / separator(+1)
+    /// chrome members that `base_row_count` folds in. Stored ALONGSIDE
+    /// `base_row_count` (double-field, review B2c): cache entries are built
+    /// once and never re-measured on a flag toggle — consumers pick the
+    /// field their flag governs. The derived prefix-sum arrays stay a single
+    /// pair and are still rebuilt O(n) when the flag flips (the flag joins
+    /// the sync key), only the CONSUMED values are identical because
+    /// `base_row_count = content_row_count + gap + command_wrap_rows + 1`
+    /// and the per-block overlay chrome px equals `gap + 1` rows of pitch
+    /// plus the header band (an integer multiple of pitch).
+    /// S1 reads the flag-routed totals via `stale_output_rows` (which already
+    /// folds the hint rows the sister domain counts); `content_row_count`
+    /// stays as the D2b cache-entry hook for S2's per-block consumers, so
+    /// the dead-code allowance is scoped and intentional.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) content_row_count: usize,
     /// M6-c (PLAN_M6 §三): tables dropped by the memory budget
     /// (`enforce_table_budget`). A degraded entry is a metrics-only shell:
     /// every scalar (base_row_count / stale_output_rows / command_wrap_rows /
@@ -213,9 +230,27 @@ pub(crate) struct BlockLayoutCache {
     no_degradable_candidates: bool,
     /// F7-1b: metric scalars of retain-evicted entries (see tombstone.rs).
     tombstones: tombstone::TombstoneMap,
+    /// v1.20.0 (PLAN_v1200 §4 D2e): the `complete_block_overlay` flag the
+    /// last sync ran under. A toggle marks the derived prefix sums dirty so
+    /// they are rebuilt O(n) on the next sync (review B2c: the arrays are
+    /// single and still rebuilt on toggle; the ENTRIES are not re-measured —
+    /// `content_row_count` rides along for free, and the rebuilt values are
+    /// identical because the per-block overlay chrome px equals the chrome
+    /// rows already folded into `base_row_count`).
+    synced_complete_block_overlay: bool,
 }
 
 impl BlockLayoutCache {
+    /// v1.20.0 (PLAN_v1200 §4 D2e): fold the overlay flag into the sync
+    /// state. A toggle marks the derived prefix sums dirty so the next
+    /// `sync_blocks` re-derives them O(n) (single arrays, review B2c).
+    pub(crate) fn set_complete_block_overlay(&mut self, enabled: bool) {
+        if self.synced_complete_block_overlay != enabled {
+            self.prefix_sum_dirty = true;
+            self.synced_complete_block_overlay = enabled;
+        }
+    }
+
     /// Synchronize the append-only block history incrementally. Scrolling
     /// frames check only the newest block; append, resize and explicit
     /// invalidation rebuild affected entries before refreshing the prefix sum.
@@ -739,6 +774,10 @@ fn compute_block_layout_with_content(
         cols,
         foldable,
         base_row_count,
+        // v1.20.0 (PLAN_v1200 §4 D2b): sister-domain count = hint + output
+        // only (chrome members live in base_row_count). Same collapsed=0
+        // rule as content_rows.
+        content_row_count: content_rows,
         is_clear,
         command_wrap_rows,
         content,

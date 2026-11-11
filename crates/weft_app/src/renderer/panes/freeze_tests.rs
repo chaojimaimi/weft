@@ -171,6 +171,7 @@ fn frozen_serve_follows_pane_rect_and_identity_stays_byte_exact() {
                 rect: rect_a,
                 block_scroll: 0.0,
                 editor_mode: false,
+                complete_block_overlay: false,
             },
             last_rebuild: std::time::Instant::now(),
         },
@@ -324,6 +325,7 @@ fn bg_fingerprint_tracks_grid_revision_while_grid_render_flag_on() {
                 rect: rect_a,
                 block_scroll: 0.0,
                 editor_mode: false,
+                complete_block_overlay: renderer.complete_block_overlay,
             },
             // Backdate past the 60ms content throttle: after the revision
             // bump below the gate must reach RebuildNow, not the Throttled
@@ -394,5 +396,79 @@ fn bg_fingerprint_tracks_grid_revision_while_grid_render_flag_on() {
 
     // Clean slate for the other tests under the shared lock.
     renderer.background_block_caches.borrow_mut().remove(&9200);
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
+}
+
+/// v1.20.0 (PLAN_v1200 §4 D2e): the `complete_block_overlay` flag joins
+/// `BgBlockFingerprint` as a composite-key member — background block
+/// vertices bake the finished-block chrome (overlay bands vs laid
+/// Header/Separator rows), so a toggle must invalidate the entry and
+/// rebuild even though every other fingerprint input is unchanged.
+#[test]
+fn bg_fingerprint_toggle_invalidates_on_complete_block_overlay_flip() {
+    let Some(renderer) = headless_renderer_or_skip() else {
+        eprintln!("skipping overlay-toggle fingerprint test: no Metal device available");
+        return;
+    };
+    let _guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::paint::zoom_render::set_self_zoom_window(false);
+    crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
+
+    let mut terminal = weft_core::vt::Terminal::new(6, 40);
+    terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07seq 3\n");
+
+    // Hand-bake an entry whose fingerprint pins the OPPOSITE flag value;
+    // every other composite-key input matches the pane below.
+    let rect_a: crate::layout::Rect = [0.0, 0.0, 400.0, 300.0];
+    let baked: Vec<f32> = vec![1.0; 24];
+    renderer.background_block_caches.borrow_mut().insert(
+        9300,
+        crate::renderer::bg_block_cache::BgBlockCache {
+            vertices: baked.clone(),
+            fingerprint: crate::renderer::bg_block_cache::BgBlockFingerprint {
+                live_output_version: crate::paint::region_cache::live_output_version_source(
+                    &terminal,
+                ),
+                screen_head_lines: terminal.screen_head_lines(),
+                cwd: None,
+                git_branch: None,
+                theme_generation: renderer.background_grid_generation.get(),
+                cell_dims: (renderer.cell_width(), renderer.cell_height()),
+                rect: rect_a,
+                block_scroll: 0.0,
+                editor_mode: false,
+                complete_block_overlay: !renderer.complete_block_overlay,
+            },
+            // Backdate past the 60ms content throttle: the flag flip fails
+            // `same_content`, so the rebuild is gated only by the window.
+            last_rebuild: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        },
+    );
+
+    let rebuilt: Vec<f32> = {
+        let pane = PaneRenderInfo {
+            rect: rect_a,
+            terminal: &terminal,
+            block_scroll: 0.0,
+            submit_on_ctrl_enter: true,
+            pane_session_id: 9300,
+        };
+        let mut rebuilt: Vec<f32> = Vec::new();
+        assert!(renderer.build_background_pane_content(
+            &pane,
+            &mut rebuilt,
+            &mut Vec::new(),
+            &mut Vec::new()
+        ));
+        rebuilt
+    };
+    assert_ne!(
+        rebuilt, baked,
+        "flag toggle must rebuild, not re-serve the stale baked bytes"
+    );
+
+    renderer.background_block_caches.borrow_mut().remove(&9300);
     crate::paint::zoom_render::set_rewrap_freeze_live_resize(false);
 }

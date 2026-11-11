@@ -16,10 +16,10 @@
 //!   display-row total;
 //! - v1.19.2 (PLAN_v1192 §2): the prefix-sum fast path matches the legacy
 //!   full-loop sum — dyn slots, wrapped slots, blank edges, and the
-//!   all-blank legacy full-sum all pinned.
+//!   all-blank legacy full-sum all pinned. v1.20.0 (D10): inputs pass
+//!   `complete_block_overlay: false` (legacy row-stream domain).
 
-use std::collections::HashMap;
-use std::time::SystemTime;
+use std::{collections::HashMap, time::SystemTime};
 
 use weft_core::blocks::{Block, BlockId, InFlightBlock};
 use weft_core::vt::Terminal;
@@ -27,11 +27,9 @@ use weft_core::vt::Terminal;
 use crate::app_state::BlockDiagnoseState;
 use crate::paint::block_view::layout_pass::{compute_block_layout_pass, LaidRow, LayoutPassInput};
 use crate::paint::grid_cache::BlockLayoutCache;
-use crate::paint::live_cache::count_line_chunks;
-use crate::paint::live_cache::LiveLayoutCache;
-use crate::paint::region_cache::{
-    region_display_chunk_total, region_source_for, PaneRegionState, RegionLiveCache, RegionSlot,
-};
+use crate::paint::live_cache::{count_line_chunks, LiveLayoutCache};
+use crate::paint::region_cache::region_display_chunk_total;
+use crate::paint::region_cache::{region_source_for, PaneRegionState, RegionLiveCache, RegionSlot};
 
 // ── fixtures ────────────────────────────────────────────────────────────
 
@@ -104,6 +102,7 @@ fn make_input<'a, 'b, 'c>(
         clip_bottom: 120.0,
         resolve_styles: false,
         styled_lookup_counter: None,
+        complete_block_overlay: false, // v1.20.0 (D10): legacy domain
         block_diagnose_state,
         now: SystemTime::UNIX_EPOCH,
         region,
@@ -717,6 +716,7 @@ fn tall_input<'a, 'b, 'c>(
         clip_bottom: 20_000.0,
         resolve_styles: false,
         styled_lookup_counter: None,
+        complete_block_overlay: false, // v1.20.0 (D10): legacy domain
         block_diagnose_state,
         now: SystemTime::UNIX_EPOCH,
         region,

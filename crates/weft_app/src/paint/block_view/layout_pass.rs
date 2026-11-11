@@ -35,6 +35,9 @@ mod region_rows;
 #[path = "layout_pass/completed_pass.rs"]
 mod completed_pass;
 
+// v1.20.0 (PLAN_v1200 §4 D1): screen-space chrome carrier.
+use super::overlay::OverlayChromeRow;
+
 /// A laid-out row in the block view. Paint-superset fields (`line`/`style`/
 /// `collapsed`/`foldable`/`tone`) are ignored by hit-testing.
 pub(super) enum LaidRow<'a> {
@@ -111,6 +114,11 @@ pub(super) struct LayoutPassOutput<'a> {
     /// Count of finished blocks whose internal lines were expanded
     /// (is_visible && !collapsed) — low vs. `blocks.len()` shows culling works.
     pub(super) expanded_block_count: usize,
+    /// v1.20.0 (PLAN_v1200 §4 D1): completed-block chrome (gap/header/
+    /// separator) emitted as screen-space overlays when
+    /// `complete_block_overlay` is ON. Empty under flag OFF (chrome stays in
+    /// `row_data`). Populated only for blocks the assembly pass walked.
+    pub(super) overlay_rows: Vec<OverlayChromeRow>,
 }
 
 /// Parameters for the shared layout pass (subset of `BlockViewPaintModel`).
@@ -135,6 +143,11 @@ pub(super) struct LayoutPassInput<'a, 'b, 'c> {
     pub(super) resolve_styles: bool,
     /// Counter for `styled.line()` lookups (paint) or `None` (hit-testing).
     pub(super) styled_lookup_counter: Option<&'a Cell<usize>>,
+    /// v1.20.0 (PLAN_v1200 §4 D10): completed-block chrome overlay switch —
+    /// flag ON stops emitting gap/Header/Separator LaidRows and emits
+    /// screen-space `OverlayChromeRow`s instead (D1/D3/D7/D8 ride the same
+    /// switch).
+    pub(super) complete_block_overlay: bool,
     /// Per-block AI diagnose state; extra rows render the panel after output.
     /// Separate lifetime `'b`: output does not borrow from this field.
     pub(super) block_diagnose_state:
@@ -187,6 +200,7 @@ pub(super) fn compute_block_layout_pass<'a, 'b, 'c>(
         clip_bottom,
         resolve_styles,
         styled_lookup_counter,
+        complete_block_overlay,
         block_diagnose_state,
         now,
         region: _,
@@ -206,7 +220,15 @@ pub(super) fn compute_block_layout_pass<'a, 'b, 'c>(
     // LiveLayoutCache's cumulative prefix sums locate the visible logical-line
     // window in O(log n); only visible ± overscan lines are sliced out.
     let scroll_px = block_scroll * pitch;
-    let overscan = header_height + pitch * 2.0;
+    // v1.20.0 (PLAN_v1200 §4 D6): flag ON widens the overscan by the uniform
+    // per-block overlay chrome pixel height (gap 1×pitch + header band +
+    // separator 1×pitch) so the window still covers blocks whose chrome sits
+    // just outside the content bounds.
+    let overscan = if complete_block_overlay {
+        header_height + pitch * 2.0 + header_height + pitch * 2.0
+    } else {
+        header_height + pitch * 2.0
+    };
     if let Some(live) = live {
         live_cache.sync(
             live.output,
@@ -310,7 +332,7 @@ pub(super) fn compute_block_layout_pass<'a, 'b, 'c>(
     // completed_pass::assemble_completed_rows. Each track keeps its own live
     // segment (hand-rolled above / region_live_segment) — only the finished
     // blocks are unified.
-    let expanded_block_count = completed_pass::assemble_completed_rows(
+    let (expanded_block_count, overlay_rows) = completed_pass::assemble_completed_rows(
         completed_pass::CompletedPassCtx {
             blocks,
             cache,
@@ -327,6 +349,7 @@ pub(super) fn compute_block_layout_pass<'a, 'b, 'c>(
             resolve_styles,
             styled_lookup_counter,
             cursor_dist,
+            complete_block_overlay,
         },
         &mut rows,
         &mut row_data,
@@ -336,6 +359,7 @@ pub(super) fn compute_block_layout_pass<'a, 'b, 'c>(
         rows,
         row_data,
         expanded_block_count,
+        overlay_rows,
     }
 }
 

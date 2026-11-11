@@ -34,6 +34,30 @@ pub(crate) fn hovered_block_for_row(
     }
 }
 
+/// One overlay header band in screen space (v1.20.0 PLAN D8). Produced by
+/// hit-testing from the same `OverlayChromeRow` list the paint pass emits,
+/// so hover geometry and paint geometry share a single source and cannot
+/// drift.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BlockChromeBand {
+    pub(crate) y_top: f32,
+    pub(crate) y_bottom: f32,
+    pub(crate) block_id: BlockId,
+}
+
+/// Resolve hover inside an overlay chrome band (flag ON). Under
+/// `complete_block_overlay` the header band is painted where no laid row
+/// exists, so `hovered_block_for_row` never sees it; this half-open lookup
+/// keeps header hover — and with it the inline copy/fold actions —
+/// reachable. Gap/separator bands are deliberately not represented: they
+/// resolve to no hover, matching the flag-OFF row kinds.
+pub(crate) fn hovered_block_in_chrome_bands(bands: &[BlockChromeBand], y: f32) -> Option<BlockId> {
+    bands
+        .iter()
+        .find(|band| y >= band.y_top && y < band.y_bottom)
+        .map(|band| band.block_id)
+}
+
 /// Resolve only the inline header actions. Half-open bounds ensure a point on
 /// an adjacent row belongs to exactly one block and cannot fall through to
 /// terminal text selection.
@@ -130,6 +154,39 @@ mod tests {
             target: HitTarget::BlockFold(BlockId(1)),
         }];
         assert_eq!(block_header_action_at(&regions, 10.0, 10.0), None);
+    }
+
+    #[test]
+    fn chrome_band_lookup_is_half_open_and_first_match() {
+        let bands = vec![
+            BlockChromeBand {
+                y_top: 100.0,
+                y_bottom: 120.0,
+                block_id: BlockId(1),
+            },
+            BlockChromeBand {
+                y_top: 130.0,
+                y_bottom: 150.0,
+                block_id: BlockId(2),
+            },
+        ];
+        assert_eq!(
+            hovered_block_in_chrome_bands(&bands, 100.0),
+            Some(BlockId(1))
+        );
+        assert_eq!(
+            hovered_block_in_chrome_bands(&bands, 119.9),
+            Some(BlockId(1))
+        );
+        // Half-open: the bottom boundary belongs to the next band (or none).
+        assert_eq!(hovered_block_in_chrome_bands(&bands, 120.0), None);
+        assert_eq!(
+            hovered_block_in_chrome_bands(&bands, 130.0),
+            Some(BlockId(2))
+        );
+        assert_eq!(hovered_block_in_chrome_bands(&bands, 150.0), None);
+        assert_eq!(hovered_block_in_chrome_bands(&bands, 90.0), None);
+        assert_eq!(hovered_block_in_chrome_bands(&[], 100.0), None);
     }
 
     #[test]

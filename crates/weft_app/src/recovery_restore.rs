@@ -45,6 +45,10 @@ impl App {
                     let render_mode = self.config_state.config.experimental.tui_render_mode;
                     let live_grid_render =
                         self.config_state.config.experimental.live_block_grid_render;
+                    // v1.20.0 (PLAN_v1200 §4 D10): overlay flag twin binding —
+                    // injected on the PANE below (flag never enters Terminal).
+                    let complete_block_overlay =
+                        self.config_state.config.experimental.complete_block_overlay;
                     if i == 0 {
                         if cwd_to_apply.is_some() {
                             let mut tab = Tab::new(
@@ -69,6 +73,11 @@ impl App {
                                 }
                             }
                             tab.restore_from_snapshot(snap);
+                            // v1.20.0 (D10): pane-level overlay injection twin
+                            // of the terminal-direct calls above.
+                            for pane in tab.panes_mut() {
+                                pane.set_complete_block_overlay(complete_block_overlay);
+                            }
                             self.sessions.replace_tab(0, tab);
                         } else if let Some(t) = self.sessions.tab_mut(0) {
                             t.restore_from_snapshot(snap);
@@ -82,6 +91,11 @@ impl App {
                             cwd_to_apply.as_deref(),
                         );
                         tab.restore_from_snapshot(snap);
+                        // v1.20.0 (D10): pane-level overlay injection twin of
+                        // the terminal-direct calls below.
+                        for pane in tab.panes_mut() {
+                            pane.set_complete_block_overlay(complete_block_overlay);
+                        }
                         if let Some(mut t) = tab.lock_terminal() {
                             t.set_blocks_retained_limit(blocks_limit);
                             t.set_block_output_cap(crate::config_controller::output_cap_bytes(
@@ -142,6 +156,8 @@ impl App {
         let output_cap_mib = self.config_state.config.blocks.output_cap_mib;
         let render_mode = self.config_state.config.experimental.tui_render_mode;
         let live_grid_render = self.config_state.config.experimental.live_block_grid_render;
+        // v1.20.0 (PLAN_v1200 §4 D10): overlay flag twin binding.
+        let complete_block_overlay = self.config_state.config.experimental.complete_block_overlay;
 
         // Root leaf spawns the initial tab. `root_leaf_spawn_cwd` returns ""
         // for an absent cwd → `restore_spawn_cwd` → None → inherit weft cwd.
@@ -165,6 +181,11 @@ impl App {
                 t.set_palette(r.theme().palette);
                 t.set_background_color(r.theme().background);
             }
+        }
+        // v1.20.0 (D10): root-pane overlay injection twin of the terminal-
+        // direct calls above (single-pane root).
+        for pane in tab.panes_mut() {
+            pane.set_complete_block_overlay(complete_block_overlay);
         }
         // Shared block-id allocator (workspace restore_tab precedent) so the
         // restored panes never mint ids colliding with the persisted store.
@@ -194,6 +215,8 @@ impl App {
             new_pane.set_tui_render_mode(render_mode);
             // v1.19.0 (PLAN_v1190 §4 D10): pair the grid-render flag.
             new_pane.set_live_block_grid_render(live_grid_render);
+            // v1.20.0 (PLAN_v1200 §4 D10): pair the overlay flag.
+            new_pane.set_complete_block_overlay(complete_block_overlay);
             tab.split_pane_with_pane(leaf, dir, ratio.clamp(0.1, 0.9), new_pane)
                 .map_err(|e| {
                     warn!(?e, "tab snapshot restore: split failed, skipping subtree");

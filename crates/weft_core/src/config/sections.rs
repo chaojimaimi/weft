@@ -593,6 +593,13 @@ pub struct ExperimentalConfig {
     /// `Terminal::new` stays `false` (core-neutral) — the app injects this
     /// value at construction, same shape as `tui_render_mode`.
     pub live_block_grid_render: bool,
+    /// v1.20.0 (PLAN_v1200 §4 D10): finished-block chrome overlay — gap /
+    /// header band / separator rows render as screen-space overlay instead
+    /// of laid rows. Config default `true` (overlay on by default; set
+    /// `false` to roll back to the laid-row stream). App-layer paint flag
+    /// only — lives on `Pane`, never in `Terminal` (core-neutral, same
+    /// shape as `live_block_grid_render`).
+    pub complete_block_overlay: bool,
 }
 
 impl Default for ExperimentalConfig {
@@ -600,6 +607,7 @@ impl Default for ExperimentalConfig {
         Self {
             tui_render_mode: TuiRenderMode::Noninteractive,
             live_block_grid_render: true,
+            complete_block_overlay: true,
         }
     }
 }
