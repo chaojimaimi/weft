@@ -372,12 +372,16 @@ pub(crate) fn region_source_for<'a>(
 
 // ── internals ───────────────────────────────────────────────────────────
 
-/// Position-domain twin of a document-index row: `position() - (len - idx)`.
+/// Position-domain twin of a document-index row: `position() - (len - idx)`
+/// for retained rows, `position() + (idx - len)` for virtual rows
+/// (v1.20.1: viewport-domain anchors) — the exact inverse of
+/// `FlatStorage::index_since`.
 fn position_of(grid: &Grid, idx: u64) -> u64 {
     let sb_len = grid.scrollback.len() as u64;
     grid.scrollback
         .position()
         .saturating_sub(sb_len.saturating_sub(idx))
+        .saturating_add(idx.saturating_sub(sb_len))
 }
 
 /// `Row::wrapped` of physical row `idx` (document-index domain): scrollback

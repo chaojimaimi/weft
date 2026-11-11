@@ -5999,6 +5999,205 @@ fn sudo_su_cub_edit_grid_region_caret_anchor() {
     );
 }
 
+// ── v1.20.1: the region begin anchor must land on the command line ───────
+
+/// v1.20.1 regression (user report: the `sudo su` live block repeated the
+/// whole pane history while earlier blocks stayed intact). v1.19.0 sampled
+/// the bare `scrollback.position()` at `133;B`, which stays 0 until the
+/// session's first scroll — in a fresh pane every block's live region then
+/// spanned `[0, head)` = the entire visible history. The anchor must be the
+/// command line's *future* position (`position() + its viewport row`), so
+/// the region starts at the command line itself.
+#[test]
+fn region_track_begin_anchors_at_command_line_in_fresh_pane() {
+    let mut t = Terminal::new(40, 120);
+    t.set_live_block_grid_render(true);
+    // Three committed blocks; a 40-row viewport means nothing scrolls.
+    t.process(b"\x1b]133;A\x07$ cd ~\r\n");
+    t.process(b"\x1b]133;B\x07\x1b]133;D;0\x07");
+    t.process(b"\x1b]133;A\x07$ ls -l\r\n");
+    t.process(b"\x1b]133;B\x07");
+    t.process(b"total 16\r\n-rw-r--r-- config.toml\r\n");
+    t.process(b"\x1b]133;D;0\x07");
+    t.process(b"\x1b]133;A\x07$ echo hello\r\n");
+    t.process(b"\x1b]133;B\x07hello\r\n");
+    t.process(b"\x1b]133;D;0\x07");
+    assert_eq!(t.grid().scrollback.position(), 0, "nothing has scrolled");
+
+    // The live `sudo su` block: the anchor must be its command line's
+    // future position, not the top of the pane history.
+    t.process(b"\x1b]133;A\x07$ sudo su\r\n");
+    t.process(b"\x1b]133;B\x07");
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("live block must carry a region begin anchor");
+    let grid = t.grid();
+    let cmd_row = (0..grid.num_rows)
+        .rev()
+        .find(|&row| grid.row_text(row).contains("sudo su"))
+        .expect("command line row in viewport");
+    assert_eq!(
+        begin as usize,
+        grid.scrollback.position() as usize + cmd_row,
+        "anchor = committed rows + command line viewport row"
+    );
+
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert_eq!(
+        lines[0].text,
+        "$ sudo su",
+        "region starts at the command line, got {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().all(|line| !line.text.contains("cd ~")
+            && !line.text.contains("ls -l")
+            && !line.text.contains("hello")),
+        "region must exclude earlier blocks: {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+}
+
+/// v1.20.1 regression, scrolled variant: with committed history in the
+/// scrollback (`position() > 0`) the anchor `position() + viewport_row`
+/// still names the command line — its virtual index is `len + row` and the
+/// region excludes every earlier block.
+#[test]
+fn region_track_begin_excludes_scrolled_history() {
+    let mut t = Terminal::new(6, 80);
+    t.set_live_block_grid_render(true);
+    t.process(b"\x1b]133;A\x07$ echo one\r\n");
+    t.process(b"\x1b]133;B\x07one\r\n");
+    t.process(b"\x1b]133;D;0\x07");
+    t.process(b"\x1b]133;A\x07$ echo two\r\n");
+    t.process(b"\x1b]133;B\x07two\r\n");
+    t.process(b"\x1b]133;D;0\x07");
+    t.process(b"\x1b]133;A\x07$ echo three\r\n");
+    t.process(b"\x1b]133;B\x07three\r\n");
+    t.process(b"\x1b]133;D;0\x07");
+    t.process(b"\x1b]133;A\x07$ echo four\r\n");
+    t.process(b"\x1b]133;B\x07four\r\n");
+    t.process(b"\x1b]133;D;0\x07");
+    assert!(
+        t.grid().scrollback.position() > 0,
+        "session must have scrolled"
+    );
+
+    t.process(b"\x1b]133;A\x07$ sleep 999\r\n");
+    t.process(b"\x1b]133;B\x07");
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("live block must carry a region begin anchor");
+    let grid = t.grid();
+    let cmd_row = (0..grid.num_rows)
+        .rev()
+        .find(|&row| grid.row_text(row).contains("sleep 999"))
+        .expect("command line row in viewport");
+    assert_eq!(
+        begin,
+        grid.scrollback.position() + cmd_row as u64,
+        "anchor = committed rows + command line viewport row"
+    );
+
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert_eq!(
+        lines[0].text,
+        "$ sleep 999",
+        "region starts at the command line, got {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().all(|line| !line.text.contains("echo one")
+            && !line.text.contains("echo two")
+            && !line.text.contains("echo three")
+            && !line.text.contains("echo four")),
+        "region must exclude scrolled-out blocks: {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+}
+
+/// v1.20.1: a soft-wrapped command line anchors at its FIRST segment — the
+/// viewport-row walk follows `Row::wrapped` up the chain — so the region's
+/// first logical line is the whole wrapped command.
+#[test]
+fn region_track_begin_walks_wrapped_command_chain() {
+    let mut t = Terminal::new(20, 40);
+    t.set_live_block_grid_render(true);
+    // A committed block first: with position()>0 and first_seg>0 the
+    // anchor assertion discriminates the v1.20.1 sampling
+    // (position + command viewport row) from the pre-fix bare
+    // position() (which would anchor at the viewport top and red both
+    // asserts below).
+    t.process(b"\x1b]133;A\x07echo ready\r\n");
+    t.process(b"\x1b]133;B\x07ready\r\n\x1b]133;D;0\x07");
+    // 52 chars > 40 cols: the command line wraps into two physical rows.
+    let long_cmd = format!("$ {}", "a".repeat(50));
+    t.process(b"\x1b]133;A\x07");
+    t.process(long_cmd.as_bytes());
+    t.process(b"\r\n");
+    t.process(b"\x1b]133;B\x07");
+    let begin = t
+        .block_tracker()
+        .region_begin_position()
+        .expect("live block must carry a region begin anchor");
+    let grid = t.grid();
+    let first_seg = (0..grid.num_rows)
+        .rev()
+        .find(|&row| grid.row_text(row).starts_with("$ "))
+        .expect("first wrapped segment row");
+    assert_eq!(
+        begin as usize,
+        grid.scrollback.position() as usize + first_seg,
+        "anchor lands on the first wrapped segment"
+    );
+
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert_eq!(
+        lines[0].text,
+        long_cmd,
+        "wrapped segments merge into one logical line, got {:?}",
+        lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+}
+
 // ── v1.19.2 WP3-A / WP4 (PLAN_v1192 §3-§4): region-track hyperlinks and
 // finalize equivalence, at the core resolver layer ──────────────────────
 
@@ -6152,3 +6351,5 @@ fn region_track_finalize_preserves_completed_rows() {
         "plain-core capture keeps no styled spans; link survival is the region track's job"
     );
 }
+
+// ── TEMP REPRO (v1.20.0 user report: sudo su live block shows entire pane history) ──

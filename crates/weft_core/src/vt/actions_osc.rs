@@ -13,6 +13,27 @@ use super::{Terminal, PRIMARY_SCREEN_EXIT_SETTLE_DELAY};
 use crate::blocks::ShellPhase;
 
 impl Terminal {
+    /// Viewport row where the region track's begin anchor lands: the command
+    /// line at `133;B`. The cursor usually sits on the empty row below it
+    /// (real shells emit the newline before preexec — see
+    /// `snapshot_command_line`), so walk up to the last non-empty row, then
+    /// to the first row of its soft-wrap chain so a wrapped command anchors
+    /// at its prompt row.
+    fn region_begin_viewport_row(&self) -> u64 {
+        let mut row = self.grid.cursor.row;
+        loop {
+            if self.grid.row_text(row).is_empty() && row > 0 {
+                row -= 1;
+            } else {
+                break;
+            }
+        }
+        while row > 0 && self.grid.viewport[row - 1].wrapped {
+            row -= 1;
+        }
+        row as u64
+    }
+
     pub(super) fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         self.suppress_joined_scalar = false;
         if params.is_empty() {
@@ -302,9 +323,20 @@ impl Terminal {
                                 self.block_tracker.on_command_start(command);
                                 // v1.19.0 (D3): sample the grid-region begin
                                 // anchor after `on_command_start` (which resets
-                                // it) — scrollback.position() at 133;B.
-                                self.block_tracker
-                                    .note_command_begin_position(self.grid.scrollback.position());
+                                // it). v1.20.1 fix: the anchor is the document
+                                // position of the command line itself —
+                                // committed-row count (position()) PLUS the
+                                // command line's viewport row. Bare
+                                // position() stays 0 until the session's first
+                                // scroll, so in a fresh pane every block
+                                // sampled begin 0 and its live region rendered
+                                // the whole pane history above the command
+                                // (the v1.20.0 "sudo su block repeats earlier
+                                // commands" bug).
+                                let command_row = self.region_begin_viewport_row();
+                                self.block_tracker.note_command_begin_position(
+                                    self.grid.scrollback.position().saturating_add(command_row),
+                                );
                                 // v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三
                                 // M1.1, P1-2): real command boundary — clear
                                 // the interactive-stdin exemption. Deliberately

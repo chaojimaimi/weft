@@ -102,9 +102,11 @@ fn head_below_begin_yields_empty_region_without_clamping() {
     );
 }
 
-/// Clear/recreate defense: an anchor from a previous buffer generation
-/// (`begin_position > scrollback.position()`) yields an EMPTY region,
-/// mirroring `FlatStorage::index_since`'s guard instead of clamping.
+/// Clear/recreate defense: an anchor beyond the document's future
+/// (`begin_position >= scrollback.position() + num_rows`) yields an EMPTY
+/// region. Since v1.20.1 anchors between `position()` and
+/// `position() + num_rows - 1` are legitimate virtual positions (a command
+/// line's future slot); only genuinely stale anchors are rejected.
 #[test]
 fn begin_position_past_flat_position_yields_empty_region() {
     let mut terminal = Terminal::new(4, 20);

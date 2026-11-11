@@ -16,10 +16,12 @@
 //! leading/trailing empty logical lines are KEPT (dropping them is the app
 //! layer's job, P1-6). Interior empty rows stay as empty logical lines.
 //!
-//! Defense (D4): `begin_position > scrollback.position()` — the buffer was
-//! cleared and recreated — yields an EMPTY region, mirroring
-//! `FlatStorage::index_since`'s guard instead of clamping; a `head` below
-//! `start` likewise yields empty (no `max(begin, head)` clamp).
+//! Defense (D4): a `begin_position` at or beyond
+//! `scrollback.position() + num_rows` cannot name any row of the current
+//! document (the largest legitimate anchor is the command line's future
+//! position at the viewport's bottom row) and yields an EMPTY region —
+//! the recreate-epoch guard; a `head` below `start` likewise yields empty
+//! (no `max(begin, head)` clamp).
 //!
 //! Reflow (D5): a resize rewraps the document, so a sampled
 //! `begin_position` may point at a different physical row afterwards (begin
@@ -38,8 +40,10 @@ use std::sync::Arc;
 /// document. Stateless: every read re-derives the row range from the grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridRegionSource {
-    /// Scrollback `position()` sampled at `133;B` (or the screen-owned
-    /// `screen_document_start`); see `BlockTracker::region_begin_position`.
+    /// Scrollback `position()` sampled at `133;B` *plus the command line's
+    /// viewport row* — the command line's future insert position (v1.20.1;
+    /// the bare `position()` sample anchored fresh panes at the top of the
+    /// pane history). See `BlockTracker::region_begin_position`.
     pub begin_position: u64,
     /// Exclusive end as a unified document index. `None` extends to the
     /// document tail (extension slot; v1.19.0 always passes `Some`).
@@ -69,9 +73,17 @@ pub fn logical_lines<F>(grid: &Grid, source: GridRegionSource, url_resolver: F) 
 where
     F: Fn(u32) -> Option<Arc<str>>,
 {
-    // Buffer cleared and recreated (flat position reset): the anchor is
-    // stale — empty region, never a clamp (D4).
-    if source.begin_position > grid.scrollback.position() {
+    // Anchor beyond the document's future: `position() + num_rows - 1` is
+    // the largest legitimate anchor (the command line's future position at
+    // the viewport's bottom row), so anything at or past
+    // `position() + num_rows` is stale (cleared-and-recreated buffer) —
+    // empty region, never a clamp (D4; v1.20.1 admits in-viewport anchors).
+    if source.begin_position
+        >= grid
+            .scrollback
+            .position()
+            .saturating_add(grid.num_rows as u64)
+    {
         return Vec::new();
     }
     let total = grid.scrollback.len() as u64 + grid.num_rows as u64;

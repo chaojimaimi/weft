@@ -300,10 +300,21 @@ fn new_begin_anchor_rebuilds_wholesale() {
     t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07");
     let st = snapshot(&cache, &t, 1);
     assert_eq!(cache.rebuilds(), 2, "begin change → wholesale");
-    assert_eq!(st.begin_position, t.grid().scrollback.position());
-    // The new region starts at the fresh anchor (scrollback holds alpha):
-    // beta/gamma (still the viewport content) remain.
-    assert_eq!(texts(&st), ["beta", "gamma"]);
+    // v1.20.1: the anchor is the fresh command line's document position
+    // — committed rows + its viewport row (the cursor rests on
+    // "gamma", whose viewport row is 1).
+    let cmd_row = (0..t.grid().num_rows)
+        .rev()
+        .find(|&row| !t.grid().row_text(row).trim_end().is_empty())
+        .expect("command line row");
+    assert_eq!(
+        st.begin_position,
+        t.grid().scrollback.position() + cmd_row as u64
+    );
+    // The new region starts at the fresh command line: only gamma remains
+    // (beta belongs to the previous, already-archived block — under the
+    // pre-v1.20.1 bare-position sample the region wrongly included it).
+    assert_eq!(texts(&st), ["gamma"]);
 }
 
 // ── wrapped-line merging ────────────────────────────────────────────────

@@ -203,13 +203,18 @@ impl FlatStorage {
         self.position
     }
 
-    /// Index of the oldest retained row inserted at or after `position`.
+    /// Index of the row whose insert position is `position`, over the
+    /// unified document index space.
     ///
-    /// Bit-for-bit transplant of `scrollback.rs:102-108`.
+    /// Bit-for-bit transplant of `scrollback.rs:102-108`, extended
+    /// (v1.20.1) to *future* positions: a position beyond `self.position`
+    /// maps to a virtual index `>= len` — the index that row will occupy
+    /// once pushed. This is what lets a region anchor sampled at `133;B`
+    /// name the command line while it still lives in the viewport
+    /// (`position() + its viewport row`). Anchor-epoch validation (a
+    /// position from a cleared-and-recreated buffer) is the caller's job —
+    /// `grid::region` bounds the anchor by `position() + num_rows`.
     pub fn index_since(&self, position: u64) -> usize {
-        if position > self.position {
-            return 0; // The buffer was cleared and recreated.
-        }
         let oldest = self.position.saturating_sub(self.len() as u64);
         position.max(oldest).saturating_sub(oldest) as usize
     }

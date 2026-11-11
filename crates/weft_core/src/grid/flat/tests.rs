@@ -486,7 +486,13 @@ fn position_clear_and_index_since_match_scrollback_semantics() {
     assert_eq!(storage.index_since(2), 0);
     assert_eq!(storage.index_since(4), 2);
     assert_eq!(storage.index_since(5), 3);
-    assert_eq!(storage.index_since(6), 0, "future positions clamp to 0");
+    // v1.20.1: future positions are virtual indices (viewport-domain
+    // anchors), not clamps: 6 - oldest(2) = 4 = len(3) + 1.
+    assert_eq!(
+        storage.index_since(6),
+        4,
+        "future positions map to virtual indices"
+    );
 
     // CSI 3J: rows dropped, anchors stay valid, position never rewinds.
     storage.clear();
