@@ -5,12 +5,13 @@ A modern macOS terminal emulator with block-based command history, Metal GPU ren
 ## Features
 
 - **Metal GPU rendering** — instance-based cell rendering with dirty-row tracking and GPU scroll blit
-- **Block view** — commands and their output are grouped into navigable blocks (à la Warp)
+- **Block view** — commands and their output are grouped into navigable blocks (à la Warp), with grid-faithful live rendering for interactive commands (sudo, ssh, REPLs) and in-place line editing (caret tracking) since v1.19
+- **OSC 8 hyperlinks** — URLs advertised by shells/CLI tools render styled and open on click
 - **Shell integration** — OSC 133 markers from zsh integration split commands into blocks
 - **Find** — async regex/case-sensitive search across full scrollback (FindWorker background thread)
 - **Multi-tab** — Cmd+T new tab, Cmd+W close, Cmd+Shift+[/] cycle
 - **Split panes + workspaces** — nested pane layouts, save/open workspace, crash recovery
-- **Themes** — 11 built-in themes (Tokyo Night, Solarized, One Dark, Gruvbox, Catppuccin, Nord, ...) + custom theme files
+- **Themes** — 12 built-in themes (Tokyo Night, Solarized, One Dark, Gruvbox, Catppuccin, Nord, Dracula, Monokai Pro, Warp Light/Dark, Weft Light/Warm) + custom theme files
 - **System theme follow** — auto-switch light/dark with macOS appearance
 - **Settings UI** — Cmd+, opens Appearance/Font/Keybindings/Window/Local AI/Advanced settings with profiles
 - **Command palette** — Cmd+P fuzzy command runner + workflow execution
@@ -32,7 +33,7 @@ Interactive throughput (2026-08-17 manual 3-run avg; both columns same methodolo
 | `seq 1 100000` | ~150ms | ~50ms |
 | `ls -la /usr/bin` | ~7.6ms | ~5ms |
 
-Automated baselines (2026-08-29, Apple M2 Max, macOS 26.6.2, release build — full data in `docs/perf/v1.11.9-baseline.md`): VT parse 14.6–20.6 MB/s (100k/1M lines), block visible-window render p95 ≤0.15ms at 100k lines, 10k history filter 15.3ms, offscreen Metal frame p95 ≤0.68ms, GUI idle CPU frame p95 0.48ms. Cold start ~0.39s to first frame (bundled, warm; gate protocol p95 456ms on the bare binary) — exceeded the legacy 0.30s budget set against the v1.10.3-era codebase; waiver and attribution recorded in the baseline doc, optimization queued for v1.12.
+Automated baselines (2026-08-29, Apple M2 Max, macOS 26.6.2, release build — full data in `docs/perf/v1.11.9-baseline.md`): VT parse 14.6–20.6 MB/s (100k/1M lines), block visible-window render p95 ≤0.15ms at 100k lines, 10k history filter 15.3ms, offscreen Metal frame p95 ≤0.68ms, GUI idle CPU frame p95 0.48ms. Cold start ~0.39s to first frame (bundled, warm; gate protocol p95 456ms on the bare binary); waiver and attribution recorded in the baseline doc. Current gate budgets (v1.20): cold start 485ms p95, interactive throughput and CJK 50k render median ≤130ms enforced by `scripts/performance_gate.sh`.
 
 Cold-start budget: 485ms p95 (bare release binary, fresh config; bundled warm typically lower). Protocol: `scripts/performance_gate.sh` samples 20 sequential launches of the bare `target/release/weft` binary, each with an isolated fresh `XDG_CACHE_HOME`/`XDG_CONFIG_HOME`, and takes the nearest-rank p95 of `first_frame_ms`. The 485ms figure was rescaled in v1.11.12 from measured data (max(ceil(p95×1.1), 300), cap 500 — see `scripts/performance_gate.sh`); per-phase attribution lives in the plan report (`docs/PLAN_v11112_SNAPSHOT_COST_COLDSTART.md` M-B).
 
@@ -59,7 +60,7 @@ First launch: right-click → Open to bypass Gatekeeper (Ad-hoc signature is not
 
 ### From release
 
-Download the latest `Weft-*.zip` from [Releases](https://github.com/chaojimaimi/weft/releases), unzip, drag `Weft.app` to `/Applications`.
+Download the latest `Weft-*.dmg` from [Releases](https://github.com/chaojimaimi/weft/releases) (SHA256 checksums in `SHA256SUMS`), open the DMG and drag `Weft.app` to `/Applications`.
 
 > **Note**: Public distribution requires an Apple Developer certificate for notarization. Until then, the app ships Ad-hoc signed and users must right-click → Open on first launch.
 
@@ -74,7 +75,7 @@ size = 13.0
 line_height = 1.2
 
 [theme]
-name = "weft-warm"           # 11 built-in themes + custom files
+name = "warp"                # 12 built-in themes + custom files (default: warp; "weft-warm" restores the classic look)
 minimum_contrast = 7.0        # 1.0 preserves exact ANSI/truecolor RGB
 follow_system = false        # auto-switch with macOS appearance
 
