@@ -174,8 +174,6 @@ impl GridInstanceBatch {
     /// glyphs stored in the RGBA color atlas (color emoji); their `fg` is
     /// replaced by an alpha=2.0 sentinel so the fragment shader can route
     /// them to the color texture. Normal glyphs keep their own `fg`.
-    /// Extend both streams with a row's instances, resolving glyph UVs via
-    /// `resolve_uv`. Returns the float offsets occupied by this row.
     ///
     /// `y_offset_px` is the v1.14.0 (PLAN_v1140 T6) sub-row scroll shift:
     /// - bg instances shift by the EXACT px (continuous background motion);
@@ -191,56 +189,89 @@ impl GridInstanceBatch {
         y_offset_px: f32,
         resolve_uv: &ResolveUv<'_>,
     ) -> PaneInstanceRanges {
-        let glyph_floor = y_offset_px.floor();
-        let bg_start = self.bg_stream.len();
-        for bi in &row.bg_instances {
-            let mut shifted = *bi;
-            shifted.y0 += y_offset_px;
-            shifted.push(&mut self.bg_stream);
-        }
-        let bg_end = self.bg_stream.len();
+        // v1.20.5: the body moved to the free function `push_row_instances`
+        // so the active-pane path (`MetalRenderer::build_grid_instances`) can
+        // write straight into the caller's frame-level scratch pool without
+        // building an intermediate `GridInstanceBatch` (single-API discipline:
+        // this method is now the batch-shaped wrapper, the free function is
+        // the implementation).
+        push_row_instances(
+            &mut self.bg_stream,
+            &mut self.glyph_stream,
+            row,
+            y_offset_px,
+            resolve_uv,
+        )
+    }
+}
 
-        let glyph_start = self.glyph_stream.len();
-        for gi in &row.glyph_instances {
-            match gi {
-                GlyphInstance::Text {
-                    dst,
-                    ch,
-                    fg,
-                    cluster,
-                    style,
-                } => {
-                    let (uv, is_color) = resolve_uv(*ch, cluster.as_deref(), *style);
-                    // fg.a = 2.0 sentinel (normal fg alpha ≤ 1.0): the shader
-                    // detects color-atlas glyphs via `fg.a >= 1.5` and samples
-                    // color_atlas instead of tinting the mask with fg.
-                    let fg = if is_color { [0.0, 0.0, 0.0, 2.0] } else { *fg };
-                    let mut shifted = *dst;
-                    shifted[1] += glyph_floor;
-                    shifted[3] += glyph_floor;
-                    push_cell_instance(&mut self.glyph_stream, shifted, uv, fg, [0.0; 4]);
-                }
-                GlyphInstance::Decoration { dst, color } => {
-                    // UV [0,0,0,1] → mask=0 → only bg (color) shows.
-                    let mut shifted = *dst;
-                    shifted[1] += glyph_floor;
-                    shifted[3] += glyph_floor;
-                    push_cell_instance(
-                        &mut self.glyph_stream,
-                        shifted,
-                        [0.0, 0.0, 0.0, 1.0],
-                        [0.0; 4],
-                        *color,
-                    );
-                }
+/// Extend two dual-stream output buffers with one row's instances, resolving
+/// glyph UVs via `resolve_uv`. Returns the float offsets occupied by this row.
+///
+/// v1.20.5: extracted verbatim from `GridInstanceBatch::push_row` (the batch
+/// method now delegates here) so the active grid path can write directly into
+/// the WP3 frame scratch pools, eliminating the per-dirty-frame intermediate
+/// `GridInstanceBatch` allocation + extend copy (allocation sampling
+/// 2026-11-12: 104,448 B per dirty frame). Byte-for-byte identical output.
+///
+/// `y_offset_px` is the v1.14.0 (PLAN_v1140 T6) sub-row scroll shift:
+/// - bg instances shift by the EXACT px (continuous background motion);
+/// - glyph instances shift by `floor(px)` whole physical pixels (px is
+///   already physical — accumulated from PixelDelta ÷ physical cell
+///   height — and the integer floor prevents sub-pixel glyph smear).
+///
+/// The caller passes `0.0` for every non-scrolling surface (background
+/// panes, block view); `0.0` reproduces the pre-T6 output bit-for-bit.
+pub(crate) fn push_row_instances(
+    bg_out: &mut Vec<f32>,
+    glyph_out: &mut Vec<f32>,
+    row: &GridRowInstances,
+    y_offset_px: f32,
+    resolve_uv: &ResolveUv<'_>,
+) -> PaneInstanceRanges {
+    let glyph_floor = y_offset_px.floor();
+    let bg_start = bg_out.len();
+    for bi in &row.bg_instances {
+        let mut shifted = *bi;
+        shifted.y0 += y_offset_px;
+        shifted.push(bg_out);
+    }
+    let bg_end = bg_out.len();
+
+    let glyph_start = glyph_out.len();
+    for gi in &row.glyph_instances {
+        match gi {
+            GlyphInstance::Text {
+                dst,
+                ch,
+                fg,
+                cluster,
+                style,
+            } => {
+                let (uv, is_color) = resolve_uv(*ch, cluster.as_deref(), *style);
+                // fg.a = 2.0 sentinel (normal fg alpha ≤ 1.0): the shader
+                // detects color-atlas glyphs via `fg.a >= 1.5` and samples
+                // color_atlas instead of tinting the mask with fg.
+                let fg = if is_color { [0.0, 0.0, 0.0, 2.0] } else { *fg };
+                let mut shifted = *dst;
+                shifted[1] += glyph_floor;
+                shifted[3] += glyph_floor;
+                push_cell_instance(glyph_out, shifted, uv, fg, [0.0; 4]);
+            }
+            GlyphInstance::Decoration { dst, color } => {
+                // UV [0,0,0,1] → mask=0 → only bg (color) shows.
+                let mut shifted = *dst;
+                shifted[1] += glyph_floor;
+                shifted[3] += glyph_floor;
+                push_cell_instance(glyph_out, shifted, [0.0, 0.0, 0.0, 1.0], [0.0; 4], *color);
             }
         }
-        let glyph_end = self.glyph_stream.len();
+    }
+    let glyph_end = glyph_out.len();
 
-        PaneInstanceRanges {
-            bg_range: (bg_start, bg_end),
-            glyph_range: (glyph_start, glyph_end),
-        }
+    PaneInstanceRanges {
+        bg_range: (bg_start, bg_end),
+        glyph_range: (glyph_start, glyph_end),
     }
 }
 

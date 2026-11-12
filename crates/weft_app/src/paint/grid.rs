@@ -7,11 +7,16 @@
 //! v1.4.2 Phase B3: rewired to use B2's pure-logic `build_row_instances`
 //! collector. The per-row cache now stores `GridRowInstances` (bg runs +
 //! glyph instances) instead of a flat `Vec<f32>`. Each frame flattens the
-//! cache into a `GridInstanceBatch` (bg_stream + glyph_stream) for the
-//! Metal dual-stream pipeline.
+//! cache into the Metal dual-stream pipeline: since v1.20.5 the ACTIVE
+//! pane path writes those streams directly into the caller's frame-level
+//! scratch pool via `build_grid_instances` out-params; only the throttled
+//! BACKGROUND-pane path still assembles an intermediate
+//! `GridInstanceBatch` (60 ms fingerprint-gated rebuilds).
 
 use crate::layout::Rect;
-use crate::paint::grid_instances::{build_row_instances, GridInstanceBatch, GridRowInstances};
+use crate::paint::grid_instances::{
+    build_row_instances, push_row_instances, GridInstanceBatch, GridRowInstances,
+};
 use crate::paint::primitives::color_to_normalized;
 use crate::renderer::MetalRenderer;
 use weft_core::grid::{Color, CursorStyle};
@@ -263,11 +268,25 @@ impl MetalRenderer {
     /// via `self.atlas` and splits into `bg_stream` (8 floats/run) +
     /// `glyph_stream` (16 floats/cell).
     ///
-    /// R3-1: returns `(batch, dirty_row_count)` so the frame trace can
-    /// report how many rows were actually rebuilt this frame. `dirty_row_count`
-    /// is the number of non-hidden rows rebuilt: `num_rows` (or fewer if
+    /// R3-1: returns `dirty_row_count` so the frame trace can report how
+    /// many rows were actually rebuilt this frame. `dirty_row_count` is the
+    /// number of non-hidden rows rebuilt: `num_rows` (or fewer if
     /// primary-screen masking hides some) on `force_full`, 0 on the idle
     /// fast path, and the actual dirty set size otherwise.
+    ///
+    /// v1.20.5 (PLAN_V1205_GRID_BATCH_POOL): writes the dual-stream output
+    /// straight into the caller's frame-level scratch pool (`bg_out` /
+    /// `glyph_out`, the WP3 reuse pools) instead of building an intermediate
+    /// `GridInstanceBatch` that the caller then `extend`-copies and drops
+    /// (allocation sampling 2026-11-12: 104,448 B allocated + copied per
+    /// dirty frame). Output is byte-for-byte identical to the previous
+    /// batch path; the background-pane path (`:628`) still uses the batch
+    /// shape via the `GridInstanceBatch::push_row` wrapper.
+    // v1.20.5: the two out-stream params complete the dual-stream write API
+    // (PLAN D1); the alternative — bundling cursor/selection/policy/streams
+    // into a params struct — was rejected to keep the call site in
+    // draw_phases.rs flat and the diff minimal.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_grid_instances(
         &self,
         grid: &weft_core::grid::Grid,
@@ -275,7 +294,9 @@ impl MetalRenderer {
         cursor: &weft_core::grid::Cursor,
         selection: &SelectionHandler,
         policy: GridViewPolicy,
-    ) -> (GridInstanceBatch, usize) {
+        bg_out: &mut Vec<f32>,
+        glyph_out: &mut Vec<f32>,
+    ) -> usize {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let num_rows = grid.num_rows;
@@ -417,7 +438,12 @@ impl MetalRenderer {
         if rows_to_rebuild.is_empty() && grid_scroll_px == 0.0 {
             drop(cache);
             self.instances_unchanged.set(true);
-            return (GridInstanceBatch::default(), 0);
+            // v1.20.5: the idle path writes nothing into bg_out/glyph_out
+            // (the caller's scratch pools are cleared per frame by frame.rs
+            // and the bg-pane segments were already appended there) — the
+            // previous `GridInstanceBatch::default()` allocated nothing but
+            // the caller's extend of empty streams was a no-op either way.
+            return 0;
         }
         self.instances_unchanged.set(false);
 
@@ -458,11 +484,16 @@ impl MetalRenderer {
         }
         drop(cache);
 
-        // Flatten the per-row cache into a dual-stream batch. Glyph UVs
-        // are resolved here (needs `self.atlas`) via the closure passed to
-        // `GridInstanceBatch::push_row`.
+        // Flatten the per-row cache into the caller's dual-stream output.
+        // Glyph UVs are resolved here (needs `self.atlas`) via the closure
+        // passed to `push_row_instances`.
+        // v1.20.5: direct write — no intermediate `GridInstanceBatch`. The
+        // capacity hints mirror the old `with_capacity(num_rows + 1,
+        // num_cols)` budget; once the WP3 scratch pools reach steady-state
+        // capacity these reserves are no-ops.
         let cache = self.grid_row_cache.borrow();
-        let mut batch = GridInstanceBatch::with_capacity(num_rows + 1, num_cols);
+        bg_out.reserve((num_rows + 1) * 4 * 8);
+        glyph_out.reserve((num_rows + 1) * (num_cols / 2 + 1) * 16);
         // P1-1: a px≠0 shift moves every cached row DOWN, leaving the
         // viewport-top band [origin_y, origin_y + px) empty. Fill it with
         // the scrollback row above the visible top, pushed with the SAME
@@ -482,17 +513,25 @@ impl MetalRenderer {
                 self.bold_is_bright,
                 self.theme.link,
             ) {
-                batch.push_row(&extra, grid_scroll_px, &|ch, cluster, style| {
-                    self.resolve_glyph_uv(ch, cluster, style)
-                });
+                push_row_instances(
+                    bg_out,
+                    glyph_out,
+                    &extra,
+                    grid_scroll_px,
+                    &|ch, cluster, style| self.resolve_glyph_uv(ch, cluster, style),
+                );
             }
         }
         for row_inst in cache.iter() {
-            batch.push_row(row_inst, grid_scroll_px, &|ch, cluster, style| {
-                self.resolve_glyph_uv(ch, cluster, style)
-            });
+            push_row_instances(
+                bg_out,
+                glyph_out,
+                row_inst,
+                grid_scroll_px,
+                &|ch, cluster, style| self.resolve_glyph_uv(ch, cluster, style),
+            );
         }
-        (batch, rebuilt_rows)
+        rebuilt_rows
     }
 
     /// v1.3 Batch 5 / v1.4.2 Phase B3: Build grid instances for a

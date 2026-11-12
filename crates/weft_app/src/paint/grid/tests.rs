@@ -226,6 +226,8 @@ fn active_pane_cache_invalidates_on_layout_origin_move() {
     let mut terminal = weft_core::vt::Terminal::new(4, 20);
     let build = |renderer: &crate::renderer::MetalRenderer, terminal: &weft_core::vt::Terminal| {
         let grid = terminal.grid();
+        let mut bg_out = Vec::new();
+        let mut glyph_out = Vec::new();
         renderer.build_grid_instances(
             grid,
             terminal.palette(),
@@ -239,16 +241,18 @@ fn active_pane_cache_invalidates_on_layout_origin_move() {
                 is_alt_screen: false,
                 inset_block_gutter: false,
             },
+            &mut bg_out,
+            &mut glyph_out,
         )
     };
 
-    let (_, rebuilt) = build(&renderer, &terminal);
+    let rebuilt = build(&renderer, &terminal);
     assert_eq!(rebuilt, 4, "first build for a fresh renderer is full");
 
     // Steady state: dirty flags cleared (the redraw_controller's post-frame
     // clear on the live path), no scroll/dims/cursor change → incremental.
     terminal.grid_mut().clear_all_dirty();
-    let (_, rebuilt) = build(&renderer, &terminal);
+    let rebuilt = build(&renderer, &terminal);
     assert_eq!(rebuilt, 0, "idle active pane must not rebuild any row");
 
     // Layout origin moved (split drag / sidebar) with the SAME pane →
@@ -256,7 +260,7 @@ fn active_pane_cache_invalidates_on_layout_origin_move() {
     if let Some(ctx) = renderer.layout_ctx.as_mut() {
         ctx.padding_x += 5.0;
     }
-    let (_, rebuilt) = build(&renderer, &terminal);
+    let rebuilt = build(&renderer, &terminal);
     assert_eq!(rebuilt, 4, "origin move invalidates baked row coordinates");
 }
 
@@ -524,6 +528,8 @@ fn active_pane_cache_invalidates_on_chrome_left_move() {
     let mut terminal = weft_core::vt::Terminal::new(4, 20);
     let build = |renderer: &crate::renderer::MetalRenderer, terminal: &weft_core::vt::Terminal| {
         let grid = terminal.grid();
+        let mut bg_out = Vec::new();
+        let mut glyph_out = Vec::new();
         renderer.build_grid_instances(
             grid,
             terminal.palette(),
@@ -537,13 +543,15 @@ fn active_pane_cache_invalidates_on_chrome_left_move() {
                 is_alt_screen: false,
                 inset_block_gutter: false,
             },
+            &mut bg_out,
+            &mut glyph_out,
         )
     };
 
-    let (_, rebuilt) = build(&renderer, &terminal);
+    let rebuilt = build(&renderer, &terminal);
     assert_eq!(rebuilt, 4, "first build for a fresh renderer is full");
     terminal.grid_mut().clear_all_dirty();
-    let (_, rebuilt) = build(&renderer, &terminal);
+    let rebuilt = build(&renderer, &terminal);
     assert_eq!(rebuilt, 0, "idle active pane must not rebuild any row");
 
     // Sidebar drag frame: chrome_left moves, window size (viewport) does
@@ -552,12 +560,12 @@ fn active_pane_cache_invalidates_on_chrome_left_move() {
     if let Some(ctx) = renderer.layout_ctx.as_mut() {
         ctx.chrome_left += 5.0;
     }
-    let (_, rebuilt) = build(&renderer, &terminal);
+    let rebuilt = build(&renderer, &terminal);
     assert_eq!(
         rebuilt, 4,
         "chrome_left move must trigger one full rebuild via the origin fingerprint"
     );
     terminal.grid_mut().clear_all_dirty();
-    let (_, rebuilt) = build(&renderer, &terminal);
+    let rebuilt = build(&renderer, &terminal);
     assert_eq!(rebuilt, 0, "post-move steady state is incremental");
 }

@@ -420,8 +420,17 @@ impl crate::renderer::MetalRenderer {
                 cursor_blink_on,
                 prompt.is_some() || tui_preedit.is_some(),
             );
+            // v1.4.2 Phase B3: append active pane's dual-stream instances.
+            // v1.20.5 (PLAN_V1205_GRID_BATCH_POOL): the build writes straight
+            // into the frame scratch pools (no intermediate batch, no extend
+            // copy). The active segment ranges bracket exactly this write;
+            // snapshot order below preserves the bg-pane-first semantics of
+            // the previous build-then-extend shape. The timing window covers
+            // only the build call, as before.
+            let active_bg_start = bg_stream.len();
+            let active_glyph_start = glyph_stream.len();
             let grid_build_start = std::time::Instant::now();
-            let (grid_batch, grid_dirty_rows) = self.build_grid_instances(
+            let grid_dirty_rows = self.build_grid_instances(
                 grid,
                 terminal.palette(),
                 cursor,
@@ -435,14 +444,11 @@ impl crate::renderer::MetalRenderer {
                     inset_block_gutter: !terminal.is_alt_screen_active()
                         && terminal.primary_screen_owns_live_view(),
                 },
+                bg_stream,
+                glyph_stream,
             );
             self.grid_build_us_counter
                 .set(grid_build_start.elapsed().as_micros() as u64);
-            // v1.4.2 Phase B3: append active pane's dual-stream instances.
-            let active_bg_start = bg_stream.len();
-            let active_glyph_start = glyph_stream.len();
-            bg_stream.extend(&grid_batch.bg_stream);
-            glyph_stream.extend(&grid_batch.glyph_stream);
             let active_bg_end = bg_stream.len();
             let active_glyph_end = glyph_stream.len();
             // v1.14.1 (F2): bake the sub-row scroll clip into the stored rect
