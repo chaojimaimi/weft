@@ -748,7 +748,7 @@ fn bg_block_fingerprint_flag_bit_breaks_same_content() {
 // ── D2f: find/panel chokepoints ─────────────────────────────────────────
 
 #[test]
-fn find_jump_chokepoint_drops_chrome_from_distance() {
+fn find_jump_chokepoint_parity_across_flags() {
     let b = plain_block(1, "alpha line\nbeta line\n", false);
     let cmd_hit = BlockMatch {
         block_id: b.id,
@@ -764,40 +764,73 @@ fn find_jump_chokepoint_drops_chrome_from_distance() {
         col: 0,
         len: 3,
     };
-    // 2 output chunks, no hints: command distance = output rows under ON,
-    // output + gap + separator under OFF.
+    // v1.20.6: flag-agnostic single formula (the assembly advances
+    // cursor_dist over the chrome under BOTH flags, so the chokepoint must
+    // too). 2 output chunks, no hints: the command hit sits out(2) + gap(1)
+    // rows above the block bottom plus its own line (+1); an output hit is
+    // the chunks after it plus its own line (+1). The separator lives at the
+    // TOP of the block (above the command), never inside a hit-row offset.
     assert_eq!(completed_block_output_rows(&b, COLS), 2);
-    assert_eq!(
-        completed_block_match_row_from_bottom(&b, &cmd_hit, COLS, true),
-        2
-    );
-    assert_eq!(
-        completed_block_match_row_from_bottom(&b, &cmd_hit, COLS, false),
-        4
-    );
-    // Output hit: chunks after the hit chunk; OFF adds the separator (+1).
-    assert_eq!(
-        completed_block_match_row_from_bottom(&b, &out_hit, COLS, true),
-        1
-    );
-    assert_eq!(
-        completed_block_match_row_from_bottom(&b, &out_hit, COLS, false),
-        2
-    );
+    assert_eq!(completed_block_match_row_from_bottom(&b, &cmd_hit, COLS), 4);
+    assert_eq!(completed_block_match_row_from_bottom(&b, &out_hit, COLS), 2);
 
     // Whole-block row counts (panel/find scroll targets): plain / clear.
-    assert_eq!(completed_block_layout_rows(&b, COLS, 2, VIEWPORT, true), 3);
-    // OFF = out(2) + gap(1) + header band(2, the header_rows param) + wrap(1)
-    // + separator(1) — the legacy formula, byte-identical chokepoint.
+    // v1.20.6: ON == OFF == out(2) + gap(1) + header band(2) + wrap(1)
+    // + separator(1) — the metrics total now counts the chrome it used to
+    // drop, matching the scroll-distance domain (FIX_V1206).
+    assert_eq!(completed_block_layout_rows(&b, COLS, 2, VIEWPORT, true), 7);
     assert_eq!(completed_block_layout_rows(&b, COLS, 2, VIEWPORT, false), 7);
     let clear = clear_block(2);
     assert_eq!(
         completed_block_layout_rows(&clear, COLS, 2, VIEWPORT, true),
-        25
+        28
     );
     assert_eq!(
         completed_block_layout_rows(&clear, COLS, 2, VIEWPORT, false),
         28
+    );
+    // Collapsed blocks short-circuit match_row to the command line itself.
+    let folded = plain_block(3, "hidden\n", true);
+    let folded_hit = BlockMatch {
+        block_id: folded.id,
+        is_command: true,
+        line: 0,
+        col: 0,
+        len: 3,
+    };
+    assert_eq!(
+        completed_block_match_row_from_bottom(&folded, &folded_hit, COLS),
+        1
+    );
+}
+
+/// v1.20.6 (D5): the chrome-counting chokepoint holds its three structural
+/// shapes — plain output (7), empty output (4), collapsed (4) — and ON
+/// stays byte-equal to OFF (overlay changes the carrier, not the domain).
+#[test]
+fn chokepoint_counts_chrome_identically_across_flags_and_shapes() {
+    let plain = plain_block(1, "alpha line\nbeta line\n", false);
+    let empty = plain_block(2, "", false);
+    let collapsed = plain_block(3, "hidden\n", true);
+    for block in [&plain, &empty, &collapsed] {
+        let on = completed_block_layout_rows(block, COLS, 2, VIEWPORT, true);
+        let off = completed_block_layout_rows(block, COLS, 2, VIEWPORT, false);
+        assert_eq!(on, off, "flag parity broken for block {:?}", block.id);
+    }
+    // out(2) + gap(1) + header(2) + wrap(1) + separator(1).
+    assert_eq!(
+        completed_block_layout_rows(&plain, COLS, 2, VIEWPORT, true),
+        7
+    );
+    // out(0) + no gap + header(2) + wrap(1) + separator(1).
+    assert_eq!(
+        completed_block_layout_rows(&empty, COLS, 2, VIEWPORT, true),
+        4
+    );
+    // Collapsed: out(0) + no gap + header(2) + wrap(1) + separator(1).
+    assert_eq!(
+        completed_block_layout_rows(&collapsed, COLS, 2, VIEWPORT, true),
+        4
     );
 }
 

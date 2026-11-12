@@ -131,9 +131,15 @@ pub(crate) fn completed_block_row_count(
 /// v1.20.0 (PLAN_v1200 §4 D2/D2f): flag-routed twin of
 /// [`completed_block_row_count`] — the unified chokepoint every completed
 /// row-count consumer (scrollbar metrics, find jump, panel jump) goes
-/// through. Overlay ON reads the sister domain (output + wrap; the gap /
-/// header band / separator rows no longer exist in the laid stream), OFF is
-/// byte-identical to the legacy formula.
+/// through.
+/// v1.20.6 (FIX_V1206): overlay detours the per-block chrome (gap, header
+/// band, separator) out of the VERTEX stream only — the scroll-distance
+/// domain keeps advancing over them (completed_pass.rs cursor_dist: gap
+/// :357, header :392, separator :412), so the metrics total must count the
+/// same chrome rows or max_scroll under-clamps and pins scrolling to 0.
+/// OFF stays byte-identical to the legacy formula (its defensive .max(1)
+/// predates the guarantee that compact_control_row_span >= 1,
+/// ui_tokens.rs:156; the assembly adds header_height unconditionally).
 pub(crate) fn completed_block_row_count_for(
     output_lines: usize,
     header_rows: usize,
@@ -141,7 +147,8 @@ pub(crate) fn completed_block_row_count_for(
     complete_block_overlay: bool,
 ) -> usize {
     if complete_block_overlay {
-        output_lines + command_wrap_rows
+        output_lines + command_output_gap_rows(output_lines) + header_rows + command_wrap_rows + 1
+    // separator
     } else {
         completed_block_row_count(output_lines, header_rows, command_wrap_rows)
     }
@@ -238,14 +245,14 @@ pub(crate) fn completed_block_layout_rows(
 }
 
 /// 块底到 Find 命中视觉行的距离,镜像渲染器自底向上的顺序(含折行输出与恢复提示)。
-/// v1.20.0 (D2f): routed through the flag chokepoint — overlay ON drops the
-/// gap/separator (+1) chrome from the distance (the laid stream no longer
-/// contains it).
+/// v1.20.6 (FIX_V1206): flag-agnostic. The assembly advances cursor_dist over
+/// the per-block chrome under BOTH flags (overlay only changes the carrier),
+/// so one formula serves both domains; the v1.20.0 ON special case (dropping
+/// gap/separator) measured the wrong domain and is deleted.
 pub(crate) fn completed_block_match_row_from_bottom(
     block: &Block,
     hit: &weft_core::find::BlockMatch,
     cols: usize,
-    complete_block_overlay: bool,
 ) -> usize {
     if block.collapsed {
         return 1;
@@ -266,11 +273,7 @@ pub(crate) fn completed_block_match_row_from_bottom(
                 .iter()
                 .map(|line| block_line_chunks(line, cols).count())
                 .sum::<usize>();
-        return if complete_block_overlay {
-            output_rows
-        } else {
-            output_rows + command_output_gap_rows(output_rows) + 1
-        };
+        return output_rows + command_output_gap_rows(output_rows) + 1;
     }
 
     let line_index = hit.line.min(lines.len().saturating_sub(1));
@@ -294,11 +297,7 @@ pub(crate) fn completed_block_match_row_from_bottom(
         })
         .unwrap_or_else(|| chunks.len().saturating_sub(1));
     let row_from_chunk = hints + rows_after + chunks.len().saturating_sub(chunk_index + 1);
-    if complete_block_overlay {
-        row_from_chunk
-    } else {
-        row_from_chunk + 1
-    }
+    row_from_chunk + 1
 }
 
 /// 把按字符索引的命中转成折行后的视觉行范围;列/长度均为显示列,保证 CJK 与绘制的字形对齐。

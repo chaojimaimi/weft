@@ -932,3 +932,88 @@ fn region_track_completed_block_session_equivalence() {
     // completed shape (1 + 1 + 2 + 1 + 1).
     assert_eq!(final_total, live_total + (1 + 1 + 2 + 1 + 1) - (1 + 1 + 2));
 }
+
+// ── scroll-clamp domain audit: chrome distance vs metrics total ──
+// The wheel clamp derives `max_scroll` from `block_content_metrics_with_overlay`,
+// while the layout pass's distance domain carries per-block chrome (gap +
+// header band + separator). v1.20.6 (FIX_V1206) adds the chrome back to the
+// metrics formula, so the two domains must now agree exactly: laid_px ==
+// metrics_px for a plain multi-block history.
+#[test]
+fn overlay_chrome_distance_matches_metrics_total() {
+    let mut terminal = Terminal::new(24, 80);
+    for i in 0..6 {
+        terminal.process(
+            format!("\x1b]133;A\x07echo {i}\r\n\x1b]133;B\x07\x07out-{i}\r\n\x1b]133;D;0\x07")
+                .as_bytes(),
+        );
+    }
+    let blocks = terminal.block_tracker().session_blocks();
+    assert_eq!(blocks.len(), 6, "six finished blocks");
+    let mut layout_cache = BlockLayoutCache::default();
+    for b in blocks {
+        layout_cache.ensure_cached(b, 80);
+    }
+    layout_cache.build_prefix_sum(blocks);
+
+    // Production geometry: pitch 20, header band = compact_control_row_span
+    // (2 rows) * pitch = 40 px; oversized viewport so nothing is culled.
+    let diagnose = std::collections::HashMap::new();
+    let out = compute_block_layout_pass(
+        LayoutPassInput {
+            blocks,
+            live: None,
+            pane_session_id: 1,
+            cwd: None,
+            git_branch: None,
+            block_scroll: 0.0,
+            viewport_rows: 400,
+            cols: 80,
+            pitch: 20.0,
+            header_height: 40.0,
+            content_bottom_y: 8000.0,
+            clip_top: 0.0,
+            clip_bottom: 8000.0,
+            resolve_styles: false,
+            styled_lookup_counter: None,
+            complete_block_overlay: true,
+            block_diagnose_state: &diagnose,
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            region: None,
+            region_state: None,
+        },
+        &layout_cache,
+        &mut LiveLayoutCache::default(),
+    );
+
+    // Full assembled extent: content rows store `content_bottom_y - row_top`
+    // (pushed at a row's top), overlay chrome rows carry their own dist +
+    // height. Take the max over both domains — the oldest block's header
+    // band + separator live only in the overlay carrier.
+    let laid_px = out.rows.iter().copied().fold(0.0_f32, f32::max).max(
+        // overlay dist_px is the chrome piece's BOTTOM edge (pushed after
+        // the cursor advance), so no extra height term.
+        out.overlay_rows
+            .iter()
+            .map(|c| c.dist_px)
+            .fold(0.0_f32, f32::max),
+    );
+    let (total, _) = crate::block_component::block_content_metrics_with_overlay(
+        &terminal,
+        80,
+        2,
+        Some(&layout_cache),
+        None,
+        None,
+        true,
+        None,
+    );
+    let metrics_px = total as f32 * 20.0;
+    // Regression (v1.20.0 lockout): the clamp domain and the assembly domain
+    // must agree exactly — zero drift, or `max_scroll` under-reports and a
+    // short history can no longer scroll at all.
+    assert_eq!(
+        laid_px, metrics_px,
+        "metrics total must count the chrome its distance domain carries"
+    );
+}

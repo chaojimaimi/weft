@@ -34,12 +34,7 @@ fn block_find_scroll_target(
             )
         })
         .sum::<usize>();
-    let row_in_block = completed_block_match_row_from_bottom(
-        &blocks[block_idx],
-        hit,
-        cols,
-        complete_block_overlay,
-    );
+    let row_in_block = completed_block_match_row_from_bottom(&blocks[block_idx], hit, cols);
     Some(
         (rows_below + row_in_block)
             .saturating_sub(visible * 2 / 3)
