@@ -234,6 +234,9 @@ impl MetalRenderer {
         settings: Option<&SettingsDrawParams<'_>>,
         tab_bar: &TabBarDrawState,
         diagnose_texts: &[&str],
+        // v1.20.3 WP4: the live paste-toast text (`self.paste_toast`), if
+        // any — see the warm arm near the tail of this function.
+        paste_toast: Option<&str>,
     ) {
         // Collect unique on-screen GRID + panel characters not yet in the
         // atlas, then rasterize each exactly once.
@@ -432,6 +435,26 @@ impl MetalRenderer {
         // F3-2: warm up the braille spinner glyphs (animated activity
         // indicator) and the static ● used under Reduce Motion.
         missing.extend(['●', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
+        // v1.20.3 WP4: paste-toast text — arbitrary pasted content is the one
+        // warm source that can carry chars the whole five-rung ladder lacks
+        // (真盲区). Warming them walks the blind-miss gate once while the
+        // toast is on screen, so the first PAINT frame already has pool
+        // glyphs instead of blanks. `get_or_rasterize` is idempotent
+        // (cache fast path) — already-hot chars cost a hashmap probe.
+        // The paint path truncates the same string, and truncation only
+        // removes chars, so warming the full text covers every visible one.
+        if let Some(toast) = paste_toast {
+            missing.extend(toast.chars());
+        }
+        // v1.20.3 WP4: F7 context-menu labels (shared const with the draw
+        // path — paint/overlays.rs `CONTEXT_MENU_ITEMS`). All ASCII
+        // today; the shared const keeps warm and draw in sync forever.
+        for label in crate::paint::overlays::CONTEXT_MENU_ITEMS {
+            missing.extend(label.chars());
+        }
+        // (settings keycaps need no extra warm — every
+        // SETTINGS_FOOTER_HINTS key char is already inside the
+        // OverlayContent::Settings::warm_chars arm's label set.)
         for ch in &missing {
             atlas.get_or_rasterize(*ch, crate::glyph::GlyphStyle::REGULAR);
         }

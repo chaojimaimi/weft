@@ -417,4 +417,18 @@ pub struct MetalRenderer {
     /// Per-pane ranges in the legacy vertex buffer. Block-view base content
     /// uses this path and needs the same hard GPU clipping as grid instances.
     pub(crate) pane_vertex_ranges: RefCell<Vec<(crate::layout::Rect, std::ops::Range<usize>)>>,
+    /// v1.20.3 WP3: per-frame scratch reuse pools for the three `Vec<f32>`
+    /// streams `draw()` used to `Vec::new()` every frame (legacy background
+    /// vertices, bg dual-stream, glyph dual-stream). Same `RefCell` rationale
+    /// as `pane_instance_ranges` above: `draw()` holds an immutable
+    /// `self.layer` borrow for the whole frame, so `&mut self` setters are
+    /// unavailable. Borrow discipline: the `RefMut` is taken once at the top
+    /// of `draw()` and handed down as `&mut *ref_mut`; nothing else in the
+    /// renderer touches these fields (single RefCell, no nested borrow of the
+    /// same cell — the region-cache sync and per-pane caches borrow their own
+    /// cells). `clear()` on checkout keeps the allocation capacity across
+    /// frames; byte-level output is unchanged (same writes, same order).
+    pub(crate) scratch_background_vertices: RefCell<Vec<f32>>,
+    pub(crate) scratch_bg_stream: RefCell<Vec<f32>>,
+    pub(crate) scratch_glyph_stream: RefCell<Vec<f32>>,
 }

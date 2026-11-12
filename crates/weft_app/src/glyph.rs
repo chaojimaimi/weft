@@ -15,7 +15,7 @@
 //! - `special` — procedural terminal glyphs (box drawing, block elements)
 //! - `tests` — device-free rasterization and transform probes
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use font_kit::loaders::core_text::Font;
@@ -25,6 +25,7 @@ use weft_core::config::FontConfig;
 
 mod atlas;
 mod cluster;
+mod fallback_tests;
 mod font;
 mod query;
 mod rasterize;
@@ -198,6 +199,33 @@ pub struct GlyphAtlas {
     /// hops 1/2 both miss — the source font of every pre-existing glyph is
     /// unchanged.
     menlo_font: Option<Font>,
+    /// v1.20.3 WP4: tail-inserted script fallback pool. Built lazily on the
+    /// first blind-miss (after every existing ladder rung missed — the five
+    /// rungs' order and their glyph sources are untouched, so every
+    /// pre-existing glyph keeps its exact font and pixels). Each blind char
+    /// is probed against the pool fonts one by one via `glyph_for_char`;
+    /// only `Some` results map to that char. Fonts that stay loaded after
+    /// launch can change coverage (fonts get installed/removed at runtime),
+    /// so — per the v1.20.3 plan — only misses are cached (`probed_missing`
+    /// below); pool→char hits are re-probed each time from the live pool.
+    /// `None` = pool not built yet (lazy, first blind miss triggers the
+    /// build). A failed build (`SourceError` on the system font enumeration)
+    /// lands as `Some(Vec::new())` — an empty pool — plus one
+    /// `tracing::warn!`; behavior then falls back to the pre-WP4 five-rung
+    /// world and the failed build is never retried.
+    script_fallback_pool: Option<Vec<Font>>,
+    /// v1.20.3 WP4: chars whose full ladder + pool probe came up empty.
+    /// Char-level miss memo (in-memory only, never persisted — a restart
+    /// naturally re-probes, which is the self-heal path when the user
+    /// installs a font covering the char). Short-circuits the pool scan;
+    /// the ladder rungs still run exactly as before so existing hit paths
+    /// never consult this set.
+    probed_missing: HashSet<char>,
+    /// v1.20.3 WP4: pool-scan counter (diagnostics + regression tests: a
+    /// memoized miss must not re-scan the pool — the counter stays flat on
+    /// repeat queries of the same char). Same `Cell` diagnostics pattern as
+    /// `cluster_hits`/`cluster_misses`.
+    fallback_pool_scans: std::cell::Cell<u64>,
     /// Scaled font size in pixels.
     scaled_size: f32,
     /// Primary font's |descent| in pixels — the single vertical-baseline
@@ -428,6 +456,9 @@ impl GlyphAtlas {
             emoji_family: font_config.emoji_family.clone(),
             symbol_font,
             menlo_font,
+            script_fallback_pool: None,
+            probed_missing: HashSet::new(),
+            fallback_pool_scans: std::cell::Cell::new(0),
             scaled_size,
             primary_descent_px,
         }

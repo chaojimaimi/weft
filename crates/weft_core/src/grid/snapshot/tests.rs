@@ -91,7 +91,7 @@ fn cursor_snapshot_line_tracks_cursor_at_viewport_origin_document() {
 }
 
 #[test]
-fn document_clamps_a_cleared_scrollback_baseline() {
+fn document_oldest_clamps_a_cleared_scrollback_baseline() {
     let mut grid = Grid::with_scrollback(2, 20, 20);
     grid.viewport[0] = row("final screen", 20);
     assert_eq!(

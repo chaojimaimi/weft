@@ -180,6 +180,12 @@ impl BlockTracker {
             self.live_styled_snapshot = None;
             self.last_live_styled_publish = None;
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            // v1.20.3 (N3 takeover window): a plain-phase `133;B` anchor must
+            // not survive the takeover either — `region_begin_position()`
+            // prefers the plain anchor via `.or()`, so leaving a stale sample
+            // here pins the region to rows captured before the screen-owned
+            // run began (the same rationale as the snapshot clears above).
+            self.command_begin_position = None;
             self.screen_document_start = Some(document_start);
             self.activate_screen_continuation();
         }

@@ -1,7 +1,8 @@
 //! F7-2 (PLAN_v1184 §2-F7-2) background-pane freeze tests, split out of
-//! panes.rs's inline `mod tests` (commit-gate `*/tests.rs` budget
-//! exemption — panes.rs sat 15 lines over the 800 gate with the test
-//! inline). The freeze-bits globals are process-global, so this module is
+//! panes.rs's inline `mod tests` per the `*/tests.rs` budget convention
+//! (tests files sit outside the 800-line gate; panes.rs itself measured
+//! 756/800 at the split — see the v1.18.10 B1 line-count precedent in
+//! ROADMAP). The freeze-bits globals are process-global, so this module is
 //! self-contained: own renderer helper, own lock discipline.
 
 use crate::renderer::panes::PaneRenderInfo;

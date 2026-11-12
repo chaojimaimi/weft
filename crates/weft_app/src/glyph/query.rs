@@ -1,11 +1,13 @@
 //! Glyph lookup + on-demand rasterization (v1.10.12 split to keep
 //! `glyph/mod.rs` under the line budget).
 
+use font_kit::loaders::core_text::Font;
 use std::sync::Arc;
 
 use super::cluster;
-use super::font::{is_emoji_char, rasterize_emoji_rgba, resolve_font};
+use super::font::{build_script_fallback_pool, is_emoji_char, rasterize_emoji_rgba, resolve_font};
 use super::{narrow_font_ladder, wide_font_ladder, GlyphAtlas, GlyphInfo, GlyphStyle};
+use tracing::warn;
 
 /// v1.10.4: a cluster renders via the RGBA color atlas only when it is
 /// classified emoji **and** the emoji font contains the base scalar.
@@ -14,6 +16,63 @@ use super::{narrow_font_ladder, wide_font_ladder, GlyphAtlas, GlyphInfo, GlyphSt
 /// fg-tinted. Those stay on the A8 mask path. Real emoji keep the color path.
 pub(super) fn cluster_wants_color_atlas(is_emoji: bool, emoji_font_has_base: bool) -> bool {
     is_emoji && emoji_font_has_base
+}
+
+/// v1.20.3 WP4: TRUE iff every narrow-ladder rung (primary → Apple Symbols →
+/// Menlo) lacks `ch` — exactly the condition under which `narrow_font_ladder`
+/// returns the blind primary carrying no glyph (the all-zero-bitmap trap the
+/// third hop fixed for ✓/✔/✗). Pure field-by-field reads so call sites stay
+/// borrow-disjoint (same reason the ladders take `&Option<Font>`).
+/// MSRV 注意: 用 map_or(true, …),勿 is_none_or(项目既有备案,query.rs:132)。
+fn narrow_ladder_blind(
+    primary: &Font,
+    symbol: &Option<Font>,
+    menlo: &Option<Font>,
+    ch: char,
+) -> bool {
+    primary.glyph_for_char(ch).is_none()
+        && symbol
+            .as_ref()
+            .map_or(true, |f| f.glyph_for_char(ch).is_none())
+        && menlo
+            .as_ref()
+            .map_or(true, |f| f.glyph_for_char(ch).is_none())
+}
+
+/// v1.20.3 WP4: TRUE iff the wide ladder (cjk → SDG → narrow tail) also ends
+/// blind: cjk misses, the SDG fallback is absent-or-missing, and the narrow
+/// tail is blind. Only then does the char reach the script fallback pool.
+fn wide_ladder_blind(
+    cjk: &Option<Font>,
+    wide_fallback: &Option<Font>,
+    primary: &Font,
+    symbol: &Option<Font>,
+    menlo: &Option<Font>,
+    ch: char,
+) -> bool {
+    narrow_ladder_blind(primary, symbol, menlo, ch)
+        && cjk
+            .as_ref()
+            .map_or(true, |f| f.glyph_for_char(ch).is_none())
+        && wide_fallback
+            .as_ref()
+            .map_or(true, |f| f.glyph_for_char(ch).is_none())
+}
+
+/// v1.20.3 WP4: pool-first resolution — `Some(pool index)` wins, otherwise
+/// the original ladder decides. The pool NEVER changes a non-blind glyph's
+/// source font: `pick` is `Some` only after every ladder rung missed. Free
+/// function on purpose: taking the pool as `Option<&Vec<Font>>` keeps each
+/// call-site borrow field-precise (`&self.script_fallback_pool` plus a
+/// disjoint-capture ladder closure), which is what keeps the
+/// `&mut self.next_x`-style writes below E0502-clean.
+fn pool_or<'a>(
+    pick: Option<usize>,
+    pool: Option<&'a Vec<Font>>,
+    fallback: impl FnOnce() -> &'a Font,
+) -> &'a Font {
+    pick.and_then(|i| pool.map(|p| &p[i]))
+        .unwrap_or_else(fallback)
 }
 
 /// 宽字符是否落在 PingFang 缺、SD Gothic Neo 可补的区间(v1.13.15 取证定表)。
@@ -143,6 +202,68 @@ impl GlyphAtlas {
         }
     }
 
+    /// v1.20.3 WP4: probe the tail-inserted script fallback pool for a blind
+    /// char. `Some(pool index)` = a pool font carries the glyph; `None` =
+    /// nothing in the pool has it (the char is memoized in `probed_missing`).
+    ///
+    /// N2 semantics (v1.20.3 plan, per review批注):
+    /// - per-char probing — one ladder miss triggers one pool scan; never a
+    ///   global upfront sweep of the whole pool;
+    /// - only misses are cached — font coverage is mutable (fonts can be
+    ///   installed/removed while weft runs), so hits re-probe the live pool
+    ///   every time and only the "nothing anywhere" verdict is memoized;
+    /// - the pool itself is built lazily exactly once (first blind miss); a
+    ///   failed enumeration lands as an empty pool + one `warn!`, and the
+    ///   failed build is never retried (behavior = pre-WP4 five-rung world);
+    /// - `probed_missing` is in-memory only and never persisted — a restart
+    ///   naturally re-probes, which is the self-heal path after the user
+    ///   installs a font covering the char.
+    fn probe_script_fallback_pool(&mut self, ch: char) -> Option<usize> {
+        // Memoized miss: the full scan already came up empty once — do not
+        // re-scan. (The ladder rungs still run above; only the pool scan is
+        // skipped, so a newly loaded rung font keeps its priority.)
+        if self.probed_missing.contains(&ch) {
+            return None;
+        }
+        if self.script_fallback_pool.is_none() {
+            // Exclude the ladder's own families so the pool holds only NEW
+            // candidate fonts; duplicate faces dedupe inside the builder.
+            let mut excluded = vec![
+                self.primary_font.family_name(),
+                self.cjk_family.clone(),
+                self.emoji_family.clone(),
+            ];
+            for f in [
+                self.symbol_font.as_ref(),
+                self.menlo_font.as_ref(),
+                self.cjk_font.as_ref(),
+                self.wide_fallback_font.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                excluded.push(f.family_name());
+            }
+            self.script_fallback_pool =
+                Some(build_script_fallback_pool(&excluded).unwrap_or_else(|| {
+                    warn!(
+                        "script fallback pool enumeration failed; falling back to the five-rung ladder"
+                    );
+                    Vec::new()
+                }));
+        }
+        let pool_pick = self.script_fallback_pool.as_ref().and_then(|pool| {
+            self.fallback_pool_scans
+                .set(self.fallback_pool_scans.get() + 1);
+            pool.iter().position(|f| f.glyph_for_char(ch).is_some())
+        });
+        if pool_pick.is_none() {
+            // Char-level miss memo — the full pool scan came up empty once.
+            self.probed_missing.insert(ch);
+        }
+        pool_pick
+    }
+
     /// Look up a cached glyph by character, or rasterize on demand.
     ///
     /// Called from the render path so the grid's characters always have an
@@ -171,6 +292,36 @@ impl GlyphAtlas {
         let is_emoji = is_emoji_char(ch);
         self.ensure_script_font(ch, is_emoji, is_wide);
 
+        // v1.20.3 WP4: blind-miss gate. After `ensure_script_font` gave the
+        // eager rungs (cjk/SDG) their chance, decide whether the ladder this
+        // char is about to walk ends blind (every rung it consults lacks a
+        // glyph — the pre-WP4 world rasterized an all-zero bitmap from the
+        // blind primary and permanently cached a blank). Only blind chars
+        // reach the tail-inserted script fallback pool; every non-blind char
+        // keeps its exact pre-WP4 source font (golden-zero-drift invariant).
+        // Emoji never enters the pool (Apple Color Emoji is its own ladder).
+        let pool_pick = if is_emoji {
+            None
+        } else {
+            let blind = if is_wide {
+                wide_ladder_blind(
+                    &self.cjk_font,
+                    &self.wide_fallback_font,
+                    &self.primary_font,
+                    &self.symbol_font,
+                    &self.menlo_font,
+                    ch,
+                )
+            } else {
+                narrow_ladder_blind(&self.primary_font, &self.symbol_font, &self.menlo_font, ch)
+            };
+            if blind {
+                self.probe_script_fallback_pool(ch)
+            } else {
+                None
+            }
+        };
+
         // v1.10.12: styled glyphs use the primary font's variant face when
         // available; fallback fonts (CJK/emoji/symbol) and missing variants
         // degrade to the regular ladder. The `filter` keeps the borrow of a
@@ -188,10 +339,14 @@ impl GlyphAtlas {
             }
             .filter(|f| f.glyph_for_char(ch).is_some())
             .unwrap_or_else(|| {
-                // Edition 2021 disjoint capture: the closure borrows the three
-                // font fields individually, so it never borrows `self` whole
-                // and stays compatible with the `&mut self.*cursor` uses below.
-                narrow_font_ladder(&self.primary_font, &self.symbol_font, &self.menlo_font, ch)
+                // Edition 2021 disjoint capture: the closure borrows the font
+                // fields individually, so it never borrows `self` whole and
+                // stays compatible with the `&mut self.*cursor` uses below.
+                // v1.20.3 WP4: a styled miss degrades to the narrow ladder —
+                // a blind one consults the script fallback pool first.
+                pool_or(pool_pick, self.script_fallback_pool.as_ref(), || {
+                    narrow_font_ladder(&self.primary_font, &self.symbol_font, &self.menlo_font, ch)
+                })
             })
         } else if is_emoji {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
@@ -199,21 +354,27 @@ impl GlyphAtlas {
             // v1.13.15 FIX-A: wide ladder — PingFang 缺的宽字符(假名/韩文/
             // ExtB-H)不再盲走 cjk 的全零位图,由 wide_fallback(SDG)兜底;
             // cjk-first 保序,既有 PingFang 墨迹零漂移。
-            wide_font_ladder(
-                &self.cjk_font,
-                &self.wide_fallback_font,
-                &self.primary_font,
-                &self.symbol_font,
-                &self.menlo_font,
-                ch,
-            )
+            // v1.20.3 WP4: blind wide miss → script fallback pool tail.
+            pool_or(pool_pick, self.script_fallback_pool.as_ref(), || {
+                wide_font_ladder(
+                    &self.cjk_font,
+                    &self.wide_fallback_font,
+                    &self.primary_font,
+                    &self.symbol_font,
+                    &self.menlo_font,
+                    ch,
+                )
+            })
         } else {
             // Narrow text: the shared ladder — monospace primary, then the
             // lightweight symbol fallback, then Menlo (third hop, see
             // `narrow_font_ladder`). CJK and emoji fonts are loaded by script
             // class above instead of probing both large TTCs for every
             // missing glyph.
-            narrow_font_ladder(&self.primary_font, &self.symbol_font, &self.menlo_font, ch)
+            // v1.20.3 WP4: blind narrow miss → script fallback pool tail.
+            pool_or(pool_pick, self.script_fallback_pool.as_ref(), || {
+                narrow_font_ladder(&self.primary_font, &self.symbol_font, &self.menlo_font, ch)
+            })
         };
 
         // Step 1: Allocate atlas slot (layout only, no pixel work). Color
@@ -398,27 +559,64 @@ impl GlyphAtlas {
             || cluster.contains('\u{fe0f}')
             || cluster.contains('\u{200d}');
         self.ensure_script_font(base_char, is_emoji, is_wide);
+
+        // v1.20.3 WP4: same blind-miss gate as `get_or_rasterize` — only a
+        // char every ladder rung lacks consults the tail-inserted script
+        // fallback pool; all other clusters keep their pre-WP4 source font.
+        // Emoji never enters the pool.
+        let pool_pick = if is_emoji {
+            None
+        } else {
+            let blind = if is_wide {
+                wide_ladder_blind(
+                    &self.cjk_font,
+                    &self.wide_fallback_font,
+                    &self.primary_font,
+                    &self.symbol_font,
+                    &self.menlo_font,
+                    base_char,
+                )
+            } else {
+                narrow_ladder_blind(
+                    &self.primary_font,
+                    &self.symbol_font,
+                    &self.menlo_font,
+                    base_char,
+                )
+            };
+            if blind {
+                self.probe_script_fallback_pool(base_char)
+            } else {
+                None
+            }
+        };
         let font = if is_emoji {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
         } else if is_wide {
             // v1.13.15 FIX-A: same wide ladder as `get_or_rasterize` —
             // cjk-first 保序,SDG 兜底 PingFang 缺的宽字符。
-            wide_font_ladder(
-                &self.cjk_font,
-                &self.wide_fallback_font,
-                &self.primary_font,
-                &self.symbol_font,
-                &self.menlo_font,
-                base_char,
-            )
+            // v1.20.3 WP4: blind wide miss → script fallback pool tail.
+            pool_or(pool_pick, self.script_fallback_pool.as_ref(), || {
+                wide_font_ladder(
+                    &self.cjk_font,
+                    &self.wide_fallback_font,
+                    &self.primary_font,
+                    &self.symbol_font,
+                    &self.menlo_font,
+                    base_char,
+                )
+            })
         } else {
             // Narrow base scalar: same ladder as `get_or_rasterize`.
-            narrow_font_ladder(
-                &self.primary_font,
-                &self.symbol_font,
-                &self.menlo_font,
-                base_char,
-            )
+            // v1.20.3 WP4: blind narrow miss → script fallback pool tail.
+            pool_or(pool_pick, self.script_fallback_pool.as_ref(), || {
+                narrow_font_ladder(
+                    &self.primary_font,
+                    &self.symbol_font,
+                    &self.menlo_font,
+                    base_char,
+                )
+            })
         };
 
         // v1.10.4: only emoji clusters whose base scalar the emoji font

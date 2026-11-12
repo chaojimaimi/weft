@@ -196,6 +196,50 @@ fn font_from_handle(handle: font_kit::handle::Handle) -> Option<Font> {
     }
 }
 
+/// v1.20.3 WP4: hard cap on the script fallback pool size (defensive — the
+/// macOS system font list can be huge on dev machines; 64 candidate fonts is
+/// far beyond any realistic blind-char coverage need).
+const SCRIPT_FALLBACK_POOL_CAP: usize = 64;
+
+/// v1.20.3 WP4: build the tail-inserted script fallback pool for blind-miss
+/// chars (chars none of the five ladder rungs can render). Enumerates every
+/// font the system offers (`SystemSource::all_fonts()`), materializes each
+/// handle with `font_from_handle` (the same Path/Memory handling that fixed
+/// user-installed families in v1.10.12), dedupes by
+/// `(family, postscript_name)` so the pool cannot balloon with duplicate
+/// faces, skips the ladder's own families (passed in `excluded_families`,
+/// lowercase-insensitive) and stops at `SCRIPT_FALLBACK_POOL_CAP`.
+///
+/// Returns `None` only when the system enumeration itself fails
+/// (`SourceError`) — the caller logs a single `warn!` and runs with an empty
+/// pool (pre-WP4 behavior). Individual font load failures are skipped
+/// silently: a broken half-installed font must not poison the pool.
+pub(super) fn build_script_fallback_pool(excluded_families: &[String]) -> Option<Vec<Font>> {
+    let handles = SystemSource::new().all_fonts().ok()?;
+    let mut pool: Vec<Font> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for handle in handles {
+        if pool.len() >= SCRIPT_FALLBACK_POOL_CAP {
+            break;
+        }
+        let Some(font) = font_from_handle(handle) else {
+            continue;
+        };
+        let family = font.family_name();
+        let postscript = font.postscript_name().unwrap_or_default();
+        let key = (family.to_lowercase(), postscript.to_lowercase());
+        if excluded_families
+            .iter()
+            .any(|ex| ex.to_lowercase() == key.0)
+            || !seen.insert(key)
+        {
+            continue;
+        }
+        pool.push(font);
+    }
+    Some(pool)
+}
+
 /// v1.10.12: Resolve a styled variant (bold / italic) of a font family.
 ///
 /// Prefers the system source's `select_best_match` with the requested

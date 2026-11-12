@@ -628,3 +628,38 @@ fn finalize_bumps_live_output_version() {
     );
     assert!(t.live_output_version() > v);
 }
+
+/// v1.20.3 (N3 takeover window): a plain-phase `133;B` anchor sampled before
+/// the output turns screen-owned must not survive `begin_screen_owned_output`
+/// — `region_begin_position()` prefers the plain anchor via `.or()`, so a
+/// stale sample pinned the region to rows captured before the screen-owned
+/// run began instead of tracking the screen document.
+#[test]
+fn takeover_drops_stale_plain_begin_anchor() {
+    let mut t = BlockTracker::new();
+    t.on_prompt_start();
+    t.on_command_start("slow_tui".to_string());
+
+    // Plain `133;B` sampled while the command still streams to the primary
+    // screen (first-sample-wins; the plain phase owns the anchor).
+    t.note_command_begin_position(100);
+    assert_eq!(t.region_begin_position(), Some(100));
+
+    // Mid-command the output takes the primary screen (vim, htop, ...).
+    t.begin_screen_owned_output(500);
+    assert_eq!(t.screen_document_start(), Some(500));
+    assert_eq!(
+        t.region_begin_position(),
+        Some(500),
+        "takeover must drop the stale plain anchor so the region tracks the \
+         screen document, not pre-takeover rows"
+    );
+
+    // After the TUI exits and finalize runs, the next plain command samples
+    // a fresh anchor normally (the clear did not wedge the sampler).
+    t.on_command_end(0);
+    t.on_prompt_start();
+    t.on_command_start("next".to_string());
+    t.note_command_begin_position(900);
+    assert_eq!(t.region_begin_position(), Some(900));
+}

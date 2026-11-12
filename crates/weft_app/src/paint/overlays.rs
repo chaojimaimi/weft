@@ -9,6 +9,23 @@ use crate::renderer::MetalRenderer;
 mod find;
 mod note;
 
+/// v1.20.3 WP4: single source for the F7 context-menu labels — the draw
+/// path (`build_context_menu_vertices`) and the glyph-atlas warm-up
+/// (`warm_atlas`) both read this so they cannot drift. All labels are ASCII
+/// today (pre-rasterized 32–126), so warming them is idempotent; the const
+/// exists so a future non-ASCII label warms itself automatically.
+pub(crate) const CONTEXT_MENU_ITEMS: [&str; 9] = [
+    "Copy Command",
+    "Copy Output",
+    "Copy Block",
+    "Toggle Fold",
+    "Send to Input",
+    "Toggle Bookmark",
+    "Add Note",
+    "Export Block",
+    "Diagnose with AI",
+];
+
 /// Per-frame FindInGrid draw state (v0.8 B3). Set by the app before `draw()`.
 #[derive(Clone, Debug, Default)]
 pub struct FindDrawState {
@@ -115,17 +132,7 @@ impl MetalRenderer {
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
-        let items = [
-            "Copy Command",
-            "Copy Output",
-            "Copy Block",
-            "Toggle Fold",
-            "Send to Input",
-            "Toggle Bookmark",
-            "Add Note",
-            "Export Block",
-            "Diagnose with AI",
-        ];
+        let items = CONTEXT_MENU_ITEMS;
 
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
         let layout = crate::layout::layout_context_menu(&ctx, x, y, self.scale as f32);
@@ -388,6 +395,18 @@ fn split_highlight_around_cursor(
 mod tests {
     use super::*;
     use crate::paint::command_surface::CommandSurfaceState;
+
+    /// v1.20.3 review N1: the warm-side label list and the scene-side
+    /// (label, action) pairs must stay label-for-label identical; the const
+    /// exists so neither side can drift silently.
+    #[test]
+    fn context_menu_items_match_scene_pairs_in_order() {
+        let pairs = crate::context_menu_component::CONTEXT_MENU_ITEMS;
+        assert_eq!(CONTEXT_MENU_ITEMS.len(), pairs.len());
+        for (warm, (label, _action)) in CONTEXT_MENU_ITEMS.iter().zip(pairs.iter()) {
+            assert_eq!(warm, label);
+        }
+    }
 
     #[test]
     fn find_draw_state_exposes_real_worker_loading_and_error_priority() {

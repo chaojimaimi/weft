@@ -215,6 +215,9 @@ impl crate::renderer::MetalRenderer {
             settings,
             tab_bar,
             &diagnose_texts,
+            // v1.20.3 WP4: paste-toast text (disjoint field read, same
+            // partial-borrow contract as the other &self.x args).
+            self.paste_toast.as_ref().map(|(text, _)| text.as_str()),
         );
         Self::warm_background_pane_atlases(
             &mut self.atlas,
@@ -264,9 +267,21 @@ impl crate::renderer::MetalRenderer {
         // v1.4.2 Phase B3: background grid panes append to dual-stream buffers
         // (bg_stream + glyph_stream) and push a `PaneInstanceSegment` (rect +
         // ranges). Background block panes still emit legacy vertices.
-        let mut background_vertices = Vec::new();
-        let mut bg_stream: Vec<f32> = Vec::new();
-        let mut glyph_stream: Vec<f32> = Vec::new();
+        // v1.20.3 WP3: the three frame-level streams moved from a per-frame
+        // `Vec::new()` to renderer-held reuse pools (`scratch_*` fields).
+        // Borrow discipline: each `RefCell` is borrowed mutably exactly once
+        // here and handed down as `&mut *ref_mut`; nothing inside the
+        // `RefMut` window re-borrows these cells (verified statically — the
+        // region-cache sync and per-pane caches borrow their own fields), so
+        // no runtime panic is reachable. `clear()` keeps the allocation
+        // capacity across frames; writes, order and lengths are byte-identical
+        // to the previous `Vec::new()` behavior (golden-hard requirement).
+        let mut background_vertices = self.scratch_background_vertices.borrow_mut();
+        background_vertices.clear();
+        let mut bg_stream = self.scratch_bg_stream.borrow_mut();
+        bg_stream.clear();
+        let mut glyph_stream = self.scratch_glyph_stream.borrow_mut();
+        glyph_stream.clear();
         // v1.12.27b (P1-01): the per-pane layout_ctx swap loop stays in the
         // skeleton per plan mandate — bare `self.layout_ctx` writes
         // (baseline :691/:713); `layout_ctx` is NOT Cell-ized.
@@ -448,6 +463,13 @@ impl crate::renderer::MetalRenderer {
             session_block_count,
             bv_rows_count,
         );
+        // v1.20.3 WP3: hand the three scratch pools back (RefMut drop) before
+        // the hit-region write — the pool capacity stays in the renderer for
+        // the next frame; the drops are explicit so the "return to pool"
+        // point is visible and the borrow can never silently extend.
+        drop(vertices);
+        drop(bg_stream);
+        drop(glyph_stream);
         // Assign hit-test regions after encoding. Done here (not inside
         // `encode_and_present`) because `drawable` borrows `self.layer` for the
         // whole frame, so `&mut self` is unavailable — but `self.hit_regions` is

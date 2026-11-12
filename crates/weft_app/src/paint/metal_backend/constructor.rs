@@ -418,6 +418,12 @@ impl MetalRenderer {
             frame_id: Cell::new(0),
             pane_instance_ranges: RefCell::new(Vec::new()),
             pane_vertex_ranges: RefCell::new(Vec::new()),
+            // v1.20.3 WP3: per-frame scratch reuse pools (see the field docs
+            // in renderer.rs). Start empty; the first frame pays one
+            // allocation per stream, later frames reuse the retained capacity.
+            scratch_background_vertices: RefCell::new(Vec::new()),
+            scratch_bg_stream: RefCell::new(Vec::new()),
+            scratch_glyph_stream: RefCell::new(Vec::new()),
         }
     }
 
