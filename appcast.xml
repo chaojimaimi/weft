@@ -2,6 +2,17 @@
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
     <channel>
         <item>
+            <title>Weft 1.20.3</title>
+            <sparkle:version>1.20.3</sparkle:version>
+            <sparkle:shortVersionString>1.20.3</sparkle:shortVersionString>
+            <link>https://github.com/chaojimaimi/weft/releases/download/v1.20.3/Weft-1.20.3.dmg</link>
+            <enclosure url="https://github.com/chaojimaimi/weft/releases/download/v1.20.3/Weft-1.20.3.dmg" length="8436135" type="application/x-bzip2-diskimage" sparkle:edSignature="AxKc0W9gTfsZ2i6MzwjNWW133baisUrSPGpUNw3ye8D1rUmWsKpXtSBFZIjDR78RNJ6AD/CrHV/V9xBb5r0zAg==" />
+            <description><![CDATA[
+                <h2>Weft 1.20.3</h2>
+                <p>See the <a href="https://github.com/chaojimaimi/weft/releases/tag/v1.20.3">release notes</a>.</p>
+            ]]></description>
+        </item>
+        <item>
             <title>Weft 1.20.2</title>
             <sparkle:version>1.20.2</sparkle:version>
             <sparkle:shortVersionString>1.20.2</sparkle:shortVersionString>
