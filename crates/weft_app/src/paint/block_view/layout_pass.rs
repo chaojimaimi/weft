@@ -180,9 +180,11 @@ pub(super) fn compute_block_layout_pass<'a, 'b, 'c>(
     // the live block renders from the grid-region snapshot; the capture
     // branch below stays byte-for-byte untouched (flag OFF path).
     if let (Some(_), Some(_)) = (&input.region, input.region_state) {
-        if input.live.is_some() {
-            return region_pass::compute_region_layout_pass(&input, cache);
-        }
+        // v1.20.7 (PLAN_v1207 §3 D2): the pseudo-block frame (live=None +
+        // region Some — between submit and the shell's 133;B marker) also
+        // routes here; the region pass renders its live segment without the
+        // LiveCommand/LiveHeader chrome (D3).
+        return region_pass::compute_region_layout_pass(&input, cache);
     }
     let LayoutPassInput {
         blocks,

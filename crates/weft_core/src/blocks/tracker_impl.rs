@@ -214,6 +214,20 @@ impl BlockTracker {
         }
     }
 
+    /// v1.20.7 (PLAN_v1207 §3 D1): `submit_command` primes the begin anchor
+    /// before the shell's `133;B` so the pseudo-block frame (between submit
+    /// and the marker) has a live region. Unconditional — the idempotent
+    /// guard of [`Self::note_command_begin_position`] would reject the sample
+    /// while a screen-owned `133;D` defer still holds
+    /// `screen_document_start: Some(...)`, and after the settle clears it the
+    /// pseudo-block would lose its anchor entirely. `.or()` ordering in
+    /// [`Self::region_begin_position`] prefers this sample over the stale
+    /// screen anchor, `133;B` clears and re-samples it, and a screen
+    /// takeover clears it (`begin_screen_owned_output`).
+    pub fn prime_command_begin_position(&mut self, position: u64) {
+        self.command_begin_position = Some(position);
+    }
+
     /// v1.19.0 (D3): the live block's grid-region begin anchor — the plain
     /// `133;B` sample, or the screen-owned document start.
     pub fn region_begin_position(&self) -> Option<u64> {

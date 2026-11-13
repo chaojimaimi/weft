@@ -39,7 +39,7 @@ pub(super) struct RegionLiveSegment<'a> {
 /// snapshot's chunk prefix sums, then the capture-branch row shapes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn region_live_segment<'a>(
-    live: &InFlightBlock<'a>,
+    live: Option<&InFlightBlock<'a>>,
     state: &'a PaneRegionState,
     cols: usize,
     pitch: f32,
@@ -150,29 +150,36 @@ pub(super) fn region_live_segment<'a>(
     }
 
     // Structure rows — semantics-equal to the capture branch (:261-283).
-    let live_cmd_chunks: Rc<[String]> = Rc::from(command_line_chunks(
-        &strip_prompt_prefix(live.command),
-        cols.saturating_sub(2).max(1),
-        cols,
-    ));
+    // v1.20.7 (PLAN_v1207 §3 D3): live=None (pseudo-block, between submit
+    // and 133;B) skips the LiveCommand/LiveHeader chrome — there is no
+    // in-flight data source, and the command text is already present as the
+    // region's echoed prompt line. The Separator stays as the bottom
+    // boundary separating the pseudo-block from the finished blocks.
     let mut cursor_dist = if total_logical > 0 {
         (total_display + 1) as f32 * pitch
     } else {
         0.0
     };
-    cursor_dist += live_cmd_chunks.len() as f32 * pitch;
-    rows.push(cursor_dist);
-    row_data.push(LaidRow::LiveCommand {
-        command: live.command,
-        chunks: live_cmd_chunks,
-    });
-    // `now` is the caller-injected frame clock so paint/hit-test double
-    // builds of one model yield identical bytes (capture-branch comment).
-    let elapsed = live_elapsed_label(live.started_at, now);
-    if let Some(text) = live_context_label(live.cwd.or(cwd), git_branch, Some(&elapsed)) {
-        cursor_dist += pitch;
+    if let Some(live) = live {
+        let live_cmd_chunks: Rc<[String]> = Rc::from(command_line_chunks(
+            &strip_prompt_prefix(live.command),
+            cols.saturating_sub(2).max(1),
+            cols,
+        ));
+        cursor_dist += live_cmd_chunks.len() as f32 * pitch;
         rows.push(cursor_dist);
-        row_data.push(LaidRow::LiveHeader { text });
+        row_data.push(LaidRow::LiveCommand {
+            command: live.command,
+            chunks: live_cmd_chunks,
+        });
+        // `now` is the caller-injected frame clock so paint/hit-test double
+        // builds of one model yield identical bytes (capture-branch comment).
+        let elapsed = live_elapsed_label(live.started_at, now);
+        if let Some(text) = live_context_label(live.cwd.or(cwd), git_branch, Some(&elapsed)) {
+            cursor_dist += pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::LiveHeader { text });
+        }
     }
     cursor_dist += pitch;
     rows.push(cursor_dist);

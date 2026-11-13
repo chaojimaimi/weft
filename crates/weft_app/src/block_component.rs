@@ -485,6 +485,24 @@ pub(crate) fn block_content_metrics_with_overlay(
             total += 2; // command + separator
             total += usize::from(live.cwd.or(terminal.cwd()).is_some());
         }
+    } else if terminal.is_live_block_grid_render()
+        && region_live_rows.is_some()
+        // v1.20.7 review (medium-2): Editor frames never count pseudo rows —
+        // the layout's editor branch passes region=None (draw_phases.rs), so
+        // the scrollbar total must match. This gates the residual-anchor
+        // window (133;A after a PS2 Ctrl+C leaves the primed anchor behind
+        // while the phase is already AtPrompt/Editor).
+        && terminal.effective_input_mode() != weft_core::input::InputMode::Editor
+    {
+        // v1.20.7 (PLAN_v1207 §3 D4): pseudo-block frame — in_flight None
+        // (between submit and the shell's 133;B) but a region snapshot is
+        // live. Row budget matches the pseudo segment's assembly domain
+        // (region_rows.rs D3): region rows + Blank (only when any) +
+        // Separator. No gap/cwd tail — the pseudo-block lays no LiveHeader.
+        // Sits OUTSIDE the CommandExecuting gate above: non-integrated shells
+        // never enter CommandExecuting at all (Passthrough throughout).
+        let pseudo_rows = region_live_rows.unwrap_or(0);
+        total += pseudo_rows + usize::from(pseudo_rows > 0) + 1;
     }
     let metrics_ms = metrics_started.elapsed().as_millis();
     if metrics_ms > 10 {

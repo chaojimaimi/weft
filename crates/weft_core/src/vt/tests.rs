@@ -6442,3 +6442,165 @@ fn region_track_finalize_preserves_completed_rows() {
 }
 
 // ── TEMP REPRO (v1.20.0 user report: sudo su live block shows entire pane history) ──
+
+// ── v1.20.7 (PLAN_v1207 §4 D5): pseudo-block region — submit-time priming ──
+
+#[test]
+fn submit_command_primes_region_begin_at_the_cursor_row() {
+    let mut terminal = Terminal::new(6, 40);
+    terminal.process(b"\x1b]133;A\x07\x1b[Hecho hi\r\necho done\r\n");
+    for ch in "ls".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    // D5-1: the primed anchor exists immediately after submit (before the
+    // shell sees anything) and sits on the prompt row.
+    terminal.submit_command();
+    let primed = terminal
+        .block_tracker()
+        .region_begin_position()
+        .expect("submit must prime a begin anchor");
+    assert_eq!(
+        primed,
+        terminal.grid().scrollback.position() + terminal.grid().cursor.row as u64,
+        "anchor = scrollback position + cursor row (the prompt line)"
+    );
+    // 133;B clears both anchors and RE-SAMPLES from the current cursor
+    // (R1 transfer): scroll the pane so the sample cannot coincide with the
+    // primed value, then pin the transfer.
+    for _ in 0..5 {
+        terminal.process(b"line\r\n");
+    }
+    terminal.process(b"\x1b]133;B\x07");
+    let resampled = terminal
+        .block_tracker()
+        .region_begin_position()
+        .expect("133;B must sample a fresh begin anchor");
+    assert_ne!(
+        resampled, primed,
+        "133;B re-samples from the current cursor row, not the primed value"
+    );
+    assert_eq!(
+        resampled,
+        terminal.grid().scrollback.position() + terminal.grid().cursor.row as u64,
+        "133;B anchor = scrollback position + cursor row at the marker"
+    );
+    // 133;D clears it: AtPrompt is anchor-free between commands.
+    terminal.process(b"out\r\n\x1b]133;D;0\x07");
+    assert_eq!(
+        terminal.block_tracker().region_begin_position(),
+        None,
+        "133;D must clear the primed anchor"
+    );
+}
+
+#[test]
+fn submit_command_prime_survives_a_screen_owned_defer_window() {
+    // D5-1b: a screen-owned command's 133;D defers the screen exit
+    // (screen_document_start stays Some until settle). The unconditional
+    // prime must still land the plain anchor; region_begin_position prefers
+    // it via `.or()` ordering.
+    let mut terminal = Terminal::new(6, 40);
+    // A screen-owned run: 1049 alt-screen enter + leave defers the exit.
+    terminal.process(b"\x1b]133;A\x07\x1b[Hvim\r\n\x1b]133;B\x07\x1b]133;C\x07\x1b[?1049h\x1b[2J\x1b[Htui\x1b]133;D;0\x07\x1b[?1049l");
+    assert_eq!(terminal.block_tracker().phase(), ShellPhase::AtPrompt);
+    for ch in "ls".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command();
+    let primed = terminal
+        .block_tracker()
+        .region_begin_position()
+        .expect("prime must survive the defer window");
+    assert_eq!(
+        primed,
+        terminal.grid().scrollback.position() + terminal.grid().cursor.row as u64,
+        "the plain anchor wins over the deferred screen anchor"
+    );
+}
+
+#[test]
+fn pseudo_block_region_serves_rows_between_submit_and_133b() {
+    // D5-2: E2E — after submit, before the shell's 133;B, the flag-ON region
+    // track is live from the primed anchor (pseudo-block). Echo and the PS2
+    // line are inside [begin, head); after 133;B + output + 133;D the block
+    // finalizes into session_blocks as usual.
+    let mut terminal = Terminal::new(6, 40);
+    terminal.set_live_block_grid_render(true);
+    terminal.process(b"\x1b]133;A\x07\x1b[Hecho hi\r\n");
+    for ch in "sudo su".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command();
+    // Pseudo-block window: begin anchor live, no in-flight block.
+    assert!(
+        terminal.block_tracker().in_flight().is_none(),
+        "pre-133;B: no in-flight block"
+    );
+    let begin = terminal
+        .block_tracker()
+        .region_begin_position()
+        .expect("pseudo-block needs the primed anchor");
+    // Shell echoes the command, then a PS2 continuation line.
+    terminal.process(b"sudo su\r\n> ");
+    // D4 head: bottom-up first non-empty viewport row's document_index + 1
+    // (same formula the app-side region cache uses).
+    let grid = terminal.grid();
+    let sb_len = grid.scrollback.len();
+    let head = (0..grid.num_rows)
+        .rev()
+        .find(|&row| !grid.displayed_row_text(row).trim_end().is_empty())
+        .map_or(sb_len as u64, |row| (sb_len + row + 1) as u64);
+    assert!(
+        begin < head,
+        "primed anchor ({begin}) must precede the region head ({head})"
+    );
+    // The pseudo-block window's region content: the echo and the PS2 line.
+    let lines = crate::grid::region::logical_lines(
+        grid,
+        crate::grid::region::GridRegionSource {
+            begin_position: begin,
+            head: Some(head),
+        },
+        |_| None,
+    );
+    assert!(
+        lines.iter().any(|l| l.text.contains("sudo su")),
+        "pseudo-block region must contain the echoed command: {:?}",
+        lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+    // Real block takes over at 133;B and finalizes at 133;D.
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07pass\r\n\x1b]133;D;0\x07");
+    assert!(terminal.block_tracker().in_flight().is_none());
+    assert_eq!(terminal.block_tracker().session_blocks().len(), 1);
+    let block = &terminal.block_tracker().session_blocks()[0];
+    assert_eq!(block.command, "sudo su");
+    assert_eq!(block.output.as_ref(), "pass");
+    // AtPrompt is anchor-free again.
+    assert_eq!(terminal.block_tracker().region_begin_position(), None);
+    terminal.set_live_block_grid_render(false);
+}
+
+#[test]
+fn empty_enter_primed_anchor_is_cleared_by_the_synthesized_block() {
+    // D5-8: an empty Enter fires no preexec (no 133;B/D will ever arrive),
+    // so the prime sampled before the empty branch must be cleared by the
+    // synthesized block's on_command_start/on_command_end pair.
+    let mut terminal = Terminal::new(6, 40);
+    terminal.process(b"\x1b]133;A\x07\x1b[Hready\r\n");
+    terminal.submit_command(); // empty editor buffer
+    assert_eq!(
+        terminal.block_tracker().region_begin_position(),
+        None,
+        "empty Enter must not leak an anchor"
+    );
+    // A non-empty submit on the same session still primes (bidirectional
+    // lock: the clear is the synthesized block's doing, not a stuck state).
+    for ch in "pwd".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command();
+    assert!(
+        terminal.block_tracker().region_begin_position().is_some(),
+        "non-empty submit keeps priming"
+    );
+}

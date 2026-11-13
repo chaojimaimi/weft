@@ -359,7 +359,17 @@ impl MetalRenderer {
                 };
                 (Some(version), live.cwd.or(terminal.cwd()).is_some())
             }
-            None => (None, false),
+            None => {
+                // v1.20.7 (PLAN_v1207 §3 D4-b): pseudo-block frames (no
+                // in-flight block) still key on grid.revision under the flag —
+                // the region snapshot grows as PS2 input lands, and without
+                // this term the memo would serve a stale total while the
+                // region track renders the new rows. Flag OFF stays None.
+                let version = terminal
+                    .is_live_block_grid_render()
+                    .then(|| terminal.grid().revision);
+                (version, false)
+            }
         };
         let key = crate::paint::live_cache::BlockScrollMetricsKey {
             pane_session_id,

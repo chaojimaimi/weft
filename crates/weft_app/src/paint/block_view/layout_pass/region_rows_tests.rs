@@ -138,7 +138,7 @@ fn wrapped_logical_row_chunks_into_visual_rows() {
     );
     let live = live_block("cmd", "");
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &st,
         10,
         10.0,
@@ -183,7 +183,7 @@ fn leading_and_trailing_blank_slots_drop_and_renumber() {
     );
     let live = live_block("cmd", "");
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &st,
         80,
         10.0,
@@ -218,7 +218,7 @@ fn interior_blank_rows_survive_but_edge_blanks_do_not() {
     );
     let live = live_block("cmd", "");
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &st,
         80,
         10.0,
@@ -253,7 +253,7 @@ fn all_blank_region_emits_only_structural_rows() {
     let st = state(vec![slot("", 0, 1), slot("", 1, 2)], Vec::new(), 80);
     let live = live_block("cmd", "");
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &st,
         80,
         10.0,
@@ -282,7 +282,7 @@ fn style_borrows_from_the_snapshot_only_when_resolve_styles() {
     let run = |resolve: bool| {
         let mut bumps = 0usize;
         let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-            &live,
+            Some(&live),
             &st,
             80,
             10.0,
@@ -327,7 +327,7 @@ fn structural_rows_match_capture_distances() {
     let st = state(vec![slot("hi", 0, 1)], Vec::new(), 80);
     let live = live_block("git status", "");
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &st,
         80,
         10.0,
@@ -359,7 +359,7 @@ fn no_cwd_no_git_branch_skips_live_header() {
     let st = state(vec![slot("hi", 0, 1)], Vec::new(), 80);
     let live = live_block("git status", "");
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &st,
         80,
         10.0,
@@ -531,7 +531,7 @@ fn metrics_chunk_total_equals_assembly_display_rows() {
     );
     let live = live_block("cmd", "");
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &wrapped,
         10,
         10.0,
@@ -563,7 +563,7 @@ fn metrics_chunk_total_equals_assembly_display_rows() {
         80,
     );
     let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
-        &live,
+        Some(&live),
         &blanked,
         80,
         10.0,
@@ -1015,5 +1015,220 @@ fn overlay_chrome_distance_matches_metrics_total() {
     assert_eq!(
         laid_px, metrics_px,
         "metrics total must count the chrome its distance domain carries"
+    );
+}
+
+// ── v1.20.7 (PLAN_v1207 §4 D5): pseudo-block assembly & metrics ──
+
+#[test]
+fn pseudo_block_segment_lays_content_without_live_chrome() {
+    // D5-3: live=None (pseudo-block) — content rows + Blank + Separator,
+    // NO LiveCommand/LiveHeader (there is no in-flight data source).
+    let st = state(
+        vec![slot("$ ps2", 0, 1), slot("password:", 1, 2)],
+        Vec::new(),
+        40,
+    );
+    let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
+        None,
+        &st,
+        40,
+        10.0,
+        24.0,
+        120.0,
+        0.0,
+        0.0,
+        120.0,
+        false,
+        &mut |_| {},
+        SystemTime::UNIX_EPOCH,
+        None,
+        None,
+    );
+    assert!(
+        seg.row_data
+            .iter()
+            .all(|r| !matches!(r, LaidRow::LiveCommand { .. } | LaidRow::LiveHeader { .. })),
+        "pseudo-block must not lay live chrome"
+    );
+    // Emission is newest-first (rev loop); Blank sits above the output.
+    let texts: Vec<&str> = seg
+        .row_data
+        .iter()
+        .filter_map(|r| match r {
+            LaidRow::Output { text, .. } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["password:", "$ ps2"]);
+    assert!(
+        matches!(seg.row_data.iter().rev().nth(1), Some(LaidRow::Blank)),
+        "Blank (n>0) is laid outside the live branch"
+    );
+    assert!(
+        matches!(seg.row_data.last(), Some(LaidRow::Separator)),
+        "Separator stays the bottom boundary"
+    );
+    assert_eq!(seg.total_display_rows, 2);
+    assert_eq!(seg.total_logical_rows, 2);
+}
+
+#[test]
+fn pseudo_block_segment_keeps_interior_blank_as_empty_output() {
+    // D5-3b: interior blank slots survive as empty-chunk Output lines
+    // (F2 assembly semantics) — the metrics pseudo branch counts them via
+    // region_live_rows, keeping clamp/assembly in one domain.
+    let st = state(
+        vec![slot("beta", 0, 1), slot("", 1, 2), slot("alpha", 2, 3)],
+        Vec::new(),
+        40,
+    );
+    let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
+        None,
+        &st,
+        40,
+        10.0,
+        24.0,
+        120.0,
+        0.0,
+        0.0,
+        120.0,
+        false,
+        &mut |_| {},
+        SystemTime::UNIX_EPOCH,
+        None,
+        None,
+    );
+    let texts: Vec<&str> = seg
+        .row_data
+        .iter()
+        .filter_map(|r| match r {
+            LaidRow::Output { text, .. } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["alpha", "", "beta"],
+        "newest-first: alpha, interior blank, beta"
+    );
+    assert_eq!(seg.total_display_rows, 3);
+}
+
+#[test]
+fn pseudo_block_metrics_matches_assembly_domain() {
+    // D5-4: the metrics pseudo branch (flag ON + region rows supplied, no
+    // in-flight block) adds n + (n>0 as Blank) + 1 Separator — exactly the
+    // assembly domain of the two cases above. Flag OFF never fires.
+    let mut terminal = Terminal::new(6, 40);
+    terminal.set_live_block_grid_render(true);
+    for n in [0usize, 2, 3] {
+        let (total, _) = crate::block_component::block_content_metrics_with_overlay(
+            &terminal,
+            40,
+            2,
+            None,
+            None,
+            Some(n),
+            false,
+            None,
+        );
+        assert_eq!(
+            total,
+            n + usize::from(n > 0) + 1,
+            "pseudo metrics = content + Blank(if any) + Separator (n={n})"
+        );
+    }
+    // Flag OFF: the branch is gated on the flag (region_live_rows is always
+    // None on the real call chain; this pins the gate itself).
+    terminal.set_live_block_grid_render(false);
+    let (total, _) = crate::block_component::block_content_metrics_with_overlay(
+        &terminal,
+        40,
+        2,
+        None,
+        None,
+        Some(3),
+        false,
+        None,
+    );
+    assert_eq!(total, 0, "flag OFF must not enter the pseudo branch");
+
+    // Review medium-2: Editor frames never count pseudo rows — 133;A flips
+    // the phase to AtPrompt (Editor) WITHOUT clearing a residual begin
+    // anchor (the PS2 Ctrl+C escape window); the layout's editor branch
+    // passes region=None, so the metrics must gate the same way.
+    terminal.set_live_block_grid_render(true);
+    terminal.process(b"\x1b]133;A\x07");
+    terminal.block_tracker_mut().prime_command_begin_position(0);
+    let (total, _) = crate::block_component::block_content_metrics_with_overlay(
+        &terminal,
+        40,
+        2,
+        None,
+        None,
+        Some(3),
+        false,
+        None,
+    );
+    assert_eq!(
+        total, 0,
+        "Editor frames must not count pseudo rows (residual-anchor window)"
+    );
+}
+
+#[test]
+fn dispatch_routes_pseudo_block_and_flag_off_frames() {
+    // D5-7: live=None + region Some routes to the region pass (no panic —
+    // the removed `live.is_some()` guard was the only blocker). D5-5: region
+    // None (flag OFF / no anchor) falls through to the capture branch, which
+    // skips its live segment when live is None (`if let Some(live)`).
+    let mut terminal = Terminal::new(6, 80);
+    terminal.set_live_block_grid_render(true);
+    terminal.process(b"\x1b]133;A\x07$ \x1b[Hecho hi\r\n");
+    for ch in "ps".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command();
+    terminal.process(b"ps\r\n> ");
+    let blocks: Vec<Block> = Vec::new();
+    let diagnose = HashMap::new();
+    let layout_cache = BlockLayoutCache::default();
+
+    // Pseudo-block frame: the region pass serves snapshot rows + Separator.
+    let grid = terminal.grid();
+    let region = region_source_for(&terminal, grid).expect("the primed anchor yields a source");
+    let region_cache = RegionLiveCache::default();
+    region_cache.sync(1, &region, 80);
+    let state_ref = region_cache.state(1).expect("sync inserts the pane");
+    let pseudo_out = compute_block_layout_pass(
+        make_input(
+            &blocks,
+            None,
+            Some(region),
+            Some(&*state_ref),
+            80,
+            &diagnose,
+        ),
+        &layout_cache,
+        &mut LiveLayoutCache::default(),
+    );
+    assert!(
+        matches!(pseudo_out.row_data.last(), Some(LaidRow::Separator)),
+        "the pseudo-block frame must route to the region pass"
+    );
+    // Flag-off twin: region fields None → capture branch. The live segment
+    // is skipped (live=None) and no live chrome is emitted.
+    let flag_off_out = compute_block_layout_pass(
+        make_input(&blocks, None, None, None, 80, &diagnose),
+        &layout_cache,
+        &mut LiveLayoutCache::default(),
+    );
+    assert!(
+        flag_off_out
+            .row_data
+            .iter()
+            .all(|r| !matches!(r, LaidRow::LiveCommand { .. } | LaidRow::LiveHeader { .. })),
+        "flag OFF + live=None must fall through to the capture branch cleanly"
     );
 }

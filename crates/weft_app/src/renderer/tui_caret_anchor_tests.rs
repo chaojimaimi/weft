@@ -6,6 +6,7 @@
 //! gate-exempt sibling-module convention (panes/freeze_tests.rs precedent)
 //! — these target the renderer seam itself, not the layout pass.
 
+use crate::paint::region_cache::{region_source_for, RegionLiveCache};
 use crate::renderer::MetalRenderer;
 use weft_core::vt::Terminal;
 
@@ -128,4 +129,46 @@ fn tui_caret_streaming_shapes_stay_equivalent_to_formula() {
             "streaming equivalence for {text:?} @ {cols} cols"
         );
     }
+}
+
+/// v1.20.7 (PLAN_v1207 §4 D5-6): pseudo-block frames (live=None between
+/// submit and 133;B) reach the region-track D6 anchor — the branch no
+/// longer early-returns on `in_flight` (D3b). State comes from the real
+/// sync path (`region_source_for` + `RegionLiveCache::sync`).
+#[test]
+fn tui_caret_anchors_in_pseudo_block_region_without_in_flight() {
+    let Some(renderer) = headless_renderer_or_skip() else {
+        eprintln!("skipping D5-6 pseudo-block caret test: no Metal device available");
+        return;
+    };
+    let mut terminal = Terminal::new(6, 40);
+    terminal.set_live_block_grid_render(true);
+    terminal.process(b"\x1b]133;A\x07$ \x1b[Hecho hi\r\n");
+    for ch in "sudo su".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command(); // primes begin; no 133;B → no in-flight block
+    assert!(
+        terminal.block_tracker().in_flight().is_none(),
+        "pre-133;B: the pseudo-block window"
+    );
+    terminal.process(b"sudo su\r\n> "); // PTY echo + PS2 continuation
+    let grid = terminal.grid();
+    let region = region_source_for(&terminal, grid).expect("the primed anchor yields a source");
+    let cache = RegionLiveCache::default();
+    cache.sync(1, &region, 40);
+    let state = cache.state(1).expect("sync inserts the pane");
+    let anchor = renderer.block_view_tui_cursor(&terminal, terminal.grid(), Some(&*state));
+    let grid = terminal.grid();
+    let cursor_doc = (grid.scrollback.len() + grid.cursor.row) as u64;
+    let expected_row = state.display_logical_row_of_cursor(cursor_doc);
+    assert!(
+        expected_row.is_some(),
+        "the cursor must land inside the snapshot slots (PS2 row)"
+    );
+    assert_eq!(
+        anchor,
+        expected_row.map(|row| (row, grid.cursor.col)),
+        "D6 anchor in the pseudo-block window: region row + cursor col"
+    );
 }

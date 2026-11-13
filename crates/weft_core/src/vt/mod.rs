@@ -538,6 +538,26 @@ impl Terminal {
     /// editor's command rather than the grid snapshot.
     pub fn submit_command(&mut self) -> Vec<u8> {
         let command = self.editor.text();
+        // v1.20.7 (PLAN_v1207 §3 D1): prime the region begin anchor at
+        // submit — the window between Enter and the shell's `133;B` marker
+        // (PS2 continuations, slow shells) has no in-flight block, so the
+        // region track renders a pseudo-block (live=None) from this anchor.
+        // Sampled BEFORE the empty-Enter branch: the synthesized block's
+        // on_command_start clears it again (an empty Enter must not leak an
+        // anchor — no preexec fires, so no 133;B/D would ever clear it).
+        // Primed UNCONDITIONALLY (`prime_command_begin_position`): the
+        // idempotent guard would reject the sample while a screen-owned
+        // `133;D` defer still holds `screen_document_start`, and after the
+        // settle clears it the pseudo-block would lose its anchor entirely.
+        // `133;B` clears both anchors and re-samples from the current
+        // cursor (the primed value only matters for marker-less shells);
+        // 133;D clears it back (AtPrompt stays anchor-free).
+        self.block_tracker.prime_command_begin_position(
+            self.grid
+                .scrollback
+                .position()
+                .saturating_add(self.grid.cursor.row as u64),
+        );
         // v1.0: Empty Enter — zsh's preexec hook does NOT fire on an empty
         // command, so no 133;B/D markers arrive. We synthesize an empty
         // block here (Warp-style spacer) so the block view preserves a

@@ -25,7 +25,12 @@ impl MetalRenderer {
         grid: &weft_core::grid::Grid,
         region_state: Option<&PaneRegionState>,
     ) -> Option<(usize, usize)> {
-        let live = terminal.block_tracker().in_flight()?;
+        // v1.20.7 (PLAN_v1207 §3 D3b): `live` is no longer an early-return —
+        // the pseudo-block frame (live=None between submit and the shell's
+        // 133;B) must still reach the region-track anchor below, whose D6
+        // formula needs only the region snapshot. The capture-path fallback
+        // after the region branch re-early-returns when live is None.
+        let live = terminal.block_tracker().in_flight();
         if !terminal.show_block_view() {
             return None;
         }
@@ -65,6 +70,10 @@ impl MetalRenderer {
                 return None;
             }
         }
+        // Capture-path fallback needs the in-flight block (v1.18.9 capture
+        // cursor anchor + T16b tail formula) — pseudo-block frames return
+        // None here instead of anchoring in a different line domain.
+        let live = live?;
         let tracked = terminal.primary_screen_cursor_snapshot_line();
         let (line, col) = match tracked {
             // v1.10.6: the precisely tracked snapshot line beats the formula.

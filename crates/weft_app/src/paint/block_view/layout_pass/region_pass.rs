@@ -22,10 +22,11 @@ pub(super) fn compute_region_layout_pass<'a, 'b>(
     input: &LayoutPassInput<'a, 'b, '_>,
     cache: &'a BlockLayoutCache,
 ) -> LayoutPassOutput<'a> {
-    let Some(live) = input.live.as_ref() else {
-        // The dispatch guard only routes live-block frames here.
-        unreachable!("region track requires an in-flight block");
-    };
+    // v1.20.7 (PLAN_v1207 §3 D3): the pseudo-block frame routes here with
+    // live=None (no in-flight block between submit and the shell's 133;B
+    // marker) — the live segment then renders region rows only, without the
+    // LiveCommand/LiveHeader chrome.
+    let live = input.live.as_ref();
     let Some(region_state) = input.region_state else {
         unreachable!("region track requires a snapshot");
     };
