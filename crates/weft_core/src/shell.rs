@@ -98,6 +98,10 @@ fi
 ///
 /// Note: bash's DEBUG trap fires per simple-command, so `B` may emit more than
 /// once for compound commands — best-effort, unlike the robust zsh path.
+/// Known residual (v1.20.8 review N2, accepted): if the user re-traps DEBUG
+/// *after* sourcing this snippet, `B` never fires; a real command then
+/// SIGINT-killed synthesizes an orphan `D;130` block whose PTY echo staging
+/// Weft intentionally discards (echo lines only, grid rollback intact).
 const BASH_INTEGRATION_BODY: &str = "\
 # weft shell integration — source from ~/.bashrc:
 #   [ -n \"$WEFT_SHELL_INTEGRATION\" ] && . ~/.cache/weft/bash-integration.sh

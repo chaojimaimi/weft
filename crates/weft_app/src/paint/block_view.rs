@@ -38,6 +38,7 @@ pub(crate) use actions::block_header_action_rects;
 // (block_view.rs:94 同式) so the window's header-depth term cannot drift.
 pub(crate) use actions::block_header_band_height;
 pub(crate) use rows::sticky_block_id;
+pub(crate) use rows::sticky_cover_bottom;
 
 #[cfg(test)]
 #[path = "block_view/b_path_tests.rs"]
@@ -597,7 +598,14 @@ impl MetalRenderer {
                 .unwrap_or_default();
             let sticky_y = layout.clip_top;
             let header_rows = rows::sticky_header_rows(!block_cwd.is_empty());
-            let sticky_bottom = sticky_y + header_rows as f32 * pitch;
+            // FIX_STICKY_PARTIAL_ROW: extend the cover past fractional-scroll
+            // misalignment so no straddling content row pokes out as a
+            // half-height sliver under the sticky band (see rows.rs).
+            let sticky_bottom = rows::sticky_cover_bottom(
+                &bv_rows,
+                sticky_y,
+                sticky_y + header_rows as f32 * pitch,
+            );
             let sticky_bg = crate::paint::color_math::lighten_to_white(theme_bg, 0.08);
             push_quad(
                 &mut verts,

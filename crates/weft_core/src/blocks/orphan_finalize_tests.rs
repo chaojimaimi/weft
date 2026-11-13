@@ -190,3 +190,41 @@ fn empty_enter_spacer_does_not_duplicate_via_orphan_d() {
         "orphan D must stay noop for an empty submission — no second spacer"
     );
 }
+
+/// FIX_PS2_ESCAPE_ORPHAN_ECHO: bash abandons a PS2 continuation line on
+/// `Ctrl+C` (unclosed backquote, say) — the precmd pair then reports
+/// `133;D;130` with no `133;B` ever seen. The staged bytes at that point
+/// are the PTY echo of the abandoned input plus the PS2 prompt itself;
+/// synthesizing them as block output duplicated the command text inside
+/// its own finished block (header `cmd` + output `cmd`/`bquote>`).
+/// A 130 orphan must keep the block as a header-only record and drop the
+/// staged echo; parse-error reports (exit != 130) keep theirs.
+#[test]
+fn ps2_escape_orphan_drops_echoed_input_from_staged_output() {
+    let mut t = Terminal::new(24, 80);
+    boot_prompt(&mut t);
+    let _ = t.run_command("./scripts/dev.sh`");
+    assert!(t.command_from_editor_pending());
+
+    // PTY echo: the abandoned line, then the PS2 continuation prompt.
+    t.process(
+        b"./scripts/dev.sh`
+bquote> ",
+    );
+    assert!(t.preexec_staging_len() > 0);
+
+    // Ctrl+C: bash abandons the line; the precmd pair reports SIGINT.
+    t.process(b"\x1b]133;D;130\x07");
+    t.process(b"\x1b]133;A\x07");
+
+    let tracker = t.block_tracker();
+    assert_eq!(tracker.blocks().len(), 1, "one header-only record");
+    let block = tracker.blocks().last().unwrap();
+    assert_eq!(block.command, "./scripts/dev.sh`");
+    assert_eq!(block.exit_code, Some(130));
+    assert!(
+        block.output.as_ref().is_empty(),
+        "staged echo + PS2 prompt must be dropped for a 130 orphan, got: {:?}",
+        block.output
+    );
+}

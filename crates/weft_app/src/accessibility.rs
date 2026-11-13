@@ -406,9 +406,17 @@ impl App {
                     {
                         if let Some(block) = blocks.iter().find(|b| b.id == sid) {
                             let cell_h = layout.cell_height as f32;
-                            // At most 2 rows (CWD + command); use the
-                            // full band so screen readers cover both.
-                            let sticky_bottom = clip_top + cell_h * 2.0;
+                            // Mirror the painted band exactly (v1.20.8):
+                            // base = 2 rows (CWD + command), grown past any
+                            // row straddling the fractional-scroll edge via
+                            // the same fn block_view.rs draws with. Rows were
+                            // just clipped to the viewport, which contains the
+                            // band, so the intersection rows are all present.
+                            let sticky_bottom = crate::paint::block_view::sticky_cover_bottom(
+                                &rows,
+                                clip_top,
+                                clip_top + cell_h * 2.0,
+                            );
                             sticky_header = Some((
                                 format!("Header: {}", block.command),
                                 [

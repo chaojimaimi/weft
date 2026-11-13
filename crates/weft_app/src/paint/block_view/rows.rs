@@ -43,6 +43,35 @@ pub(super) fn sticky_header_rows(has_cwd: bool) -> usize {
     }
 }
 
+/// FIX_STICKY_PARTIAL_ROW (v1.20.8): fractional block scroll leaves the
+/// content-row grid misaligned with the sticky band's fixed height, so a
+/// straddling row pokes out as a half-height sliver right under the sticky
+/// header (its top half covered by the sticky background, its bottom half
+/// visible). Extend the cover down to whole content rows: any laid row that
+/// intersects the sticky band is covered through its bottom edge, so the
+/// first fully visible row below the sticky header starts at a row boundary.
+/// Rows are iterated to a fixed point because extending the cover can bring
+/// the next row into intersection (adjacent-row grids settle in one pass).
+pub(crate) fn sticky_cover_bottom(
+    rows: &[BlockViewRow],
+    sticky_y: f32,
+    mut sticky_bottom: f32,
+) -> f32 {
+    loop {
+        let mut grew = false;
+        for row in rows {
+            if row.y_bottom > sticky_y && row.y_top < sticky_bottom && row.y_bottom > sticky_bottom
+            {
+                sticky_bottom = row.y_bottom;
+                grew = true;
+            }
+        }
+        if !grew {
+            return sticky_bottom;
+        }
+    }
+}
+
 /// Expand wrapped chunks into (chunk index, y_top, char offset) triples
 /// ordered bottom-to-top — the invariant `bv_rows` relies on (index grows
 /// upward). The last chunk (visually lowest) is pushed first; char offsets
@@ -512,6 +541,54 @@ mod tests {
     fn sticky_header_uses_a_separate_context_row_when_cwd_is_known() {
         assert_eq!(sticky_header_rows(true), 2);
         assert_eq!(sticky_header_rows(false), 1);
+    }
+
+    #[test]
+    fn sticky_cover_extends_past_straddling_fractional_row() {
+        // pitch 20 rows against a 2-row sticky band ending at 40.0; the
+        // fractional scroll leaves a row straddling the band edge (top 30.0
+        // < 40.0, bottom 50.0 > 40.0) — the cover must swallow it whole.
+        let rows = [
+            row(BlockViewRowKind::Output, 7, -20.0, 0.0),
+            row(BlockViewRowKind::Output, 7, 0.0, 20.0),
+            row(BlockViewRowKind::Output, 7, 30.0, 50.0),
+            row(BlockViewRowKind::Output, 7, 50.0, 70.0),
+        ];
+        assert_eq!(sticky_cover_bottom(&rows, 0.0, 40.0), 50.0);
+    }
+
+    #[test]
+    fn sticky_cover_keeps_aligned_grid_unchanged() {
+        // Row boundary exactly at the band edge (50.0): y_top < bottom is
+        // false, so nothing extends — the next row stays fully visible.
+        let rows = [
+            row(BlockViewRowKind::Output, 7, 0.0, 20.0),
+            row(BlockViewRowKind::Output, 7, 30.0, 50.0),
+            row(BlockViewRowKind::Output, 7, 50.0, 70.0),
+        ];
+        assert_eq!(sticky_cover_bottom(&rows, 0.0, 50.0), 50.0);
+    }
+
+    #[test]
+    fn sticky_cover_ignores_rows_below_and_above_band() {
+        let rows = [
+            row(BlockViewRowKind::Output, 7, -60.0, -40.0),
+            row(BlockViewRowKind::Output, 7, 80.0, 100.0),
+        ];
+        assert_eq!(sticky_cover_bottom(&rows, 0.0, 40.0), 40.0);
+    }
+
+    #[test]
+    fn sticky_cover_swallows_straddling_header_band() {
+        // The cover is kind-blind (v1.20.8 review N3): a straddling row of
+        // any kind — here the next block's taller Header band — is swallowed
+        // whole rather than left as a half-height sliver. Scrolling reveals
+        // it fully; the cover only ever grows by one row span per level.
+        let rows = [
+            row(BlockViewRowKind::Output, 7, 0.0, 20.0),
+            row(BlockViewRowKind::Header, 8, 30.0, 60.0),
+        ];
+        assert_eq!(sticky_cover_bottom(&rows, 0.0, 40.0), 60.0);
     }
 
     #[test]

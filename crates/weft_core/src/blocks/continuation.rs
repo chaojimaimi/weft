@@ -92,6 +92,20 @@ impl BlockTracker {
         command: String,
         mut staged: OutputCapture,
     ) {
+        // FIX_PS2_ESCAPE_ORPHAN_ECHO (v1.20.8): exit 130 is SIGINT. An orphan
+        // (no `133;B` ever arrived) carrying 130 means the shell abandoned
+        // the line before the command could run — bash's PS2 escape on an
+        // unclosed quote (`Ctrl+C` at a continuation prompt) is the real
+        // case. The staged bytes there are the PTY echo of the abandoned
+        // input plus the PS2 prompt itself, NOT command output; keeping them
+        // duplicated the command text inside its own finished block (header
+        // shows `cmd`, output repeats `cmd` + `bquote>`). Drop them and
+        // keep the block as a header-only record. Parse-error reports (the
+        // original reason staging is synthesized, exit != 130) still keep
+        // their staged text — see parse_error_produces_block_with_error_text.
+        if exit_code == 130 {
+            staged.clear();
+        }
         self.pending_command = Some(command);
         self.pending_started = Some(SystemTime::now());
         self.pending_cwd = self.current_cwd.clone();
