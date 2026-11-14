@@ -500,8 +500,9 @@ pub(crate) fn block_content_metrics_with_overlay(
         // (between submit and the shell's 133;B) but a region snapshot is
         // live. Row budget matches the pseudo segment's assembly domain
         // (region_rows.rs D3): region rows + Blank (only when any) +
-        // Separator + cwd header (v1.20.9 D3: the pseudo-block lays a
-        // LiveHeader when a cwd exists — same predicate as the assembly).
+        // Separator + cwd header (v1.20.9 D3, restored in R4: the header
+        // the user wants is THIS pseudo-block context header; the stray
+        // pinned line was the fixed CWD band, hidden separately in R3).
         // Sits OUTSIDE the CommandExecuting gate above: non-integrated shells
         // never enter CommandExecuting at all (Passthrough throughout).
         let pseudo_rows = region_live_rows.unwrap_or(0);

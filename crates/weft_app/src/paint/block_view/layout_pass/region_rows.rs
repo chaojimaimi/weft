@@ -188,6 +188,10 @@ pub(super) fn region_live_segment<'a>(
         // header above the echoed command line, separator at the bottom
         // boundary. Metrics mirrors this with the same
         // `live_context_label` predicate (block_component.rs).
+        // R4: restored after the R2 revert — the header the user missed was
+        // THIS one (pseudo-block context); the stray pinned line was the
+        // separate v1.10.34 fixed CWD band, now hidden independently
+        // (block_view.rs/rows.rs R3).
         cursor_dist += pitch;
         rows.push(cursor_dist);
         row_data.push(LaidRow::LiveHeader { text });

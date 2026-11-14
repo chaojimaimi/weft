@@ -110,7 +110,16 @@ impl MetalRenderer {
         let bg_uv = [su, sv + svh, su + suw, sv];
 
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
-        let cwd_header_active = cwd.is_some() && live.is_none();
+        // v1.20.9 R3: the fixed CWD band stays hidden on pseudo-block frames
+        // (region Some + live None: the submit-to-133;B window). Its band
+        // used to peek out below the editor box there, because
+        // command_from_editor=Some forces Passthrough so the box is not
+        // drawn to cover it — and the metrics side (runtime.rs
+        // block_cwd_header_active) is Editor-gated, so it never counted the
+        // band row in that window either. Keeping paint and metrics on the
+        // same side of that gate restores the v1.10.34-era equivalence.
+        let cwd_header_active = cwd.is_some() && live.is_none() && region.is_none();
+
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
         let pitch = layout.pitch;
         let header_height = block_header_band_height(pitch, self.scale);

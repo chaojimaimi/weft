@@ -169,7 +169,11 @@ impl MetalRenderer {
             Some(c) => c,
             None => return (Vec::new(), 0.0, 0.0, Vec::new()),
         };
-        let cwd_header_active = cwd.is_some() && live.is_none();
+        // v1.20.9 R3: mirror block_view.rs — hide the fixed CWD band on
+        // pseudo-block frames so paint and the Editor-gated metrics agree
+        // (same reasoning, one domain).
+        let cwd_header_active = cwd.is_some() && live.is_none() && region.is_none();
+
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
         let pitch = layout.pitch;
         let header_height = block_header_band_height(pitch, self.scale);
