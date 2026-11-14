@@ -56,6 +56,8 @@ pub use osc::osc52_read_reply;
 #[cfg(test)]
 pub(crate) use screen_exit::{sustained_alt_cols_kind, SUSTAINED_ALT_COLS_MS};
 
+use std::time::SystemTime;
+
 use crate::blocks::{BlockTracker, OutputCapture};
 use crate::editor::Editor;
 use crate::grid::{Color, Cursor, CursorStyle, Grid};
@@ -79,6 +81,14 @@ pub struct Terminal {
     git_branch: Option<String>,
     /// Editor command awaiting `133;B`; keeps the preexec window passthrough.
     command_from_editor: Option<String>,
+    /// v1.20.9 (PLAN_v1209 §1 D1): wall-clock instant of the editor submit.
+    /// Lives exactly as long as `command_from_editor` (set together in
+    /// `submit_command`, cleared at `133;B` / the `133;A` fallback /
+    /// consumed by the orphan `133;D` arm) so an orphan synthesis can date
+    /// the block from the Enter keypress instead of the `133;D` arrival —
+    /// a PS2 escape (`Ctrl+C` at a continuation prompt, no preexec ever
+    /// fired) otherwise reports 0ms for a minute-long wait.
+    command_submitted_at: Option<SystemTime>,
     /// FIX_ORPHAN_PARSE_ERROR_OUTPUT: bytes printed between editor submission
     /// and `133;B` (ZLE repaints, or a whole parse-error report when zsh
     /// rejects the line before preexec). Routed here because the in-flight
@@ -201,6 +211,7 @@ impl Terminal {
             cwd: None,
             git_branch: None,
             command_from_editor: None,
+            command_submitted_at: None,
             preexec_staging: OutputCapture::default(),
             bracketed_paste: false,
             origin_mode: false,
@@ -567,6 +578,15 @@ impl Terminal {
             self.block_tracker.on_command_end(0);
         }
         self.command_from_editor = Some(command.clone());
+        // v1.20.9 (PLAN_v1209 §1 D1): same lifecycle as the flag above — the
+        // orphan `133;D` arm dates its synthesized block from here (the
+        // submit) rather than from the marker arrival, so a PS2 escape
+        // reports the real wait instead of 0ms. An empty Enter leaves a
+        // stale value behind, but its synthesized block closes its own
+        // lifecycle and the staging buffer stays unarmed (a later orphan
+        // arm never consumes it); the next `133;A` fallback or submit
+        // overwrites it regardless.
+        self.command_submitted_at = Some(SystemTime::now());
         let bytes = build_submit_bytes(&command, self.bracketed_paste);
         // Record into in-memory history so ↑/↓ navigation works. This is the
         // only place commands enter the editor's history — without it the

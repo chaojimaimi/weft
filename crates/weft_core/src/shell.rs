@@ -74,20 +74,28 @@ if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
         # Report the current git branch (if in a repo) for the prompt header.
         local __weft_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
         [ -n \"$__weft_branch\" ] && printf '\\033]9;git=%s\\007' \"$__weft_branch\"
-        # weft renders the prompt in its input box; blank the shell's PS1 so
-        # the grid doesn't show a duplicate prompt line at the shell cursor.
-        # Also clear PROMPT_EOL_MARK (zsh prints it — a '%' — when a command's
-        # output lacks a trailing newline, and it lands inside the block's
-        # capture window, showing a stray '%' after each command).
+    }
+    __weft_prompt_clear() {
+        # Chain-tail hook: frameworks like oh-my-zsh run their own precmd
+        # functions AFTER ours and reassign PROMPT to their theme prompt —
+        # a blank set at chain head gets overwritten and the grid shows a
+        # duplicate PWD line under the pseudo-block (v1.20.9 user report).
+        # PROMPT_EOL_MARK: zsh prints it — a '%' — when a command's output
+        # lacks a trailing newline; it lands inside the block's capture
+        # window, showing a stray '%' after each command.
         PROMPT=''
         PROMPT_EOL_MARK=''
+        RPROMPT=''
     }
     __weft_preexec() {
         printf '\\033]133;B;weft-shell\\007'
         printf '\\033]133;C;weft-shell\\007'
     }
-    # Prepend so our precmd runs before user hooks and captures a clean exit code.
-    precmd_functions=(__weft_precmd ${precmd_functions[@]})
+    # Head: __weft_precmd runs first so $? is still the command's exit code
+    # (later precmd functions clobber $? with their own return value).
+    # Tail: __weft_prompt_clear runs last so the blank PROMPT survives the
+    # oh-my-zsh theme functions that reassign PROMPT later in the chain.
+    precmd_functions=(__weft_precmd ${precmd_functions[@]} __weft_prompt_clear)
     preexec_functions=(__weft_preexec ${preexec_functions[@]})
 fi
 ";
@@ -110,14 +118,19 @@ __weft_bash_precmd() {
     printf '\\033]133;D;%d;weft-shell\\007' \"$__weft_rc\"
     printf '\\033]133;A;weft-shell\\007'
     printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"
+}
+__weft_bash_ps1() {
+    # Tail of PROMPT_COMMAND: user entries (starship etc.) may reassign PS1
+    # after our precmd ran; blank it last so it sticks (v1.20.9 zsh lesson).
     PS1=''
+}
 }
 __weft_bash_preexec() {
     printf '\\033]133;B;weft-shell\\007'
     printf '\\033]133;C;weft-shell\\007'
 }
 if [ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]; then
-    PROMPT_COMMAND=\"__weft_bash_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"
+    PROMPT_COMMAND=\"__weft_bash_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};__weft_bash_ps1\"
     trap '__weft_bash_preexec' DEBUG
 fi
 ";

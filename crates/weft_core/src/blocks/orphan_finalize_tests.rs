@@ -200,7 +200,7 @@ fn empty_enter_spacer_does_not_duplicate_via_orphan_d() {
 /// A 130 orphan must keep the block as a header-only record and drop the
 /// staged echo; parse-error reports (exit != 130) keep theirs.
 #[test]
-fn ps2_escape_orphan_drops_echoed_input_from_staged_output() {
+fn ps2_escape_orphan_strips_echo_keeps_ps2_line() {
     let mut t = Terminal::new(24, 80);
     boot_prompt(&mut t);
     let _ = t.run_command("./scripts/dev.sh`");
@@ -218,13 +218,101 @@ bquote> ",
     t.process(b"\x1b]133;A\x07");
 
     let tracker = t.block_tracker();
-    assert_eq!(tracker.blocks().len(), 1, "one header-only record");
+    assert_eq!(tracker.blocks().len(), 1, "one synthesized record");
     let block = tracker.blocks().last().unwrap();
     assert_eq!(block.command, "./scripts/dev.sh`");
     assert_eq!(block.exit_code, Some(130));
+    // v1.20.9 (PLAN_v1209 §2 D2): only the echoed command line is
+    // stripped; the PS2 continuation line stays (informative — Warp
+    // keeps it too). The trailing space of the PS2 prompt is dropped by
+    // the existing PROMPT_SP tail-strip at finalize (output_capture.rs).
+    assert_eq!(
+        block.output.as_ref(),
+        "bquote>",
+        "130 orphan must keep the PS2 line and drop only the echoed command, got: {:?}",
+        block.output
+    );
+}
+
+/// v1.20.9 (PLAN_v1209 §2 D2 fallback): when the staged text does NOT start
+/// with the echoed command line (unexpected shape), the v1.20.8 full clear
+/// remains the safe fallback — never leak arbitrary bytes into the block.
+#[test]
+fn ps2_escape_orphan_falls_back_to_clear_on_shape_mismatch() {
+    let mut t = Terminal::new(24, 80);
+    boot_prompt(&mut t);
+    let _ = t.run_command("./scripts/dev.sh`");
+    assert!(t.command_from_editor_pending());
+
+    // ZLE repaint noise whose first line is NOT the echoed command.
+    t.process(
+        b"[2Krepaint junk
+bquote> ",
+    );
+    assert!(t.preexec_staging_len() > 0);
+
+    t.process(b"]133;D;130");
+    t.process(b"]133;A");
+
+    let tracker = t.block_tracker();
+    assert_eq!(tracker.blocks().len(), 1);
+    let block = tracker.blocks().last().unwrap();
+    assert_eq!(block.exit_code, Some(130));
     assert!(
         block.output.as_ref().is_empty(),
-        "staged echo + PS2 prompt must be dropped for a 130 orphan, got: {:?}",
+        "shape mismatch must fall back to the full clear, got: {:?}",
         block.output
+    );
+}
+
+/// v1.20.9 (PLAN_v1209 §1 D1): the orphan block is dated from the editor
+/// submit, not from the 133;D arrival — a PS2 escape waited real time
+/// between Enter and Ctrl+C (Warp shows 1m20s where Weft showed 0ms).
+#[test]
+fn ps2_escape_orphan_dates_block_from_submit_instant() {
+    let mut t = Terminal::new(24, 80);
+    boot_prompt(&mut t);
+    let _ = t.run_command("./scripts/dev.sh`");
+
+    // Simulated real wait between Enter and Ctrl+C.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    t.process(
+        b"./scripts/dev.sh`
+bquote> ",
+    );
+    t.process(b"]133;D;130");
+
+    let block = t.block_tracker().blocks().last().unwrap();
+    let age = block
+        .started_at
+        .elapsed()
+        .expect("started_at is in the past");
+    assert!(
+        age >= std::time::Duration::from_millis(200),
+        "orphan block must be dated from the submit (>=250ms wait), got {age:?}"
+    );
+    assert!(
+        age <= std::time::Duration::from_millis(1500),
+        "sanity: {age:?}"
+    );
+}
+
+/// v1.20.9 (PLAN_v1209 §1 D1 fallback): a tracker-level orphan with no
+/// editor submission (submitted_at None) still synthesizes a block dated
+/// 'now' — the v1.20.8 behavior is preserved for bare callers.
+#[test]
+fn orphan_without_submit_instant_dates_from_now() {
+    let mut tracker = crate::blocks::BlockTracker::new();
+    let mut staged = crate::blocks::OutputCapture::default();
+    staged.print_str("err", crate::blocks::CapturedStyle::default(), 1 << 20);
+    tracker.on_orphan_command_end(1, "print(x)".to_string(), staged, None);
+    let block = tracker.blocks().last().unwrap();
+    let age = block
+        .started_at
+        .elapsed()
+        .expect("started_at is in the past");
+    assert!(
+        age <= std::time::Duration::from_millis(1500),
+        "fallback must date from now, got {age:?}"
     );
 }

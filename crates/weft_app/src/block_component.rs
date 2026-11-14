@@ -1,7 +1,9 @@
 //! Pure presentation model for BlockView metadata.
 
 use crate::paint::grid_cache::{block_line_chunks, command_line_chunks};
-use crate::paint::ui_helpers::{abbreviate_path, block_duration_str, strip_prompt_prefix};
+use crate::paint::ui_helpers::{
+    abbreviate_path, block_duration_str, live_context_label, strip_prompt_prefix,
+};
 use weft_core::blocks::continuation::{classify_exit, ExitClass};
 use weft_core::blocks::{Block, BlockId};
 use weft_core::vt::Terminal;
@@ -498,11 +500,19 @@ pub(crate) fn block_content_metrics_with_overlay(
         // (between submit and the shell's 133;B) but a region snapshot is
         // live. Row budget matches the pseudo segment's assembly domain
         // (region_rows.rs D3): region rows + Blank (only when any) +
-        // Separator. No gap/cwd tail — the pseudo-block lays no LiveHeader.
+        // Separator + cwd header (v1.20.9 D3: the pseudo-block lays a
+        // LiveHeader when a cwd exists — same predicate as the assembly).
         // Sits OUTSIDE the CommandExecuting gate above: non-integrated shells
         // never enter CommandExecuting at all (Passthrough throughout).
         let pseudo_rows = region_live_rows.unwrap_or(0);
-        total += pseudo_rows + usize::from(pseudo_rows > 0) + 1;
+        // v1209-review N4: this predicate must stay source-identical to the
+        // assembly side — LayoutPassInput.cwd flows from the same accessors
+        // (draw_phases.rs terminal.cwd()/git_branch() → PaintModel →
+        // LayoutPassInput → region_rows.rs). Any change of source on either
+        // side desyncs the scrollbar by one row.
+        let pseudo_header =
+            live_context_label(terminal.cwd(), terminal.git_branch(), None).is_some();
+        total += pseudo_rows + usize::from(pseudo_rows > 0) + 1 + usize::from(pseudo_header);
     }
     let metrics_ms = metrics_started.elapsed().as_millis();
     if metrics_ms > 10 {

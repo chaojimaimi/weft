@@ -215,6 +215,10 @@ impl Terminal {
                             // (crashed / non-integrated sub-shell) can't pin the
                             // editor in passthrough forever.
                             self.command_from_editor = None;
+                            // v1.20.9 (PLAN_v1209 §1 D1): same lifecycle — a
+                            // stale submit instant must not date a LATER
+                            // orphan synthesis.
+                            self.command_submitted_at = None;
                             // FIX_ORPHAN_PARSE_ERROR_OUTPUT: same staleness
                             // guard for the staging buffer — a D-less sequence
                             // (interrupted / crashed shell) must not leak its
@@ -294,6 +298,10 @@ impl Terminal {
                                 // cursor may sit below the command —
                                 // `snapshot_command_line` walks up).
                                 let command = if let Some(c) = self.command_from_editor.take() {
+                                    // v1.20.9 (PLAN_v1209 §1 D1): the real
+                                    // path dates from preexec (on_command_start
+                                    // below); drop the submit instant.
+                                    self.command_submitted_at = None;
                                     c
                                 } else {
                                     self.snapshot_command_line()
@@ -416,8 +424,17 @@ impl Terminal {
                                     command = %command,
                                     "orphan 133;D: synthesizing block from pre-exec staging"
                                 );
-                                self.block_tracker
-                                    .on_orphan_command_end(exit_code, command, staged);
+                                self.block_tracker.on_orphan_command_end(
+                                    exit_code,
+                                    command,
+                                    staged,
+                                    // v1.20.9 (PLAN_v1209 §1 D1): date the
+                                    // synthesized block from the editor
+                                    // submit, not from this marker — a
+                                    // PS2 escape waited real time before
+                                    // its Ctrl+C.
+                                    self.command_submitted_at.take(),
+                                );
                             } else {
                                 self.block_tracker.on_command_end(exit_code);
                             }

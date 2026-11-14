@@ -180,6 +180,17 @@ pub(super) fn region_live_segment<'a>(
             rows.push(cursor_dist);
             row_data.push(LaidRow::LiveHeader { text });
         }
+    } else if let Some(text) = live_context_label(cwd, git_branch, None) {
+        // v1.20.9 (PLAN_v1209 §3 D3): the pseudo-block (live=None, between
+        // submit and the shell's `133;B`) renders the cwd/git header —
+        // the Warp-style prompt context, without the elapsed suffix
+        // (nothing is running yet). Same push order as the live branch:
+        // header above the echoed command line, separator at the bottom
+        // boundary. Metrics mirrors this with the same
+        // `live_context_label` predicate (block_component.rs).
+        cursor_dist += pitch;
+        rows.push(cursor_dist);
+        row_data.push(LaidRow::LiveHeader { text });
     }
     cursor_dist += pitch;
     rows.push(cursor_dist);

@@ -91,23 +91,49 @@ impl BlockTracker {
         exit_code: i32,
         command: String,
         mut staged: OutputCapture,
+        // v1.20.9 (PLAN_v1209 §1 D1): wall-clock instant of the editor
+        // submit, captured by the caller before this call. `None` (no
+        // editor submission preceded this `133;D` — e.g. a tracker-level
+        // test) falls back to "now", the v1.20.8 behavior.
+        submitted_at: Option<SystemTime>,
     ) {
-        // FIX_PS2_ESCAPE_ORPHAN_ECHO (v1.20.8): exit 130 is SIGINT. An orphan
-        // (no `133;B` ever arrived) carrying 130 means the shell abandoned
-        // the line before the command could run — bash's PS2 escape on an
-        // unclosed quote (`Ctrl+C` at a continuation prompt) is the real
-        // case. The staged bytes there are the PTY echo of the abandoned
-        // input plus the PS2 prompt itself, NOT command output; keeping them
-        // duplicated the command text inside its own finished block (header
-        // shows `cmd`, output repeats `cmd` + `bquote>`). Drop them and
-        // keep the block as a header-only record. Parse-error reports (the
-        // original reason staging is synthesized, exit != 130) still keep
-        // their staged text — see parse_error_produces_block_with_error_text.
+        // FIX_PS2_ESCAPE_ORPHAN_ECHO (v1.20.8, refined v1.20.9 D2): exit 130
+        // is SIGINT. An orphan (no `133;B` ever arrived) carrying 130 means
+        // the shell abandoned the line before the command could run —
+        // bash/zsh's PS2 escape on an unclosed quote (`Ctrl+C` at a
+        // continuation prompt) is the real case. The staged bytes there are
+        // the PTY echo of the abandoned input plus the PS2 prompt itself,
+        // NOT command output; keeping the echo duplicated the command text
+        // inside its own finished block (header shows `cmd`, output
+        // repeats `cmd`). v1.20.9 strips only the echoed command line and
+        // keeps the rest (the PS2 prompt line is informative — Warp keeps
+        // it too); the full clear remains as the shape-mismatch fallback.
+        // Parse-error reports (the original reason staging is synthesized,
+        // exit != 130) still keep their staged text — see
+        // parse_error_produces_block_with_error_text.
         if exit_code == 130 {
-            staged.clear();
+            // v1.20.9 (PLAN_v1209 §2 D2): strip ONLY the echoed command
+            // line; keep the rest — PS2 continuation lines like `bquote>`
+            // carry real information (the command died at a continuation
+            // prompt) and Warp keeps them too. The v1.20.8 full clear
+            // stays as the fallback for an unexpected staged shape (the
+            // echo is always first when it is present at all).
+            let echoed = format!("{command}\n");
+            let rest = staged
+                .as_str()
+                .strip_prefix(echoed.as_str())
+                .map(str::to_string);
+            match rest {
+                Some(rest) => staged.replace(&rest, self.output_cap),
+                None => staged.clear(),
+            }
         }
         self.pending_command = Some(command);
-        self.pending_started = Some(SystemTime::now());
+        // v1.20.9 (PLAN_v1209 §1 D1): date the block from the editor
+        // submit — the PS2 escape scenario (no `133;B` ever arrived)
+        // waited real time between Enter and `Ctrl+C`, and dating from
+        // this `133;D` reported a misleading 0ms.
+        self.pending_started = Some(submitted_at.unwrap_or_else(SystemTime::now));
         self.pending_cwd = self.current_cwd.clone();
         self.styled_output = None;
         // FIX_LIVE_STYLED_OUTPUT: mirror on_command_start's throttle reset so
@@ -511,7 +537,7 @@ mod tests {
         for _ in 0..(2 * mib + 64) {
             staged.print('e', CapturedStyle::default(), 2 * mib);
         }
-        tracker.on_orphan_command_end(1, "print(x)".to_string(), staged);
+        tracker.on_orphan_command_end(1, "print(x)".to_string(), staged, None);
 
         assert_eq!(tracker.blocks().len(), 1);
         let block = tracker.blocks().last().unwrap();

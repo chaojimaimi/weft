@@ -1232,3 +1232,95 @@ fn dispatch_routes_pseudo_block_and_flag_off_frames() {
         "flag OFF + live=None must fall through to the capture branch cleanly"
     );
 }
+
+/// v1.20.9 (PLAN_v1209 §3 D3): the pseudo-block (live=None) lays the
+/// cwd/git header when a cwd exists — the Warp-style prompt context,
+/// without the elapsed suffix. Push order matches the live branch (header
+/// between the content and the bottom separator).
+#[test]
+fn pseudo_block_lays_cwd_header_when_cwd_exists() {
+    let st = state(
+        vec![slot("$ ps2", 0, 1), slot("password:", 1, 2)],
+        Vec::new(),
+        40,
+    );
+    let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
+        None,
+        &st,
+        40,
+        10.0,
+        24.0,
+        120.0,
+        0.0,
+        0.0,
+        120.0,
+        false,
+        &mut |_| {},
+        SystemTime::UNIX_EPOCH,
+        Some("/tmp/proj"),
+        Some("main"),
+    );
+    let headers: Vec<&String> = seg
+        .row_data
+        .iter()
+        .filter_map(|r| match r {
+            LaidRow::LiveHeader { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headers.len(), 1, "exactly one cwd header");
+    assert!(
+        headers[0].contains("proj") && headers[0].contains("git:(main)"),
+        "header must carry cwd + git branch: {}",
+        headers[0]
+    );
+    assert!(
+        !headers[0].contains("·"),
+        "no elapsed suffix on the pseudo header"
+    );
+    // Position: the header row sits between the content and the separator
+    // (its dist is below the separator’s, above the blank/output rows).
+    let header_dist = seg
+        .row_data
+        .iter()
+        .zip(seg.rows.iter())
+        .find(|(r, _)| matches!(r, LaidRow::LiveHeader { .. }))
+        .map(|(_, d)| *d)
+        .expect("header present");
+    let sep_dist = seg
+        .row_data
+        .iter()
+        .zip(seg.rows.iter())
+        .find(|(r, _)| matches!(r, LaidRow::Separator))
+        .map(|(_, d)| *d)
+        .expect("separator present");
+    assert!(
+        header_dist < sep_dist,
+        "header must precede the separator in the bottom-up distance domain",
+    );
+}
+
+/// v1.20.9 (PLAN_v1209 §3 D3 metrics parity): with a cwd in place the
+/// pseudo metrics branch adds +1 for the cwd header; without one (the case
+/// above) the +0 baseline is unchanged.
+#[test]
+fn pseudo_block_metrics_counts_cwd_header() {
+    let mut terminal = Terminal::new(6, 40);
+    terminal.set_live_block_grid_render(true);
+    terminal.process(b"]7;file:///tmp/proj"); // OSC 7 cwd stamp
+    let (total, _) = crate::block_component::block_content_metrics_with_overlay(
+        &terminal,
+        40,
+        2,
+        None,
+        None,
+        Some(2),
+        false,
+        None,
+    );
+    assert_eq!(
+        total,
+        2 + 1 + 1 + 1,
+        "pseudo metrics = content(2) + Blank + Separator + cwd header",
+    );
+}

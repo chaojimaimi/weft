@@ -184,3 +184,92 @@ async fn zsh_output_becomes_block() {
         probe.output
     );
 }
+
+/// Spawn variant: appends extra to the generated .zshenv AFTER the weft
+/// integration guard — the exact position a user's .zshrc-level framework
+/// (oh-my-zsh) loads at. Used to simulate the omz theme precmd that reassigns
+/// PROMPT later in the chain.
+fn spawn_sandboxed_zsh_with_extra_rc(extra: &str) -> (Pty, std::path::PathBuf) {
+    let sandbox = std::env::temp_dir().join(format!("weft-shell-it-{}", std::process::id()));
+    let redirect_dir = sandbox.join("zsh"); // ZDOTDIR → here (holds our .zshenv)
+    let fake_home = sandbox.join("home"); // isolated empty HOME: no user rc
+    std::fs::create_dir_all(&redirect_dir).unwrap();
+    std::fs::create_dir_all(&fake_home).unwrap();
+    let fake_home_str = fake_home.to_string_lossy().into_owned();
+
+    let (_, file) = Integration::Zsh.rc_redirect().expect("zsh has rc redirect");
+    std::fs::write(
+        redirect_dir.join(file.filename),
+        format!("{}\n{}", file.body, extra),
+    )
+    .unwrap();
+
+    let mut env: Vec<(&str, String)> = Integration::Zsh
+        .child_env(Some(&fake_home_str))
+        .into_iter()
+        .collect();
+    env.push(("ZDOTDIR", redirect_dir.to_string_lossy().into_owned()));
+    env.push(("HOME", fake_home_str));
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let pty = Pty::spawn_with_args(
+        "/bin/zsh",
+        &[],
+        (24, 80),
+        &env_refs,
+        None,
+        weft_core::input::new_flag(),
+    )
+    .expect("failed to spawn zsh");
+    (pty, sandbox)
+}
+
+/// v1.20.9 (user report: a stray PWD line under the pseudo-block): an
+/// oh-my-zsh-style theme precmd that PREPENDS itself to precmd_functions and
+/// reassigns PROMPT must not resurrect the prompt line — __weft_prompt_clear
+/// sits at the chain TAIL exactly so the blank PROMPT survives it. The theme
+/// prompt text must never reach the PTY stream (nor the faithful grid).
+#[tokio::test]
+async fn zsh_theme_precmd_prompt_override_stays_blank() {
+    if !std::path::Path::new("/bin/zsh").exists() {
+        eprintln!("skipping: /bin/zsh not present on this system");
+        return;
+    }
+
+    // Loads after the integration guard (like omz from .zshrc): prepends its
+    // theme precmd — chain = [__fake_theme_precmd, __weft_precmd, ...,
+    // __weft_prompt_clear].
+    let omz_sim = r#"
+__fake_theme_precmd() { PROMPT='~/FakeDir git:(main) '; }
+precmd_functions=(__fake_theme_precmd ${precmd_functions[@]})
+"#;
+    let (mut pty, sandbox) = spawn_sandboxed_zsh_with_extra_rc(omz_sim);
+    let mut rx = pty.take_event_rx().expect("fresh Pty holds the receiver");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let writer = pty.writer();
+    writer.write(b"echo weft_theme_probe\n").await.unwrap();
+    writer.write(b"exit\n").await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let out = collect(&mut rx, deadline).await;
+    let _ = std::fs::remove_dir_all(&sandbox);
+
+    let mut term = Terminal::new(24, 80);
+    term.process(&out);
+
+    let blocks = term.block_tracker().blocks();
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b.command.contains("weft_theme_probe")),
+        "markers must still fire with a theme precmd present"
+    );
+    // The blank PROMPT is a shell-side fact: the theme prompt text must
+    // never reach the PTY stream (and thus never the grid, which is a
+    // faithful transcript of it).
+    let stream = String::from_utf8_lossy(&out);
+    assert!(
+        !stream.contains("FakeDir"),
+        "theme prompt must stay blank at the precmd chain tail; stream:\n{stream}"
+    );
+}
