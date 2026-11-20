@@ -6,7 +6,7 @@
             <sparkle:version>1.20.10</sparkle:version>
             <sparkle:shortVersionString>1.20.10</sparkle:shortVersionString>
             <link>https://github.com/chaojimaimi/weft/releases/download/v1.20.10/Weft-1.20.10.dmg</link>
-            <enclosure url="https://github.com/chaojimaimi/weft/releases/download/v1.20.10/Weft-1.20.10.dmg" length="8438269" type="application/x-bzip2-diskimage" sparkle:edSignature="vMyfXdy5calz64jG1cj7ttSpyIGxqZEc8J7m2HE5Itmvmev2UqjGkAFZoVntHIAMYUJN4lutgpZnsyAl7s9GBw==" />
+            <enclosure url="https://github.com/chaojimaimi/weft/releases/download/v1.20.10/Weft-1.20.10.dmg" length="8438760" type="application/x-bzip2-diskimage" sparkle:edSignature="kUQIedq6arIFIx0PpTlnVHtO2kuc0ZQe7rFHBEsF1dPwtXU3P+eg4SQpshX5OdYIRKdGz1tIRIVFRnjKGCmlCg==" />
             <description><![CDATA[
                 <h2>Weft 1.20.10</h2>
                 <p>See the <a href="https://github.com/chaojimaimi/weft/releases/tag/v1.20.10">release notes</a>.</p>
