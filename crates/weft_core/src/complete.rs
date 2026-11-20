@@ -182,14 +182,69 @@ pub fn resolve_dir(dir_part: &str, cwd: &str) -> String {
     }
 }
 
+/// Escape one path component for safe insertion into an unquoted shell word.
+/// Per-char rule (the ONLY rule; do not use `is_ascii_graphic` alone — it
+/// excludes space and would silently leave the main bug unfixed):
+///   pass through: non-ASCII (CJK, emoji); `A-Za-z0-9 . _ - / : , @ % +`;
+///                 ASCII control 0x00-0x08, 0x0A-0x1F, 0x7F (out of scope,
+///                 see PLAN v1.20.10 §2 非目标)
+///   escape:       0x09 (tab), 0x20 (space), and every other printable
+///                 ASCII (0x21-0x7E) not in the whitelist — prefix `\`
+/// Trailing `/` (dir separator) is appended by the caller, never escaped here.
+pub fn shell_escape_component(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        // tab 与空格显式转义;可打印非白名单 ASCII 转义;其余(控制字符/非 ASCII)直通
+        if matches!(c, '\t' | ' ')
+            || (c.is_ascii_graphic()
+                && !matches!(
+                    c,
+                    'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' | '/' | ':' | ',' | '@'
+                        | '%' | '+'
+                ))
+        {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Inverse of [`shell_escape_component`] (best-effort): `\x` → `x` for any
+/// `x`; a lone trailing `\` is preserved verbatim. This is a full-character
+/// decode — distinct from the display-layer narrow decode
+/// `smart_select_controller::decode_terminal_path` (only `\ `; separate
+/// domain, evolve independently — see PLAN v1.20.10 §3 T0).
+pub fn shell_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                // lone trailing backslash: keep it, there is nothing to unescape
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Filesystem path completions for `prefix` within `cwd`. Public so the
 /// v1.7.2 `completion::FilesystemProvider` can reuse the same logic.
 pub fn path_matches(prefix: &str, cwd: &str) -> Vec<Match> {
-    let (dir_part, file_prefix) = match prefix.rfind('/') {
+    let (dir_part, file_prefix_raw) = match prefix.rfind('/') {
         Some(i) => (&prefix[..=i], &prefix[i + 1..]),
         None => ("", prefix),
     };
-    let resolved = resolve_dir(dir_part, cwd);
+    // v1.20.10: fs access and name matching use the unescaped form (the user
+    // may have typed `\ ` by hand or accepted an escaped completion in a
+    // previous hop); `dir_part` itself is passed through verbatim into the
+    // insert so already-escaped text stays literal.
+    let resolved = resolve_dir(&shell_unescape(dir_part), cwd);
+    let file_prefix = shell_unescape(file_prefix_raw);
     let entries = match std::fs::read_dir(&resolved) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
@@ -198,7 +253,7 @@ pub fn path_matches(prefix: &str, cwd: &str) -> Vec<Match> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(file_prefix) {
+        if !name.starts_with(file_prefix.as_str()) {
             continue;
         }
         let is_hidden = name.starts_with('.');
@@ -206,16 +261,21 @@ pub fn path_matches(prefix: &str, cwd: &str) -> Vec<Match> {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let display = if is_dir {
+        // Label keeps the raw file name (dropdown shows `Application Support/`);
+        // only the insert is escaped (`Application\ Support/`). The trailing
+        // `/` is appended after escaping — the separator is never escaped.
+        let label = if is_dir {
             format!("{name}/")
         } else {
             name.clone()
         };
-        let mut m = Match::new(
-            display.clone(),
-            MatchKind::Path,
-            format!("{dir_part}{display}"),
-        );
+        let escaped_name = shell_escape_component(&name);
+        let display = if is_dir {
+            format!("{escaped_name}/")
+        } else {
+            escaped_name
+        };
+        let mut m = Match::new(label, MatchKind::Path, format!("{dir_part}{display}"));
         m.is_dir = is_dir;
         out.push(m);
     }
@@ -475,5 +535,170 @@ mod tests {
         assert!(kinds.contains(&MatchKind::History));
         assert!(kinds.contains(&MatchKind::Path));
         assert!(kinds.contains(&MatchKind::Command));
+    }
+
+    // ── v1.20.10: shell-escape insert + unescape-aware matching ─────────
+
+    #[test]
+    fn shell_escape_component_escapes_space_tab_and_metachars() {
+        assert_eq!(shell_escape_component("a b"), "a\\ b");
+        // tab (0x09) is NOT in the control-char exemption interval — it escapes.
+        assert_eq!(shell_escape_component("a\tb"), "a\\\tb");
+        // metachars, one per case
+        for c in [
+            '$', '&', '|', ';', '(', ')', '*', '?', '[', ']', '<', '>', '!', '#', '~', '=', '^',
+            '"', '\'', '`', '\\',
+        ] {
+            let s = format!("a{c}b");
+            assert_eq!(
+                shell_escape_component(&s),
+                format!("a\\{c}b"),
+                "char {c:?} must be escaped"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_escape_component_passes_safe_and_non_ascii_chars() {
+        assert_eq!(shell_escape_component("a.txt"), "a.txt");
+        assert_eq!(shell_escape_component("my_file-old"), "my_file-old");
+        assert_eq!(shell_escape_component("p/q:r,s@t%u+v"), "p/q:r,s@t%u+v");
+        assert_eq!(shell_escape_component("中文目录"), "中文目录");
+        assert_eq!(shell_escape_component("café🎉"), "café🎉");
+    }
+
+    #[test]
+    fn shell_escape_component_re_escaping_doubles_the_backslash() {
+        // Not idempotent by design (per-component rule): re-escaping an
+        // already-escaped token escapes the `\` itself. Pin the actual
+        // behavior; unescape still recovers the original text.
+        assert_eq!(shell_escape_component("\\"), "\\\\");
+        let once = shell_escape_component("a b");
+        assert_eq!(once, "a\\ b");
+        let twice = shell_escape_component(&once);
+        assert_ne!(twice, once);
+        // one unescape peels exactly one escape layer; a full roundtrip needs
+        // one unescape per escape application
+        assert_eq!(shell_unescape(&twice), once);
+        assert_eq!(shell_unescape(&shell_unescape(&twice)), "a b");
+    }
+
+    #[test]
+    fn shell_unescape_drops_escape_backslashes() {
+        assert_eq!(shell_unescape("Application\\ Support"), "Application Support");
+        assert_eq!(shell_unescape("a\\$b"), "a$b");
+        // full decode: \x → x for any x (not only shell metachars)
+        assert_eq!(shell_unescape("a\\nb"), "anb");
+        assert_eq!(shell_unescape("plain"), "plain");
+    }
+
+    #[test]
+    fn shell_unescape_preserves_lone_trailing_backslash() {
+        assert_eq!(shell_unescape("Application\\"), "Application\\");
+        assert_eq!(shell_unescape("\\"), "\\");
+    }
+
+    #[test]
+    fn shell_unescape_roundtrips_escape_for_legal_names() {
+        for name in [
+            "a.txt",
+            "sub",
+            "x.txt",
+            "Application Support",
+            "a$b&c|d;e",
+            "my_file-old.v2",
+            "中文目录 名",
+            "tab\tname",
+            "back\\slash",
+        ] {
+            assert_eq!(
+                shell_unescape(&shell_escape_component(name)),
+                name,
+                "escape/unescape roundtrip for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_completion_first_hop_escapes_space_dir() {
+        // T3-4: `cd Appl` + Tab → insert escapes the space
+        let d = scratch_dir("path_escape_first");
+        fs::create_dir(d.join("Application Support")).unwrap();
+        let ctx = path_ctx(d.to_str().unwrap());
+        let ms = complete("Appl", &ctx, CompletePosition::Argument);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].label, "Application Support/", "dropdown shows raw name");
+        assert_eq!(ms[0].insert, "Application\\ Support/", "insert is escaped");
+        assert!(ms[0].is_dir);
+    }
+
+    #[test]
+    fn path_completion_chains_through_escaped_space_dir() {
+        // T3-3: chained hop — the line already holds the escaped form from
+        // hop 1; fs access must unescape it back to the real dir name.
+        let d = scratch_dir("path_escape_chain");
+        fs::create_dir_all(d.join("App Support")).unwrap();
+        fs::write(d.join("App Support").join("x.txt"), "").unwrap();
+        let ctx = path_ctx(d.to_str().unwrap());
+        let ms = complete("App\\ Support/x", &ctx, CompletePosition::Argument);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].label, "x.txt");
+        assert_eq!(ms[0].insert, "App\\ Support/x.txt");
+    }
+
+    #[test]
+    fn path_completion_matches_manually_escaped_prefix() {
+        // §4 boundary: user typed `\ ` by hand, no `/` in the prefix yet.
+        let d = scratch_dir("path_escape_hand");
+        fs::write(d.join("my file.txt"), "").unwrap();
+        let ctx = path_ctx(d.to_str().unwrap());
+        let ms = complete("my\\ f", &ctx, CompletePosition::Argument);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].insert, "my\\ file.txt");
+    }
+
+    #[test]
+    fn path_completion_hanging_trailing_backslash_yields_no_candidates() {
+        // T2 row 4 safe-degrade, core side: a dangling `\` prefix survives
+        // unescape verbatim (lone trailing `\`) and matches nothing.
+        let d = scratch_dir("path_escape_hang");
+        fs::create_dir(d.join("Application Support")).unwrap();
+        let ctx = path_ctx(d.to_str().unwrap());
+        assert!(complete("Application\\", &ctx, CompletePosition::Argument).is_empty());
+    }
+
+    #[test]
+    fn history_matches_insert_stays_verbatim_for_spaced_commands() {
+        // T3-10 禁区钉子: only `path_matches` may escape inserts; history
+        // whole-line inserts keep spaces bare.
+        let history = vec![
+            "cd ~/Library/Application Support".to_string(),
+            "echo hi".to_string(),
+        ];
+        let ms = history_matches("c", &history);
+        assert_eq!(ms.len(), 1, "spaced history entry must be present");
+        assert_eq!(ms[0].insert, "cd ~/Library/Application Support");
+        assert!(
+            !ms[0].insert.contains('\\'),
+            "no new backslashes in history insert"
+        );
+    }
+
+    #[test]
+    fn command_matches_insert_stays_verbatim() {
+        // T3-10: a space-containing $PATH prefix would yield an empty set
+        // (asserting emptiness proves nothing), so carry this on a space-free
+        // multi-candidate input and pin the inserts verbatim.
+        let bins = vec![
+            "git".to_string(),
+            "gitk".to_string(),
+            "github-ls".to_string(),
+        ];
+        // prefix "gi" (not "git"): exact-prefix entries are excluded by design
+        // (`bin.len() > prefix.len()`), so "gi" keeps all three in play.
+        let ms = command_matches("gi", &bins);
+        assert_eq!(ms.len(), 3);
+        assert!(ms.iter().all(|m| m.insert == m.label));
+        assert!(ms.iter().all(|m| !m.insert.contains('\\')));
     }
 }

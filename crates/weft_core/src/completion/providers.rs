@@ -311,6 +311,27 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_provider_escapes_insert_but_keeps_raw_label_for_space_dir() {
+        // v1.20.10 (T3-9): space-containing dir — insert is shell-escaped,
+        // label (dropdown) keeps the raw name.
+        let d = scratch_dir("fs_space_escape");
+        std::fs::create_dir_all(d.join("App Support")).unwrap();
+        let r = CompletionRequest {
+            prefix: "App",
+            cwd: d.to_str().unwrap(),
+            history: &[],
+            path_bins: &[],
+            position: CompletePosition::Argument,
+        };
+        let cancel = CancelToken::new();
+        let candidates = FilesystemProvider.complete(&r, &cancel);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "App Support/", "dropdown shows raw name");
+        assert_eq!(candidates[0].insert, "App\\ Support/", "insert is escaped");
+        assert!(candidates[0].is_dir);
+    }
+
+    #[test]
     fn workflow_provider_matches_by_name() {
         let workflows = vec![
             ("deploy".to_string(), "kubectl deploy".to_string()),

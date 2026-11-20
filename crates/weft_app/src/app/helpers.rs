@@ -44,8 +44,36 @@ pub(crate) fn word_at(line: &str, col: usize) -> Option<(usize, usize)> {
     }
     let end = col.min(chars.len());
     let mut start = end;
-    while start > 0 && !chars[start - 1].is_whitespace() {
-        start -= 1;
+    while start > 0 {
+        let prev = chars[start - 1];
+        if !prev.is_whitespace() {
+            start -= 1;
+            continue;
+        }
+        // v1.20.10: whitespace splits words only when unescaped — count the `\`
+        // run ending right before it; odd = escaped (part of the word), even =
+        // real boundary. Parity mirrors `weft_core/src/smart_select.rs:263
+        // is_escaped_at` (byte-indexed; char domain here — PLAN §3 T0).
+        let mut slashes = 0usize;
+        let mut j = start - 1; // the whitespace char itself
+        while j > 0 {
+            j -= 1;
+            if chars[j] != '\\' {
+                break;
+            }
+            slashes += 1;
+        }
+        if slashes % 2 == 0 {
+            break; // real word boundary
+        }
+        if start == end {
+            // Cursor right after an *escaped* whitespace, no word chars yet:
+            // like real whitespace → None. Splitting would leave only the left
+            // half as the word and `completion_accept` (editor.rs) would glue
+            // the untouched right half onto the insert.
+            return None;
+        }
+        start -= 1; // escaped whitespace belongs to the word; keep scanning
     }
     if start == end {
         return None; // cursor on whitespace
@@ -508,6 +536,100 @@ mod tests {
         assert_eq!(word_at(line, 5), Some((0, 5)));
         // Cursor at char index 2 (the 'l').
         assert_eq!(word_at(line, 2), Some((0, 2)));
+    }
+
+    // ── v1.20.10: word_at shell-escape awareness (PLAN §3 T2) ────────────
+
+    fn word_at_str(line: &str, col: usize) -> Option<String> {
+        word_at(line, col).map(|(s, e)| line.chars().skip(s).take(e - s).collect())
+    }
+
+    #[test]
+    fn word_at_keeps_escaped_space_inside_the_word() {
+        // T2 row 1: chained completion — escaped space stays in the word.
+        let line = "cd Application\\ Support/f";
+        assert_eq!(
+            word_at_str(line, line.chars().count()),
+            Some("Application\\ Support/f".to_string())
+        );
+    }
+
+    #[test]
+    fn word_at_real_space_still_splits_words() {
+        // T2 row 2: a bare space remains a boundary.
+        assert_eq!(word_at("cd a b", 6), Some((5, 6)));
+    }
+
+    #[test]
+    fn word_at_doubled_backslash_space_is_a_real_boundary() {
+        // T2 row 3: `\\` is an escaped backslash, so the space after it is
+        // real (parity even) — same rule as smart_select::is_escaped_at.
+        assert_eq!(word_at("cd a\\\\ b", 8), Some((7, 8)));
+    }
+
+    #[test]
+    fn word_at_hanging_trailing_backslash_stays_in_word() {
+        // T2 row 4: dangling `\` stays in word → unescape keeps it → no candidates.
+        let line = "cd Application\\";
+        assert_eq!(
+            word_at_str(line, line.chars().count()),
+            Some("Application\\".to_string())
+        );
+    }
+
+    #[test]
+    fn word_at_cursor_on_escaped_space_returns_none() {
+        // T2 row 5 (start==end rule): cursor right after an escaped space →
+        // None like real whitespace; Tab takes the empty-prefix list-dir branch.
+        assert_eq!(word_at("cd a\\ b", 6), None);
+        // contrast: cursor at end of line (on `b`) → the whole word.
+        assert_eq!(word_at("cd a\\ b", 7), Some((3, 7)));
+    }
+
+    #[test]
+    fn golden_completion_flow_escapes_space_dir_end_to_end() {
+        // T3-6: word_at → weft_core::complete::path_matches → manual
+        // completion_accept-style replacement, pinning the reported
+        // `cd ~/Library/Application` scenario char-for-char. Pure logic only
+        // (no completion_worker thread).
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = unique_temp_dir("weft-golden-home");
+        std::fs::create_dir_all(home.join("Library").join("Application Support")).unwrap();
+
+        // Only weft_app reaches word_at(pub(crate)) + weft_core API; `~` needs HOME.
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let line = "cd ~/Library/Application";
+        let col = line.chars().count();
+
+        // step 1: word_at picks the token left of the cursor
+        let (ws, we) = word_at(line, col).expect("word under cursor");
+        let prefix: String = line.chars().skip(ws).take(we - ws).collect();
+        assert_eq!(prefix, "~/Library/Application");
+
+        // step 2: the pure core yields an escaped insert, raw label
+        let lib_dir = home.join("Library");
+        let matches = weft_core::complete::path_matches(&prefix, lib_dir.to_str().unwrap());
+        let m = matches
+            .iter()
+            .find(|m| m.label == "Application Support/")
+            .expect("Application Support/ candidate");
+        assert_eq!(m.insert, "~/Library/Application\\ Support/");
+        assert!(m.is_dir);
+
+        // step 3: editor.completion_accept semantics — splice insert into the range
+        let mut chars: Vec<char> = line.chars().collect();
+        let we_clamped = we.min(chars.len()).max(ws);
+        chars.splice(ws..we_clamped, m.insert.chars());
+        let new_line: String = chars.into_iter().collect();
+        assert_eq!(new_line, "cd ~/Library/Application\\ Support/");
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // ── Keybindings tab: chord_label formatting ──────────────────────
