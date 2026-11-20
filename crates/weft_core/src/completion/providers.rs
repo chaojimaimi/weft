@@ -326,7 +326,10 @@ mod tests {
         let cancel = CancelToken::new();
         let candidates = FilesystemProvider.complete(&r, &cancel);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].label, "App Support/", "dropdown shows raw name");
+        assert_eq!(
+            candidates[0].label, "App Support/",
+            "dropdown shows raw name"
+        );
         assert_eq!(candidates[0].insert, "App\\ Support/", "insert is escaped");
         assert!(candidates[0].is_dir);
     }

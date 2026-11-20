@@ -585,7 +585,10 @@ mod tests {
 
     #[test]
     fn shell_unescape_drops_escape_backslashes() {
-        assert_eq!(shell_unescape("Application\\ Support"), "Application Support");
+        assert_eq!(
+            shell_unescape("Application\\ Support"),
+            "Application Support"
+        );
         assert_eq!(shell_unescape("a\\$b"), "a$b");
         // full decode: \x → x for any x (not only shell metachars)
         assert_eq!(shell_unescape("a\\nb"), "anb");
@@ -627,7 +630,10 @@ mod tests {
         let ctx = path_ctx(d.to_str().unwrap());
         let ms = complete("Appl", &ctx, CompletePosition::Argument);
         assert_eq!(ms.len(), 1);
-        assert_eq!(ms[0].label, "Application Support/", "dropdown shows raw name");
+        assert_eq!(
+            ms[0].label, "Application Support/",
+            "dropdown shows raw name"
+        );
         assert_eq!(ms[0].insert, "Application\\ Support/", "insert is escaped");
         assert!(ms[0].is_dir);
     }
