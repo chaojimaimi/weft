@@ -61,6 +61,8 @@ fn state(slots: Vec<RegionSlot>, dyn_slots: Vec<RegionSlot>, cols: usize) -> Pan
         slots,
         dyn_slots,
         cumulative,
+        head_high_water_doc: 0,
+        display_last_high_water: 0,
     }
 }
 
@@ -687,6 +689,54 @@ fn chunk_total_fast_path_skips_leading_dyn_blanks() {
         80,
     );
     assert_eq!(region_display_chunk_total(&st, 80), 1);
+}
+
+// ── v1.20.11 (PLAN_v12011 §3 T2-8/T3): clamp parity metrics ↔ assembly ──
+
+#[test]
+fn erase_state_metrics_chunk_total_matches_assembly_rows() {
+    // ED[J erase state: slot 3 holds the blanked spinner row and the L2
+    // high-water (4) holds the display edge the pre-erase sync raised.
+    // Metrics (region_display_chunk_total) and the paint assembly
+    // (region_live_segment) must consume the SAME clamped range — the
+    // scrollbar extent and the laid rows stay 1:1 while the clamp is
+    // active (the blank slot carries one chunk, exactly like the erased
+    // text did; the raw range would answer 3 and shrink the block).
+    let mut st = state(
+        vec![slot("alpha", 0, 1), slot("beta", 1, 2), slot("gamma", 2, 3)],
+        vec![slot("", 3, 4)],
+        80,
+    );
+    st.display_last_high_water = 4;
+    let metrics = region_display_chunk_total(&st, 80) as usize;
+    let seg = crate::paint::block_view::layout_pass::region_rows::region_live_segment(
+        None,
+        &st,
+        80,
+        10.0,
+        24.0,
+        120.0,
+        0.0,
+        0.0,
+        120.0,
+        false,
+        &mut |_| {},
+        SystemTime::UNIX_EPOCH,
+        None,
+        None,
+    );
+    assert_eq!(
+        seg.total_display_rows, metrics,
+        "metrics == paint through the clamp"
+    );
+    assert_eq!(
+        metrics, 4,
+        "the blank slot keeps its chunk (clamp holds last=4)"
+    );
+    assert_eq!(
+        seg.total_logical_rows, 4,
+        "the blank row stays in the layout domain"
+    );
 }
 
 // ── v1.19.2 WP4 (PLAN_v1192 §4): region track across the finalize switch ──

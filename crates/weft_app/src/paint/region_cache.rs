@@ -42,6 +42,17 @@ pub(crate) struct RegionSource<'g> {
     /// v1.19.3 (WP3-B): the registry's mutation generation at build time —
     /// a sync fast-tier key so registry drift alone forces a wholesale.
     pub(crate) registry_generation: u64,
+    /// v1.20.11: whether the live block is a linear (non-screen-origin)
+    /// capture — only then do the head/display high-waters apply.
+    /// Computed in `region_source_for`:
+    /// `in_flight().map(|l| l.screen_origin).unwrap_or(false)` negated —
+    /// pseudo-block frames (in_flight None) take `false` → the clamp
+    /// applies (linear echo). Target-workload check: ED mode 0 does not
+    /// trip the screen-takeover heuristic (actions_csi notes primary-screen
+    /// ownership on `2J`/`EL2` only), so the openclaw retention spinner
+    /// keeps `clamp_high_water == true` and the gate cannot disable the
+    /// fix's target scenario; T2-2 pins that in an assertion.
+    pub(crate) clamp_high_water: bool,
 }
 
 /// One logical row of the region snapshot. `start_idx`/`end_idx` delimit the
@@ -79,6 +90,20 @@ pub(crate) struct PaneRegionState {
     /// Chunk prefix sums over `slots` at `cols` (`len == slots.len() + 1`).
     /// The viewport tail is chunk-counted per frame by the assembly.
     pub(crate) cumulative: Vec<u32>,
+    /// v1.20.11 L1: head high-water in the unified document-index domain.
+    /// ED[J erase frames collapse `region_head`; the clamp keeps the erased
+    /// rows inside the snapshot as blank slots (total_slots stops
+    /// shrinking). Domain stability: stable across viewport→scrollback
+    /// transfer; scrollback front eviction (apply_max_rows) shifts the
+    /// whole doc domain downward, so a stored hw drifts upward by k rows
+    /// after k evictions — bounded and cosmetic, clamped by the extent
+    /// upper bound in sync (`min(sb_len + num_rows)`). No re-base needed.
+    pub(crate) head_high_water_doc: u64,
+    /// v1.20.11 L2: display-range `last` high-water in the slot domain (the
+    /// second step: the trailing-blank trim over the now-preserved blank
+    /// slots). Re-based when trim_cap drains slots from the front; reset on
+    /// begin_position change only.
+    pub(crate) display_last_high_water: usize,
 }
 
 impl PaneRegionState {
@@ -89,11 +114,11 @@ impl PaneRegionState {
         self.slots.iter().chain(self.dyn_slots.iter())
     }
 
-    /// D6 logical-row lookup in the P1-6 display domain: the index that the
-    /// assembly stamps onto `LaidRow::Output::line` for the row owning
-    /// `cursor_doc_idx`. `None` when the cursor is outside the region or on
-    /// a dropped blank row.
-    pub(crate) fn display_logical_row_of_cursor(&self, cursor_doc_idx: u64) -> Option<usize> {
+    /// Raw (unclamped) P1-6 display range over the joint slot view — the
+    /// `region_display_range` call every consumer made before v1.20.11.
+    /// The sync tail feeds `.1` into [`update_high_waters`]; production
+    /// display consumers read [`Self::clamped_display_range`] instead.
+    fn raw_display_range(&self) -> (usize, usize) {
         let total = self.slots.len() + self.dyn_slots.len();
         let slot_at = |i: usize| -> &RegionSlot {
             if i < self.slots.len() {
@@ -102,7 +127,34 @@ impl PaneRegionState {
                 &self.dyn_slots[i - self.slots.len()]
             }
         };
-        let (first, last) = region_display_range(total, |i| slot_at(i).text.is_empty());
+        region_display_range(total, |i| slot_at(i).text.is_empty())
+    }
+
+    /// v1.20.11: display range with the L2 high-water clamp. Raw range may
+    /// shrink when an ED[J tick blanks the tail slots; the clamp holds
+    /// `last` at the historical max (bounded by total_slots, which L1
+    /// keeps stable). Invariant: first <= last <= total_slots.
+    pub(crate) fn clamped_display_range(&self) -> (usize, usize) {
+        let (raw_first, raw_last) = self.raw_display_range();
+        let total = self.slots.len() + self.dyn_slots.len();
+        let last = raw_last.max(self.display_last_high_water).min(total);
+        let first = raw_first.min(last);
+        (first, last)
+    }
+
+    /// D6 logical-row lookup in the P1-6 display domain: the index that the
+    /// assembly stamps onto `LaidRow::Output::line` for the row owning
+    /// `cursor_doc_idx`. `None` when the cursor is outside the region or on
+    /// a dropped blank row.
+    pub(crate) fn display_logical_row_of_cursor(&self, cursor_doc_idx: u64) -> Option<usize> {
+        let slot_at = |i: usize| -> &RegionSlot {
+            if i < self.slots.len() {
+                &self.slots[i]
+            } else {
+                &self.dyn_slots[i - self.slots.len()]
+            }
+        };
+        let (first, last) = self.clamped_display_range();
         (first..last).position(|i| {
             let slot = slot_at(i);
             slot.start_idx <= cursor_doc_idx && cursor_doc_idx < slot.end_idx
@@ -113,7 +165,6 @@ impl PaneRegionState {
     /// domain [`Self::display_logical_row_of_cursor`] returns). Feeds the D6
     /// wrap-pending clamp; zero when the row is out of range.
     pub(crate) fn logical_row_width(&self, display_row: usize) -> usize {
-        let total = self.slots.len() + self.dyn_slots.len();
         let slot_at = |i: usize| -> &RegionSlot {
             if i < self.slots.len() {
                 &self.slots[i]
@@ -121,7 +172,7 @@ impl PaneRegionState {
                 &self.dyn_slots[i - self.slots.len()]
             }
         };
-        let (first, last) = region_display_range(total, |i| slot_at(i).text.is_empty());
+        let (first, last) = self.clamped_display_range();
         let absolute = first + display_row;
         if absolute >= last {
             return 0;
@@ -161,6 +212,39 @@ impl RegionLiveCache {
     pub(crate) fn sync(&self, pane_session_id: u64, source: &RegionSource, cols: usize) {
         let revision = source.grid.revision;
         let mut map = self.panes.borrow_mut();
+        // v1.20.11 (T1-c): begin-change detection FIRST — a begin change
+        // resets the previous block's high-waters before the effective head
+        // is computed, so a new block's snapshot cannot inherit the old
+        // block's padding (a stale hw would pad the snapshot past the new
+        // block's tail and, being monotone, never go away). The carried
+        // values also implement the wholesale-drift tier ("keep and raise"):
+        // a registry/cols-drift wholesale rebuilds with the previous hw
+        // instead of collapsing for one frame.
+        let (begin_changed, carried_head_hw, carried_display_hw) = {
+            let prev = map.get(&pane_session_id);
+            match prev {
+                None => (true, 0, 0),
+                Some(st) if st.begin_position != source.begin_position => (true, 0, 0),
+                Some(st) => (false, st.head_high_water_doc, st.display_last_high_water),
+            }
+        };
+        // L1 head high-water: only linear (non-screen-origin) live blocks
+        // clamp, and only while the begin anchor is unchanged.
+        let hw_head = if source.clamp_high_water && !begin_changed {
+            carried_head_hw
+        } else {
+            0
+        };
+        // Extent upper bound: a historical hw is not a current bound — a
+        // height-shrinking resize or a shrunk scrollback cap can leave the
+        // stored hw past the current grid range, where rebuild_dyn's
+        // scan_logical_ranges returns None → ok=false → dyn_slots cleared
+        // with the revision already persisted → torn empty snapshots on
+        // every later D7 hit (the core's logical_lines has an
+        // end.min(total) guard; region_cache's own scan does not). Clamp
+        // the effective head into the live document.
+        let extent = source.grid.scrollback.len() as u64 + source.grid.num_rows as u64;
+        let effective_head = source.head.max(hw_head).min(extent);
         if map.get(&pane_session_id).is_some_and(|st| {
             st.begin_position == source.begin_position
                 && st.grid_revision == revision
@@ -186,12 +270,16 @@ impl RegionLiveCache {
                 && st.registry_generation == source.registry_generation
         }) {
             let st = map.get_mut(&pane_session_id).unwrap();
-            if advance_anchor(st, source.grid, source.head, source.hyperlinks) {
+            if advance_anchor(st, source.grid, effective_head, source.hyperlinks) {
                 // Persist the revision or the D7 hit tier above becomes
                 // unreachable: every subsequent idle frame would rescan the
                 // anchor and re-decode the viewport (review N1).
                 st.grid_revision = revision;
-                rebuild_dyn(st, source.grid, source.head, source.hyperlinks);
+                rebuild_dyn(st, source.grid, effective_head, source.hyperlinks);
+                if source.clamp_high_water {
+                    let raw_last = st.raw_display_range().1;
+                    update_high_waters(st, effective_head, raw_last, begin_changed);
+                }
                 #[cfg(test)]
                 self.advances.set(self.advances.get() + 1);
                 return;
@@ -209,25 +297,35 @@ impl RegionLiveCache {
             slots: Vec::new(),
             dyn_slots: Vec::new(),
             cumulative: vec![0],
+            // v1.20.11: carried values — zeroed on a begin change (reset
+            // before the effective head above), the previous block's
+            // high-waters on a same-begin wholesale (drift tier).
+            head_high_water_doc: carried_head_hw,
+            display_last_high_water: carried_display_hw,
         };
         // Normalize anchor_position to anchor_idx's position-domain twin so
         // the per-frame logical_lines calls start exactly at the anchor row
         // even when `begin_position` predates the scrollback window.
         st.anchor_position = position_of(source.grid, st.anchor_idx);
-        if advance_anchor(&mut st, source.grid, source.head, source.hyperlinks) {
+        if advance_anchor(&mut st, source.grid, effective_head, source.hyperlinks) {
             #[cfg(test)]
             self.advances.set(self.advances.get() + 1);
         } else {
             // Defensive: keep the snapshot empty rather than torn; the next
-            // revision bump retries.
+            // revision bump retries. (T1-c: the high-waters are kept here —
+            // not zeroed — so the retry cannot shrink the layout.)
             st.slots.clear();
             st.cumulative.clear();
             st.cumulative.push(0);
             st.anchor_idx = source.grid.scrollback.index_since(source.begin_position) as u64;
             st.anchor_position = position_of(source.grid, st.anchor_idx);
         }
-        rebuild_dyn(&mut st, source.grid, source.head, source.hyperlinks);
+        rebuild_dyn(&mut st, source.grid, effective_head, source.hyperlinks);
         rebuild_cumulative(&mut st);
+        if source.clamp_high_water {
+            let raw_last = st.raw_display_range().1;
+            update_high_waters(&mut st, effective_head, raw_last, begin_changed);
+        }
         map.insert(pane_session_id, st);
         #[cfg(test)]
         self.rebuilds.set(self.rebuilds.get() + 1);
@@ -301,6 +399,10 @@ pub(crate) fn live_output_version_source(terminal: &Terminal) -> u64 {
 /// LiveCommand/LiveHeader/Separator rows, which the metrics live term adds
 /// separately as `+2` + cwd). Slot texts are already `trim_end`ed by the
 /// core, so blank detection is `text.is_empty()`.
+/// v1.20.11: the range is the L2-clamped one
+/// ([`PaneRegionState::clamped_display_range`]) so an ED[J erase frame
+/// cannot shrink the live block's height; metrics and the assembly share
+/// the same clamp (1:1 contract, T3).
 pub(crate) fn region_display_chunk_total(state: &PaneRegionState, cols: usize) -> u32 {
     let total_slots = state.slots.len() + state.dyn_slots.len();
     let slot_at = |i: usize| -> &RegionSlot {
@@ -310,7 +412,7 @@ pub(crate) fn region_display_chunk_total(state: &PaneRegionState, cols: usize) -
             &state.dyn_slots[i - state.slots.len()]
         }
     };
-    let (first, last) = region_display_range(total_slots, |i| slot_at(i).text.is_empty());
+    let (first, last) = state.clamped_display_range();
     // v1.19.2 (PLAN_v1192 §2) fast path: slots contribute through the
     // maintained `cumulative` prefix sums (O(1) each side) and only the
     // viewport tail (`dyn_slots`, viewport-bounded) counts row by row. The
@@ -361,12 +463,23 @@ pub(crate) fn region_source_for<'a>(
         return None;
     }
     let begin_position = terminal.block_tracker().region_begin_position()?;
+    // v1.20.11 (T1-a): the clamp gate. A screen-origin live block owns the
+    // screen — its erase frames must keep collapsing (TUI redraw IS the
+    // intent). Everything else clamps: a linear capture, and the
+    // pseudo-block window (in_flight None between submit and 133;B) where
+    // `unwrap_or(false)` deliberately maps to "clamp applies".
+    let clamp_high_water = !terminal
+        .block_tracker()
+        .in_flight()
+        .map(|live| live.screen_origin)
+        .unwrap_or(false);
     Some(RegionSource {
         grid,
         begin_position,
         head: region_head(grid),
         hyperlinks: terminal.hyperlinks(),
         registry_generation: terminal.hyperlinks().generation(),
+        clamp_high_water,
     })
 }
 
@@ -525,6 +638,31 @@ fn rebuild_dyn(
     }
 }
 
+/// v1.20.11 (T1-c): single-point high-water update, called at the tail of
+/// every sync path that re-reads the grid (advance + wholesale). The tier
+/// rules of PLAN_v12011 §3 T1-c reduce to: a begin change resets both
+/// high-waters before the raise (a new block must not inherit the old
+/// block's ghost padding), every other re-read raises them monotonically
+/// (advance: raise; wholesale-drift: the wholesale literal already carried
+/// the previous values — keep and raise; defensive empty branch: raw_last
+/// is 0 there, so the display hw simply holds). Screen-origin frames never
+/// reach this function — the caller gates on `source.clamp_high_water`
+/// (the TUI owns the screen; its erase frames keep collapsing, T2-6). The
+/// D7 hit and cols-only tiers early-return before any update.
+fn update_high_waters(
+    state: &mut PaneRegionState,
+    effective_head: u64,
+    raw_last: usize,
+    begin_changed: bool,
+) {
+    if begin_changed {
+        state.head_high_water_doc = 0;
+        state.display_last_high_water = 0;
+    }
+    state.head_high_water_doc = state.head_high_water_doc.max(effective_head);
+    state.display_last_high_water = state.display_last_high_water.max(raw_last);
+}
+
 /// Cap the immutable prefix at `cap` logical rows (production passes the
 /// capture-track live budget; testable via the parameter). The chunk prefix
 /// sums are re-based in lockstep so `cumulative.len() == slots.len() + 1`
@@ -538,6 +676,13 @@ fn trim_cap(state: &mut PaneRegionState, cap: usize) {
         for c in &mut state.cumulative {
             *c -= base;
         }
+        // v1.20.11 (T1-e): the L2 high-water is slot-domain — a prefix drain
+        // shifts every surviving slot's display index down by `excess`, so
+        // the clamp re-bases in lockstep (saturating: the drained prefix may
+        // extend past the display core). L1 (`head_high_water_doc`) is
+        // doc-index domain — a flat-storage prefix drain shifts positions,
+        // not this field's meaning; do NOT re-base it here.
+        state.display_last_high_water = state.display_last_high_water.saturating_sub(excess);
     }
 }
 

@@ -19,7 +19,7 @@ use weft_core::blocks::InFlightBlock;
 use super::LaidRow;
 use crate::paint::grid_cache::{block_line_chunks, command_line_chunks};
 use crate::paint::live_cache::count_line_chunks;
-use crate::paint::region_cache::{region_display_range, PaneRegionState};
+use crate::paint::region_cache::PaneRegionState;
 use crate::paint::ui_helpers::{live_context_label, live_elapsed_label, strip_prompt_prefix};
 
 /// One live segment's layout output — the same tuple the capture branch
@@ -66,7 +66,11 @@ pub(super) fn region_live_segment<'a>(
         }
     };
     // P1-6: leading/trailing blank logical rows never reach the layout.
-    let (first, last) = region_display_range(total_slots, |i| slot_at(i).text.is_empty());
+    // v1.20.11: through the L2 high-water clamp — when an ED[J tick blanks
+    // the tail slots, the clamp holds the trailing edge (and with it the
+    // live block's height) until the content is rewritten. Metrics consume
+    // the same clamp (region_display_chunk_total) — 1:1 contract, T3.
+    let (first, last) = state.clamped_display_range();
 
     // Chunk prefix sums: the immutable prefix re-uses the snapshot's table
     // (cols-keyed, rebuilt on cols changes), the viewport tail is counted

@@ -157,10 +157,11 @@ impl App {
                     state.dyn_slots.get(i - state.slots.len())
                 }
             };
-            let total = state.slots.len() + state.dyn_slots.len();
-            let (first, last) = crate::paint::region_cache::region_display_range(total, |i| {
-                slot_at(i).map_or(true, |slot| slot.text.is_empty())
-            });
+            // v1.20.11: the L2-clamped range — the hyperlink row mapping
+            // (`first + line_idx`) must live in the same display domain the
+            // assembly stamped onto `LaidRow::Output::line`, which is the
+            // clamped one (T1-d / T3).
+            let (first, last) = state.clamped_display_range();
             let slot_idx = first + line_idx;
             (slot_idx < last)
                 .then(|| slot_at(slot_idx))

@@ -11,8 +11,9 @@ use weft_core::blocks::StyledLine;
 use weft_core::vt::Terminal;
 
 use super::{
-    document_index_of_cursor, live_output_version_source, region_display_range, region_head,
-    region_source_for, trim_cap, PaneRegionState, RegionLiveCache, RegionSlot,
+    document_index_of_cursor, live_output_version_source, region_display_chunk_total,
+    region_display_range, region_head, region_source_for, scan_logical_ranges, trim_cap,
+    PaneRegionState, RegionLiveCache, RegionSlot,
 };
 
 // ── test-only helpers (moved here v1.19.2, PLAN_v1192 task 0) ───────────
@@ -426,6 +427,8 @@ fn d6_display_domain_skips_dropped_blanks() {
             slot("", 7, 8),
         ],
         cumulative: vec![0u32, 0, 1, 1, 2, 3, 3],
+        head_high_water_doc: 0,
+        display_last_high_water: 0,
     };
     assert_eq!(state.display_logical_row_of_cursor(1), Some(0), "a");
     // Mid-wrap-chain cursors resolve to their owning logical row; interior
@@ -488,6 +491,8 @@ fn trim_cap_preserves_suffix_and_rebases_prefix_sums() {
             .collect(),
         dyn_slots: Vec::new(),
         cumulative: (0..=30u32).collect(),
+        head_high_water_doc: 0,
+        display_last_high_water: 0,
     };
     trim_cap(&mut state, 20);
     assert_eq!(state.slots.len(), 20);
@@ -765,3 +770,8 @@ fn registry_drift_during_scroll_forces_wholesale_not_advance() {
         );
     }
 }
+
+// v1.20.11 (PLAN_v12011 T2): the ED[J collapse-immunization regression
+// suite, split to a #[path] submodule (tests.rs budget discipline).
+#[path = "tests/high_water.rs"]
+mod high_water;
