@@ -11,9 +11,8 @@ use weft_core::blocks::StyledLine;
 use weft_core::vt::Terminal;
 
 use super::{
-    document_index_of_cursor, live_output_version_source, region_display_chunk_total,
-    region_display_range, region_head, region_source_for, scan_logical_ranges, trim_cap,
-    PaneRegionState, RegionLiveCache, RegionSlot,
+    document_index_of_cursor, live_output_version_source, region_display_range, region_head,
+    region_source_for, trim_cap, PaneRegionState, RegionLiveCache, RegionSlot,
 };
 
 // ── test-only helpers (moved here v1.19.2, PLAN_v1192 task 0) ───────────
